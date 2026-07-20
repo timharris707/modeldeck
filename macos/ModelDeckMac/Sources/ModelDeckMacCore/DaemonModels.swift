@@ -311,10 +311,32 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
 public struct DeckState: Codable, Equatable, Sendable {
     public var accounts: [DeckAccount]
     public var usage: [UsageSnapshot]
+    /// Per-provider PHYSICAL activation truth (issue #55/#56). Optional by
+    /// design: a pre-#56 daemon omits the field entirely, and the UI then
+    /// keeps its previous behavior with no false warnings. Decoded
+    /// tolerantly — an unexpected shape reads as absent rather than failing
+    /// the whole state decode.
+    public var activation: DeckActivation?
 
-    public init(accounts: [DeckAccount] = [], usage: [UsageSnapshot] = []) {
+    public init(
+        accounts: [DeckAccount] = [],
+        usage: [UsageSnapshot] = [],
+        activation: DeckActivation? = nil
+    ) {
         self.accounts = accounts
         self.usage = usage
+        self.activation = activation
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case accounts, usage, activation
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.accounts = try container.decodeIfPresent([DeckAccount].self, forKey: .accounts) ?? []
+        self.usage = try container.decodeIfPresent([UsageSnapshot].self, forKey: .usage) ?? []
+        self.activation = try? container.decodeIfPresent(DeckActivation.self, forKey: .activation)
     }
 }
 

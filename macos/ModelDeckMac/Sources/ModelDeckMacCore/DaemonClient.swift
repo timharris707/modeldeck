@@ -50,6 +50,16 @@ public enum DaemonClientError: Error, Equatable, Sendable {
     case httpStatus(Int)
     /// A non-2xx response whose body carried the daemon's `{"error": …}` shape.
     case daemonError(message: String, status: Int)
+    /// A non-2xx response whose body carried BOTH `error` and a
+    /// machine-readable `code` (issue #55: the activation clobber-guard
+    /// refusal ships `code: "active-link-blocked"` so the UI can render the
+    /// daemon's guidance prominently rather than as a generic failure).
+    case daemonCodedError(message: String, code: String, status: Int)
+}
+
+public extension DaemonClientError {
+    /// The activation clobber-guard's machine-readable refusal code.
+    static let activeLinkBlockedCode = "active-link-blocked"
 }
 
 extension DaemonClientError: LocalizedError {
@@ -60,6 +70,8 @@ extension DaemonClientError: LocalizedError {
         case .httpStatus(let code):
             return "The daemon returned HTTP \(code)."
         case .daemonError(let message, _):
+            return message
+        case .daemonCodedError(let message, _, _):
             return message
         }
     }
@@ -204,7 +216,7 @@ public struct DaemonClient: Sendable {
             return outcome
         }
         if let body = try? JSONDecoder().decode(DaemonErrorBody.self, from: data) {
-            throw DaemonClientError.daemonError(message: body.error, status: http.statusCode)
+            throw body.clientError(status: http.statusCode)
         }
         if (200..<300).contains(http.statusCode) {
             throw DaemonClientError.invalidResponse
@@ -349,7 +361,7 @@ public struct DaemonClient: Sendable {
         }
         guard (200..<300).contains(http.statusCode) else {
             if let body = try? JSONDecoder().decode(DaemonErrorBody.self, from: data) {
-                throw DaemonClientError.daemonError(message: body.error, status: http.statusCode)
+                throw body.clientError(status: http.statusCode)
             }
             throw DaemonClientError.httpStatus(http.statusCode)
         }
@@ -366,9 +378,20 @@ public struct DaemonClient: Sendable {
     }
 }
 
-/// The daemon's non-2xx `{"error": …}` body shape.
+/// The daemon's non-2xx `{"error": …}` body shape, optionally carrying a
+/// machine-readable `code` (issue #55: "active-link-blocked").
 private struct DaemonErrorBody: Decodable {
     var error: String
+    var code: String?
+
+    /// The typed error for this body: coded when the daemon attached a
+    /// machine-readable code, the classic message-only error otherwise.
+    func clientError(status: Int) -> DaemonClientError {
+        if let code, !code.isEmpty {
+            return .daemonCodedError(message: error, code: code, status: status)
+        }
+        return .daemonError(message: error, status: status)
+    }
 }
 
 extension DaemonClient: AccountActivating {}

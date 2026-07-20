@@ -139,12 +139,26 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     public var account: DeckAccount
     public var provider: DeckProvider?
     public var windows: [DeckWindow]
-    /// Whether this is the provider's active account (checkmark beside the
-    /// title — spec amendment 2026-07-19 replaced the ACTIVE badge, and the
-    /// Activate control lives in Settings → Accounts).
+    /// Whether this is the provider's DB-default account (the account the
+    /// daemon INTENDS new sessions to use — spec amendment 2026-07-19
+    /// replaced the ACTIVE badge, and the Activate control lives in
+    /// Settings → Accounts). Whether that intent is physically in effect is
+    /// `activationState` (issue #55).
     public var isActive: Bool
+    /// The provider's verified physical activation state (issue #55).
+    /// `.unknown` when the daemon didn't report it (pre-#56) — the marker
+    /// then renders the full checkmark exactly as before.
+    public var activationState: ProviderActivationState
 
     public var id: String { account.id }
+
+    /// How this row's active marker renders when `isActive`: the full
+    /// checkmark only when activation is physically effective (or
+    /// unreported); a hollow warning-tinted marker with an honest caption
+    /// otherwise.
+    public var activeIndicator: ActiveIndicator {
+        ActiveIndicator.indicator(for: activationState)
+    }
 
     /// The window with the lowest % left — what the collapsed line shows.
     ///
@@ -199,11 +213,18 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
         return "\(worst.title) · \(worst.resetText)"
     }
 
-    public init(account: DeckAccount, provider: DeckProvider?, windows: [DeckWindow], isActive: Bool) {
+    public init(
+        account: DeckAccount,
+        provider: DeckProvider?,
+        windows: [DeckWindow],
+        isActive: Bool,
+        activationState: ProviderActivationState = .unknown
+    ) {
         self.account = account
         self.provider = provider
         self.windows = windows
         self.isActive = isActive
+        self.activationState = activationState
     }
 }
 
@@ -245,11 +266,13 @@ public enum DeckBuilder {
                         if l != r { return l < r }
                         return lhs.scope.localizedCaseInsensitiveCompare(rhs.scope) == .orderedAscending
                     }
+                let provider = DeckProvider.from(account.provider)
                 return DeckAccountRow(
                     account: account,
-                    provider: DeckProvider.from(account.provider),
+                    provider: provider,
                     windows: windows,
-                    isActive: account.isDefault
+                    isActive: account.isDefault,
+                    activationState: provider.map { state.activationState(for: $0) } ?? .unknown
                 )
             }
     }
@@ -492,6 +515,11 @@ public final class DeckPopoverModel: ObservableObject {
     @Published public private(set) var activatingAccountID: String?
     /// Inline error text per account id, shown under the Activate button.
     @Published public private(set) var activationErrors: [String: String] = [:]
+    /// Issue #55: the clobber-guard's own guidance per account id, VERBATIM
+    /// from the daemon's `code: "active-link-blocked"` refusal. Rendered as
+    /// a prominent inline alert near the row (never a silent console
+    /// error), separate from generic activation failures.
+    @Published public private(set) var blockedActivationGuidance: [String: String] = [:]
     /// Optimistic ACTIVE override, keyed by provider key. While set, rows of
     /// that provider render the override target as active regardless of what
     /// the (still stale) daemon state says. Cleared on verified success
@@ -560,6 +588,12 @@ public final class DeckPopoverModel: ObservableObject {
         activationErrors[accountID]
     }
 
+    /// The daemon's one-time-migration guidance for a refused activation of
+    /// this account (issue #55), or nil.
+    public func blockedActivationGuidance(for accountID: String) -> String? {
+        blockedActivationGuidance[accountID]
+    }
+
     /// One-click switch for a non-active account (Settings → Accounts since
     /// the 2026-07-19 spec amendment): flip the active checkmark
     /// optimistically, `POST …/activate`, then verify against a fresh
@@ -572,6 +606,7 @@ public final class DeckPopoverModel: ObservableObject {
         let key = Self.activationKey(for: row.account)
         let previous = optimisticActive[key]
         activationErrors[row.id] = nil
+        blockedActivationGuidance[row.id] = nil
         activatingAccountID = row.id
         optimisticActive[key] = row.id // optimistic flip — badge moves now
         defer { activatingAccountID = nil }
@@ -587,8 +622,24 @@ public final class DeckPopoverModel: ObservableObject {
             onVerifiedState?(fresh)
         } catch {
             optimisticActive[key] = previous // revert the flip
-            activationErrors[row.id] = Self.activationMessage(for: error)
+            if let guidance = Self.blockedGuidance(for: error) {
+                // Issue #55: the clobber-guard refusal is guidance, not a
+                // generic failure — the daemon's message renders VERBATIM
+                // in a prominent inline alert near the row.
+                blockedActivationGuidance[row.id] = guidance
+            } else {
+                activationErrors[row.id] = Self.activationMessage(for: error)
+            }
         }
+    }
+
+    /// The daemon's verbatim guidance when activation hit the clobber guard
+    /// (`code: "active-link-blocked"`), nil for every other failure.
+    nonisolated static func blockedGuidance(for error: Error) -> String? {
+        guard case DaemonClientError.daemonCodedError(let message, let code, _) = error,
+              code == DaemonClientError.activeLinkBlockedCode
+        else { return nil }
+        return message
     }
 
     /// Rows with the optimistic ACTIVE override applied: within an
@@ -613,7 +664,8 @@ public final class DeckPopoverModel: ObservableObject {
         switch error {
         case DeckActivationError.verificationFailed:
             return "Switch not confirmed — the daemon still reports the previous account."
-        case DaemonClientError.daemonError(let message, _):
+        case DaemonClientError.daemonError(let message, _),
+             DaemonClientError.daemonCodedError(let message, _, _):
             return "Couldn't activate: \(message)"
         default:
             return "Couldn't activate: \(error.localizedDescription)"

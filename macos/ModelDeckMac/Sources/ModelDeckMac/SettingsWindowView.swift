@@ -94,6 +94,22 @@ struct AccountsSettingsPane: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 10)
             }
+            // Issue #55 item 3: when a provider's verified activation state
+            // isn't effective, say honestly what works (usage tracking) and
+            // what doesn't (switching accounts) until the one-time migration
+            // runs. Display + guidance only — no migration control here.
+            if let state = statusModel.deckState {
+                let notices = ActivationNotice.notices(for: state)
+                if !notices.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(notices) { notice in
+                            ActivationNoticeView(notice: notice)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 10)
+                }
+            }
             if accounts.isEmpty {
                 Spacer()
                 Text(statusModel.deckState == nil
@@ -111,7 +127,9 @@ struct AccountsSettingsPane: View {
                             canEdit: AccountsSettingsModel.canEdit(account),
                             isActivating: deckModel.activatingAccountID == account.id,
                             isActivationInFlight: deckModel.activatingAccountID != nil,
+                            activationState: activationState(for: account),
                             activationError: deckModel.activationError(for: account.id),
+                            blockedActivationGuidance: deckModel.blockedActivationGuidance(for: account.id),
                             signInPhase: signInModel.phase(for: account.id),
                             signInError: signInModel.error(for: account.id),
                             onActivate: deckModel.canActivate && !account.isDefault
@@ -178,6 +196,16 @@ struct AccountsSettingsPane: View {
             isActive: account.isDefault
         )
     }
+
+    /// The verified physical activation state for this account's provider
+    /// (issue #55); `.unknown` for unknown providers or a pre-#56 daemon —
+    /// which renders exactly like today (full checkmark, no warnings).
+    private func activationState(for account: DeckAccount) -> ProviderActivationState {
+        guard let provider = DeckProvider.from(account.provider),
+              let state = statusModel.deckState
+        else { return .unknown }
+        return state.activationState(for: provider)
+    }
 }
 
 /// One Settings → Accounts roster row. This is the activation surface (spec
@@ -191,7 +219,14 @@ struct AccountRosterRow: View {
     var isActivating: Bool = false
     /// True while ANY activation is in flight — every Activate button disables.
     var isActivationInFlight: Bool = false
+    /// Issue #55: this provider's verified physical activation state — the
+    /// active row's marker renders the full checkmark only when effective
+    /// (or unreported by an older daemon).
+    var activationState: ProviderActivationState = .unknown
     var activationError: String?
+    /// Issue #55: the daemon's clobber-guard guidance, rendered VERBATIM as
+    /// a prominent inline alert near the row.
+    var blockedActivationGuidance: String?
     /// Issue #32: this account's own sign-in-again flow state.
     var signInPhase: AccountSignInModel.Phase?
     var signInError: String?
@@ -227,7 +262,7 @@ struct AccountRosterRow: View {
                         Text(account.label)
                             .font(.system(size: 12.5, weight: .semibold))
                         if account.isDefault {
-                            ActiveCheckmark()
+                            ActiveMarkerView(indicator: ActiveIndicator.indicator(for: activationState))
                         }
                     }
                     Text(subtitle)
@@ -256,6 +291,33 @@ struct AccountRosterRow: View {
                 Button("Remove", role: .destructive, action: onRemove)
                     .controlSize(.small)
                     .disabled(isBusy)
+            }
+            if let blockedActivationGuidance {
+                // Issue #55 item 2: the clobber-guard refusal surfaces
+                // prominently — a calm, warning-tinted inline alert carrying
+                // the daemon's guidance verbatim (never a silent failure).
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(severityColor(.warning))
+                    Text(blockedActivationGuidance)
+                        .font(.system(size: 10.5))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+                .padding(8)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(severityColor(.warning).opacity(0.10))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(severityColor(.warning).opacity(0.25))
+                )
+                .padding(.leading, 28)
+                .padding(.top, 4)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Activation blocked: \(blockedActivationGuidance)")
             }
             if let activationError {
                 Text(activationError)
@@ -330,6 +392,33 @@ struct AccountRosterRow: View {
         if let identity = account.identity, !identity.isEmpty { parts.append(identity) }
         if let purpose = account.purpose, !purpose.isEmpty { parts.append(purpose) }
         return parts.joined(separator: " · ")
+    }
+}
+
+/// Issue #55 item 3: compact per-provider notice above the roster when the
+/// provider's activation isn't physically effective. Calm, informational
+/// tone (restraint bar — no scary red banners): usage tracking works today;
+/// account switching waits on the one-time migration.
+struct ActivationNoticeView: View {
+    let notice: ActivationNotice
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            ProviderMarkView(provider: notice.provider, size: 13)
+            Text(notice.message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 6)
+        .padding(.horizontal, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.primary.opacity(0.05))
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(notice.provider.displayName) activation notice: \(notice.message)")
     }
 }
 

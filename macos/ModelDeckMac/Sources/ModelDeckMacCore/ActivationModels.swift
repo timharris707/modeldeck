@@ -1,0 +1,143 @@
+import Foundation
+
+// Issue #55 (UI half) — honest activation state. The daemon (#56) verifies
+// the PHYSICAL active link on every `GET /api/state` and reports, per
+// provider, whether the DB-default account is actually the one new sessions
+// consume. Everything here is pure derivation so it is directly unit
+// testable; the views stay thin.
+
+/// One provider's entry in the daemon's `activation` map
+/// (`GET /api/state` → `activation.claude` / `activation.codex`).
+public struct ProviderActivation: Codable, Equatable, Sendable {
+    /// "effective" | "blocked" | "mismatched" | "unlinked".
+    public var state: String?
+    /// Where the active link physically resolves, when a symlink exists.
+    public var resolvedProfileRef: String?
+
+    public init(state: String? = nil, resolvedProfileRef: String? = nil) {
+        self.state = state
+        self.resolvedProfileRef = resolvedProfileRef
+    }
+}
+
+/// The daemon's per-provider activation map. Optional everywhere — a
+/// pre-#56 daemon simply omits the field and the UI keeps today's behavior.
+public struct DeckActivation: Codable, Equatable, Sendable {
+    public var claude: ProviderActivation?
+    public var codex: ProviderActivation?
+
+    public init(claude: ProviderActivation? = nil, codex: ProviderActivation? = nil) {
+        self.claude = claude
+        self.codex = codex
+    }
+}
+
+/// Typed activation state for a provider. `.unknown` covers BOTH an absent
+/// `activation` field (older daemon) and an unrecognized state string (newer
+/// daemon) — in either case the UI must not invent warnings, so `.unknown`
+/// renders exactly like today's behavior (full checkmark, no notice).
+public enum ProviderActivationState: Equatable, Sendable {
+    case effective
+    case blocked
+    case mismatched
+    case unlinked
+    case unknown
+
+    /// Lenient mapping from the daemon's state string.
+    public static func from(_ raw: String?) -> ProviderActivationState {
+        switch raw?.lowercased() {
+        case "effective": return .effective
+        case "blocked": return .blocked
+        case "mismatched": return .mismatched
+        case "unlinked": return .unlinked
+        default: return .unknown
+        }
+    }
+}
+
+/// How the DB-default account's active marker renders (deck popover and
+/// Settings → Accounts alike): the full checkmark only when activation is
+/// physically effective — or when the daemon didn't report activation at
+/// all (honest fallback, no false warnings). Every verified-not-effective
+/// state gets the hollow warning-tinted marker with an honest caption.
+public enum ActiveIndicator: Equatable, Sendable {
+    case checkmark
+    case pending(caption: String)
+
+    public static func indicator(for state: ProviderActivationState) -> ActiveIndicator {
+        switch state {
+        case .effective, .unknown:
+            return .checkmark
+        case .blocked:
+            return .pending(caption: "Activation pending — one-time migration needed")
+        case .mismatched:
+            return .pending(caption: "Active link points at a different account")
+        case .unlinked:
+            return .pending(caption: "Activation pending — no active link yet")
+        }
+    }
+}
+
+/// Compact per-provider notice for Settings → Accounts (issue #55 item 3):
+/// when a provider's activation isn't effective, say honestly what works
+/// (usage tracking) and what doesn't (switching accounts) until the
+/// one-time migration runs. Display + guidance only — the migration itself
+/// stays a manual, deliberately gated ceremony.
+public struct ActivationNotice: Equatable, Identifiable, Sendable {
+    public var provider: DeckProvider
+    public var message: String
+
+    public var id: String { provider.rawValue }
+
+    public init(provider: DeckProvider, message: String) {
+        self.provider = provider
+        self.message = message
+    }
+
+    /// Notices for every provider whose VERIFIED activation state is not
+    /// effective. `.unknown` (absent field / unrecognized value) yields no
+    /// notice, and a provider with no enabled accounts has nothing to warn
+    /// about. Order is fixed: Claude first, then Codex.
+    public static func notices(for state: DeckState) -> [ActivationNotice] {
+        DeckProvider.allCases.compactMap { provider in
+            guard state.accounts.contains(where: { $0.enabled && DeckProvider.from($0.provider) == provider })
+            else { return nil }
+            guard let message = message(for: state.activationState(for: provider), provider: provider)
+            else { return nil }
+            return ActivationNotice(provider: provider, message: message)
+        }
+    }
+
+    static func message(for state: ProviderActivationState, provider: DeckProvider) -> String? {
+        let name = provider.displayName
+        switch state {
+        case .effective, .unknown:
+            return nil
+        case .blocked:
+            return "\(name) usage tracking is accurate today, but switching accounts "
+                + "isn't in effect yet — a one-time migration is needed before "
+                + "activation can take hold."
+        case .mismatched:
+            return "\(name) usage tracking is accurate today, but the active link "
+                + "points at a different account than the one marked active, so "
+                + "switching accounts hasn't taken hold."
+        case .unlinked:
+            return "\(name) usage tracking is accurate today, but no active link "
+                + "exists yet, so switching accounts isn't in effect."
+        }
+    }
+}
+
+public extension DeckState {
+    /// Typed activation state for a provider, `.unknown` when the daemon
+    /// didn't report the `activation` field (pre-#56 daemon).
+    func activationState(for provider: DeckProvider) -> ProviderActivationState {
+        let entry: ProviderActivation?
+        switch provider {
+        case .claude: entry = activation?.claude
+        case .codex: entry = activation?.codex
+        }
+        guard let entry else { return .unknown }
+        return ProviderActivationState.from(entry.state)
+    }
+}

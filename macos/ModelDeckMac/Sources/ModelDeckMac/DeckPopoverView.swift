@@ -335,7 +335,14 @@ struct DeckAccountRowView: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("\(row.account.label)\(row.isActive ? ", active" : "")")
+            .accessibilityLabel({ () -> String in
+                // Issue #55 (CodeRabbit): VoiceOver must hear the pending
+                // state, not just silence, for a DB-active-but-blocked row.
+                if case .pending(let caption) = row.activeIndicator {
+                    return "\(row.account.label), marked active, pending — \(caption)"
+                }
+                return "\(row.account.label)\(row.isActive ? ", active" : "")"
+            }())
             .accessibilityHint(isExpanded ? "Collapse usage windows" : "Expand usage windows")
 
             if isExpanded {
@@ -373,7 +380,10 @@ struct DeckAccountRowView: View {
                 titleText
                     .lineLimit(1)
                 if row.isActive {
-                    ActiveCheckmark()
+                    // Issue #55: the marker is honest — full checkmark only
+                    // when the daemon verified activation is physically in
+                    // effect (or didn't report activation at all).
+                    ActiveMarkerView(indicator: row.activeIndicator)
                 }
                 Spacer(minLength: 8)
                 // Issue #33 amendment: the headline percent only exists
@@ -480,6 +490,27 @@ struct ActiveCheckmark: View {
             .foregroundStyle(Color.accentColor)
             .help("Active account — new sessions use this account")
             .accessibilityLabel("Active")
+    }
+}
+
+/// Issue #55: honest active marker. Full checkmark only when the provider's
+/// activation is physically effective (or the daemon didn't report
+/// activation — older daemon, no false warnings); otherwise a hollow,
+/// warning-tinted mark whose tooltip carries the honest caption.
+struct ActiveMarkerView: View {
+    let indicator: ActiveIndicator
+
+    var body: some View {
+        switch indicator {
+        case .checkmark:
+            ActiveCheckmark()
+        case .pending(let caption):
+            Image(systemName: "checkmark.circle")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(severityColor(.warning))
+                .help(caption)
+                .accessibilityLabel("Marked active, pending — \(caption)")
+        }
     }
 }
 
