@@ -83,7 +83,17 @@ public final class MenuBarStatusModel: ObservableObject {
                 let state = try await stateProvider.deckState()
                 guard generation == stateGeneration else { return }
                 deckState = state
-                worst = WorstRemainingCalculator.worstRemaining(in: state)
+                // Issue #45: the evaluator (in the app, the daemon's own
+                // /api/capacity/worst — the single source of truth) is the
+                // PRIMARY worst-remaining source; the client-side calc over
+                // the state we already fetched is the offline fallback so
+                // the icon keeps working against daemons without the
+                // endpoint or when the second GET fails mid-refresh.
+                do {
+                    worst = try await evaluator.evaluateWorstRemaining()
+                } catch {
+                    worst = WorstRemainingCalculator.worstRemaining(in: state)
+                }
             } else {
                 worst = try await evaluator.evaluateWorstRemaining()
             }
@@ -116,6 +126,7 @@ public final class MenuBarStatusModel: ObservableObject {
     /// default 5 min; 0 or negative disables). Replaces any prior schedule.
     public func startAutoRefresh(interval: TimeInterval) {
         stopAutoRefresh()
+        autoRefreshInterval = max(interval, 0)
         guard interval > 0 else { return }
         autoRefreshTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -138,5 +149,46 @@ public final class MenuBarStatusModel: ObservableObject {
         if seconds < 60 { return "Updated just now" }
         let minutes = Int(seconds / 60)
         return "Updated \(minutes) min ago"
+    }
+
+    // MARK: - Footer freshness (issue #42)
+
+    /// The effective auto-refresh cadence (seconds); 0 while disabled. Feeds
+    /// the footer's staleness threshold (~2x this interval).
+    public private(set) var autoRefreshInterval: TimeInterval = 0
+
+    /// What the popover footer renders: the freshness line plus whether it
+    /// should carry the muted warning tint.
+    public struct FooterStatus: Equatable, Sendable {
+        public var text: String
+        public var isStale: Bool
+
+        public init(text: String, isStale: Bool) {
+            self.text = text
+            self.isStale = isStale
+        }
+    }
+
+    /// Footer freshness derived from the newest usage snapshot's
+    /// `observedAt` — the provider observation, NOT this app's last GET of
+    /// the daemon cache (issue #42's exact complaint). Stale when that age
+    /// exceeds ~2x the auto-refresh interval or the daemon flags any row
+    /// stale. Falls back to the app-side "Updated…" text when no snapshot
+    /// carries observedAt (older daemons); nil before the first load.
+    public func footerStatus(now: Date? = nil) -> FooterStatus? {
+        let now = now ?? clock()
+        let rowStale = deckState.map(DeckFreshness.anyRowStale(in:)) ?? false
+        if let state = deckState, let observedAt = DeckFreshness.newestObservedAt(in: state) {
+            return FooterStatus(
+                text: DeckFreshness.text(observedAt: observedAt, now: now),
+                isStale: rowStale || DeckFreshness.isStale(
+                    observedAt: observedAt,
+                    now: now,
+                    autoRefreshInterval: autoRefreshInterval
+                )
+            )
+        }
+        guard let text = updatedAgoText(now: now) else { return nil }
+        return FooterStatus(text: text, isStale: rowStale)
     }
 }

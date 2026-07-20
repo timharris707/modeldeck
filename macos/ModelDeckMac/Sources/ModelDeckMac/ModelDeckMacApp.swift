@@ -11,12 +11,16 @@ struct ModelDeckMacApp: App {
     @StateObject private var addAccountModel: AddAccountModel
     @StateObject private var signInModel: AccountSignInModel
     @StateObject private var toolUpdateModel: ToolUpdateModel
+    @StateObject private var appUpdateModel: AppUpdateModel
     @StateObject private var notifications: UsageNotificationCoordinator
 
     init() {
         let configuration = DaemonConfiguration.resolved()
         let client = DaemonClient(configuration: configuration)
-        let evaluator = ClientSideUsageEvaluator(client: client)
+        // Issue #45: the daemon's /api/capacity/worst is the primary icon
+        // evaluator (single source of truth); MenuBarStatusModel falls back
+        // to the client-side calc over /api/state when it fails.
+        let evaluator = DaemonWorstCapacityEvaluator(provider: client)
         let statusModel = MenuBarStatusModel(
             evaluator: evaluator,
             stateProvider: client
@@ -51,6 +55,10 @@ struct ModelDeckMacApp: App {
             stateProvider: client
         )
         let toolUpdateModel = ToolUpdateModel(updater: client)
+        // Issue #33: the app's own update check against the PUBLIC repo's
+        // GitHub releases feed. Strictly separate from CLI updates; no
+        // self-replacing installer (that's issue #16's signed DMG work).
+        let appUpdateModel = AppUpdateModel(checker: GitHubReleaseChecker())
         let notifications = UsageNotificationCoordinator(poster: UserNotificationCenterPoster())
 
         // Every daemon-confirmed settings document applies live to the
@@ -120,14 +128,24 @@ struct ModelDeckMacApp: App {
         _addAccountModel = StateObject(wrappedValue: addAccountModel)
         _signInModel = StateObject(wrappedValue: signInModel)
         _toolUpdateModel = StateObject(wrappedValue: toolUpdateModel)
+        _appUpdateModel = StateObject(wrappedValue: appUpdateModel)
         _notifications = StateObject(wrappedValue: notifications)
     }
 
     var body: some Scene {
         MenuBarExtra {
-            DeckPopoverView(statusModel: statusModel, deckModel: deckModel)
+            DeckPopoverView(
+                statusModel: statusModel,
+                deckModel: deckModel,
+                appUpdateModel: appUpdateModel
+            )
         } label: {
-            MenuBarIconView(state: statusModel.iconState)
+            // Issue #45: the view observes the model ITSELF — passing a
+            // value snapshot from this Scene body left the status-item
+            // label frozen at its launch-time render (.plain) because
+            // MenuBarExtra label invalidation doesn't reliably reach
+            // value-type dependencies captured up here.
+            MenuBarIconView(statusModel: statusModel)
                 .task {
                     await statusModel.refresh()
                     // Daemon settings are the source of truth; a successful
@@ -153,7 +171,8 @@ struct ModelDeckMacApp: App {
                 addAccountModel: addAccountModel,
                 deckModel: deckModel,
                 signInModel: signInModel,
-                updateModel: toolUpdateModel
+                updateModel: toolUpdateModel,
+                appUpdateModel: appUpdateModel
             )
         }
     }

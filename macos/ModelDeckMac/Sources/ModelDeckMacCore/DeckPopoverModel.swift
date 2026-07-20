@@ -158,9 +158,23 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
             .min { ($0.remainingPercent ?? .infinity) < ($1.remainingPercent ?? .infinity) }
     }
 
-    /// The soonest upcoming reset across all windows — the "next reset" sort key.
-    public var nextReset: Date? {
-        windows.compactMap(\.resetsAt).min()
+    /// Issue #33 amendment (2026-07-20): the top-right headline "% left"
+    /// renders ONLY while the card is collapsed — it summarizes the worst
+    /// meter you can't see. Expanded cards list every window with its own
+    /// percent, so the headline hides (no duplicated number); it returns on
+    /// collapse. Both layouts share this rule.
+    public func headlineWindow(isExpanded: Bool) -> DeckWindow? {
+        isExpanded ? nil : worstWindow
+    }
+
+    /// The Reset sort key (issue #43): the DISPLAYED binding (worst)
+    /// window's reset — the same reset time the collapsed card shows — so
+    /// visible order always matches visible text. The old key (soonest
+    /// reset across ALL windows) sorted by a number the user couldn't see,
+    /// e.g. a nearly-idle 5-hour window resetting in minutes. Nil when the
+    /// binding window carries no reset data; those rows sort last.
+    public var displayedReset: Date? {
+        worstWindow?.resetsAt
     }
 
     /// Lowest % left across windows — the "lowest remaining" sort key.
@@ -234,8 +248,10 @@ public enum DeckBuilder {
         rows.sorted { lhs, rhs in
             switch order {
             case .nextReset:
-                let l = lhs.nextReset ?? .distantFuture
-                let r = rhs.nextReset ?? .distantFuture
+                // Issue #43: keyed on the displayed (binding) window's
+                // reset, never a hidden window's.
+                let l = lhs.displayedReset ?? .distantFuture
+                let r = rhs.displayedReset ?? .distantFuture
                 if l != r { return l < r }
             case .lowestRemaining:
                 let l = lhs.lowestRemaining ?? .infinity
@@ -243,14 +259,14 @@ public enum DeckBuilder {
                 if l != r { return l < r }
             case .provider:
                 // Issue #30: group by provider even in single-column mode;
-                // within a provider group keep the next-reset order. In
-                // two-column mode every row in a column shares a provider,
-                // so this degrades to next-reset there.
+                // within a provider group keep the Reset order (displayed
+                // binding reset, issue #43). In two-column mode every row in
+                // a column shares a provider, so this degrades to Reset.
                 let lp = providerRank(lhs.provider)
                 let rp = providerRank(rhs.provider)
                 if lp != rp { return lp < rp }
-                let l = lhs.nextReset ?? .distantFuture
-                let r = rhs.nextReset ?? .distantFuture
+                let l = lhs.displayedReset ?? .distantFuture
+                let r = rhs.displayedReset ?? .distantFuture
                 if l != r { return l < r }
             }
             return lhs.account.label.localizedCaseInsensitiveCompare(rhs.account.label) == .orderedAscending

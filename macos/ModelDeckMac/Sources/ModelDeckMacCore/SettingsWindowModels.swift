@@ -100,22 +100,32 @@ public protocol ToolsProbing: Sendable {
 extension DaemonClient: ToolsProbing {}
 
 /// CLI tools section: shows the cached probe (installed vs. latest vs. auth
-/// state) and offers the token-gated forced re-check.
+/// state). Since issue #33 there is NO manual re-check control — opening the
+/// General pane fires the token-gated forced probe automatically (debounced),
+/// and the per-CLI Update pills render from the fresh result.
 @MainActor
 public final class ToolsStatusModel: ObservableObject {
+    /// Minimum spacing between pane-open forced probes. Rapid pane
+    /// open/close inside this window degrades to cheap cached reads (the
+    /// daemon's own probe cache already absorbs most of the cost).
+    public static let paneProbeDebounce: TimeInterval = 30
+
     @Published public private(set) var probe: ToolsProbeResponse?
     @Published public private(set) var isChecking = false
     @Published public private(set) var lastError: String?
 
     private let prober: any ToolsProbing
+    private let clock: @Sendable () -> Date
+    private var lastPaneProbeAt: Date?
 
-    public init(prober: any ToolsProbing) {
+    public init(prober: any ToolsProbing, clock: @escaping @Sendable () -> Date = { Date() }) {
         self.prober = prober
+        self.clock = clock
     }
 
     /// `refresh: false` reads the daemon's cache (cheap, no token);
-    /// `refresh: true` is the Check for Updates button (token-gated,
-    /// re-probes binaries and the npm registry).
+    /// `refresh: true` is the forced probe (`/api/tools?refresh=1`,
+    /// mutation-token gated — re-probes binaries and the npm registry).
     public func load(refresh: Bool = false) async {
         guard !isChecking else { return }
         isChecking = true
@@ -126,5 +136,22 @@ public final class ToolsStatusModel: ObservableObject {
         } catch {
             lastError = SettingsSyncModel.message(for: error)
         }
+    }
+
+    /// Issue #33: General pane appear → automatic forced re-probe, so users
+    /// never have to ask the app to look for CLI updates. Debounced: within
+    /// `paneProbeDebounce` of the last forced probe it only re-reads the
+    /// daemon cache (still populates on first show). The debounce stamp is
+    /// taken up front so overlapping appears can't double-fire the forced
+    /// path; a failed probe stays debounced too — the next pane open after
+    /// the window retries.
+    public func probeOnPaneOpen() async {
+        let now = clock()
+        if let last = lastPaneProbeAt, now.timeIntervalSince(last) < Self.paneProbeDebounce {
+            await load(refresh: false)
+            return
+        }
+        lastPaneProbeAt = now
+        await load(refresh: true)
     }
 }

@@ -9,8 +9,20 @@ import ModelDeckMacCore
 struct DeckPopoverView: View {
     @ObservedObject var statusModel: MenuBarStatusModel
     @ObservedObject var deckModel: DeckPopoverModel
+    /// Issue #33 final placement: the gear menu carries the PRIMARY
+    /// "Check for App Updates…" affordance, wired to the same shared model
+    /// as the Settings mirror — one check state, two entry points.
+    @ObservedObject var appUpdateModel: AppUpdateModel
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
     @State private var launchAtLoginError: String?
+    /// Presents the standard result dialog once a gear-menu check finishes.
+    @State private var updateDialog: AppUpdateModel.ResultDialog?
+    @Environment(\.openURL) private var openURL
+    /// Issue #45: Settings opens via the environment action wrapped in
+    /// activation + fronting (see SettingsWindowFronting) instead of a bare
+    /// SettingsLink, which with the accessory activation policy opened the
+    /// window behind the frontmost app or failed to raise an existing one.
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -32,18 +44,25 @@ struct DeckPopoverView: View {
     // MARK: - Header
 
     /// Issue #30 item 10: the product name sits top-left as a quiet
-    /// wordmark — system semibold with a touch of tracking, no color, no
-    /// glyph (Anthropic usage-panel restraint). The sort control shrinks to
-    /// compact icon segments (clock = next reset, percent = lowest
-    /// remaining, grid = by provider; tooltips + accessibility labels carry
-    /// the names) and sits beside the settings gear, which stays top-right.
-    /// No version/update chrome — that surface is issue #33's.
+    /// wordmark — system semibold with a touch of tracking, no color
+    /// (Anthropic usage-panel restraint). Issue #33 amendment (2026-07-20):
+    /// the site/favicon's three-bar brand mark sits immediately left of the
+    /// wordmark for app ⇄ site ⇄ favicon consistency. The sort control
+    /// shrinks to compact icon segments (clock = next reset, percent =
+    /// lowest remaining, grid = by provider; tooltips + accessibility labels
+    /// carry the names) and sits beside the settings gear, top-right.
+    /// Update chrome stays out of the header — the version is a muted footer
+    /// detail and update checks live in Settings (issue #33).
     private var header: some View {
         HStack(spacing: 8) {
-            Text("ModelDeck")
-                .font(.system(size: 13, weight: .semibold))
-                .tracking(0.4)
-                .accessibilityAddTraits(.isHeader)
+            HStack(spacing: 6) {
+                ModelDeckBrandMark()
+                Text("ModelDeck")
+                    .font(.system(size: 13, weight: .semibold))
+                    .tracking(0.4)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(.isHeader)
 
             Spacer()
 
@@ -63,8 +82,9 @@ struct DeckPopoverView: View {
             .help("Sort accounts: next reset, lowest remaining, or grouped by provider")
 
             Menu {
-                SettingsLink {
-                    Text("Settings…")
+                Button("Settings…") {
+                    openSettings()
+                    SettingsWindowFronting.activateAndFront()
                 }
                 Divider()
                 Toggle("Launch at Login", isOn: $launchAtLogin)
@@ -73,12 +93,45 @@ struct DeckPopoverView: View {
                     Text("Single column").tag(DeckLayout.singleColumn)
                 }
                 Divider()
+                // Issue #33 final placement (Tim, 2026-07-20): the canonical
+                // macOS spot for the app's own update check. Runs the shared
+                // AppUpdateModel and presents a standard result dialog.
+                // Never a CLI-update control — those live in Settings.
+                Button("Check for App Updates…") {
+                    Task {
+                        await appUpdateModel.check()
+                        // Issue #45: same accessory-policy pitfall as the
+                        // Settings window — activate so the result dialog
+                        // presents in front of whatever app was frontmost.
+                        SettingsWindowFronting.activateForDialog()
+                        updateDialog = appUpdateModel.resultDialog
+                    }
+                }
+                .disabled(appUpdateModel.isChecking)
+                Divider()
                 Button("Quit ModelDeck") { NSApp.terminate(nil) }
             } label: {
                 Image(systemName: "gearshape")
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
+            .alert(
+                updateDialog?.title ?? "",
+                isPresented: Binding(
+                    get: { updateDialog != nil },
+                    set: { if !$0 { updateDialog = nil } }
+                ),
+                presenting: updateDialog
+            ) { dialog in
+                if let releaseURL = dialog.releaseURL {
+                    Button("View Release") { openURL(releaseURL) }
+                    Button("Cancel", role: .cancel) {}
+                } else {
+                    Button("OK", role: .cancel) {}
+                }
+            } message: { dialog in
+                Text(dialog.message)
+            }
             .onChange(of: launchAtLogin) { _, enabled in
                 do {
                     try LaunchAtLogin.setEnabled(enabled)
@@ -149,14 +202,38 @@ struct DeckPopoverView: View {
 
     // MARK: - Footer
 
+    /// The running app's version (bundle authority — see `AppVersion`); nil
+    /// on unstamped dev builds, which then render no version at all.
+    private let appVersionText = AppVersion.footerText(for: AppVersion.current())
+
     private var footer: some View {
         HStack {
-            // TimelineView keeps "Updated N min ago" fresh while the
-            // popover stays open (the placeholder's timestamp went stale).
+            // Issue #42: the freshness line derives from the newest usage
+            // snapshot's observedAt (the provider observation), not this
+            // app's last GET of the daemon cache — and turns a muted warning
+            // gold once that age exceeds ~2x the auto-refresh interval or
+            // the daemon flags rows stale. TimelineView keeps it live while
+            // the popover stays open.
             TimelineView(.periodic(from: .now, by: 30)) { context in
-                Text(statusModel.updatedAgoText(now: context.date) ?? "Not updated yet")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                let status = statusModel.footerStatus(now: context.date)
+                HStack(spacing: 6) {
+                    Text(status?.text ?? "Not updated yet")
+                        .font(.caption)
+                        .foregroundStyle(status?.isStale == true
+                            ? AnyShapeStyle(severityColor(.warning))
+                            : AnyShapeStyle(.secondary))
+                        .help(status?.isStale == true
+                            ? "Usage data is older than expected — Refresh forces a fresh provider poll."
+                            : "Age of the newest provider-reported usage snapshot")
+                    // Issue #33: the app's own version, muted and small,
+                    // beside the freshness line (restraint bar applies).
+                    if let appVersionText {
+                        Text(appVersionText)
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                            .help("ModelDeck app version")
+                    }
+                }
             }
             Spacer()
             Button {
@@ -299,7 +376,10 @@ struct DeckAccountRowView: View {
                     ActiveCheckmark()
                 }
                 Spacer(minLength: 8)
-                if let worst = row.worstWindow, let remainingText = worst.remainingText {
+                // Issue #33 amendment: the headline percent only exists
+                // while collapsed — expanded rows carry their own numbers.
+                if let worst = row.headlineWindow(isExpanded: isExpanded),
+                   let remainingText = worst.remainingText {
                     Text(remainingText)
                         .font(DeckType.value)
                         .foregroundStyle(valueColor(for: worst))

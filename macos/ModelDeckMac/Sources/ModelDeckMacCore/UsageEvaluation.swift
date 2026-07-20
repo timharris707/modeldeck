@@ -121,6 +121,98 @@ public protocol UsageEvaluating: Sendable {
     func evaluateWorstRemaining() async throws -> WorstRemaining?
 }
 
+// MARK: - Daemon worst-capacity endpoint (issue #45)
+
+/// Typed mirror of `GET /api/capacity/worst` (src/capacity.mjs
+/// `evaluateWorstCapacity`) — the daemon's own worst-remaining evaluation,
+/// which is the single source of truth. Decoding is lenient like every other
+/// daemon mirror: unknown keys are ignored, optional fields stay optional.
+public struct CapacityWorstReport: Codable, Equatable, Sendable {
+    /// The winning row ("worst"): the lowest-remaining non-spend window
+    /// across enabled accounts.
+    public struct Row: Codable, Equatable, Sendable {
+        public var accountId: String
+        public var accountLabel: String?
+        public var provider: String?
+        public var scope: String
+        public var remainingPercent: Double
+        public var resetsAt: String?
+        public var observedAt: String?
+
+        public init(
+            accountId: String,
+            accountLabel: String? = nil,
+            provider: String? = nil,
+            scope: String,
+            remainingPercent: Double,
+            resetsAt: String? = nil,
+            observedAt: String? = nil
+        ) {
+            self.accountId = accountId
+            self.accountLabel = accountLabel
+            self.provider = provider
+            self.scope = scope
+            self.remainingPercent = remainingPercent
+            self.resetsAt = resetsAt
+            self.observedAt = observedAt
+        }
+    }
+
+    /// "ok" / "warn" / "critical" / "unknown".
+    public var status: String
+    public var worst: Row?
+    public var thresholdPercent: Double?
+    public var criticalPercent: Double?
+
+    public init(
+        status: String,
+        worst: Row? = nil,
+        thresholdPercent: Double? = nil,
+        criticalPercent: Double? = nil
+    ) {
+        self.status = status
+        self.worst = worst
+        self.thresholdPercent = thresholdPercent
+        self.criticalPercent = criticalPercent
+    }
+
+    /// The endpoint's worst row in the client's `WorstRemaining` shape; nil
+    /// when the daemon has nothing to evaluate (status "unknown").
+    public var worstRemaining: WorstRemaining? {
+        guard let worst else { return nil }
+        return WorstRemaining(
+            percent: worst.remainingPercent,
+            accountId: worst.accountId,
+            scope: worst.scope,
+            resetsAt: worst.resetsAt,
+            stale: false
+        )
+    }
+}
+
+/// Source of the daemon's worst-capacity report. `DaemonClient` conforms;
+/// tests stub it.
+public protocol WorstCapacityProviding: Sendable {
+    func worstCapacity() async throws -> CapacityWorstReport
+}
+
+/// Issue #45 evaluator: the daemon's `/api/capacity/worst` is the PRIMARY
+/// worst-remaining source (single source of truth — same code path as the
+/// CLI's capacity checks). `MenuBarStatusModel` falls back to the
+/// client-side calc over the already-fetched `/api/state` when this
+/// evaluator fails (daemon briefly unreachable between state fetches).
+public struct DaemonWorstCapacityEvaluator: UsageEvaluating {
+    private let provider: any WorstCapacityProviding
+
+    public init(provider: any WorstCapacityProviding) {
+        self.provider = provider
+    }
+
+    public func evaluateWorstRemaining() async throws -> WorstRemaining? {
+        try await provider.worstCapacity().worstRemaining
+    }
+}
+
 /// Phase 3 evaluator: fetch `GET /api/state`, compute worst-remaining locally.
 public struct ClientSideUsageEvaluator: UsageEvaluating {
     private let client: DaemonClient

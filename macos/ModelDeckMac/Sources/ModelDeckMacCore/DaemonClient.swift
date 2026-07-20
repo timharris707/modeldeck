@@ -109,6 +109,12 @@ public struct DaemonClient: Sendable {
         try await get("/api/state")
     }
 
+    /// `GET /api/capacity/worst` — the daemon's own worst-remaining
+    /// evaluation (issue #45: primary source for the menu bar icon).
+    public func worstCapacity() async throws -> CapacityWorstReport {
+        try await get("/api/capacity/worst")
+    }
+
     /// `GET /api/session` — fetches the daemon's mutation token. The server
     /// requires the same token as BOTH the `x-modeldeck-token` header and the
     /// `modeldeck_session` cookie on every non-GET request (`mutationAllowed`
@@ -366,3 +372,5 @@ private struct DaemonErrorBody: Decodable {
 }
 
 extension DaemonClient: AccountActivating {}
+
+extension DaemonClient: WorstCapacityProviding {}

@@ -108,11 +108,70 @@ struct DeckBuilderTests {
         #expect(columns[0].accountCountText == "3 accounts")
     }
 
-    @Test func sortByNextResetUsesSoonestWindowAcrossScopes() {
-        // c1's soonest reset is its 5-hour window (57 min), well before
-        // c2 (3 days) and c3 (4 days).
+    // Issue #43: the Reset sort keys on the DISPLAYED binding (worst)
+    // window's reset — the time the collapsed card shows — never a hidden
+    // window's sooner reset.
+    @Test func resetSortUsesTheDisplayedBindingWindow() {
+        // c1's binding window is week:fable (32%, resets in 2 days) even
+        // though its hidden 5-hour window resets in 57 min; c2 3 d, c3 4 d.
         let columns = DeckBuilder.columns(state: fixtureState(), sortOrder: .nextReset, now: now)
-        #expect(columns[0].rows.first?.id == "c1")
+        #expect(columns[0].rows.map(\.id) == ["c1", "c2", "c3"])
+    }
+
+    @Test func resetSortNeverKeysOnAHiddenWindow() {
+        // Tim's live repro shape: "early"'s binding weekly resets Tue-ish
+        // (3 days) while its idle 5-hour window resets in 16 min; "soon"'s
+        // binding window resets in 2h55m. The displayed times demand soon
+        // first — the old soonest-across-all key put early first.
+        let state = DeckState(
+            accounts: [
+                account("early", provider: "claude", label: "Studio"),
+                account("soon", provider: "claude", label: "Client"),
+            ],
+            usage: [
+                snapshot("early", scope: "5h", remaining: 96, resetsIn: 16 * 60),
+                snapshot("early", scope: "week", remaining: 12, resetsIn: 3 * 86_400),
+                snapshot("soon", scope: "5h", remaining: 25, resetsIn: 2 * 3_600 + 55 * 60),
+            ]
+        )
+        let columns = DeckBuilder.columns(state: state, sortOrder: .nextReset, now: now)
+        #expect(columns[0].rows.map(\.id) == ["soon", "early"])
+        // And the key each row sorted by is exactly the displayed reset.
+        #expect(columns[0].rows.map { $0.displayedReset == $0.worstWindow?.resetsAt } == [true, true])
+    }
+
+    @Test func bindingWindowWithoutResetDataSortsLast() {
+        let state = DeckState(
+            accounts: [
+                account("nodata", provider: "claude", label: "Aardvark"),
+                account("dated", provider: "claude", label: "Zebra"),
+            ],
+            usage: [
+                // Binding window (8%) has no reset data; a healthier window
+                // does — the row still sorts by its DISPLAYED (binding)
+                // window, i.e. last.
+                snapshot("nodata", scope: "week", remaining: 8, resetsIn: nil),
+                snapshot("nodata", scope: "5h", remaining: 90, resetsIn: 600),
+                snapshot("dated", scope: "week", remaining: 50, resetsIn: 5 * 86_400),
+            ]
+        )
+        let columns = DeckBuilder.columns(state: state, sortOrder: .nextReset, now: now)
+        #expect(columns[0].rows.map(\.id) == ["dated", "nodata"])
+    }
+
+    @Test func resetSortTieBreaksByLabelStable() {
+        let state = DeckState(
+            accounts: [
+                account("b", provider: "claude", label: "Studio"),
+                account("a", provider: "claude", label: "Client"),
+            ],
+            usage: [
+                snapshot("b", scope: "week", remaining: 40, resetsIn: 86_400),
+                snapshot("a", scope: "week", remaining: 60, resetsIn: 86_400),
+            ]
+        )
+        let columns = DeckBuilder.columns(state: state, sortOrder: .nextReset, now: now)
+        #expect(columns[0].rows.map(\.id) == ["a", "b"]) // Client before Studio
     }
 
     @Test func sortByLowestRemaining() {
@@ -416,16 +475,18 @@ struct MenuBarStatusModelDeckStateTests {
         func deckState() async throws -> DeckState { try result.get() }
     }
 
-    private struct UnusedEvaluator: UsageEvaluating {
+    /// Issue #45: refresh with a state provider consults the evaluator
+    /// FIRST (in the app: the daemon's /api/capacity/worst); this stub
+    /// throws so these tests exercise the client-calc fallback.
+    private struct FailingEvaluator: UsageEvaluating {
         func evaluateWorstRemaining() async throws -> WorstRemaining? {
-            Issue.record("evaluator should not be consulted when a state provider is set")
-            return nil
+            throw URLError(.cannotConnectToHost)
         }
     }
 
-    @Test func refreshPopulatesDeckStateAndIcon() async {
+    @Test func refreshPopulatesDeckStateAndIconViaFallbackCalc() async {
         let model = MenuBarStatusModel(
-            evaluator: UnusedEvaluator(),
+            evaluator: FailingEvaluator(),
             stateProvider: StubStateProvider(result: .success(fixtureState()))
         )
         await model.refresh()
@@ -435,14 +496,30 @@ struct MenuBarStatusModelDeckStateTests {
         #expect(model.connection == .connected)
     }
 
+    @Test func daemonEvaluatorIsPrimaryOverClientCalc() async {
+        // The evaluator (daemon endpoint) reports 3% while the client calc
+        // over the fixture state would say 8% — the evaluator must win.
+        let model = MenuBarStatusModel(
+            evaluator: StubEvaluator(results: [.success(
+                WorstRemaining(percent: 3, accountId: "acct-endpoint", scope: "Fable weekly")
+            )]),
+            stateProvider: StubStateProvider(result: .success(fixtureState()))
+        )
+        await model.refresh()
+        #expect(model.deckState?.accounts.count == 5)
+        #expect(model.worstRemaining?.percent == 3)
+        #expect(model.worstRemaining?.accountId == "acct-endpoint")
+        #expect(model.iconState == .critical(percentRemaining: 3))
+    }
+
     @Test func failureKeepsLastDeckState() async {
         let model = MenuBarStatusModel(
-            evaluator: UnusedEvaluator(),
+            evaluator: FailingEvaluator(),
             stateProvider: StubStateProvider(result: .success(fixtureState()))
         )
         await model.refresh()
         let failing = MenuBarStatusModel(
-            evaluator: UnusedEvaluator(),
+            evaluator: FailingEvaluator(),
             stateProvider: StubStateProvider(result: .failure(.httpStatus(500)))
         )
         await failing.refresh()

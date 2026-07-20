@@ -17,6 +17,9 @@ struct SettingsWindowView: View {
     /// Issue #32: per-account "Sign in again" flow and the CLI update pill.
     @ObservedObject var signInModel: AccountSignInModel
     @ObservedObject var updateModel: ToolUpdateModel
+    /// Issue #33: the app's own update check — a strictly separate surface
+    /// from CLI updates (never a shared control or wording).
+    @ObservedObject var appUpdateModel: AppUpdateModel
 
     var body: some View {
         TabView {
@@ -33,15 +36,15 @@ struct SettingsWindowView: View {
                 settingsSync: settingsSync,
                 toolsModel: toolsModel,
                 statusModel: statusModel,
-                updateModel: updateModel
+                updateModel: updateModel,
+                appUpdateModel: appUpdateModel
             )
             .tabItem { Label("General", systemImage: "gearshape") }
         }
         .frame(width: 520, height: 520)
         .task {
-            // Cached read only — populating chips/versions never forces the
-            // daemon to spawn probes; that's the explicit Check button.
-            await toolsModel.load(refresh: false)
+            // The CLI probe now loads from the General pane itself (issue
+            // #33: pane appear fires the debounced forced re-probe).
             if !settingsSync.isLoaded {
                 await settingsSync.load()
             }
@@ -416,9 +419,13 @@ struct GeneralSettingsPane: View {
     /// (daemon contract), so the row names that account explicitly.
     @ObservedObject var statusModel: MenuBarStatusModel
     @ObservedObject var updateModel: ToolUpdateModel
+    /// Issue #33: app-update check state (GitHub releases feed of the public
+    /// repo). Deliberately separate from every CLI update control.
+    @ObservedObject var appUpdateModel: AppUpdateModel
 
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
     @State private var launchAtLoginError: String?
+    @Environment(\.openURL) private var openURL
 
     /// Interval choices inside the daemon's validated 60–3600 s range.
     private static let intervalChoices: [Int] = [60, 120, 300, 600, 900, 1800, 3600]
@@ -477,6 +484,12 @@ struct GeneralSettingsPane: View {
                     .foregroundStyle(.secondary)
             }
 
+            // Issue #33: NO manual "Check for Updates" button here anymore —
+            // opening this pane fires the debounced forced re-probe (see the
+            // .task below), the version lines carry a subtle checking state
+            // while it runs, and the per-CLI Update pills (PR #38) render
+            // from the fresh result. CLI updates and the app's own update
+            // (ModelDeck section below) never share a control or wording.
             Section("CLI tools") {
                 if let probe = toolsModel.probe {
                     ToolStatusRow(
@@ -485,6 +498,7 @@ struct GeneralSettingsPane: View {
                         probe: probe.tools.claude,
                         activeAccount: activeAccountStatus(for: .claude),
                         updatePhase: updateModel.phase(for: "claude"),
+                        isProbing: toolsModel.isChecking,
                         onUpdate: { Task { await updateModel.update(tool: "claude") } },
                         onDismissOutcome: { updateModel.dismissOutcome(tool: "claude") }
                     )
@@ -494,21 +508,13 @@ struct GeneralSettingsPane: View {
                         probe: probe.tools.codex,
                         activeAccount: activeAccountStatus(for: .codex),
                         updatePhase: updateModel.phase(for: "codex"),
+                        isProbing: toolsModel.isChecking,
                         onUpdate: { Task { await updateModel.update(tool: "codex") } },
                         onDismissOutcome: { updateModel.dismissOutcome(tool: "codex") }
                     )
                 } else {
-                    Text(toolsModel.isChecking ? "Checking…" : "No probe data yet.")
+                    Text(toolsModel.isChecking ? "Checking versions…" : "No probe data yet.")
                         .foregroundStyle(.secondary)
-                }
-                HStack {
-                    Button("Check for Updates") {
-                        Task { await toolsModel.load(refresh: true) }
-                    }
-                    .disabled(toolsModel.isChecking)
-                    if toolsModel.isChecking {
-                        ProgressView().controlSize(.small)
-                    }
                 }
                 if let error = toolsModel.lastError {
                     Text(error)
@@ -536,6 +542,33 @@ struct GeneralSettingsPane: View {
                 }
             }
 
+            // Issue #33: ModelDeck's OWN update surface — a clearly separate
+            // section so app updates can never be conflated with the CLI
+            // rows above (distinct wording throughout: "Check for App
+            // Updates" / "View Release" vs. the CLI "Update" pills).
+            // Final placement decision (Tim, 2026-07-20): the PRIMARY
+            // affordance is the gear-menu "Check for App Updates…" item in
+            // the popover; this section keeps the version display and this
+            // check button as a deliberate mirror — both drive the same
+            // shared AppUpdateModel, so their states always agree.
+            Section("ModelDeck") {
+                LabeledContent("Version") {
+                    Text(appUpdateModel.currentVersion ?? "Unknown (development build)")
+                        .foregroundStyle(.secondary)
+                }
+                HStack {
+                    Button("Check for App Updates") {
+                        Task { await appUpdateModel.check() }
+                    }
+                    .disabled(appUpdateModel.isChecking)
+                    .help("Check the ModelDeck releases feed on GitHub. Nothing installs automatically.")
+                    if appUpdateModel.isChecking {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                appUpdateStatusLine
+            }
+
             if let error = settingsSync.lastError {
                 Text(error)
                     .font(.caption)
@@ -544,6 +577,42 @@ struct GeneralSettingsPane: View {
             }
         }
         .formStyle(.grouped)
+        // Issue #33: pane appear → automatic CLI re-probe (debounced in the
+        // model; the daemon's /api/tools?refresh=1 cache absorbs the rest).
+        // Users never have to ask the app to look for CLI updates.
+        .task { await toolsModel.probeOnPaneOpen() }
+    }
+
+    /// Outcome line under "Check for App Updates". On "update available" the
+    /// action is opening the release page — a self-replacing installer is
+    /// deliberately NOT built here; real auto-update install lands with
+    /// issue #16's signed, notarized DMG pipeline.
+    @ViewBuilder
+    private var appUpdateStatusLine: some View {
+        switch appUpdateModel.phase {
+        case .idle:
+            EmptyView()
+        case .checking:
+            EmptyView()
+        case .upToDate(let latest):
+            Text("Up to date — \(latest) is the latest release.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .updateAvailable(let release):
+            HStack(spacing: 8) {
+                Text("Version \(release.version) is available.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                Button("View Release") { openURL(release.url) }
+                    .controlSize(.small)
+                    .help("Opens the GitHub release page — download and install from there.")
+            }
+        case .unavailable(let message):
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     /// The provider's active (default) account, for the CLI-row chip
@@ -618,6 +687,10 @@ struct ToolStatusRow: View {
     let probe: ToolProbe
     var activeAccount: ActiveAccountStatus = .noAccounts
     var updatePhase: ToolUpdateModel.Phase?
+    /// Issue #33: true while the pane-open forced probe is in flight — the
+    /// version line dims with a mini spinner (subtle checking state) until
+    /// the fresh result lands.
+    var isProbing: Bool = false
     var onUpdate: (() -> Void)?
     var onDismissOutcome: (() -> Void)?
 
@@ -631,6 +704,12 @@ struct ToolStatusRow: View {
                     Text(probe.versionSummary)
                         .font(.caption)
                         .foregroundStyle(probe.updateAvailable == true ? .orange : .secondary)
+                        .opacity(isProbing ? 0.45 : 1)
+                    if isProbing {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .help("Re-checking installed and latest versions")
+                    }
                     // Issue #32 item 3 — the update pill. Shown while an
                     // update is available and no attempt is in flight or
                     // pending dismissal; the daemon single-flights the run.
