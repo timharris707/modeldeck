@@ -13,6 +13,20 @@ extension DaemonClient: DeckStateProviding {
     }
 }
 
+/// Icon-path diagnostics (issue #45 reopen): opt-in via
+/// `MODELDECK_ICON_DEBUG=1`, silent otherwise. Kept permanently so a future
+/// "icon looks wrong" report can be diagnosed on a live install without a
+/// custom build.
+public enum IconDebugLog {
+    public static let enabled = ProcessInfo.processInfo.environment["MODELDECK_ICON_DEBUG"] == "1"
+
+    public static func log(_ message: @autoclosure () -> String) {
+        guard enabled else { return }
+        // stderr: unbuffered, so lines survive even an abrupt exit.
+        FileHandle.standardError.write(Data("[icon-debug] \(message())\n".utf8))
+    }
+}
+
 /// View model behind the menu bar icon and the popover deck. Owns refresh,
 /// connection status, the derived icon state, and (when a state provider is
 /// supplied) the full deck state the popover renders.
@@ -91,8 +105,11 @@ public final class MenuBarStatusModel: ObservableObject {
                 // endpoint or when the second GET fails mid-refresh.
                 do {
                     worst = try await evaluator.evaluateWorstRemaining()
+                    IconDebugLog.log("evaluator worst=\(String(describing: worst))")
                 } catch {
+                    IconDebugLog.log("evaluator FAILED (\(error)); falling back to client calc")
                     worst = WorstRemainingCalculator.worstRemaining(in: state)
+                    IconDebugLog.log("fallback worst=\(String(describing: worst))")
                 }
             } else {
                 worst = try await evaluator.evaluateWorstRemaining()
@@ -102,9 +119,11 @@ public final class MenuBarStatusModel: ObservableObject {
             iconState = MenuBarIconState.state(for: worst, thresholds: thresholds)
             connection = .connected
             lastUpdatedAt = clock()
+            IconDebugLog.log("refresh done: thresholds=(warn \(thresholds.warningPercent), crit \(thresholds.criticalPercent)) iconState=\(iconState)")
             onStateUpdate?(worst, deckState)
         } catch {
             guard generation == stateGeneration else { return }
+            IconDebugLog.log("refresh FAILED: \(error)")
             connection = .unreachable(error.localizedDescription)
         }
     }

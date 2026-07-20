@@ -139,7 +139,9 @@ test('activates Claude and Codex accounts without changing defaults when provide
   fs.mkdirSync(fixture.claudeActiveLink, { recursive: true });
   result = await request(fixture, `/api/accounts/${firstClaude.id}/activate`, { method: 'POST', body: '{}' });
   assert.equal(result.response.status, 400);
-  assert.match(result.body.error, /contains real data; move it/);
+  assert.equal(result.body.code, 'active-link-blocked');
+  assert.match(result.body.error, /one-time migration/);
+  assert.match(result.body.error, /move the existing directory aside at a quiet moment/);
   assert.equal(fixture.store.getAccount(secondClaude.id).isDefault, true);
 
   const secondHome = path.join(fixture.root, 'profiles', 'second');
@@ -158,7 +160,9 @@ test('activates Claude and Codex accounts without changing defaults when provide
   fs.mkdirSync(fixture.codexActiveLink, { recursive: true });
   result = await request(fixture, `/api/accounts/${firstCodex.id}/activate`, { method: 'POST', body: '{}' });
   assert.equal(result.response.status, 400);
-  assert.match(result.body.error, /move it before activating/);
+  assert.equal(result.body.code, 'active-link-blocked');
+  assert.match(result.body.error, /one-time migration/);
+  assert.match(result.body.error, /move the existing directory aside at a quiet moment/);
   assert.equal(fixture.store.getAccount(secondCodex.id).isDefault, true);
 
   result = await request(fixture, '/api/accounts/missing/activate', { method: 'POST', body: '{}' });

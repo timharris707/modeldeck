@@ -53,11 +53,18 @@ class FakeClock {
   }
 }
 
-function fixture({ enabled = true, intervalSeconds = 60, initialDelayMs = 100 } = {}) {
+function fixture({
+  enabled = true,
+  intervalSeconds = 60,
+  initialDelayMs = 100,
+  pauseWhileActive = true,
+  listProviderProcesses = async () => [],
+} = {}) {
   const store = new Store(':memory:');
   store.saveSettings({
     autoRefreshEnabled: enabled,
     autoRefreshIntervalSeconds: intervalSeconds,
+    pauseWhileActive,
   });
   const clock = new FakeClock();
   const service = new ModelDeckService(store, {
@@ -65,6 +72,7 @@ function fixture({ enabled = true, intervalSeconds = 60, initialDelayMs = 100 } 
     setTimeout: clock.setTimeout,
     clearTimeout: clock.clearTimeout,
     autoRefreshInitialDelayMs: initialDelayMs,
+    listProviderProcesses,
   });
   return { store, clock, service, close: () => { service.stopAutoRefresh(); store.close(); } };
 }
@@ -159,4 +167,105 @@ test('a long sleep drops missed ticks instead of firing a catch-up burst', async
     const [next] = data.clock.timers.values();
     assert.equal(next.dueAt, data.clock.time + 60_000);
   } finally { data.close(); }
+});
+
+test('active provider sessions skip scheduled ticks and surface the pause', async () => {
+  const data = fixture({ listProviderProcesses: async () => ['claude'] });
+  let refreshes = 0;
+  data.service.refreshAll = async () => { refreshes += 1; };
+  try {
+    data.service.startAutoRefresh();
+    await data.clock.advance(100);
+    assert.equal(refreshes, 0);
+    assert.deepEqual((await data.service.state()).scheduler, { pausedForActiveSessions: true });
+
+    await data.clock.advance(60_000);
+    assert.equal(refreshes, 0);
+  } finally { data.close(); }
+});
+
+test('active-session throttle still polls at the thirty-minute cap', async () => {
+  const data = fixture({ intervalSeconds: 3_600, listProviderProcesses: async () => ['codex'] });
+  let refreshes = 0;
+  data.service.refreshAll = async () => { refreshes += 1; };
+  try {
+    data.service.startAutoRefresh();
+    await data.clock.advance(30 * 60_000 - 1);
+    assert.equal(refreshes, 0);
+    await data.clock.advance(1_000);
+    assert.equal(refreshes, 1);
+    assert.equal((await data.service.state()).scheduler.pausedForActiveSessions, false);
+  } finally { data.close(); }
+});
+
+test('pause setting off preserves normal cadence without listing processes', async () => {
+  let processChecks = 0;
+  const data = fixture({
+    pauseWhileActive: false,
+    listProviderProcesses: async () => { processChecks += 1; return ['claude']; },
+  });
+  let refreshes = 0;
+  data.service.refreshAll = async () => { refreshes += 1; };
+  try {
+    data.service.startAutoRefresh();
+    await data.clock.advance(100);
+    await data.clock.advance(60_000);
+    assert.equal(refreshes, 2);
+    assert.equal(processChecks, 0);
+  } finally { data.close(); }
+});
+
+test('manual refresh remains available while scheduled ticks are paused', async () => {
+  const data = fixture({ listProviderProcesses: async () => ['claude'] });
+  let claudePasses = 0;
+  let codexPasses = 0;
+  data.service.refreshClaude = async () => { claudePasses += 1; return []; };
+  data.service.refreshCodex = async () => { codexPasses += 1; return []; };
+  try {
+    data.service.startAutoRefresh();
+    await data.clock.advance(100);
+    assert.equal(claudePasses, 0);
+
+    await data.service.refreshAll();
+    assert.equal(claudePasses, 1);
+    assert.equal(codexPasses, 1);
+    assert.equal((await data.service.state()).scheduler.pausedForActiveSessions, true);
+  } finally { data.close(); }
+});
+
+test('ending an active session waits for the next normal tick without a catch-up burst', async () => {
+  let active = true;
+  const data = fixture({ listProviderProcesses: async () => active ? ['codex'] : [] });
+  let refreshes = 0;
+  data.service.refreshAll = async () => { refreshes += 1; };
+  try {
+    data.service.startAutoRefresh();
+    await data.clock.advance(100);
+    assert.equal(refreshes, 0);
+
+    active = false;
+    await data.clock.advance(59_999);
+    assert.equal(refreshes, 0);
+    await data.clock.advance(1);
+    assert.equal(refreshes, 1);
+    assert.equal(data.clock.timers.size, 1);
+    const [next] = data.clock.timers.values();
+    assert.equal(next.dueAt, data.clock.time + 60_000);
+  } finally { data.close(); }
+});
+
+test('default process lister filters current-user ps output to exact provider names', async () => {
+  const calls = [];
+  const store = new Store(':memory:');
+  const service = new ModelDeckService(store, {
+    exec: async (...args) => {
+      calls.push(args);
+      return { stdout: '/opt/bin/claude\nclaude-helper\ncodex\nnode\n' };
+    },
+  });
+  try {
+    assert.deepEqual(await service.listProviderProcesses(), ['claude', 'codex']);
+    assert.equal(calls[0][0], '/bin/ps');
+    assert.ok(calls[0][1].includes('-U'));
+  } finally { service.stopAutoRefresh(); store.close(); }
 });

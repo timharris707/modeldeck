@@ -6,6 +6,16 @@ const ALLOWED_ENV = Object.freeze([
   'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY',
 ]);
 
+/// Activation clobber-guard refusal, shared by the service and the Claude
+/// adapter so the message + machine-readable code can never drift (#55).
+export function activeLinkBlockedError(provider, activeLink) {
+  const error = new Error(
+    `${provider} activation requires a one-time migration: move the existing directory aside at a quiet moment before activating: ${activeLink}`,
+  );
+  error.code = 'active-link-blocked';
+  return error;
+}
+
 export function createProviderProfileHelpers({
   envVar,
   envRequiredError,

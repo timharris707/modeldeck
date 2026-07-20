@@ -151,11 +151,22 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     /// Issue #28: spend is excluded from the headline pick (card headline,
     /// Lowest sort key, worst summary). Only when every non-spend window is
     /// absent does the headline fall back to whatever exists.
+    ///
+    /// Issue #53 tie-break: among windows tied at the worst remainingPercent,
+    /// prefer one that carries a real upcoming reset (soonest first) — the
+    /// collapsed headline must never say "no reset data" while a sibling at
+    /// the same percent shows a reset time. Only when NO tied window has a
+    /// reset does the pick fall back to display order (5-hour first).
     public var worstWindow: DeckWindow? {
         let measurable = windows.filter { $0.remainingPercent != nil }
         let rateLimits = measurable.filter { !$0.isSpend }
-        return (rateLimits.isEmpty ? measurable : rateLimits)
-            .min { ($0.remainingPercent ?? .infinity) < ($1.remainingPercent ?? .infinity) }
+        let eligible = rateLimits.isEmpty ? measurable : rateLimits
+        guard let worst = eligible.compactMap(\.remainingPercent).min() else { return nil }
+        let tied = eligible.filter { $0.remainingPercent == worst }
+        let withReset = tied
+            .compactMap { window in window.resetsAt.map { (window, $0) } }
+            .min { $0.1 < $1.1 }?.0
+        return withReset ?? tied.first
     }
 
     /// Issue #33 amendment (2026-07-20): the top-right headline "% left"

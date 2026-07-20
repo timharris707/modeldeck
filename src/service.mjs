@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { activeLinkBlockedError } from './adapters/provider-profile.mjs';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -25,6 +26,10 @@ import { evaluateWorstCapacity } from './capacity.mjs';
 import { scanProjectRoot } from './projects.mjs';
 
 const execFileAsync = promisify(execFile);
+
+// Active sessions throttle scheduled polling, but never for long enough to
+// let a continuously open provider session make the deck silently stale.
+const ACTIVE_SESSION_REFRESH_CAP_MS = 30 * 60_000;
 
 function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'\\''`)}'`;
@@ -143,6 +148,16 @@ export class ModelDeckService {
     this.claudeCredentialsPresent = options.claudeCredentialsPresent || claudeCredentialsPresent;
     this.migrateClaude = options.migrateClaude || migrateClaudeSwapProfiles;
     this.exec = options.exec || options.execFile || options.run || execFileAsync;
+    this.listProviderProcesses = options.listProviderProcesses || (async () => {
+      const result = await this.exec('/bin/ps', ['-U', os.userInfo().username, '-o', 'comm='], {
+        timeout: 5_000,
+        maxBuffer: 1_000_000,
+      });
+      return String(result?.stdout ?? result)
+        .split(/\r?\n/)
+        .map((command) => path.basename(command.trim()))
+        .filter((command) => command === 'claude' || command === 'codex');
+    });
     this.registryFetch = options.registryFetch || options.fetcher || globalThis.fetch;
     this.toolProbeTtlMs = Number(options.toolProbeTtlMs ?? 30 * 60_000);
     this.now = options.now || Date.now;
@@ -152,6 +167,9 @@ export class ModelDeckService {
     this.autoRefreshTimer = null;
     this.autoRefreshGeneration = 0;
     this.autoRefreshStarted = false;
+    this.lastCompletedRefreshAt = null;
+    this.pausedForActiveSessions = false;
+    this.activeProviderSessionPresent = false;
     this.refreshPromise = null;
     this.toolProbeCache = null;
     this.toolProbePromise = null;
@@ -168,7 +186,10 @@ export class ModelDeckService {
     this.autoRefreshStarted = true;
     const generation = ++this.autoRefreshGeneration;
     const settings = this.store.getSettings();
-    if (settings.autoRefreshEnabled) this.armAutoRefresh(this.autoRefreshInitialDelayMs, generation);
+    if (settings.autoRefreshEnabled) {
+      if (this.lastCompletedRefreshAt == null) this.lastCompletedRefreshAt = this.now();
+      this.armAutoRefresh(this.autoRefreshInitialDelayMs, generation);
+    }
   }
 
   stopAutoRefresh() {
@@ -176,6 +197,8 @@ export class ModelDeckService {
     this.autoRefreshGeneration += 1;
     if (this.autoRefreshTimer != null) this.clearTimeout(this.autoRefreshTimer);
     this.autoRefreshTimer = null;
+    this.pausedForActiveSessions = false;
+    this.activeProviderSessionPresent = false;
   }
 
   rescheduleAutoRefresh(settings = this.store.getSettings()) {
@@ -183,9 +206,25 @@ export class ModelDeckService {
     const generation = ++this.autoRefreshGeneration;
     if (this.autoRefreshTimer != null) this.clearTimeout(this.autoRefreshTimer);
     this.autoRefreshTimer = null;
-    if (settings.autoRefreshEnabled) {
-      this.armAutoRefresh(settings.autoRefreshIntervalSeconds * 1_000, generation);
+    // A stale pause flag must not outlive the setting that produced it —
+    // /api/state would keep reporting a pause until the next tick fires.
+    if (!settings.autoRefreshEnabled || !settings.pauseWhileActive) {
+      this.pausedForActiveSessions = false;
+      this.activeProviderSessionPresent = false;
     }
+    if (settings.autoRefreshEnabled) {
+      if (this.lastCompletedRefreshAt == null) this.lastCompletedRefreshAt = this.now();
+      this.armAutoRefresh(this.autoRefreshDelay(settings), generation);
+    }
+  }
+
+  autoRefreshDelay(settings) {
+    const intervalMs = settings.autoRefreshIntervalSeconds * 1_000;
+    if (!settings.pauseWhileActive || !this.activeProviderSessionPresent) return intervalMs;
+    const elapsedSinceRefresh = this.lastCompletedRefreshAt == null
+      ? ACTIVE_SESSION_REFRESH_CAP_MS
+      : this.now() - this.lastCompletedRefreshAt;
+    return Math.min(intervalMs, Math.max(0, ACTIVE_SESSION_REFRESH_CAP_MS - elapsedSinceRefresh));
   }
 
   armAutoRefresh(delayMs, generation, dueAt = this.now() + delayMs) {
@@ -200,11 +239,8 @@ export class ModelDeckService {
       this.autoRefreshTimer = null;
       const settings = this.store.getSettings();
       if (!settings.autoRefreshEnabled) return;
-      // pauseWhileActive is intentionally a no-op until session detection is
-      // implemented in the deferred PR #15 backlog item.
-      void settings.pauseWhileActive;
 
-      this.refreshAll().catch((error) => {
+      this.runAutoRefreshTick(settings, generation).catch((error) => {
         console.error(`[modeldeck] scheduled refresh failed: ${error?.message || error}`);
       }).finally(() => {
         if (!this.autoRefreshStarted || generation !== this.autoRefreshGeneration) return;
@@ -212,11 +248,41 @@ export class ModelDeckService {
         if (latest.autoRefreshEnabled) {
           // Schedule from completion time: missed ticks are dropped instead of
           // becoming provider-polling catch-up bursts after sleep or a slow pass.
-          this.armAutoRefresh(latest.autoRefreshIntervalSeconds * 1_000, generation);
+          this.armAutoRefresh(this.autoRefreshDelay(latest), generation);
         }
       });
     };
     this.autoRefreshTimer = this.setTimeout(run, Math.max(0, dueAt - this.now()));
+  }
+
+  async runAutoRefreshTick(settings, generation) {
+    let activeSessionPresent = false;
+    if (settings.pauseWhileActive) {
+      try {
+        activeSessionPresent = (await this.listProviderProcesses()).length > 0;
+      } catch (error) {
+        // Failure to inspect presence must not become another silent-staleness
+        // path. Poll normally and leave the provider processes untouched.
+        console.error(`[modeldeck] active-session check failed: ${error?.message || error}`);
+      }
+    }
+    if (!this.autoRefreshStarted || generation !== this.autoRefreshGeneration) return;
+    this.activeProviderSessionPresent = activeSessionPresent;
+
+    const elapsedSinceRefresh = this.lastCompletedRefreshAt == null
+      ? ACTIVE_SESSION_REFRESH_CAP_MS
+      : this.now() - this.lastCompletedRefreshAt;
+    if (activeSessionPresent && elapsedSinceRefresh < ACTIVE_SESSION_REFRESH_CAP_MS) {
+      this.pausedForActiveSessions = true;
+      return;
+    }
+
+    this.pausedForActiveSessions = false;
+    try {
+      await this.refreshAll();
+    } finally {
+      this.lastCompletedRefreshAt = this.now();
+    }
   }
 
   scanProjects(root = this.projectsRoot) {
@@ -488,7 +554,10 @@ export class ModelDeckService {
       return result;
     })();
     try { return await this.refreshPromise; }
-    finally { this.refreshPromise = null; }
+    finally {
+      this.refreshPromise = null;
+      this.lastCompletedRefreshAt = this.now();
+    }
   }
 
   async activateAccount(id) {
@@ -524,7 +593,7 @@ export class ModelDeckService {
     try { activeStat = await fs.promises.lstat(this.codexActiveLink); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
     if (activeStat && !activeStat.isSymbolicLink()) {
-      throw new Error(`Codex active profile path contains real data; move it before activating: ${this.codexActiveLink}`);
+      throw activeLinkBlockedError('Codex', this.codexActiveLink);
     }
 
     await fs.promises.mkdir(path.dirname(this.codexActiveLink), { recursive: true });
@@ -601,9 +670,58 @@ export class ModelDeckService {
     })));
   }
 
+  async providerActivationState(provider, activeLink, accounts) {
+    let activeStat;
+    try { activeStat = await fs.promises.lstat(activeLink); }
+    catch (error) {
+      if (error.code === 'ENOENT') return { state: 'unlinked' };
+      throw error;
+    }
+    if (!activeStat.isSymbolicLink()) return { state: 'blocked' };
+
+    const linkTarget = await fs.promises.readlink(activeLink);
+    const linkedProfileRef = path.resolve(path.dirname(activeLink), linkTarget);
+    let resolvedProfileRef;
+    let linkResolved = true;
+    try {
+      resolvedProfileRef = await fs.promises.realpath(linkedProfileRef);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      linkResolved = false;
+      resolvedProfileRef = linkedProfileRef;
+    }
+
+    const defaultAccount = accounts.find((account) => account.provider === provider && account.isDefault);
+    let defaultProfileRef = defaultAccount?.profileRef;
+    let defaultProfileResolved = Boolean(defaultProfileRef);
+    if (defaultProfileRef) {
+      try { defaultProfileRef = await fs.promises.realpath(defaultProfileRef); }
+      catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        defaultProfileResolved = false;
+      }
+    }
+    return {
+      state: linkResolved && defaultProfileResolved && defaultProfileRef === resolvedProfileRef
+        ? 'effective'
+        : 'mismatched',
+      resolvedProfileRef,
+    };
+  }
+
   async state() {
     const value = this.store.state();
-    return { ...value, accounts: await this.accountsWithAuthState(value.accounts) };
+    const [accounts, claudeActivation, codexActivation] = await Promise.all([
+      this.accountsWithAuthState(value.accounts),
+      this.providerActivationState('claude', this.claudeActiveLink, value.accounts),
+      this.providerActivationState('codex', this.codexActiveLink, value.accounts),
+    ]);
+    return {
+      ...value,
+      accounts,
+      activation: { claude: claudeActivation, codex: codexActivation },
+      scheduler: { pausedForActiveSessions: this.pausedForActiveSessions },
+    };
   }
 
   async providerAuthState(provider, activeLink) {

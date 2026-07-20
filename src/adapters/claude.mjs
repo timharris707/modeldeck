@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { extractIdentity } from './identity.mjs';
 import { claudeCredentialsPresent } from './claude-keychain.mjs';
-import { createProviderProfileHelpers } from './provider-profile.mjs';
+import { createProviderProfileHelpers, activeLinkBlockedError } from './provider-profile.mjs';
 
 const execFileAsync = promisify(execFile);
 const usageProbePath = fileURLToPath(new URL('./claude-usage-probe.mjs', import.meta.url));
@@ -225,7 +225,7 @@ export async function activateClaudeProfile({ profileRef, activeLink, profilesDi
 
   const activeStat = await lstatOrNull(activeLink);
   if (activeStat && !activeStat.isSymbolicLink()) {
-    throw new Error(`Claude active profile path contains real data; move it before activating: ${activeLink}`);
+    throw activeLinkBlockedError('Claude', activeLink);
   }
 
   await fs.promises.mkdir(path.dirname(activeLink), { recursive: true });

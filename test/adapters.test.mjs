@@ -385,7 +385,12 @@ test('atomically activates Claude profiles and refuses to clobber real data', as
   fs.unlinkSync(active);
   fs.mkdirSync(active);
   fs.writeFileSync(path.join(active, 'settings.json'), '{}');
-  await assert.rejects(activateClaudeProfile({ profileRef: first, activeLink: active }), /contains real data; move it/);
+  await assert.rejects(activateClaudeProfile({ profileRef: first, activeLink: active }), (error) => {
+    assert.equal(error.code, 'active-link-blocked');
+    assert.match(error.message, /one-time migration/);
+    assert.match(error.message, /move the existing directory aside at a quiet moment/);
+    return true;
+  });
   assert.equal(fs.readFileSync(path.join(active, 'settings.json'), 'utf8'), '{}');
 });
 

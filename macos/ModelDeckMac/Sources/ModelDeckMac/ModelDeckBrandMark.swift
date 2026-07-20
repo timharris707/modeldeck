@@ -1,14 +1,18 @@
 import SwiftUI
+import ModelDeckMacCore
 
-/// The ModelDeck brand mark — the site/favicon's three stacked rounded bars
-/// (issue #33 amendment 2026-07-20; brand consistency app ⇄ site ⇄ favicon,
-/// NOT the rocket). Geometry mirrors the site SVG: 24×5 bars, rx ≈ 2.5,
-/// 3-unit vertical gaps (total 24×21 units), drawn natively — no asset file.
+/// The ModelDeck brand mark — the deck glyph's three stacked rounded bars in
+/// the brand colors. Issue #53 unified the shape with the menu bar glyph:
+/// staggered medium/short/long widths (the 12/8/16 top-to-bottom ratio from
+/// issue #25, flush left) instead of the old equal-width favicon bars — one
+/// shape, two colorways (template in the menu bar, colored here; the site
+/// favicon is being updated to match). Drawn natively — no asset file.
 /// Colors are fixed (top-to-bottom blue / amber / red) and identical in
 /// light and dark mode; they carry both appearances on their own.
 struct ModelDeckBrandMark: View {
-    /// Overall mark width in points (~14–16pt per the amendment). Bar
-    /// height, gap, and corner radius all scale from the 24-unit design.
+    /// Overall mark width in points (~14–16pt per the #33 amendment) — the
+    /// longest (bottom) bar spans it. Bar height, gap, and corner radius
+    /// scale from the glyph's 16-unit design.
     var width: CGFloat = 15
 
     private static let barColors: [Color] = [
@@ -18,14 +22,15 @@ struct ModelDeckBrandMark: View {
     ]
 
     var body: some View {
-        let unit = width / 24
-        VStack(spacing: unit * 3) {
-            ForEach(0..<Self.barColors.count, id: \.self) { index in
-                RoundedRectangle(cornerRadius: unit * 2.5, style: .continuous)
+        let unit = width / DeckGlyphGeometry.designWidth
+        VStack(alignment: .leading, spacing: unit * 2) {
+            ForEach(Array(DeckGlyphGeometry.barWidthsTopToBottom.enumerated()), id: \.offset) { index, barWidth in
+                RoundedRectangle(cornerRadius: unit * 1.5, style: .continuous)
                     .fill(Self.barColors[index])
-                    .frame(width: width, height: unit * 5)
+                    .frame(width: unit * barWidth, height: unit * 3)
             }
         }
+        .frame(width: width, alignment: .leading)
         .accessibilityHidden(true) // decorative — the wordmark carries the name
     }
 }

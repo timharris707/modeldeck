@@ -159,6 +159,100 @@ struct DeckBuilderTests {
         #expect(columns[0].rows.map(\.id) == ["dated", "nodata"])
     }
 
+    // Issue #53: among windows tied at the worst % left, the headline pick
+    // prefers one with a real upcoming reset — "no reset data" only when no
+    // eligible window carries one. Tim's repro: everything at 100%, the
+    // 5-hour window has no resetsAt (no active session) but the weekly
+    // resets Sunday; the collapsed card must show the weekly's reset.
+    @Test func worstWindowTieBreakPrefersResetBearingWindow() {
+        let state = DeckState(
+            accounts: [account("m1", provider: "claude", label: "Studio")],
+            usage: [
+                snapshot("m1", scope: "5h", remaining: 100, resetsIn: nil),
+                snapshot("m1", scope: "week", remaining: 100, resetsIn: 5 * 86_400),
+            ]
+        )
+        let row = DeckBuilder.rows(state: state, now: now).first
+        #expect(row?.worstWindow?.scope == "week")
+        #expect(row?.worstWindow?.resetsAt != nil)
+        #expect(row?.worstSummary?.contains("no reset data") == false)
+        // #43's Reset sort key follows the displayed window automatically.
+        #expect(row?.displayedReset == now.addingTimeInterval(5 * 86_400))
+    }
+
+    @Test func worstWindowTieBreakPicksSoonestResetAmongTies() {
+        let state = DeckState(
+            accounts: [account("m1", provider: "claude", label: "Studio")],
+            usage: [
+                snapshot("m1", scope: "5h", remaining: 100, resetsIn: nil),
+                snapshot("m1", scope: "week", remaining: 100, resetsIn: 5 * 86_400),
+                snapshot("m1", scope: "week:fable", remaining: 100, resetsIn: 2 * 86_400),
+            ]
+        )
+        let row = DeckBuilder.rows(state: state, now: now).first
+        #expect(row?.worstWindow?.scope == "week:fable") // soonest reset wins the tie
+    }
+
+    @Test func worstWindowTieBreakOnlyAppliesAmongTiedWindows() {
+        // A strictly-worse window without a reset still wins — the tie-break
+        // never lets a healthier window steal the headline.
+        let state = DeckState(
+            accounts: [account("m1", provider: "claude", label: "Studio")],
+            usage: [
+                snapshot("m1", scope: "5h", remaining: 40, resetsIn: nil),
+                snapshot("m1", scope: "week", remaining: 90, resetsIn: 86_400),
+            ]
+        )
+        let row = DeckBuilder.rows(state: state, now: now).first
+        #expect(row?.worstWindow?.scope == "5h")
+        #expect(row?.worstWindow?.resetText == "no reset data")
+    }
+
+    @Test func noResetAnywhereStillSaysNoResetData() {
+        let state = DeckState(
+            accounts: [account("m1", provider: "claude", label: "Studio")],
+            usage: [
+                snapshot("m1", scope: "5h", remaining: 100, resetsIn: nil),
+                snapshot("m1", scope: "week", remaining: 100, resetsIn: nil),
+            ]
+        )
+        let row = DeckBuilder.rows(state: state, now: now).first
+        #expect(row?.worstWindow?.scope == "5h") // display-order fallback
+        #expect(row?.worstWindow?.resetText == "no reset data")
+    }
+
+    @Test func spendStaysExcludedFromTieBreak() {
+        // Issue #28 exclusion unchanged: a reset-bearing spend row tied at
+        // the worst percent never becomes the headline.
+        let state = DeckState(
+            accounts: [account("m1", provider: "claude", label: "Studio")],
+            usage: [
+                snapshot("m1", scope: "5h", remaining: 100, resetsIn: nil),
+                snapshot("m1", scope: "spend", remaining: 100, resetsIn: 86_400),
+            ]
+        )
+        let row = DeckBuilder.rows(state: state, now: now).first
+        #expect(row?.worstWindow?.scope == "5h")
+    }
+
+    // Issue #53 knock-on for #43: a repro-shaped card previously sorted
+    // "no data last"; with the tie-break it sorts by its real weekly reset.
+    @Test func resetSortUsesTieBrokenResetInsteadOfSinkingToLast() {
+        let state = DeckState(
+            accounts: [
+                account("repro", provider: "claude", label: "Studio"),
+                account("later", provider: "claude", label: "Client"),
+            ],
+            usage: [
+                snapshot("repro", scope: "5h", remaining: 100, resetsIn: nil),
+                snapshot("repro", scope: "week", remaining: 100, resetsIn: 2 * 86_400),
+                snapshot("later", scope: "week", remaining: 100, resetsIn: 6 * 86_400),
+            ]
+        )
+        let columns = DeckBuilder.columns(state: state, sortOrder: .nextReset, now: now)
+        #expect(columns[0].rows.map(\.id) == ["repro", "later"])
+    }
+
     @Test func resetSortTieBreaksByLabelStable() {
         let state = DeckState(
             accounts: [
@@ -319,6 +413,23 @@ struct DeckBuilderTests {
         // Reset data present: visible even at zero usage.
         let withReset = DeckBuilder.rows(state: spendState(spendRemaining: 100, spendResetsIn: 86_400), now: now)[0]
         #expect(withReset.windows.map(\.scope) == ["5h", "week", "spend"])
+    }
+
+    @Test func allUnknownUsageYieldsNoHeadlineWindow() {
+        // Post-#53 tie-break: when every window's remaining is unknown there
+        // is no honest worst pick — the headline shows nothing rather than an
+        // arbitrary window (intended change from the pre-#53 first-window
+        // fallback).
+        let state = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio")],
+            usage: [
+                snapshot("c1", scope: "5h", remaining: nil),
+                snapshot("c1", scope: "week", remaining: nil, resetsIn: 86_400),
+            ]
+        )
+        let row = DeckBuilder.rows(state: state, now: now)[0]
+        #expect(row.worstWindow == nil)
+        #expect(row.lowestRemaining == nil)
     }
 
     @Test func headlineFallsBackToSpendWhenNothingElseExists() {

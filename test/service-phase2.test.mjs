@@ -37,10 +37,13 @@ test('provider activation switches first and persists the default only after suc
     let active = await data.service.activateAccount(claudeTwo.id);
     assert.equal(active.isDefault, true);
     assert.equal(fs.readlinkSync(data.claudeActiveLink), fs.realpathSync(data.secondHome));
+    assert.deepEqual((await data.service.state()).activation.claude, {
+      state: 'effective', resolvedProfileRef: fs.realpathSync(data.secondHome),
+    });
 
     fs.unlinkSync(data.claudeActiveLink);
     fs.mkdirSync(data.claudeActiveLink, { recursive: true });
-    await assert.rejects(data.service.activateAccount(claudeOne.id), /contains real data; move it/);
+    await assert.rejects(data.service.activateAccount(claudeOne.id), { code: 'active-link-blocked' });
     assert.equal(data.store.getAccount(claudeTwo.id).isDefault, true);
 
     const codexOne = data.store.saveAccount({ provider: 'codex', label: 'Codex One', profileRef: data.firstHome, isDefault: true });
@@ -48,6 +51,9 @@ test('provider activation switches first and persists the default only after suc
     active = await data.service.activateAccount(codexTwo.id);
     assert.equal(active.isDefault, true);
     assert.equal(fs.readlinkSync(data.codexActiveLink), fs.realpathSync(data.secondHome));
+    assert.deepEqual((await data.service.state()).activation.codex, {
+      state: 'effective', resolvedProfileRef: fs.realpathSync(data.secondHome),
+    });
 
     active = await data.service.activateAccount(codexOne.id);
     assert.equal(active.isDefault, true);
@@ -55,9 +61,47 @@ test('provider activation switches first and persists the default only after suc
 
     fs.unlinkSync(data.codexActiveLink);
     fs.mkdirSync(data.codexActiveLink, { recursive: true });
-    await assert.rejects(data.service.activateAccount(codexTwo.id), /contains real data; move it/);
+    await assert.rejects(data.service.activateAccount(codexTwo.id), { code: 'active-link-blocked' });
     assert.equal(data.store.getAccount(codexOne.id).isDefault, true);
   } finally { data.close(); }
+});
+
+test('state reports all physical activation states for each provider', async (t) => {
+  const data = fixture({ claudeCredentialsPresent: async () => false });
+  t.after(() => data.close());
+  for (const provider of ['claude', 'codex']) {
+    data.store.saveAccount({
+      provider, label: `${provider} default`, profileRef: data.firstHome, isDefault: true,
+    });
+    const activeLink = provider === 'claude' ? data.claudeActiveLink : data.codexActiveLink;
+
+    await t.test(`${provider}: unlinked`, async () => {
+      assert.deepEqual((await data.service.state()).activation[provider], { state: 'unlinked' });
+    });
+
+    await t.test(`${provider}: blocked`, async () => {
+      fs.mkdirSync(activeLink, { recursive: true });
+      assert.deepEqual((await data.service.state()).activation[provider], { state: 'blocked' });
+      fs.rmSync(activeLink, { recursive: true });
+    });
+
+    await t.test(`${provider}: mismatched`, async () => {
+      fs.mkdirSync(path.dirname(activeLink), { recursive: true });
+      fs.symlinkSync(data.secondHome, activeLink, 'dir');
+      assert.deepEqual((await data.service.state()).activation[provider], {
+        state: 'mismatched', resolvedProfileRef: fs.realpathSync(data.secondHome),
+      });
+      fs.unlinkSync(activeLink);
+    });
+
+    await t.test(`${provider}: effective`, async () => {
+      fs.symlinkSync(data.firstHome, activeLink, 'dir');
+      assert.deepEqual((await data.service.state()).activation[provider], {
+        state: 'effective', resolvedProfileRef: fs.realpathSync(data.firstHome),
+      });
+      fs.unlinkSync(activeLink);
+    });
+  }
 });
 
 test('tool probes share in-flight work, cache results, and isolate registry errors', async () => {
@@ -360,7 +404,7 @@ test('Claude refresh isolates per-profile failures and never rotates accounts', 
     const first = data.store.saveAccount({ provider: 'claude', label: 'First', profileRef: data.firstHome, isDefault: true });
     const second = data.store.saveAccount({ provider: 'claude', label: 'Second', profileRef: data.secondHome });
     const results = await data.service.refreshClaude();
-    assert.deepEqual(calls, [data.firstHome, data.secondHome]);
+    assert.deepEqual([...calls].sort(), [data.firstHome, data.secondHome].sort());
     assert.deepEqual(results, [
       { accountId: first.id, ok: true, snapshotCount: 1 },
       { accountId: second.id, ok: false, error: 'fixture provider failure' },

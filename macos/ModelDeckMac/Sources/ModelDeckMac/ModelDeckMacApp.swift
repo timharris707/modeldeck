@@ -132,6 +132,33 @@ struct ModelDeckMacApp: App {
         _notifications = StateObject(wrappedValue: notifications)
     }
 
+    /// Issue #45 reopen diagnostics: log every status-bar window's frame and
+    /// its hosted view hierarchy sizes so the label-vs-status-item width can
+    /// be compared without seeing the menu bar.
+    @MainActor
+    private static func dumpStatusWindows(tag: String) {
+        for window in NSApp.windows {
+            let className = String(describing: type(of: window))
+            guard className.contains("StatusBar") else { continue }
+            IconDebugLog.log("[\(tag)] window \(className) frame=\(window.frame)")
+            if let content = window.contentView {
+                dumpViewTree(content, indent: "  ", tag: tag)
+            }
+        }
+    }
+
+    @MainActor
+    private static func dumpViewTree(_ view: NSView, indent: String, tag: String) {
+        IconDebugLog.log("[\(tag)]\(indent)\(String(describing: type(of: view))) frame=\(view.frame) fitting=\(view.fittingSize)")
+        if let button = view as? NSStatusBarButton {
+            let image = button.image
+            IconDebugLog.log("[\(tag)]\(indent)  button.image=\(image.map { "size=\($0.size) template=\($0.isTemplate) desc=\(String(describing: $0.accessibilityDescription))" } ?? "nil") title=\(button.title)")
+        }
+        for sub in view.subviews {
+            dumpViewTree(sub, indent: indent + "  ", tag: tag)
+        }
+    }
+
     var body: some Scene {
         MenuBarExtra {
             DeckPopoverView(
@@ -147,7 +174,15 @@ struct ModelDeckMacApp: App {
             // value-type dependencies captured up here.
             MenuBarIconView(statusModel: statusModel)
                 .task {
+                    IconDebugLog.log("label .task fired; starting initial refresh")
+                    if IconDebugLog.enabled {
+                        Self.dumpStatusWindows(tag: "pre-refresh")
+                    }
                     await statusModel.refresh()
+                    if IconDebugLog.enabled {
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        Self.dumpStatusWindows(tag: "post-refresh+2s")
+                    }
                     // Daemon settings are the source of truth; a successful
                     // load applies them (including the refresh schedule). If
                     // the daemon is unreachable, fall back to the spec

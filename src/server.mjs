@@ -199,7 +199,10 @@ export function createApp({ store, service, host = HOST, port = PORT, publicDir 
       });
       res.end(content);
     } catch (error) {
-      json(res, error.statusCode || 400, { error: error.message });
+      json(res, error.statusCode || 400, {
+        error: error.message,
+        ...(error.code === 'active-link-blocked' ? { code: error.code } : {}),
+      });
     }
   });
 
