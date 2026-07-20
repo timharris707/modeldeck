@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.hermes.modeldeck</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{NODE_BIN}}</string>
+    <string>{{REPO_DIR}}/src/server.mjs</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{REPO_DIR}}</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- Minimal, explicit PATH: node's directory plus system paths so the
+         server can invoke `security` (Keychain), `claude`, and `codex`. -->
+    <key>PATH</key>
+    <string>{{PATH_LINE}}</string>
+    <key>HOME</key>
+    <string>{{HOME_DIR}}</string>
+    <key>MODELDECK_HOST</key>
+    <string>127.0.0.1</string>
+    <key>MODELDECK_PORT</key>
+    <string>{{PORT}}</string>
+    <key>MODELDECK_PROJECTS_ROOT</key>
+    <string>{{PROJECTS_ROOT}}</string>
+    <!-- No mutation token here: the server reads it from the macOS Keychain
+         (service "modeldeck", account "mutation-token") at startup. -->
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>{{LOG_DIR}}/modeldeck.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{LOG_DIR}}/modeldeck.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

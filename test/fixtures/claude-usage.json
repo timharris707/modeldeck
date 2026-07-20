@@ -1,0 +1,37 @@
+{
+  "five_hour": {
+    "utilization": 25,
+    "resets_at": "2026-07-19T20:00:00Z"
+  },
+  "seven_day": {
+    "utilization": 40,
+    "resets_at": "2026-07-25T20:00:00Z"
+  },
+  "weekly_scoped": [
+    {
+      "model": "fable",
+      "utilization": 61,
+      "resets_at": "2026-07-24T20:00:00Z"
+    }
+  ],
+  "extra_usage": {
+    "is_enabled": false
+  },
+  "limits": [
+    {
+      "kind": "weekly_scoped",
+      "group": "weekly",
+      "percent": 96,
+      "severity": "critical",
+      "resets_at": "2026-07-23T00:59:59Z",
+      "scope": {
+        "model": {
+          "id": null,
+          "display_name": "Opus"
+        },
+        "surface": null
+      },
+      "is_active": true
+    }
+  ]
+}

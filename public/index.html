@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ModelDeck</title>
+  <meta name="description" content="Local project-aware AI account and usage control plane">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="ModelDeck home">
+        <span class="brand-mark">MD</span>
+        <span><strong>ModelDeck</strong><small>Local AI control plane</small></span>
+      </a>
+      <div class="top-actions">
+        <span class="local-badge"><i></i> Local only</span>
+        <button class="button ghost" id="scan-projects">Scan projects</button>
+        <button class="button primary" id="refresh-usage">Refresh usage</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div>
+          <p class="eyebrow">PROJECT-AWARE ROUTING</p>
+          <h1>Every model account.<br><em>One deliberate deck.</em></h1>
+          <p class="hero-copy">Map Claude and Codex identities to the projects they belong to. See capacity, launch the right profile, and keep business and personal work intentionally separated.</p>
+        </div>
+        <div class="hero-stats" id="hero-stats" aria-live="polite"></div>
+      </section>
+      <div class="capacity-alerts" id="capacity-alerts" aria-live="polite"></div>
+
+      <section class="quick-section">
+        <div class="section-heading quick-heading">
+          <div><p class="eyebrow">QUICK DECK</p><h2>Provider meters</h2><p class="section-note">Two widgets · click to reveal every account identity and meter</p></div>
+          <button class="button secondary" id="add-account-quick">+ Add profile</button>
+        </div>
+        <div class="quick-deck" id="quick-deck"></div>
+      </section>
+
+      <section class="section-block">
+        <div class="section-heading">
+          <div><p class="eyebrow">ACCOUNT DECK</p><h2>Profiles & capacity</h2><p class="section-note">Manual refresh only · defaults affect new launches · active sessions are never stopped</p></div>
+          <button class="button secondary" id="add-account">+ Add profile</button>
+        </div>
+        <div class="provider-grid">
+          <article class="provider-panel">
+            <div class="provider-title"><span class="provider-icon claude">C</span><div><h3>Claude</h3><p>Claude Code · Fable</p></div></div>
+            <div class="account-stack" id="claude-accounts"></div>
+          </article>
+          <article class="provider-panel">
+            <div class="provider-title"><span class="provider-icon codex">X</span><div><h3>Codex</h3><p>ChatGPT · Codex CLI</p></div></div>
+            <div class="account-stack" id="codex-accounts"></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section-block">
+        <div class="section-heading">
+          <div><p class="eyebrow">PROJECT ROUTER</p><h2>Project assignments</h2></div>
+          <div class="root-chip" id="projects-root">~/projects</div>
+        </div>
+        <div class="projects-list" id="projects-list"></div>
+      </section>
+
+      <section class="section-block compact">
+        <div class="section-heading"><div><p class="eyebrow">RECENT ACTIVITY</p><h2>Launch ledger</h2></div></div>
+        <div class="activity-list" id="activity-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="account-dialog">
+    <form method="dialog" id="account-form">
+      <div class="dialog-header"><div><p class="eyebrow">NEW PROFILE</p><h2>Add an account</h2></div><button class="icon-button" value="cancel" aria-label="Close">×</button></div>
+      <label>Provider<select name="provider" required><option value="claude">Claude</option><option value="codex">Codex</option></select></label>
+      <label>Display name<input name="label" required placeholder="LoanMeld business"></label>
+      <label>Account email or login<input name="identity" type="email" placeholder="name@example.com"></label>
+      <label>Purpose<input name="purpose" placeholder="Business projects"></label>
+      <label><span id="profile-label">Managed automatically</span><input name="profileRef" disabled placeholder="Created under ModelDeck Application Support"></label>
+      <label class="check"><input type="checkbox" name="isDefault"> Use as provider default</label>
+      <p class="security-note">ModelDeck creates an isolated Claude config home or records the selected CODEX_HOME. Provider login owns the credentials.</p>
+      <div class="dialog-actions"><button class="button ghost" value="cancel">Cancel</button><button class="button primary" value="default">Add profile</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="provider-detail-dialog" class="wide-dialog">
+    <form method="dialog">
+      <div class="dialog-header"><div><p class="eyebrow" id="provider-detail-eyebrow">PROVIDER ACCOUNT DECK</p><h2 id="provider-detail-label"></h2></div><button class="icon-button" value="cancel" aria-label="Close">×</button></div>
+      <p class="command-context" id="provider-detail-copy"></p>
+      <div class="provider-detail-accounts" id="provider-detail-accounts"></div>
+      <div class="dialog-actions"><button class="button primary" value="cancel">Done</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="command-dialog">
+    <form method="dialog">
+      <div class="dialog-header"><div><p class="eyebrow">SAFE LAUNCH</p><h2>Launch command</h2></div><button class="icon-button" value="cancel" aria-label="Close">×</button></div>
+      <p id="command-context" class="command-context"></p>
+      <pre id="command-preview"></pre>
+      <div class="dialog-actions"><button class="button ghost" value="cancel">Close</button><button class="button primary" type="button" id="copy-command">Copy command</button></div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

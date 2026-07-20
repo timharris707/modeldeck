@@ -1,0 +1,9 @@
+node_modules/
+.DS_Store
+.env
+*.log
+coverage/
+.modeldeck-data/
+playwright-report/
+test-results/
+.claude/lane-logs/

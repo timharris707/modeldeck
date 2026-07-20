@@ -1,0 +1,23 @@
+{
+  "name": "modeldeck",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Local project-aware AI account and usage control plane.",
+  "bin": {
+    "modeldeck": "./bin/modeldeck.mjs"
+  },
+  "scripts": {
+    "dev": "node --watch src/server.mjs",
+    "start": "node src/server.mjs",
+    "test": "node --test",
+    "test:coverage": "node --test --experimental-test-coverage",
+    "demo:seed": "node scripts/seed-demo.mjs",
+    "migrate": "node scripts/migrate-db.mjs",
+    "scan": "node bin/modeldeck.mjs scan ~/projects",
+    "status": "node bin/modeldeck.mjs status"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

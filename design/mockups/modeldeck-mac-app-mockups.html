@@ -1,0 +1,841 @@
+<title>ModelDeck — Mac App Design, Round 1</title>
+<style>
+  :root {
+    --ground: #f4f4f2;
+    --ink: #1c1d1f;
+    --ink-2: #5c5e63;
+    --ink-3: #8b8d93;
+    --card: #ffffff;
+    --line: #e2e2df;
+    --anno: #9a7b3f;
+    --anno-bg: #f3ecdd;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #131416;
+      --ink: #ececee;
+      --ink-2: #a2a4aa;
+      --ink-3: #6d6f76;
+      --card: #1b1c1f;
+      --line: #2a2b2f;
+      --anno: #c9a96a;
+      --anno-bg: #262218;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #131416; --ink: #ececee; --ink-2: #a2a4aa; --ink-3: #6d6f76;
+    --card: #1b1c1f; --line: #2a2b2f; --anno: #c9a96a; --anno-bg: #262218;
+  }
+  :root[data-theme="light"] {
+    --ground: #f4f4f2; --ink: #1c1d1f; --ink-2: #5c5e63; --ink-3: #8b8d93;
+    --card: #ffffff; --line: #e2e2df; --anno: #9a7b3f; --anno-bg: #f3ecdd;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--ground); color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+    margin: 0; padding: 48px 24px 96px;
+  }
+  main { max-width: 980px; margin: 0 auto; }
+
+  .eyebrow {
+    font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--anno); font-weight: 600; margin: 0 0 10px;
+  }
+  h1 { font-size: 30px; line-height: 1.15; font-weight: 700; letter-spacing: -.02em; margin: 0 0 8px; text-wrap: balance; }
+  .lede { color: var(--ink-2); max-width: 62ch; margin: 0 0 12px; }
+  h2 { font-size: 20px; font-weight: 650; letter-spacing: -.01em; margin: 72px 0 6px; }
+  h2 .num { color: var(--anno); font-variant-numeric: tabular-nums; margin-right: 8px; }
+  .note { color: var(--ink-2); max-width: 68ch; margin: 0 0 24px; }
+  .note strong { color: var(--ink); font-weight: 600; }
+
+  .stage {
+    background: linear-gradient(180deg, #232428, #1a1b1e);
+    border: 1px solid var(--line); border-radius: 14px;
+    padding: 44px 32px; display: flex; flex-wrap: wrap; gap: 44px;
+    justify-content: center; align-items: flex-start;
+    overflow-x: auto;
+  }
+  .stage.tight { padding: 28px 32px; }
+
+  .caption {
+    font-size: 12.5px; color: var(--ink-2); margin-top: 10px; max-width: 68ch;
+  }
+  .tag {
+    display: inline-block; font-size: 10.5px; font-weight: 650; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--anno); background: var(--anno-bg);
+    border-radius: 4px; padding: 2px 7px; margin-bottom: 10px;
+  }
+  .exhibit { display: flex; flex-direction: column; align-items: center; }
+  .exhibit .label { font-size: 12px; color: #9a9ca2; margin-top: 14px; text-align: center; max-width: 300px; }
+  .exhibit .label b { color: #d6d7da; font-weight: 600; }
+
+  /* ---------- macOS menu bar strip ---------- */
+  .menubar {
+    width: 560px; max-width: 100%; height: 30px; border-radius: 8px;
+    background: rgba(28,28,30,.92);
+    border: 1px solid rgba(255,255,255,.08);
+    display: flex; align-items: center; justify-content: flex-end;
+    gap: 18px; padding: 0 14px;
+    font: 13px/1 -apple-system, "SF Pro Text", sans-serif; color: #e8e8ea;
+  }
+  .menubar .sys { opacity: .55; font-size: 13px; }
+  .mb-icon { display: flex; align-items: center; gap: 5px; padding: 3px 7px; border-radius: 5px; }
+  .mb-icon.focus { background: rgba(255,255,255,.16); }
+  .deck-glyph { display: inline-block; position: relative; width: 15px; height: 13px; }
+  .deck-glyph i {
+    position: absolute; left: 0; right: 0; height: 3px; border-radius: 1.5px; background: #e8e8ea;
+  }
+  .deck-glyph i:nth-child(1) { top: 0; width: 100%; }
+  .deck-glyph i:nth-child(2) { top: 5px; width: 72%; }
+  .deck-glyph i:nth-child(3) { top: 10px; width: 45%; }
+  .deck-glyph.warn i:nth-child(3) { background: #ff9f0a; width: 30%; }
+  .deck-glyph.crit i:nth-child(3), .deck-glyph.crit i:nth-child(2) { background: #ff453a; }
+  .mb-pct { font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .mb-pct.warn { color: #ff9f0a; }
+  .mb-dot { width: 6px; height: 6px; border-radius: 50%; background: #ff9f0a; position: absolute; right: -2px; top: -2px; }
+
+  /* ---------- shared popover chrome ---------- */
+  .popover {
+    width: 344px; border-radius: 12px; overflow: hidden;
+    background: #232326;
+    border: 1px solid rgba(255,255,255,.10);
+    box-shadow: 0 18px 50px rgba(0,0,0,.55), 0 2px 8px rgba(0,0,0,.4);
+    font: 13px/1.4 -apple-system, "SF Pro Text", sans-serif; color: #e7e7ea;
+    text-align: left;
+  }
+  .pop-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 12px 8px;
+  }
+  .seg {
+    display: flex; background: rgba(255,255,255,.07); border-radius: 7px; padding: 2px; gap: 2px;
+  }
+  .seg span {
+    font-size: 11px; font-weight: 550; padding: 3px 9px; border-radius: 5px; color: #9a9ca4;
+  }
+  .seg .on { background: rgba(255,255,255,.14); color: #f0f0f2; box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+  .gear { color: #8e9097; font-size: 14px; }
+
+  .acct { padding: 8px 12px 10px; border-top: 1px solid rgba(255,255,255,.06); }
+  .acct.expanded { background: rgba(255,255,255,.035); }
+  .acct-row { display: flex; align-items: center; gap: 9px; }
+  .pchip {
+    width: 24px; height: 24px; border-radius: 7px; flex: none;
+    display: flex; align-items: center; justify-content: center; font-size: 13px;
+  }
+  .pchip.claude { background: rgba(217,119,87,.16); color: #d97757; }
+  .pchip.codex  { background: rgba(255,255,255,.10); color: #e9e9ec; font-size: 11px; }
+  .pchip svg { width: 14px; height: 14px; display: block; }
+  .acct-name { font-weight: 600; font-size: 13px; letter-spacing: -.01em; }
+  .acct-mail { font-size: 11px; color: #8e9097; margin-top: 1px; }
+  .acct-meta { margin-left: auto; text-align: right; flex: none; }
+  .active-pill {
+    font-size: 9.5px; font-weight: 700; letter-spacing: .06em;
+    color: #30d158; background: rgba(48,209,88,.14);
+    border-radius: 4px; padding: 2px 6px; display: inline-block;
+  }
+  .switch-pill {
+    font-size: 10.5px; font-weight: 600; color: #d6d7db;
+    background: rgba(255,255,255,.12); border-radius: 5px; padding: 3px 8px; display: inline-block;
+  }
+  .worst { font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .worst small { display: block; font-weight: 400; font-size: 10.5px; color: #8e9097; margin-top: 1px; }
+  .ok   { color: #e7e7ea; }
+  .warn { color: #ff9f0a; }
+  .crit { color: #ff453a; }
+
+  .windows { margin: 9px 0 0 33px; display: flex; flex-direction: column; gap: 9px; }
+  .win .wr { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+  .win .wl { font-size: 12px; color: #cfd0d4; }
+  .win .wv { font-size: 12px; color: #8e9097; font-variant-numeric: tabular-nums; }
+  .win .wv b { color: #e7e7ea; font-weight: 600; margin-left: 7px; }
+  .win .wv b.warn { color: #ff9f0a; }
+  .win .wv b.crit { color: #ff453a; }
+  .bar { height: 4px; border-radius: 2px; background: rgba(255,255,255,.10); overflow: hidden; }
+  .bar i { display: block; height: 100%; border-radius: 2px; background: #6d9ef1; }
+  .bar i.warn { background: #ff9f0a; }
+  .bar i.crit { background: #ff453a; }
+
+  .mini-wins { margin: 8px 0 0 33px; display: flex; gap: 5px; }
+  .mini-wins .bar { flex: 1; }
+
+  /* two-column popover */
+  .popover.wide { width: 640px; }
+  .cols { display: flex; align-items: stretch; }
+  .col { flex: 1; min-width: 0; }
+  .col + .col { border-left: 1px solid rgba(255,255,255,.06); }
+  .col-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px 8px; border-bottom: 1px solid rgba(255,255,255,.06);
+  }
+  .col-head .pchip { width: 20px; height: 20px; border-radius: 6px; }
+  .col-head .pchip svg { width: 12px; height: 12px; }
+  .col-head .cname { font-size: 13px; font-weight: 650; letter-spacing: -.01em; }
+  .col-head .ccount { margin-left: auto; font-size: 11px; color: #8e9097; font-variant-numeric: tabular-nums; }
+  .col .acct { padding-left: 12px; padding-right: 12px; }
+  .col .acct:first-of-type { border-top: 0; }
+  .col .windows, .col .mini-wins { margin-left: 0; }
+
+  .pop-foot {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 9px 12px; border-top: 1px solid rgba(255,255,255,.06);
+    font-size: 11px; color: #8e9097;
+  }
+  .pop-foot .refresh { color: #b9bac0; }
+
+  /* variant B rows */
+  .flat-row { display: flex; align-items: center; gap: 9px; padding: 9px 12px; border-top: 1px solid rgba(255,255,255,.06); }
+  .flat-main { flex: 1; min-width: 0; }
+  .flat-top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+  .flat-label { font-size: 12.5px; font-weight: 550; }
+  .flat-label small { color: #8e9097; font-weight: 400; margin-left: 6px; font-size: 11px; }
+  .flat-reset { font-size: 11px; color: #8e9097; font-variant-numeric: tabular-nums; }
+  .flat-pct { width: 74px; text-align: right; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; flex: none; }
+  .flat-pct small { display:block; font-size: 9.5px; font-weight: 500; color: #8e9097; letter-spacing: .04em; }
+
+  /* ---------- settings window ---------- */
+  .window {
+    width: 560px; max-width: 100%; border-radius: 12px; overflow: hidden;
+    background: #232326; border: 1px solid rgba(255,255,255,.10);
+    box-shadow: 0 24px 60px rgba(0,0,0,.55);
+    font: 13px/1.45 -apple-system, "SF Pro Text", sans-serif; color: #e7e7ea; text-align: left;
+  }
+  .titlebar {
+    height: 50px; display: flex; align-items: flex-end; justify-content: center; position: relative;
+    background: #2a2a2e; border-bottom: 1px solid rgba(255,255,255,.07); padding-bottom: 6px;
+  }
+  .lights { position: absolute; left: 12px; top: 14px; display: flex; gap: 7px; }
+  .lights i { width: 12px; height: 12px; border-radius: 50%; }
+  .lights i:nth-child(1){ background:#ff5f57; } .lights i:nth-child(2){ background:#febc2e; } .lights i:nth-child(3){ background:#28c840; }
+  .tabs { display: flex; gap: 4px; }
+  .tab { display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: 11px; color: #9a9ca4; padding: 4px 14px; border-radius: 7px; }
+  .tab.on { color: #f0f0f2; background: rgba(255,255,255,.09); }
+  .tab .ic { font-size: 16px; }
+  .pane { padding: 20px 22px 24px; }
+  .setting-group { background: rgba(255,255,255,.045); border: 1px solid rgba(255,255,255,.06); border-radius: 9px; overflow: hidden; margin-bottom: 16px; }
+  .setting { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 14px; border-top: 1px solid rgba(255,255,255,.055); }
+  .setting:first-child { border-top: 0; }
+  .setting .s-label { font-size: 13px; }
+  .setting .s-sub { font-size: 11px; color: #8e9097; margin-top: 1px; }
+  .select { background: rgba(255,255,255,.10); border-radius: 6px; padding: 4px 22px 4px 10px; font-size: 12px; position: relative; flex: none; }
+  .select::after { content: "⌃"; position: absolute; right: 7px; top: 7px; transform: rotate(180deg); font-size: 8px; color: #9a9ca4; }
+  .toggle { width: 38px; height: 22px; border-radius: 11px; background: #30d158; position: relative; flex: none; }
+  .toggle.off { background: rgba(255,255,255,.16); }
+  .toggle i { position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; }
+  .toggle.off i { right: auto; left: 2px; }
+  .acct-line { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-top: 1px solid rgba(255,255,255,.055); }
+  .acct-line:first-child { border-top: 0; }
+  .acct-line .who { flex: 1; min-width: 0; }
+  .acct-line .nm { font-size: 13px; font-weight: 550; }
+  .acct-line .em { font-size: 11px; color: #8e9097; }
+  .chip-ok { font-size: 10px; font-weight: 600; color: #30d158; background: rgba(48,209,88,.13); padding: 2px 7px; border-radius: 4px; flex: none; }
+  .chip-bad { font-size: 10px; font-weight: 600; color: #ff9f0a; background: rgba(255,159,10,.13); padding: 2px 7px; border-radius: 4px; flex: none; }
+  .row-act { font-size: 11.5px; color: #9fb8e8; flex: none; }
+  .btn-add {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: rgba(255,255,255,.10); border-radius: 7px; padding: 6px 12px;
+    font-size: 12.5px; font-weight: 550;
+  }
+
+  /* flow strip */
+  .flow { display: flex; gap: 14px; flex-wrap: wrap; justify-content: center; }
+  .step {
+    width: 236px; background: #232326; border: 1px solid rgba(255,255,255,.10); border-radius: 11px;
+    padding: 14px 16px 16px; color: #d9dade; font: 12.5px/1.5 -apple-system, "SF Pro Text", sans-serif;
+    text-align: left;
+  }
+  .step .sn { font-size: 10px; font-weight: 700; letter-spacing: .1em; color: #c9a96a; margin-bottom: 6px; }
+  .step .st { font-size: 13.5px; font-weight: 650; color: #f0f0f2; margin-bottom: 5px; }
+  .step p { margin: 0; color: #9fa1a8; font-size: 11.5px; }
+
+  /* decisions table */
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; }
+  td:first-child { font-weight: 600; white-space: nowrap; }
+  td { color: var(--ink-2); }
+  td:first-child { color: var(--ink); }
+  .rec { color: var(--anno); font-weight: 600; }
+  .tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--card); }
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="claude-mark" viewBox="0 0 16 16">
+      <path d="m3.127 10.604 3.135-1.76.053-.153-.053-.085H6.11l-.525-.032-1.791-.048-1.554-.065-1.505-.08-.38-.081L0 7.832l.036-.234.32-.214.455.04 1.009.069 1.513.105 1.097.064 1.626.17h.259l.036-.105-.089-.065-.068-.064-1.566-1.062-1.695-1.121-.887-.646-.48-.327-.243-.306-.104-.67.435-.48.585.04.15.04.593.456 1.267.981 1.654 1.218.242.202.097-.068.012-.049-.109-.181-.9-1.626-.96-1.655-.428-.686-.113-.411a2 2 0 0 1-.068-.484l.496-.674L4.446 0l.662.089.279.242.411.94.666 1.48 1.033 2.014.302.597.162.553.06.17h.105v-.097l.085-1.134.157-1.392.154-1.792.052-.504.25-.605.497-.327.387.186.319.456-.045.294-.19 1.23-.37 1.93-.243 1.29h.142l.161-.16.654-.868 1.097-1.372.484-.545.565-.601.363-.287h.686l.505.751-.226.775-.707.895-.585.759-.839 1.13-.524.904.048.072.125-.012 1.897-.403 1.024-.186 1.223-.21.553.258.06.263-.218.536-1.307.323-1.533.307-2.284.54-.028.02.032.04 1.029.098.44.024h1.077l2.005.15.525.346.315.424-.053.323-.807.411-3.631-.863-.872-.218h-.12v.073l.726.71 1.331 1.202 1.667 1.55.084.383-.214.302-.226-.032-1.464-1.101-.565-.497-1.28-1.077h-.084v.113l.295.432 1.557 2.34.08.718-.112.234-.404.141-.444-.08-.911-1.28-.94-1.44-.759-1.291-.093.053-.448 4.821-.21.246-.484.186-.403-.307-.214-.496.214-.98.258-1.28.21-1.016.19-1.263.112-.42-.008-.028-.092.012-.953 1.307-1.448 1.957-1.146 1.227-.274.109-.477-.247.045-.44.266-.39 1.586-2.018.956-1.25.617-.723-.004-.105h-.036l-4.212 2.736-.75.096-.324-.302.04-.496.154-.162 1.267-.871z" />
+    </symbol>
+    <symbol id="codex-mark" viewBox="0 0 16 16">
+      <path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z" />
+    </symbol>
+  </defs>
+</svg>
+
+<main>
+  <p class="eyebrow">ModelDeck · Final design spec · rev C</p>
+  <h1>A menu bar deck for seven accounts</h1>
+  <p class="lede">Native SwiftUI menu bar app. Visual language borrowed from the Codex usage popover you like: quiet dark rows, label and reset on the left, thin bar, one confident number on the right. Everything below is rendered at real size — judge it like the actual app.</p>
+
+  <!-- ============ 1. MENU BAR ICON ============ -->
+  <h2><span class="num">01</span>Menu bar icon</h2>
+  <p class="note">The glyph is a <strong>deck</strong> — three stacked bars that double as capacity meters. It's a template icon (auto-adapts to light/dark menu bars), and it carries state without you opening anything. Three treatments:</p>
+
+  <div class="stage tight" style="flex-direction: column; align-items: center; gap: 18px;">
+    <div class="exhibit">
+      <div class="menubar">
+        <span class="mb-icon focus"><span class="deck-glyph"><i></i><i></i><i></i></span></span>
+        <span class="sys">◐</span><span class="sys">Sat Jul 19</span><span class="sys">4:02 PM</span>
+      </div>
+      <div class="label"><b>A · Glyph only.</b> Quietest. All healthy — plain template icon.</div>
+    </div>
+    <div class="exhibit">
+      <div class="menubar">
+        <span class="mb-icon focus"><span class="deck-glyph warn"><i></i><i></i><i></i></span><span class="mb-pct warn">18%</span></span>
+        <span class="sys">◐</span><span class="sys">Sat Jul 19</span><span class="sys">4:02 PM</span>
+      </div>
+      <div class="label"><b>B · Glyph + worst number.</b> Shows the lowest remaining % across all accounts, only when something drops below 25%. Healthy = number hidden, back to A.</div>
+    </div>
+    <div class="exhibit">
+      <div class="menubar">
+        <span class="mb-icon focus" style="position:relative;"><span class="deck-glyph" style="position:relative;"><i></i><i></i><i></i><span class="mb-dot"></span></span></span>
+        <span class="sys">◐</span><span class="sys">Sat Jul 19</span><span class="sys">4:02 PM</span>
+      </div>
+      <div class="label"><b>C · Glyph + status dot.</b> Amber/red dot when any account crosses a threshold. Minimal footprint, no number.</div>
+    </div>
+  </div>
+  <p class="caption"><span class="rec">✓ Decided:</span> A by default — plain white template glyph (macOS tints it automatically, like every icon in your menu bar). The number tracks the <strong>lowest remaining % across every account and every window</strong> — 5-hour or weekly, active or not — and appears in gold only when it drops below the threshold set in Settings; red at critical; hidden again when capacity recovers.</p>
+
+  <!-- ============ 2. POPOVER ============ -->
+  <h2><span class="num">02</span>The popover — two-column deck <span style="font-size:12px; color:var(--anno); font-weight:600;">(✓ decided)</span></h2>
+  <p class="note"><strong>Decided: the two-column deck is the default layout.</strong> Claude's accounts on the left, Codex's on the right, each column headed by its brand mark and carrying its own ACTIVE badge — true to how switching really works, since each provider has its own active account. Rows collapse to a single line — name, badge, worst window's bar, % left, next reset. Clicking a row expands its full windows, and that's where <strong>Activate</strong> lives: it appears only in the expanded state, so collapsed rows stay clean. One click switches that provider's CLI to the account. Bars are <strong>blue</strong> when healthy, yellow-gold when low, red at critical. A Settings option switches between this two-column layout and the single-column alternate below.</p>
+
+  <div class="stage">
+    <div class="exhibit" style="order: 2;">
+      <span class="tag">Alternate layout · selectable in Settings</span>
+      <div class="popover">
+        <div class="pop-head">
+          <div class="seg"><span class="on">Reset</span><span>Lowest</span><span>Provider</span></div>
+          <span class="gear">⚙︎</span>
+        </div>
+
+        <!-- expanded account -->
+        <div class="acct expanded">
+          <div class="acct-row">
+            <span class="pchip claude"><svg fill="#d97757"><use href="#claude-mark"/></svg></span>
+            <div>
+              <div class="acct-name">Studio</div>
+              <div class="acct-mail">studio@example.com</div>
+            </div>
+            <div class="acct-meta"><span class="active-pill">ACTIVE</span></div>
+          </div>
+          <div class="windows">
+            <div class="win">
+              <div class="wr"><span class="wl">5-hour limit</span><span class="wv">Resets in 57 min<b>72% left</b></span></div>
+              <div class="bar"><i style="width:28%"></i></div>
+            </div>
+            <div class="win">
+              <div class="wr"><span class="wl">Weekly · all models</span><span class="wv">Resets Wed 6:00 PM<b>63% left</b></span></div>
+              <div class="bar"><i style="width:37%"></i></div>
+            </div>
+            <div class="win">
+              <div class="wr"><span class="wl">Weekly · Fable</span><span class="wv">Resets Wed 6:00 PM<b class="warn">32% left</b></span></div>
+              <div class="bar"><i class="warn" style="width:68%"></i></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- collapsed, hover state showing Switch -->
+        <div class="acct">
+          <div class="acct-row">
+            <span class="pchip claude"><svg fill="#d97757"><use href="#claude-mark"/></svg></span>
+            <div>
+              <div class="acct-name">Client</div>
+              <div class="acct-mail">client@example.com</div>
+            </div>
+            <div class="acct-meta"><div class="worst crit">8% left<small>Weekly · Fable · Wed 6:00 PM</small></div></div>
+          </div>
+          <div class="mini-wins">
+            <div class="bar"><i class="crit" style="width:92%"></i></div>
+          </div>
+        </div>
+
+        <div class="acct">
+          <div class="acct-row">
+            <span class="pchip codex"><svg fill="#e9e9ec"><use href="#codex-mark"/></svg></span>
+            <div>
+              <div class="acct-name">Personal</div>
+              <div class="acct-mail">personal@example.com</div>
+            </div>
+            <div class="acct-meta">
+              <div class="worst warn">22% left<small>Weekly · resets Jul 24</small></div>
+            </div>
+          </div>
+          <div class="mini-wins"><div class="bar"><i class="warn" style="width:78%"></i></div></div>
+        </div>
+
+        <div class="acct">
+          <div class="acct-row">
+            <span class="pchip codex"><svg fill="#e9e9ec"><use href="#codex-mark"/></svg></span>
+            <div>
+              <div class="acct-name">Studio</div>
+              <div class="acct-mail">studio@example.com</div>
+            </div>
+            <div class="acct-meta">
+              <div class="worst ok">99% left<small>Weekly · resets Jul 26</small></div>
+            </div>
+          </div>
+          <div class="mini-wins"><div class="bar"><i style="width:1%"></i></div></div>
+        </div>
+
+        <div class="acct">
+          <div class="acct-row">
+            <span class="pchip claude"><svg fill="#d97757"><use href="#claude-mark"/></svg></span>
+            <div>
+              <div class="acct-name">Personal</div>
+              <div class="acct-mail">personal@example.com</div>
+            </div>
+            <div class="acct-meta">
+              <div class="worst ok">88% left<small>Weekly · resets Thu 9:00 AM</small></div>
+            </div>
+          </div>
+          <div class="mini-wins"><div class="bar"><i style="width:12%"></i></div></div>
+        </div>
+
+        <div class="acct">
+          <div class="acct-row">
+            <span class="pchip codex"><svg fill="#e9e9ec"><use href="#codex-mark"/></svg></span>
+            <div>
+              <div class="acct-name">Client</div>
+              <div class="acct-mail">client@example.com</div>
+            </div>
+            <div class="acct-meta">
+              <div class="worst ok">100% left<small>Weekly · resets Jul 26</small></div>
+            </div>
+          </div>
+          <div class="mini-wins"><div class="bar"><i style="width:0%"></i></div></div>
+        </div>
+
+        <div class="acct">
+          <div class="acct-row">
+            <span class="pchip claude"><svg fill="#d97757"><use href="#claude-mark"/></svg></span>
+            <div>
+              <div class="acct-name">Side Project</div>
+              <div class="acct-mail">side.project@example.com</div>
+            </div>
+            <div class="acct-meta">
+              <div class="worst ok">95% left<small>5-hour · resets in 3 h 10 m</small></div>
+            </div>
+          </div>
+          <div class="mini-wins"><div class="bar"><i style="width:5%"></i></div></div>
+        </div>
+
+        <div class="pop-foot">
+          <span>Updated 2 min ago</span>
+          <span class="refresh">↻&nbsp;&nbsp;Refresh</span>
+        </div>
+      </div>
+      <div class="label"><b>Single-column alternate</b> for anyone who prefers a slim dropdown — same rows, provider logos back on each row, both providers interleaved by sort. Same expand-to-reveal <b>Activate</b> behavior. Bars fill with <b>usage</b>, number reads <b>% left</b>.</div>
+    </div>
+
+    <div class="exhibit">
+      <span class="tag">✓ The design · two-column deck</span>
+      <div class="popover wide">
+        <div class="pop-head">
+          <div class="seg"><span class="on">Reset</span><span>Lowest</span></div>
+          <span class="gear">⚙︎</span>
+        </div>
+        <div class="cols">
+          <!-- Claude column -->
+          <div class="col">
+            <div class="col-head">
+              <span class="pchip claude"><svg fill="#d97757"><use href="#claude-mark"/></svg></span>
+              <span class="cname">Claude</span>
+              <span class="ccount">4 accounts</span>
+            </div>
+            <div class="acct expanded">
+              <div class="acct-row">
+                <div>
+                  <div class="acct-name">Studio</div>
+                  <div class="acct-mail">studio@example.com</div>
+                </div>
+                <div class="acct-meta"><span class="active-pill">ACTIVE</span></div>
+              </div>
+              <div class="windows">
+                <div class="win">
+                  <div class="wr"><span class="wl">5-hour limit</span><span class="wv">in 57 min<b>72%</b></span></div>
+                  <div class="bar"><i style="width:28%"></i></div>
+                </div>
+                <div class="win">
+                  <div class="wr"><span class="wl">Weekly · all models</span><span class="wv">Wed 6:00 PM<b>63%</b></span></div>
+                  <div class="bar"><i style="width:37%"></i></div>
+                </div>
+                <div class="win">
+                  <div class="wr"><span class="wl">Weekly · Fable</span><span class="wv">Wed 6:00 PM<b class="warn">32%</b></span></div>
+                  <div class="bar"><i class="warn" style="width:68%"></i></div>
+                </div>
+              </div>
+            </div>
+            <div class="acct">
+              <div class="acct-row">
+                <div>
+                  <div class="acct-name">Client</div>
+                  <div class="acct-mail">client@example.com</div>
+                </div>
+                <div class="acct-meta"><div class="worst crit">8% left<small>Weekly · Fable · Wed 6:00 PM</small></div></div>
+              </div>
+              <div class="mini-wins"><div class="bar"><i class="crit" style="width:92%"></i></div></div>
+            </div>
+            <div class="acct">
+              <div class="acct-row">
+                <div>
+                  <div class="acct-name">Personal</div>
+                  <div class="acct-mail">personal@example.com</div>
+                </div>
+                <div class="acct-meta"><div class="worst ok">88% left<small>Weekly · Thu 9:00 AM</small></div></div>
+              </div>
+              <div class="mini-wins"><div class="bar"><i style="width:12%"></i></div></div>
+            </div>
+            <div class="acct">
+              <div class="acct-row">
+                <div>
+                  <div class="acct-name">Side Project</div>
+                  <div class="acct-mail">side.project@example.com</div>
+                </div>
+                <div class="acct-meta"><div class="worst ok">95% left<small>5-hour · in 3 h 10 m</small></div></div>
+              </div>
+              <div class="mini-wins"><div class="bar"><i style="width:5%"></i></div></div>
+            </div>
+          </div>
+          <!-- Codex column -->
+          <div class="col">
+            <div class="col-head">
+              <span class="pchip codex"><svg fill="#e9e9ec"><use href="#codex-mark"/></svg></span>
+              <span class="cname">Codex</span>
+              <span class="ccount">3 accounts</span>
+            </div>
+            <div class="acct expanded">
+              <div class="acct-row">
+                <div>
+                  <div class="acct-name">Personal</div>
+                  <div class="acct-mail">personal@example.com</div>
+                </div>
+                <div class="acct-meta"><span class="switch-pill">Activate</span></div>
+              </div>
+              <div class="windows">
+                <div class="win">
+                  <div class="wr"><span class="wl">Weekly</span><span class="wv">Jul 24<b class="warn">22%</b></span></div>
+                  <div class="bar"><i class="warn" style="width:78%"></i></div>
+                </div>
+                <div class="win">
+                  <div class="wr"><span class="wl">GPT-5.3-Spark · weekly</span><span class="wv">Jul 26<b>100%</b></span></div>
+                  <div class="bar"><i style="width:0%"></i></div>
+                </div>
+              </div>
+            </div>
+            <div class="acct">
+              <div class="acct-row">
+                <div>
+                  <div class="acct-name">Studio</div>
+                  <div class="acct-mail">studio@example.com</div>
+                </div>
+                <div class="acct-meta"><span class="active-pill">ACTIVE</span></div>
+              </div>
+              <div class="mini-wins"><div class="bar"><i style="width:1%"></i></div></div>
+              <div style="display:flex; justify-content:space-between; margin-top:4px; font-size:11px; color:#8e9097;">
+                <span>Weekly · Jul 26</span><span style="font-weight:600; color:#e7e7ea;">99% left</span>
+              </div>
+            </div>
+            <div class="acct">
+              <div class="acct-row">
+                <div>
+                  <div class="acct-name">Client</div>
+                  <div class="acct-mail">client@example.com</div>
+                </div>
+                <div class="acct-meta"><div class="worst ok">100% left<small>Weekly · Jul 26</small></div></div>
+              </div>
+              <div class="mini-wins"><div class="bar"><i style="width:0%"></i></div></div>
+            </div>
+          </div>
+        </div>
+        <div class="pop-foot">
+          <span>Updated 2 min ago</span>
+          <span class="refresh">↻&nbsp;&nbsp;Refresh</span>
+        </div>
+      </div>
+      <div class="label"><b>Two-column deck.</b> Left column: Studio expanded and ACTIVE. Right column: Personal expanded — the active account carries a checkmark by its title, and activation lives in Settings → Accounts (spec amendment, issue #28). Column headers carry the brand marks, so rows spend their width on names and reset times.</div>
+    </div>
+  </div>
+
+  <!-- ============ 3. VARIANT B ============ -->
+  <h2><span class="num">03</span>Alternate popover — flat window list <span style="font-size:12px; color:var(--anno); font-weight:600;">(not selected)</span></h2>
+  <p class="note"><strong>Decided: the account-row design in §02 wins</strong> for usability. This flat window list is kept for reference — its bones may return later as a denser display option, but it is not part of the build.</p>
+
+  <div class="stage">
+    <div class="exhibit">
+      <span class="tag">Variant B · window-centric</span>
+      <div class="popover">
+        <div class="pop-head">
+          <div class="seg"><span class="on">Reset</span><span>Lowest</span><span>Provider</span></div>
+          <span class="gear">⚙︎</span>
+        </div>
+        <div class="flat-row">
+          <span class="pchip claude"><svg fill="#d97757"><use href="#claude-mark"/></svg></span>
+          <div class="flat-main">
+            <div class="flat-top"><span class="flat-label">Studio<small>5-hour</small></span><span class="flat-reset">in 57 min</span></div>
+            <div class="bar"><i style="width:28%"></i></div>
+          </div>
+          <div class="flat-pct ok">72%<small>LEFT</small></div>
+        </div>
+        <div class="flat-row">
+          <span class="pchip claude"><svg fill="#d97757"><use href="#claude-mark"/></svg></span>
+          <div class="flat-main">
+            <div class="flat-top"><span class="flat-label">Side Project<small>5-hour</small></span><span class="flat-reset">in 3 h 10 m</span></div>
+            <div class="bar"><i style="width:5%"></i></div>
+          </div>
+          <div class="flat-pct ok">95%<small>LEFT</small></div>
+        </div>
+        <div class="flat-row">
+          <span class="pchip claude"><svg fill="#d97757"><use href="#claude-mark"/></svg></span>
+          <div class="flat-main">
+            <div class="flat-top"><span class="flat-label">Lend Mgmt Max<small>Weekly · Fable</small></span><span class="flat-reset">Wed 6:00 PM</span></div>
+            <div class="bar"><i class="crit" style="width:92%"></i></div>
+          </div>
+          <div class="flat-pct crit">8%<small>LEFT</small></div>
+        </div>
+        <div class="flat-row">
+          <span class="pchip claude"><svg fill="#d97757"><use href="#claude-mark"/></svg></span>
+          <div class="flat-main">
+            <div class="flat-top"><span class="flat-label">Studio<small>Weekly · Fable</small></span><span class="flat-reset">Wed 6:00 PM</span></div>
+            <div class="bar"><i class="warn" style="width:68%"></i></div>
+          </div>
+          <div class="flat-pct warn">32%<small>LEFT</small></div>
+        </div>
+        <div class="flat-row">
+          <span class="pchip codex"><svg fill="#e9e9ec"><use href="#codex-mark"/></svg></span>
+          <div class="flat-main">
+            <div class="flat-top"><span class="flat-label">Personal<small>Weekly</small></span><span class="flat-reset">Jul 24</span></div>
+            <div class="bar"><i class="warn" style="width:78%"></i></div>
+          </div>
+          <div class="flat-pct warn">22%<small>LEFT</small></div>
+        </div>
+        <div class="flat-row">
+          <span class="pchip codex"><svg fill="#e9e9ec"><use href="#codex-mark"/></svg></span>
+          <div class="flat-main">
+            <div class="flat-top"><span class="flat-label">Studio<small>Weekly</small></span><span class="flat-reset">Jul 26</span></div>
+            <div class="bar"><i style="width:1%"></i></div>
+          </div>
+          <div class="flat-pct ok">99%<small>LEFT</small></div>
+        </div>
+        <div class="pop-foot">
+          <span>Updated 2 min ago</span>
+          <span class="refresh">↻&nbsp;&nbsp;Refresh</span>
+        </div>
+      </div>
+      <div class="label">Purest "what resets next" view. Could also live as the <b>Reset</b> sort mode inside the primary design rather than a separate variant.</div>
+    </div>
+  </div>
+
+  <!-- ============ 4. SETTINGS ============ -->
+  <h2><span class="num">04</span>Settings window</h2>
+  <p class="note">A real macOS settings window (toolbar-style tabs, like System Settings panes). Two panes: <strong>Accounts</strong> — the add/remove/reauth surface you asked for — and <strong>General</strong> for refresh and appearance. This window is also where the retired web dashboard's admin duties land.</p>
+
+  <div class="stage" style="gap: 32px;">
+    <div class="exhibit">
+      <span class="tag">Accounts pane</span>
+      <div class="window">
+        <div class="titlebar">
+          <div class="lights"><i></i><i></i><i></i></div>
+          <div class="tabs">
+            <div class="tab on"><span class="ic">◎</span>Accounts</div>
+            <div class="tab"><span class="ic">⚙︎</span>General</div>
+          </div>
+        </div>
+        <div class="pane">
+          <div class="setting-group">
+            <div class="acct-line">
+              <span class="pchip claude"><svg fill="#d97757"><use href="#claude-mark"/></svg></span>
+              <div class="who"><div class="nm">Studio <span class="active-pill" style="margin-left:6px;">ACTIVE</span></div><div class="em">studio@example.com · Claude · Max 20×</div></div>
+              <span class="chip-ok">Healthy</span>
+              <span class="row-act">Edit</span>
+            </div>
+            <div class="acct-line">
+              <span class="pchip claude"><svg fill="#d97757"><use href="#claude-mark"/></svg></span>
+              <div class="who"><div class="nm">Client</div><div class="em">client@example.com · Claude · Max 20×</div></div>
+              <span class="chip-ok">Healthy</span>
+              <span class="row-act">Edit</span>
+            </div>
+            <div class="acct-line">
+              <span class="pchip claude"><svg fill="#d97757"><use href="#claude-mark"/></svg></span>
+              <div class="who"><div class="nm">Personal</div><div class="em">personal@example.com · Claude · Max 5×</div></div>
+              <span class="chip-bad">Sign in again</span>
+              <span class="row-act">Reauthenticate</span>
+            </div>
+            <div class="acct-line">
+              <span class="pchip claude"><svg fill="#d97757"><use href="#claude-mark"/></svg></span>
+              <div class="who"><div class="nm">Side Project</div><div class="em">side.project@example.com · Claude · Max 5×</div></div>
+              <span class="chip-ok">Healthy</span>
+              <span class="row-act">Edit</span>
+            </div>
+            <div class="acct-line">
+              <span class="pchip codex"><svg fill="#e9e9ec"><use href="#codex-mark"/></svg></span>
+              <div class="who"><div class="nm">Studio</div><div class="em">studio@example.com · Codex · Pro</div></div>
+              <span class="chip-ok">Healthy</span>
+              <span class="row-act">Edit</span>
+            </div>
+            <div class="acct-line">
+              <span class="pchip codex"><svg fill="#e9e9ec"><use href="#codex-mark"/></svg></span>
+              <div class="who"><div class="nm">Client</div><div class="em">client@example.com · Codex · Pro</div></div>
+              <span class="chip-ok">Healthy</span>
+              <span class="row-act">Edit</span>
+            </div>
+            <div class="acct-line">
+              <span class="pchip codex"><svg fill="#e9e9ec"><use href="#codex-mark"/></svg></span>
+              <div class="who"><div class="nm">Personal</div><div class="em">personal@example.com · Codex · Pro</div></div>
+              <span class="chip-ok">Healthy</span>
+              <span class="row-act">Edit</span>
+            </div>
+          </div>
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span class="btn-add">+&nbsp;Add Account…</span>
+            <span style="font-size:11px; color:#8e9097;">Removing an account never deletes its login or credentials.</span>
+          </div>
+        </div>
+      </div>
+      <div class="label"><b>Health chips</b> surface auth problems (the <i>relogin_required</i> case) right where the fix lives. Edit → rename, recolor, set purpose. Remove lives inside Edit, behind a confirm.</div>
+    </div>
+
+    <div class="exhibit">
+      <span class="tag">General pane</span>
+      <div class="window" style="width:560px;">
+        <div class="titlebar">
+          <div class="lights"><i></i><i></i><i></i></div>
+          <div class="tabs">
+            <div class="tab"><span class="ic">◎</span>Accounts</div>
+            <div class="tab on"><span class="ic">⚙︎</span>General</div>
+          </div>
+        </div>
+        <div class="pane">
+          <div class="setting-group">
+            <div class="setting">
+              <div><div class="s-label">Refresh usage automatically</div><div class="s-sub">Polls each provider in the background</div></div>
+              <span class="toggle"><i></i></span>
+            </div>
+            <div class="setting">
+              <div><div class="s-label">Refresh interval</div></div>
+              <span class="select">Every 5 minutes</span>
+            </div>
+            <div class="setting">
+              <div><div class="s-label">Pause while a session is active</div><div class="s-sub">Skip polling when Claude Code or Codex is running</div></div>
+              <span class="toggle off"><i></i></span>
+            </div>
+          </div>
+          <div class="setting-group">
+            <div class="setting">
+              <div><div class="s-label">Menu bar icon</div><div class="s-sub">Show the lowest remaining % when under 25%</div></div>
+              <span class="select">Glyph + number</span>
+            </div>
+            <div class="setting">
+              <div><div class="s-label">Popover layout</div></div>
+              <span class="select">Two columns</span>
+            </div>
+            <div class="setting">
+              <div><div class="s-label">Default sort</div></div>
+              <span class="select">Next reset</span>
+            </div>
+            <div class="setting">
+              <div><div class="s-label">Notify when an account drops below</div></div>
+              <span class="select">15% left</span>
+            </div>
+          </div>
+          <div class="setting-group">
+            <div class="setting">
+              <div><div class="s-label">Claude Code CLI</div><div class="s-sub">2.0.44 installed · latest 2.0.51</div></div>
+              <span class="btn-add" style="padding:4px 12px; font-size:12px;">Update</span>
+            </div>
+            <div class="setting">
+              <div><div class="s-label">Codex CLI</div><div class="s-sub">0.58.2 installed</div></div>
+              <span class="chip-ok">Up to date</span>
+            </div>
+          </div>
+          <div class="setting-group">
+            <div class="setting">
+              <div><div class="s-label">Launch at login</div></div>
+              <span class="toggle"><i></i></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="label">The refresh controls you asked for, plus a native macOS <b>notification threshold</b> — a banner when any account crosses the line, so the app warns you even when you're not looking at it.</div>
+    </div>
+  </div>
+
+  <!-- ============ 5. ADD ACCOUNT FLOW ============ -->
+  <h2><span class="num">05</span>Adding account #8</h2>
+  <p class="note">The flow that makes growth painless. The app orchestrates it; the actual OAuth login stays in the provider's own browser flow — ModelDeck never sees or stores credentials.</p>
+  <div class="stage tight">
+    <div class="flow">
+      <div class="step">
+        <div class="sn">STEP 1</div>
+        <div class="st">Choose provider &amp; label</div>
+        <p>Claude or Codex, a friendly name ("Side Project"), a purpose tag, and a color. ModelDeck creates the isolated profile home behind the scenes.</p>
+      </div>
+      <div class="step">
+        <div class="sn">STEP 2</div>
+        <div class="st">Sign in — provider's own flow</div>
+        <p>The app kicks off <b>codex login</b> / <b>claude auth login</b> under that profile and opens the browser. You complete Google OAuth exactly as normal.</p>
+      </div>
+      <div class="step">
+        <div class="sn">STEP 3</div>
+        <div class="st">Verify &amp; land</div>
+        <p>ModelDeck reads back the authenticated identity, shows "Signed in as dev@…" for confirmation, pulls first usage, and the account appears in the deck.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 6. DECISIONS ============ -->
+  <h2><span class="num">06</span>Decisions — locked 2026-07-19</h2>
+  <div class="tablewrap">
+    <table>
+      <tr><th>Question</th><th>Decision</th></tr>
+      <tr>
+        <td>% left vs % used</td>
+        <td><span class="rec">"% left"</span> everywhere — one convention across both providers.</td>
+      </tr>
+      <tr>
+        <td>Popover layout</td>
+        <td><span class="rec">Two-column deck</span> (§02) — Claude column left, Codex column right, expanding account rows. Single-column available as a Settings option; flat list (§03) not selected.</td>
+      </tr>
+      <tr>
+        <td>Switch action</td>
+        <td><span class="rec">"Activate"</span> — appears only when an account row is expanded, never on collapsed rows. One click switches that provider's CLI.</td>
+      </tr>
+      <tr>
+        <td>Menu bar icon</td>
+        <td><span class="rec">Plain glyph by default;</span> gold % appears when the <span class="rec">lowest remaining % across all accounts and windows</span> drops below the configured threshold, red at critical.</td>
+      </tr>
+      <tr>
+        <td>Bar color</td>
+        <td><span class="rec">Blue</span> when healthy (like the Claude apps), yellow-gold under threshold, red at critical.</td>
+      </tr>
+      <tr>
+        <td>Notifications</td>
+        <td><span class="rec">Yes</span> — macOS banner at a configurable threshold.</td>
+      </tr>
+      <tr>
+        <td>"Active" semantics</td>
+        <td><span class="rec">The active account is what the CLI uses for new sessions</span> — Claude Code (terminal or desktop app) picks up the active Claude account; plain <code>codex</code> uses the active Codex account. Already-running sessions are never touched.</td>
+      </tr>
+      <tr>
+        <td>CLI versions</td>
+        <td><span class="rec">Settings shows installed vs. latest</span> for Claude Code and Codex CLI, with a one-click Update when outdated. Architecture: Panely's <code>CliToolProbe</code> pattern — one cached probe returns version + availability + auth state (feeding the account health chips too), refreshed in the background, never blocking launch — plus hiverunner's latest-version comparison for the Update button.</td>
+      </tr>
+      <tr>
+        <td>Provider marks</td>
+        <td><span class="rec">Official brand logos</span> — Claude starburst in Anthropic clay (#D97757), OpenAI knot in white — now shown in every mockup above.</td>
+      </tr>
+    </table>
+  </div>
+
+  <p class="note" style="margin-top:28px;"><strong>All decisions locked — this page is the final design spec.</strong> Roster: Claude — Studio (studio@example.com), Client (client@example.com), Personal (personal@example.com), Side Project (side.project@example.com). Codex — Studio, Client, Personal (same identities). Next: roadmap doc and build.</p>
+</main>
