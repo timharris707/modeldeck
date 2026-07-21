@@ -34,6 +34,21 @@ struct ActivationStateMappingTests {
         #expect(ProviderActivationState.from("blocked") == .blocked)
         #expect(ProviderActivationState.from("mismatched") == .mismatched)
         #expect(ProviderActivationState.from("unlinked") == .unlinked)
+        // PRs #63/#64: identity verification states.
+        #expect(ProviderActivationState.from("identity-mismatch") == .identityMismatch)
+        #expect(ProviderActivationState.from("identity-unverified") == .identityUnverified)
+    }
+
+    @Test func onlyLinkLevelStatesOfferCompleteActivation() {
+        // Issue #61: the button re-runs the daemon activate, which lays the
+        // symlink — it can fix link problems, never identity problems.
+        #expect(ProviderActivationState.blocked.needsLinkCompletion)
+        #expect(ProviderActivationState.mismatched.needsLinkCompletion)
+        #expect(ProviderActivationState.unlinked.needsLinkCompletion)
+        #expect(!ProviderActivationState.effective.needsLinkCompletion)
+        #expect(!ProviderActivationState.identityMismatch.needsLinkCompletion)
+        #expect(!ProviderActivationState.identityUnverified.needsLinkCompletion)
+        #expect(!ProviderActivationState.unknown.needsLinkCompletion)
     }
 
     @Test func unrecognizedOrAbsentStateIsUnknown() {
@@ -79,19 +94,40 @@ struct ActiveIndicatorTests {
         #expect(ActiveIndicator.indicator(for: .unknown) == .checkmark)
     }
 
+    /// Issue #61: every pending caption must state the distinction — the
+    /// account is SELECTED as active, but activation isn't in effect.
+    private func caption(for state: ProviderActivationState) -> String? {
+        guard case .pending(let caption) = ActiveIndicator.indicator(for: state) else { return nil }
+        return caption
+    }
+
     @Test func blockedRendersPendingWithMigrationCaption() {
-        #expect(ActiveIndicator.indicator(for: .blocked)
-            == .pending(caption: "Activation pending — one-time migration needed"))
+        let caption = caption(for: .blocked)
+        #expect(caption?.contains("Selected as active, but not in effect yet") == true)
+        #expect(caption?.contains("one-time migration") == true)
     }
 
     @Test func mismatchedRendersPendingWithLinkCaption() {
-        #expect(ActiveIndicator.indicator(for: .mismatched)
-            == .pending(caption: "Active link points at a different account"))
+        #expect(caption(for: .mismatched)
+            == "Selected as active, but the active link points at a different account")
     }
 
     @Test func unlinkedRendersPendingWithNoLinkCaption() {
-        #expect(ActiveIndicator.indicator(for: .unlinked)
-            == .pending(caption: "Activation pending — no active link yet"))
+        let caption = caption(for: .unlinked)
+        #expect(caption?.contains("Selected as active, but not in effect yet") == true)
+        #expect(caption?.contains("no active link") == true)
+    }
+
+    @Test func identityMismatchRendersPendingWithLoginCaption() {
+        let caption = caption(for: .identityMismatch)
+        #expect(caption?.contains("signed in as a different identity") == true)
+        #expect(caption?.contains("/login") == true)
+    }
+
+    @Test func identityUnverifiedRendersPendingWithVerifyCaption() {
+        let caption = caption(for: .identityUnverified)
+        #expect(caption?.contains("identity isn't verified yet") == true)
+        #expect(caption?.contains("/login") == true)
     }
 }
 
@@ -108,7 +144,7 @@ struct DeckRowActivationTests {
         #expect(rows.first { $0.id == "x1" }?.activationState == .blocked)
         #expect(rows.first { $0.id == "c1" }?.activeIndicator == .checkmark)
         #expect(rows.first { $0.id == "x1" }?.activeIndicator
-            == .pending(caption: "Activation pending — one-time migration needed"))
+            == ActiveIndicator.indicator(for: .blocked))
     }
 
     @Test func rowsWithoutActivationFieldRenderTheCheckmark() {
@@ -158,10 +194,21 @@ struct ActivationNoticeTests {
     @Test func mismatchedAndUnlinkedGetHonestMessages() {
         #expect(ActivationNotice.message(for: .mismatched, provider: .claude)?
             .contains("points at a different account") == true)
+        // Issue #61: unlinked is the post-migration "ready" state — the
+        // banner flips from "migration needed" to pointing at the button.
         #expect(ActivationNotice.message(for: .unlinked, provider: .codex)?
-            .contains("no active link") == true)
+            .contains("Complete Activation") == true)
         #expect(ActivationNotice.message(for: .effective, provider: .claude) == nil)
         #expect(ActivationNotice.message(for: .unknown, provider: .claude) == nil)
+    }
+
+    @Test func identityStatesNoticeSplit() {
+        // identity-mismatch is actionable (log out, /login) → banner;
+        // identity-unverified is a soft state → marker tooltip only, no
+        // standing banner noise.
+        #expect(ActivationNotice.message(for: .identityMismatch, provider: .claude)?
+            .contains("/login") == true)
+        #expect(ActivationNotice.message(for: .identityUnverified, provider: .claude) == nil)
     }
 }
 
@@ -373,5 +420,89 @@ struct BlockedActivateFlowTests {
         #expect(model.blockedActivationGuidance(for: "x2") == nil)
         #expect(model.activationError(for: "x2") == nil)
         #expect(activator.calls == ["x2", "x2"])
+    }
+}
+
+// MARK: - Complete activation on the active row (issue #61)
+
+@Suite("Complete activation for the active row")
+@MainActor
+struct CompleteActivationTests {
+    private func freshDefaults() -> UserDefaults {
+        let suite = "complete-activation-tests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        return defaults
+    }
+
+    /// The DB-active codex row under the given activation state string.
+    private func activeCodexRow(_ model: DeckPopoverModel, state raw: String?) -> DeckAccountRow {
+        let activation = raw.map { DeckActivation(codex: ProviderActivation(state: $0)) }
+        let state = rosterState(activation: activation)
+        return model.columns(for: state)[1].rows.first { $0.id == "x1" }!
+    }
+
+    @Test func activeRowWithPendingLinkCanRerunActivation() async {
+        // The ceremony gap: blocker cleared (state now "unlinked"), the
+        // active account just needs the symlink laid — the re-run must go
+        // through instead of being swallowed by the isActive guard.
+        let activator = QueueActivator(results: [
+            .success(account("x1", provider: "codex", label: "Studio", isDefault: true)),
+        ])
+        let verified = rosterState(activation: DeckActivation(
+            codex: ProviderActivation(state: "effective")))
+        let model = DeckPopoverModel(
+            defaults: freshDefaults(),
+            activator: activator,
+            stateProvider: FixedStateProvider(state: verified)
+        )
+
+        await model.activate(activeCodexRow(model, state: "unlinked"))
+
+        #expect(activator.calls == ["x1"])
+        #expect(model.activationError(for: "x1") == nil)
+        #expect(model.blockedActivationGuidance(for: "x1") == nil)
+    }
+
+    @Test func activeRowStillBlockedSurfacesGuidanceVerbatim() async {
+        let guidance = "codex activation requires a one-time migration: "
+            + "move the existing directory aside at a quiet moment before "
+            + "activating: /placeholder/home/.codex"
+        let activator = QueueActivator(results: [
+            .failure(DaemonClientError.daemonCodedError(
+                message: guidance, code: "active-link-blocked", status: 409)),
+        ])
+        let state = rosterState(activation: DeckActivation(
+            codex: ProviderActivation(state: "blocked")))
+        let model = DeckPopoverModel(
+            defaults: freshDefaults(),
+            activator: activator,
+            stateProvider: FixedStateProvider(state: state)
+        )
+
+        await model.activate(activeCodexRow(model, state: "blocked"))
+
+        #expect(activator.calls == ["x1"])
+        #expect(model.blockedActivationGuidance(for: "x1") == guidance)
+        // The active marker never moved: x1 stays the DB default.
+        #expect(model.columns(for: state)[1].rows.first { $0.id == "x1" }?.isActive == true)
+    }
+
+    @Test func effectiveActiveRowStaysANoOp() async {
+        // Nothing to complete: an active row whose activation is effective
+        // (or unreported, or identity-level) must never re-POST.
+        let activator = QueueActivator(results: [])
+        let model = DeckPopoverModel(
+            defaults: freshDefaults(),
+            activator: activator,
+            stateProvider: FixedStateProvider(state: rosterState(activation: nil))
+        )
+
+        await model.activate(activeCodexRow(model, state: "effective"))
+        await model.activate(activeCodexRow(model, state: nil))
+        await model.activate(activeCodexRow(model, state: "identity-unverified"))
+        await model.activate(activeCodexRow(model, state: "identity-mismatch"))
+
+        #expect(activator.calls.isEmpty)
     }
 }

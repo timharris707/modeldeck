@@ -12,7 +12,12 @@ struct ModelDeckMacApp: App {
     @StateObject private var signInModel: AccountSignInModel
     @StateObject private var toolUpdateModel: ToolUpdateModel
     @StateObject private var appUpdateModel: AppUpdateModel
+    @StateObject private var appUpdateAutoChecker: AppUpdateAutoChecker
     @StateObject private var notifications: UsageNotificationCoordinator
+    /// Issue #59: right-click context menu on the menu bar icon (Quit +
+    /// Check for App Updates). Class ref held for the app's lifetime;
+    /// installed from the label's .task.
+    private let contextMenuController: MenuBarContextMenuController
 
     init() {
         let configuration = DaemonConfiguration.resolved()
@@ -59,22 +64,46 @@ struct ModelDeckMacApp: App {
         // GitHub releases feed. Strictly separate from CLI updates; no
         // self-replacing installer (that's issue #16's signed DMG work).
         let appUpdateModel = AppUpdateModel(checker: GitHubReleaseChecker())
+        // Issue #60: optional daily check of the same releases feed, banner
+        // on a newer version — notify only, never an install.
+        let appUpdateAutoChecker = AppUpdateAutoChecker(model: appUpdateModel) { notification in
+            await AppUpdateNotificationPoster().post(notification)
+        }
         let notifications = UsageNotificationCoordinator(poster: UserNotificationCenterPoster())
+        // Issue #59: the status-item context menu shares the same update
+        // model as the gear menu and Settings — one check state everywhere.
+        contextMenuController = MenuBarContextMenuController(appUpdateModel: appUpdateModel)
 
         // Every daemon-confirmed settings document applies live to the
         // running models: popover layout/sort, severity thresholds
         // (bars + icon + banners), and the auto-refresh schedule.
         settingsSync.onApply = { [weak statusModel, weak deckModel, weak notifications] settings in
-            deckModel?.layout = settings.deckLayout
-            // Provider grouping (issue #30) is popover-local — the daemon
-            // never stores it, so a daemon-confirmed document must not snap
-            // the user out of it.
-            if deckModel?.sortOrder != .provider {
-                deckModel?.sortOrder = settings.deckSortOrder
+            // Issue #58: applying a daemon-confirmed document is a
+            // programmatic state change, not a user gesture — animations
+            // stay off so the popover controls (sort segments, layout)
+            // never flash during the cold-launch settings load.
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                // adopt(...) applies WITHOUT firing onSelectionChange — a
+                // daemon-confirmed document must never echo back to the
+                // daemon. (Assigning the properties here used to do exactly
+                // that: layout's didSet fired mid-apply with the stale
+                // sortOrder captured and pushed it back, seeding the
+                // settings ping-pong behind the idle re-render loop.)
+                deckModel?.adopt(
+                    confirmedLayout: settings.deckLayout,
+                    // Provider grouping (issue #30) is popover-local — the
+                    // daemon never stores it, so a daemon-confirmed document
+                    // must not snap the user out of it.
+                    confirmedSortOrder: deckModel?.sortOrder == .provider
+                        ? nil
+                        : settings.deckSortOrder
+                )
+                deckModel?.thresholds = settings.usageThresholds
+                statusModel?.thresholds = settings.usageThresholds
+                notifications?.thresholds = settings.usageThresholds
             }
-            deckModel?.thresholds = settings.usageThresholds
-            statusModel?.thresholds = settings.usageThresholds
-            notifications?.thresholds = settings.usageThresholds
             statusModel?.startAutoRefresh(interval: settings.effectiveAutoRefreshInterval)
         }
         // Popover-side layout/sort changes sync back to the daemon; the
@@ -129,6 +158,7 @@ struct ModelDeckMacApp: App {
         _signInModel = StateObject(wrappedValue: signInModel)
         _toolUpdateModel = StateObject(wrappedValue: toolUpdateModel)
         _appUpdateModel = StateObject(wrappedValue: appUpdateModel)
+        _appUpdateAutoChecker = StateObject(wrappedValue: appUpdateAutoChecker)
         _notifications = StateObject(wrappedValue: notifications)
     }
 
@@ -175,6 +205,10 @@ struct ModelDeckMacApp: App {
             MenuBarIconView(statusModel: statusModel)
                 .task {
                     IconDebugLog.log("label .task fired; starting initial refresh")
+                    contextMenuController.install()
+                    // Issue #60: honors the stored preference; no-op when
+                    // automatic checks are off.
+                    appUpdateAutoChecker.start()
                     if IconDebugLog.enabled {
                         Self.dumpStatusWindows(tag: "pre-refresh")
                     }
@@ -207,7 +241,8 @@ struct ModelDeckMacApp: App {
                 deckModel: deckModel,
                 signInModel: signInModel,
                 updateModel: toolUpdateModel,
-                appUpdateModel: appUpdateModel
+                appUpdateModel: appUpdateModel,
+                appUpdateAutoChecker: appUpdateAutoChecker
             )
         }
     }

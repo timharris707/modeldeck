@@ -42,7 +42,10 @@ public final class MenuBarStatusModel: ObservableObject {
 
     @Published public private(set) var connection: ConnectionStatus = .unknown
     @Published public private(set) var worstRemaining: WorstRemaining?
-    @Published public private(set) var iconState: MenuBarIconState = .plain
+    /// Starts `.loading` (issue #58): the cold-start placeholder holds until
+    /// the first successful state lands — a failed fetch keeps it, because
+    /// data still hasn't arrived and a plain glyph would claim "healthy".
+    @Published public private(set) var iconState: MenuBarIconState = .loading
     @Published public private(set) var lastUpdatedAt: Date?
     @Published public private(set) var isRefreshing = false
     /// Full daemon state for the popover deck; nil before the first
@@ -50,7 +53,17 @@ public final class MenuBarStatusModel: ObservableObject {
     @Published public private(set) var deckState: DeckState?
 
     public var thresholds: UsageThresholds {
-        didSet { iconState = MenuBarIconState.state(for: worstRemaining, thresholds: thresholds) }
+        didSet { recomputeIconState() }
+    }
+
+    /// True once any state has landed (refresh success or `apply`); gates
+    /// the `.loading` placeholder (issue #58).
+    private var hasLoadedOnce = false
+
+    private func recomputeIconState() {
+        iconState = hasLoadedOnce
+            ? MenuBarIconState.state(for: worstRemaining, thresholds: thresholds)
+            : .loading
     }
 
     /// Called after every successful state update (manual/auto refresh and
@@ -116,7 +129,8 @@ public final class MenuBarStatusModel: ObservableObject {
             }
             guard generation == stateGeneration else { return }
             worstRemaining = worst
-            iconState = MenuBarIconState.state(for: worst, thresholds: thresholds)
+            hasLoadedOnce = true
+            recomputeIconState()
             connection = .connected
             lastUpdatedAt = clock()
             IconDebugLog.log("refresh done: thresholds=(warn \(thresholds.warningPercent), crit \(thresholds.criticalPercent)) iconState=\(iconState)")
@@ -135,7 +149,8 @@ public final class MenuBarStatusModel: ObservableObject {
         deckState = state
         let worst = WorstRemainingCalculator.worstRemaining(in: state)
         worstRemaining = worst
-        iconState = MenuBarIconState.state(for: worst, thresholds: thresholds)
+        hasLoadedOnce = true
+        recomputeIconState()
         connection = .connected
         lastUpdatedAt = clock()
         onStateUpdate?(worst, state)

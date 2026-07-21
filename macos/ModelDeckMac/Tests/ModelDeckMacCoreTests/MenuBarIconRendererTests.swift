@@ -143,6 +143,28 @@ struct MenuBarIconRendererTests {
         #expect(dark > 0.5, "glyph should be light on the dark menu bar")
     }
 
+    /// Issue #58: the cold-start state renders glyph + a muted "–%"
+    /// placeholder — visible pixels right of the glyph, but never red/gold
+    /// (it must not read as a severity signal).
+    @Test func loadingStateShowsANeutralPlaceholder() throws {
+        let image = MenuBarIconRenderer.labelImage(for: .loading)
+        #expect(image.size.width > MenuBarIconRenderer.deckGlyph.size.width + 4)
+        #expect(!image.isTemplate)
+        let rep = try rasterize(image)
+        // secondaryLabelColor draws translucent by design — count visible
+        // (not fully opaque) pixels at a lower alpha bar than the helper's.
+        var visible = 0
+        for x in 19..<rep.pixelsWide {
+            for y in 0..<rep.pixelsHigh {
+                guard let color = rep.colorAt(x: x, y: y), color.alphaComponent > 0.2 else { continue }
+                visible += 1
+                let rgb = color.usingColorSpace(.deviceRGB) ?? color
+                #expect(rgb.redComponent <= 0.6, "placeholder must stay neutral, not warm")
+            }
+        }
+        #expect(visible > 10, "placeholder pixels missing")
+    }
+
     @Test func accessibilityDescriptionsCarryTheState() {
         #expect(MenuBarIconRenderer.labelImage(for: .plain).accessibilityDescription == "ModelDeck")
         #expect(

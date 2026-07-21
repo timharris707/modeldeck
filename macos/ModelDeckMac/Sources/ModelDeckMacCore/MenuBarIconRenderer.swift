@@ -54,9 +54,15 @@ public enum MenuBarIconRenderer {
     public static func labelImage(for state: MenuBarIconState) -> NSImage {
         guard let label = state.percentLabel else { return deckGlyph }
         let color: NSColor
-        if case .critical = state {
+        switch state {
+        case .critical:
             color = criticalColor
-        } else {
+        case .loading:
+            // Issue #58: the cold-start "–%" placeholder is deliberately
+            // muted — dynamic secondaryLabelColor, resolved at draw time
+            // like the glyph, so it never reads as a severity signal.
+            color = .secondaryLabelColor
+        case .plain, .warning:
             color = warningColor
         }
 

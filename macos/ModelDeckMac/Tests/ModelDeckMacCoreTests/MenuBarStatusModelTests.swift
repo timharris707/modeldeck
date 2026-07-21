@@ -103,4 +103,44 @@ struct MenuBarStatusModelTests {
         #expect(model.worstRemaining == nil)
         #expect(model.connection == .connected)
     }
+
+    // MARK: - Cold start (issue #58)
+
+    @Test func coldStartShowsLoadingUntilFirstSuccessfulFetch() async {
+        let model = MenuBarStatusModel(evaluator: StubEvaluator(results: [.success(nil)]))
+        #expect(model.iconState == .loading)
+        await model.refresh()
+        #expect(model.iconState == .plain)
+    }
+
+    @Test func failedFirstFetchKeepsTheLoadingPlaceholder() async {
+        // Data still hasn't arrived — a plain glyph would claim "healthy".
+        let model = MenuBarStatusModel(evaluator: StubEvaluator(results: [
+            .failure(URLError(.cannotConnectToHost)),
+            .success(worst(88)),
+        ]))
+        await model.refresh()
+        #expect(model.iconState == .loading)
+        if case .unreachable = model.connection {
+        } else {
+            Issue.record("expected .unreachable, got \(model.connection)")
+        }
+        await model.refresh()
+        #expect(model.iconState == .plain)
+    }
+
+    @Test func thresholdChangeBeforeFirstFetchKeepsLoading() async {
+        // The cold-launch settings load applies thresholds BEFORE the first
+        // state fetch resolves — that must not wipe the placeholder.
+        let model = MenuBarStatusModel(evaluator: StubEvaluator(results: [.success(worst(30))]))
+        model.thresholds = UsageThresholds(warningPercent: 40, criticalPercent: 35)
+        #expect(model.iconState == .loading)
+        await model.refresh()
+        #expect(model.iconState == .critical(percentRemaining: 30))
+    }
+
+    @Test func loadingStateCarriesTheNeutralPlaceholderLabel() {
+        #expect(MenuBarIconState.loading.percentLabel == "–%")
+        #expect(MenuBarIconState.plain.percentLabel == nil)
+    }
 }

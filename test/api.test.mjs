@@ -36,6 +36,7 @@ async function startFixture(serviceOptions = {}) {
     // with an injected clock); stored settings stay at their defaults.
     setTimeout: () => 0,
     clearTimeout: () => {},
+    platform: 'linux',
     ...serviceOptions,
   });
   const app = createApp({ store, service, host: '127.0.0.1', port: 0 });
@@ -122,6 +123,42 @@ test('rejects missing mutation token, cross-origin mutations, and hostile Host h
   assert.equal(await requestWithHost(fixture, 'attacker.example'), 403);
 });
 
+test('Claude identity reset clears provenance and can re-seed; other providers and unauthenticated calls are rejected', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  fs.writeFileSync(path.join(fixture.claudeHome, '.claude.json'), JSON.stringify({
+    oauthAccount: { emailAddress: 'fresh@example.invalid', accountUuid: 'uuid-fresh' },
+  }));
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  fixture.store.saveAccount({
+    ...claude,
+    identity: 'stale@example.invalid',
+    metadata: { claudeAccountUuid: 'uuid-stale', identitySource: 'seed' },
+  });
+
+  let response = await fetch(`${fixture.base}/api/accounts/${claude.id}/reset-identity`, { method: 'POST' });
+  assert.equal(response.status, 403);
+  assert.equal(fixture.store.getAccount(claude.id).identity, 'stale@example.invalid');
+
+  let result = await request(fixture, `/api/accounts/${claude.id}/reset-identity`, { method: 'POST' });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.body.account.identity, '');
+  assert.equal(result.body.account.metadata.claudeAccountUuid, undefined);
+  assert.equal(result.body.account.metadata.identitySource, undefined);
+
+  await fixture.service.backfillClaudeIdentities();
+  const reseeded = fixture.store.getAccount(claude.id);
+  assert.equal(reseeded.identity, 'fresh@example.invalid');
+  assert.equal(reseeded.metadata.claudeAccountUuid, 'uuid-fresh');
+  assert.equal(reseeded.metadata.identitySource, 'seed');
+
+  const codex = fixture.store.saveAccount({ provider: 'codex', label: 'Codex', profileRef: fixture.codexHome });
+  result = await request(fixture, `/api/accounts/${codex.id}/reset-identity`, { method: 'POST' });
+  assert.equal(result.response.status, 400);
+  assert.match(result.body.error, /only supported for claude/);
+});
+
 test('activates Claude and Codex accounts without changing defaults when provider switching fails', async (t) => {
   const fixture = await startFixture();
   t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
@@ -133,6 +170,9 @@ test('activates Claude and Codex accounts without changing defaults when provide
   let result = await request(fixture, `/api/accounts/${secondClaude.id}/activate`, { method: 'POST', body: '{}' });
   assert.equal(result.response.status, 200);
   assert.equal(result.body.account.isDefault, true);
+  assert.equal(result.body.activation.state, 'identity-unverified');
+  assert.equal(result.body.claudeSecureStorage.value, fs.realpathSync(secondClaudeHome));
+  assert.equal(result.body.claudeSecureStorage.status, 'not-applicable');
   assert.equal(fs.readlinkSync(fixture.claudeActiveLink), fs.realpathSync(secondClaudeHome));
 
   fs.unlinkSync(fixture.claudeActiveLink);

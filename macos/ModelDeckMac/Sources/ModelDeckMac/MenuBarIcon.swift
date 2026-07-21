@@ -35,6 +35,8 @@ struct MenuBarIconView: View {
 
     private var accessibilityText: String {
         switch state {
+        case .loading:
+            return "ModelDeck: loading usage data"
         case .plain:
             return "ModelDeck"
         case .warning(let percent):

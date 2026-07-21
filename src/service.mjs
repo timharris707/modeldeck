@@ -11,6 +11,7 @@ import {
   fetchClaudeUsage,
   importClaudeSwapProfiles as migrateClaudeSwapProfiles,
   readClaudeAuthStatus,
+  readClaudeProfileIdentity,
   readClaudeRateLimitTier,
   validateClaudeProfileHome,
 } from './adapters/claude.mjs';
@@ -30,6 +31,10 @@ const execFileAsync = promisify(execFile);
 // Active sessions throttle scheduled polling, but never for long enough to
 // let a continuously open provider session make the deck silently stale.
 const ACTIVE_SESSION_REFRESH_CAP_MS = 30 * 60_000;
+
+// Claude Code 2.1.215 is the first version verified against the undocumented
+// CLAUDE_SECURESTORAGE_CONFIG_DIR scoped-Keychain behavior.
+export const CLAUDE_SECURESTORAGE_MIN_VERSION = '2.1.215';
 
 function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'\\''`)}'`;
@@ -143,6 +148,7 @@ export class ModelDeckService {
     this.createCodexProfile = options.createCodexProfile || createCodexProfileHome;
     this.readClaudeAuth = options.readClaudeAuth || readClaudeAuthStatus;
     this.readClaudeTier = options.readClaudeTier || readClaudeRateLimitTier;
+    this.readClaudeIdentity = options.readClaudeIdentity || readClaudeProfileIdentity;
     this.readCodexAuth = options.readCodexAuth || readCodexLoginStatus;
     this.readCodexPlan = options.readCodexPlan || readCodexPlan;
     this.claudeCredentialsPresent = options.claudeCredentialsPresent || claudeCredentialsPresent;
@@ -179,11 +185,16 @@ export class ModelDeckService {
     this.authPresenceCache = new Map();
     this.toolUpdatePromises = new Map();
     this.realpath = options.realpath || fs.promises.realpath;
+    this.platform = options.platform || process.platform;
+    this.claudeSecureStorage = { value: null, status: this.platform === 'darwin' ? 'inactive' : 'not-applicable' };
+    this.claudeSecureStorageSupported = null;
   }
 
   startAutoRefresh() {
     if (this.autoRefreshStarted) return;
     this.autoRefreshStarted = true;
+    // Local, credential-free startup migration for pre-#62 Claude rows.
+    void this.backfillClaudeIdentities();
     const generation = ++this.autoRefreshGeneration;
     const settings = this.store.getSettings();
     if (settings.autoRefreshEnabled) {
@@ -293,7 +304,7 @@ export class ModelDeckService {
   async refreshClaude() {
     const accounts = this.store.listAccounts().filter((account) => account.provider === 'claude' && account.enabled);
     return Promise.all(accounts.map(async (account) => {
-      await this.refreshClaudePlanTier(account).catch(() => {});
+      await this.refreshClaudeProfileMetadata(account).catch(() => {});
       try {
         const snapshots = await this.fetchClaude({ claudeConfigDir: account.profileRef, profilesDir: this.claudeProfilesDir });
         for (const snapshot of snapshots) this.store.recordUsage(account.id, snapshot);
@@ -304,25 +315,78 @@ export class ModelDeckService {
     }));
   }
 
-  // Issue #26 (Claude half): keep the account's plan tier fresh from the
-  // profile's local `.claude.json` — a file read on the existing refresh
-  // pass, never an extra provider call. Persists only on change.
-  async refreshClaudePlanTier(account) {
-    const rateLimitTier = await this.readClaudeTier({ claudeConfigDir: account.profileRef });
-    const current = account.metadata?.claudePlan || {};
-    if (!rateLimitTier || rateLimitTier === current.rateLimitTier) return;
-    this.store.saveAccount({
-      id: account.id,
-      provider: account.provider,
-      label: account.label,
-      profileRef: account.profileRef,
-      identity: account.identity,
-      color: account.color,
-      enabled: account.enabled,
-      metadata: {
-        ...account.metadata,
-        claudePlan: { subscriptionType: current.subscriptionType ?? null, rateLimitTier },
-      },
+  async refreshClaudeProfileMetadata(account) {
+    const [rateLimitTier, profileIdentity] = await Promise.all([
+      this.readClaudeTier({ claudeConfigDir: account.profileRef }),
+      this.readClaudeIdentity({ claudeConfigDir: account.profileRef }),
+    ]);
+    // Rebase on the freshest record after the awaits: a reset-identity that
+    // landed mid-read must not be undone by saving a pre-reset snapshot.
+    const latest = this.store.getAccount(account.id) ?? account;
+    const metadata = { ...latest.metadata };
+    const currentPlan = metadata.claudePlan || {};
+    if (rateLimitTier) metadata.claudePlan = {
+      subscriptionType: currentPlan.subscriptionType ?? null,
+      rateLimitTier,
+    };
+    // Backfill only: a recorded identity is the onboarding-time truth the
+    // verifier checks against. Overwriting it from the live profile would
+    // launder a real identity-mismatch into 'effective' on the next refresh.
+    // The first capture needs the same care: an active, unscoped profile can
+    // contain identity residue from the old shared-Keychain login.
+    const identitySource = !latest.identity && profileIdentity?.identity
+      ? await this.claudeIdentitySeedSource(latest.profileRef)
+      : null;
+    if (identitySource) {
+      if (profileIdentity.accountUuid) metadata.claudeAccountUuid = profileIdentity.accountUuid;
+      metadata.identitySource = identitySource;
+    }
+    const identity = latest.identity || (identitySource ? profileIdentity.identity : '');
+    if (identity === latest.identity && JSON.stringify(metadata) === JSON.stringify(latest.metadata)) return latest;
+    return this.store.saveAccount({
+      id: latest.id, provider: latest.provider, label: latest.label,
+      profileRef: latest.profileRef, identity, color: latest.color,
+      enabled: latest.enabled, metadata,
+    });
+  }
+
+  async backfillClaudeIdentities() {
+    const accounts = this.store.listAccounts().filter((account) => account.provider === 'claude');
+    return Promise.all(accounts.map((account) => this.refreshClaudeProfileMetadata(account).catch(() => account)));
+  }
+
+  async claudeIdentitySeedSource(profileRef) {
+    const profileRealPath = await this.realpath(profileRef);
+    let activeRealPath = null;
+    try {
+      const stat = await fs.promises.lstat(this.claudeActiveLink);
+      if (stat.isSymbolicLink()) activeRealPath = await this.realpath(this.claudeActiveLink);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    if (activeRealPath !== profileRealPath) return 'seed';
+
+    return this.claudeSecureStorage.status === 'active'
+      && this.claudeSecureStorage.value === profileRealPath
+      ? 'verified'
+      : null;
+  }
+
+  resetClaudeIdentity(accountId) {
+    const account = this.store.getAccount(accountId);
+    if (!account) throw new Error('account not found');
+    if (account.provider !== 'claude') {
+      const error = new Error('identity reset is only supported for claude accounts');
+      error.statusCode = 400;
+      throw error;
+    }
+    const metadata = { ...account.metadata };
+    delete metadata.claudeAccountUuid;
+    delete metadata.identitySource;
+    return this.store.saveAccount({
+      id: account.id, provider: account.provider, label: account.label,
+      profileRef: account.profileRef, identity: '', purpose: account.purpose,
+      color: account.color, enabled: account.enabled, metadata,
     });
   }
 
@@ -332,12 +396,14 @@ export class ModelDeckService {
     try {
       for (const profile of imported) {
         if (this.store.findAccount('claude', profile.profileRef)) throw new Error(`Claude profile is already registered: ${profile.profileRef}`);
-        saved.push(this.store.saveAccount({
+        let account = this.store.saveAccount({
           provider: 'claude',
           label: profile.label,
           profileRef: profile.profileRef,
           metadata: { migratedFromClaudeSwap: true },
-        }));
+        });
+        account = await this.refreshClaudeProfileMetadata(account);
+        saved.push(account);
       }
       return saved;
     } catch (error) {
@@ -353,6 +419,7 @@ export class ModelDeckService {
     let account;
     try {
       account = this.store.saveAccount({ provider: 'claude', label, identity, purpose, color, profileRef });
+      account = await this.refreshClaudeProfileMetadata(account);
       return isDefault ? this.setDefaultAccount('claude', account.id) : account;
     } catch (error) {
       if (account) this.store.deleteAccount(account.id);
@@ -381,7 +448,7 @@ export class ModelDeckService {
   // Daemon-owned metadata keys are written by verify/refresh, never by API
   // callers — an edit that re-sends a stale metadata object must not clobber
   // them (CodeRabbit, PR #29).
-  static DAEMON_OWNED_METADATA = ['claudePlan', 'codexPlan', 'migratedFromClaudeSwap'];
+  static DAEMON_OWNED_METADATA = ['claudePlan', 'claudeAccountUuid', 'identitySource', 'codexPlan', 'migratedFromClaudeSwap'];
 
   preserveDaemonMetadata(input) {
     if (!input?.id || input.metadata == null) return input;
@@ -412,7 +479,8 @@ export class ModelDeckService {
     }
     if (!input.profileRef) return this.createClaudeAccount(input);
     const profileRef = await validateClaudeProfileHome({ profileRef: input.profileRef, profilesDir: this.claudeProfilesDir });
-    const account = this.store.saveAccount({ ...input, profileRef });
+    let account = this.store.saveAccount({ ...input, profileRef });
+    account = await this.refreshClaudeProfileMetadata(account);
     if (input.isDefault) this.invalidateToolProbe();
     return account;
   }
@@ -567,12 +635,43 @@ export class ModelDeckService {
 
     if (account.provider === 'claude') {
       await this.activateClaude({ profileRef: account.profileRef, activeLink: this.claudeActiveLink, profilesDir: this.claudeProfilesDir });
+      await this.scopeClaudeSecureStorage(account.profileRef);
     } else {
       if (!this.codexActiveLink) throw new Error('Codex active profile link is not configured');
       await this.activateCodexProfile(account.profileRef);
     }
 
     return this.setDefaultAccount(account.provider, account.id);
+  }
+
+  async claudeScopingSupported() {
+    if (this.claudeSecureStorageSupported != null) return this.claudeSecureStorageSupported;
+    try {
+      const version = await this.installedToolVersion(this.claudePath);
+      this.claudeSecureStorageSupported = compareSemver(version, CLAUDE_SECURESTORAGE_MIN_VERSION) >= 0;
+    } catch {
+      this.claudeSecureStorageSupported = false;
+    }
+    return this.claudeSecureStorageSupported;
+  }
+
+  async scopeClaudeSecureStorage(profileRef) {
+    const value = await fs.promises.realpath(profileRef);
+    if (this.platform !== 'darwin') {
+      this.claudeSecureStorage = { value, status: 'not-applicable' };
+      return this.claudeSecureStorage;
+    }
+    if (!(await this.claudeScopingSupported())) {
+      this.claudeSecureStorage = { value, status: 'unsupported-cli' };
+      return this.claudeSecureStorage;
+    }
+    try {
+      await this.exec('/bin/launchctl', ['setenv', 'CLAUDE_SECURESTORAGE_CONFIG_DIR', value], { timeout: 5_000, maxBuffer: 65_536 });
+      this.claudeSecureStorage = { value, status: 'active' };
+    } catch (error) {
+      this.claudeSecureStorage = { value, status: 'degraded', error: errorMessage(error) };
+    }
+    return this.claudeSecureStorage;
   }
 
   setDefaultAccount(provider, accountId) {
@@ -701,12 +800,28 @@ export class ModelDeckService {
         defaultProfileResolved = false;
       }
     }
-    return {
-      state: linkResolved && defaultProfileResolved && defaultProfileRef === resolvedProfileRef
-        ? 'effective'
-        : 'mismatched',
-      resolvedProfileRef,
-    };
+    if (!(linkResolved && defaultProfileResolved && defaultProfileRef === resolvedProfileRef)) {
+      return { state: 'mismatched', resolvedProfileRef };
+    }
+    if (provider !== 'claude') return { state: 'effective', resolvedProfileRef };
+    const guidance = defaultAccount
+      ? `log out and run /login as ${defaultAccount.label}`
+      : 'run one Claude session then refresh, or run /login';
+    if (this.claudeSecureStorage.status === 'degraded' || this.claudeSecureStorage.status === 'unsupported-cli') {
+      return { state: 'identity-unverified', resolvedProfileRef, guidance, secureStorage: this.claudeSecureStorage };
+    }
+    const actual = await this.readClaudeIdentity({ claudeConfigDir: resolvedProfileRef });
+    const expected = defaultAccount?.identity?.trim().toLowerCase() || null;
+    if (!expected || !actual?.identity) {
+      return {
+        state: 'identity-unverified', resolvedProfileRef,
+        guidance: 'run one Claude session then refresh, or run /login',
+        secureStorage: this.claudeSecureStorage,
+      };
+    }
+    return actual.identity === expected
+      ? { state: 'effective', resolvedProfileRef, secureStorage: this.claudeSecureStorage }
+      : { state: 'identity-mismatch', resolvedProfileRef, guidance, secureStorage: this.claudeSecureStorage };
   }
 
   async state() {
@@ -716,10 +831,14 @@ export class ModelDeckService {
       this.providerActivationState('claude', this.claudeActiveLink, value.accounts),
       this.providerActivationState('codex', this.codexActiveLink, value.accounts),
     ]);
+    const claudeSecureStorage = this.claudeSecureStorage.value == null && claudeActivation.resolvedProfileRef
+      ? { ...this.claudeSecureStorage, value: claudeActivation.resolvedProfileRef }
+      : this.claudeSecureStorage;
     return {
       ...value,
       accounts,
       activation: { claude: claudeActivation, codex: codexActivation },
+      claudeSecureStorage,
       scheduler: { pausedForActiveSessions: this.pausedForActiveSessions },
     };
   }
@@ -788,6 +907,10 @@ export class ModelDeckService {
           auth: async () => this.codexAuthState(),
         }),
       ]);
+      claude.secureStorageScopingSupported = claude.version
+        ? compareSemver(claude.version, CLAUDE_SECURESTORAGE_MIN_VERSION) >= 0
+        : false;
+      this.claudeSecureStorageSupported = claude.secureStorageScopingSupported;
       const value = { tools: { claude, codex }, checkedAt: new Date(this.now()).toISOString() };
       if (this.toolProbeGeneration === generation) {
         this.toolProbeCache = { value, expiresAt: this.now() + this.toolProbeTtlMs };

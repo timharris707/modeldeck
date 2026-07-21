@@ -368,6 +368,24 @@ export async function readClaudeRateLimitTier({ claudeConfigDir, readFile = fs.p
   return typeof tier === 'string' && tier.trim() ? tier.trim() : null;
 }
 
+/// Credential-free identity truth written by Claude Code into the profile
+/// home after a runtime session. Missing or malformed data is intentionally
+/// represented as null; callers must never infer an identity from credentials.
+export async function readClaudeProfileIdentity({ claudeConfigDir, readFile = fs.promises.readFile } = {}) {
+  if (!claudeConfigDir) return null;
+  let parsed;
+  try { parsed = JSON.parse(await readFile(path.join(claudeConfigDir, '.claude.json'), 'utf8')); }
+  catch { return null; }
+  const email = parsed?.oauthAccount?.emailAddress;
+  const accountUuid = parsed?.oauthAccount?.accountUuid;
+  const normalizedEmail = typeof email === 'string' && email.trim() ? email.trim().toLowerCase() : null;
+  if (!normalizedEmail && !(typeof accountUuid === 'string' && accountUuid.trim())) return null;
+  return {
+    identity: normalizedEmail,
+    accountUuid: typeof accountUuid === 'string' && accountUuid.trim() ? accountUuid.trim() : null,
+  };
+}
+
 /// `claude auth status` under the profile's CLAUDE_CONFIG_DIR.
 /// `authenticated` is true when the status command succeeds; if the command
 /// fails for a reason other than a missing CLI, we fall back to credential

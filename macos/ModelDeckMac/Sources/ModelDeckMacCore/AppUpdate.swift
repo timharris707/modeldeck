@@ -204,3 +204,139 @@ public final class AppUpdateModel: ObservableObject {
         Self.dialog(for: phase, currentVersion: currentVersion)
     }
 }
+
+// MARK: - Automatic checks (issue #60)
+
+/// A banner announcing that a newer release exists. Notify + link only —
+/// the user still downloads and installs by hand.
+public struct AppUpdateNotification: Equatable, Sendable {
+    public var title: String
+    public var body: String
+
+    public init(title: String, body: String) {
+        self.title = title
+        self.body = body
+    }
+}
+
+/// Issue #60 — the Settings → General "Check for updates automatically"
+/// toggle. Periodic check + notify ONLY: hits the same public GitHub
+/// releases feed as the manual check (never any other endpoint) and posts a
+/// banner when a newer version exists; nothing ever installs automatically
+/// (a self-replacing updater is issue #16's signed-DMG territory). Daily
+/// cadence per the app's restraint bar — never a tight loop. The preference
+/// is app-local (UserDefaults), like Launch at Login: the daemon never
+/// stores it.
+@MainActor
+public final class AppUpdateAutoChecker: ObservableObject {
+    nonisolated public static let enabledDefaultsKey = "modeldeck.appupdate.autoCheckEnabled"
+    nonisolated public static let lastCheckDefaultsKey = "modeldeck.appupdate.lastAutoCheckAt"
+    nonisolated public static let lastNotifiedDefaultsKey = "modeldeck.appupdate.lastNotifiedVersion"
+    /// Daily — infrequent on purpose.
+    nonisolated public static let checkInterval: TimeInterval = 24 * 60 * 60
+    /// The scheduler wakes hourly to ask "is the daily check due yet?" —
+    /// cheap clock math only; the feed is hit at most once per interval.
+    nonisolated static let wakeInterval: TimeInterval = 60 * 60
+
+    @Published public private(set) var isEnabled: Bool
+
+    private let model: AppUpdateModel
+    private let defaults: UserDefaults
+    private let clock: @Sendable () -> Date
+    private let notify: @MainActor (AppUpdateNotification) async -> Void
+    private var schedulerTask: Task<Void, Never>?
+
+    public init(
+        model: AppUpdateModel,
+        defaults: UserDefaults = .standard,
+        clock: @escaping @Sendable () -> Date = { Date() },
+        notify: @escaping @MainActor (AppUpdateNotification) async -> Void
+    ) {
+        self.model = model
+        self.defaults = defaults
+        self.clock = clock
+        self.notify = notify
+        self.isEnabled = defaults.bool(forKey: Self.enabledDefaultsKey)
+    }
+
+    deinit {
+        schedulerTask?.cancel()
+    }
+
+    /// The Settings toggle. Enabling starts the schedule (with an immediate
+    /// catch-up check when one is due); disabling stops it. Persisted
+    /// app-locally.
+    public func setEnabled(_ enabled: Bool) {
+        guard enabled != isEnabled else { return }
+        isEnabled = enabled
+        defaults.set(enabled, forKey: Self.enabledDefaultsKey)
+        if enabled {
+            start()
+        } else {
+            stop()
+        }
+    }
+
+    /// Call once at launch: starts the schedule when the stored preference
+    /// is on; a no-op otherwise (and when already running).
+    public func start() {
+        guard isEnabled, schedulerTask == nil else { return }
+        schedulerTask = Task { [weak self] in
+            await self?.checkIfDue()
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(Self.wakeInterval * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                await self?.checkIfDue()
+            }
+        }
+    }
+
+    private func stop() {
+        schedulerTask?.cancel()
+        schedulerTask = nil
+    }
+
+    /// Pure due-ness rule: never checked → due; otherwise due once the
+    /// daily interval has elapsed since the last automatic check.
+    nonisolated public static func isDue(now: Date, lastCheck: Date?) -> Bool {
+        guard let lastCheck else { return true }
+        return now.timeIntervalSince(lastCheck) >= checkInterval
+    }
+
+    var lastCheckAt: Date? {
+        defaults.object(forKey: Self.lastCheckDefaultsKey) as? Date
+    }
+
+    public func checkIfDue() async {
+        guard isEnabled, Self.isDue(now: clock(), lastCheck: lastCheckAt) else { return }
+        await runCheck()
+    }
+
+    /// One automatic check through the SHARED model — Settings and the gear
+    /// menu mirror the outcome. The check is stamped regardless of result
+    /// (a failed feed retries tomorrow, never in a loop) and each discovered
+    /// version notifies at most once.
+    func runCheck() async {
+        // A manual check in flight makes model.check() a no-op; don't stamp
+        // lastCheckAt for a check that never ran — the next tick retries.
+        guard !model.isChecking else { return }
+        await model.check()
+        defaults.set(clock(), forKey: Self.lastCheckDefaultsKey)
+        guard case .updateAvailable(let release) = model.phase else { return }
+        guard release.version != defaults.string(forKey: Self.lastNotifiedDefaultsKey) else { return }
+        defaults.set(release.version, forKey: Self.lastNotifiedDefaultsKey)
+        await notify(Self.notification(for: release, currentVersion: model.currentVersion))
+    }
+
+    /// Banner copy — explicit that nothing installs by itself.
+    nonisolated public static func notification(
+        for release: AppReleaseInfo,
+        currentVersion: String?
+    ) -> AppUpdateNotification {
+        AppUpdateNotification(
+            title: "ModelDeck \(release.version) is available",
+            body: (currentVersion.map { "You're running v\($0). " } ?? "")
+                + "Use Check for App Updates to view the release — nothing installs automatically."
+        )
+    }
+}

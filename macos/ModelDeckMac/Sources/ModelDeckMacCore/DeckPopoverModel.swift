@@ -493,20 +493,47 @@ public final class DeckPopoverModel: ObservableObject {
     @Published public var layout: DeckLayout {
         didSet {
             defaults.set(layout.rawValue, forKey: Self.layoutDefaultsKey)
+            guard !isAdoptingConfirmedSettings, oldValue != layout else { return }
             onSelectionChange?(layout, sortOrder)
         }
     }
     @Published public var sortOrder: DeckSortOrder {
         didSet {
             defaults.set(sortOrder.rawValue, forKey: Self.sortDefaultsKey)
+            guard !isAdoptingConfirmedSettings, oldValue != sortOrder else { return }
             onSelectionChange?(layout, sortOrder)
         }
     }
 
-    /// Fires whenever layout or sort changes (popover controls or Settings
-    /// window alike). The app forwards these to the daemon settings sync,
-    /// whose per-field no-op guards break the echo loop.
+    /// Fires whenever the USER changes layout or sort (popover controls).
+    /// The app forwards these to the daemon settings sync. It never fires
+    /// for `adopt(confirmedLayout:confirmedSortOrder:)` — a daemon-confirmed
+    /// document echoed back would seed a settings ping-pong (see the
+    /// PR #68-era idle re-render loop) — nor for assignments that don't
+    /// change the value.
     public var onSelectionChange: ((DeckLayout, DeckSortOrder) -> Void)?
+
+    /// True while a daemon-confirmed settings document is being applied.
+    /// Suppresses `onSelectionChange`: the daemon already holds these values,
+    /// and pushing them back is how the launch-time ping-pong loop started —
+    /// `layout`'s didSet fired mid-apply with the not-yet-updated `sortOrder`
+    /// captured, pushed that stale sort to the daemon, whose confirmed
+    /// response re-applied and flipped it back, forever (the per-field no-op
+    /// guards in the sync model can't catch a stale value that genuinely
+    /// differs from the freshly confirmed document).
+    private var isAdoptingConfirmedSettings = false
+
+    /// Apply a daemon-confirmed document's layout/sort WITHOUT echoing them
+    /// back through `onSelectionChange`. Pass nil to leave a field alone
+    /// (e.g. the popover-local provider grouping, which the daemon never
+    /// stores). Values still persist to UserDefaults exactly like user
+    /// selections.
+    public func adopt(confirmedLayout: DeckLayout?, confirmedSortOrder: DeckSortOrder?) {
+        isAdoptingConfirmedSettings = true
+        defer { isAdoptingConfirmedSettings = false }
+        if let confirmedLayout { layout = confirmedLayout }
+        if let confirmedSortOrder { sortOrder = confirmedSortOrder }
+    }
     @Published public private(set) var expandedAccountIDs: Set<String> = []
 
     // MARK: Activation state (issue #6)
@@ -600,8 +627,14 @@ public final class DeckPopoverModel: ObservableObject {
     /// `GET /api/state`; on any failure revert the flip and surface an
     /// inline error. The daemon owns the new-sessions-only semantics — this
     /// never touches running sessions and adds nothing beyond the call.
+    ///
+    /// Issue #61: the DB-active row is allowed back in when its activation
+    /// is link-pending (blocked/unlinked/mismatched) — the Complete
+    /// Activation affordance re-runs the same daemon activate to lay the
+    /// symlink once the user has cleared the blocker.
     public func activate(_ row: DeckAccountRow) async {
-        guard !row.isActive, activatingAccountID == nil else { return }
+        guard !row.isActive || row.activationState.needsLinkCompletion,
+              activatingAccountID == nil else { return }
         guard let activator, let stateProvider else { return }
         let key = Self.activationKey(for: row.account)
         let previous = optimisticActive[key]

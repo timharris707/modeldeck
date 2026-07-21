@@ -21,6 +21,7 @@ function fixture(options = {}) {
     codexActiveLink,
     claudeActiveLink,
     claudeProfilesDir: path.join(root, 'profiles'),
+    platform: 'linux',
     ...options,
   });
   return {
@@ -32,13 +33,15 @@ function fixture(options = {}) {
 test('provider activation switches first and persists the default only after success', async () => {
   const data = fixture();
   try {
+    fs.writeFileSync(path.join(data.secondHome, '.claude.json'), JSON.stringify({ oauthAccount: { emailAddress: 'two@example.com' } }));
     const claudeOne = data.store.saveAccount({ provider: 'claude', label: 'Claude One', profileRef: data.firstHome, isDefault: true });
-    const claudeTwo = data.store.saveAccount({ provider: 'claude', label: 'Claude Two', profileRef: data.secondHome });
+    const claudeTwo = data.store.saveAccount({ provider: 'claude', label: 'Claude Two', identity: 'two@example.com', profileRef: data.secondHome });
     let active = await data.service.activateAccount(claudeTwo.id);
     assert.equal(active.isDefault, true);
     assert.equal(fs.readlinkSync(data.claudeActiveLink), fs.realpathSync(data.secondHome));
     assert.deepEqual((await data.service.state()).activation.claude, {
       state: 'effective', resolvedProfileRef: fs.realpathSync(data.secondHome),
+      secureStorage: { value: fs.realpathSync(data.secondHome), status: 'not-applicable' },
     });
 
     fs.unlinkSync(data.claudeActiveLink);
@@ -70,8 +73,9 @@ test('state reports all physical activation states for each provider', async (t)
   const data = fixture({ claudeCredentialsPresent: async () => false });
   t.after(() => data.close());
   for (const provider of ['claude', 'codex']) {
+    if (provider === 'claude') fs.writeFileSync(path.join(data.firstHome, '.claude.json'), JSON.stringify({ oauthAccount: { emailAddress: 'user@example.com' } }));
     data.store.saveAccount({
-      provider, label: `${provider} default`, profileRef: data.firstHome, isDefault: true,
+      provider, label: `${provider} default`, identity: provider === 'claude' ? 'user@example.com' : '', profileRef: data.firstHome, isDefault: true,
     });
     const activeLink = provider === 'claude' ? data.claudeActiveLink : data.codexActiveLink;
 
@@ -98,10 +102,186 @@ test('state reports all physical activation states for each provider', async (t)
       fs.symlinkSync(data.firstHome, activeLink, 'dir');
       assert.deepEqual((await data.service.state()).activation[provider], {
         state: 'effective', resolvedProfileRef: fs.realpathSync(data.firstHome),
+        ...(provider === 'claude' ? { secureStorage: { value: null, status: 'not-applicable' } } : {}),
       });
       fs.unlinkSync(activeLink);
     });
   }
+});
+
+test('Claude identity backfill persists normalized email and account UUID metadata', async (t) => {
+  const data = fixture();
+  t.after(() => data.close());
+  fs.writeFileSync(path.join(data.firstHome, '.claude.json'), JSON.stringify({
+    oauthAccount: { emailAddress: 'User@Example.com', accountUuid: 'uuid-placeholder' },
+  }));
+  const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+  await data.service.backfillClaudeIdentities();
+  assert.equal(data.store.getAccount(account.id).identity, 'user@example.com');
+  assert.equal(data.store.getAccount(account.id).metadata.claudeAccountUuid, 'uuid-placeholder');
+  assert.equal(data.store.getAccount(account.id).metadata.identitySource, 'seed');
+});
+
+test('Claude identity seed refuses an active unscoped profile', async (t) => {
+  const data = fixture();
+  t.after(() => data.close());
+  fs.writeFileSync(path.join(data.firstHome, '.claude.json'), JSON.stringify({
+    oauthAccount: { emailAddress: 'residue@example.invalid', accountUuid: 'uuid-residue' },
+  }));
+  fs.mkdirSync(path.dirname(data.claudeActiveLink), { recursive: true });
+  fs.symlinkSync(data.firstHome, data.claudeActiveLink, 'dir');
+  const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome, isDefault: true });
+
+  await data.service.backfillClaudeIdentities();
+
+  const saved = data.store.getAccount(account.id);
+  assert.equal(saved.identity, '');
+  assert.equal(saved.metadata.claudeAccountUuid, undefined);
+  assert.equal(saved.metadata.identitySource, undefined);
+  assert.equal((await data.service.state()).activation.claude.state, 'identity-unverified');
+});
+
+test('Claude identity seed verifies an active profile scoped to its real path', async (t) => {
+  const data = fixture();
+  t.after(() => data.close());
+  fs.writeFileSync(path.join(data.firstHome, '.claude.json'), JSON.stringify({
+    oauthAccount: { emailAddress: 'scoped@example.invalid', accountUuid: 'uuid-scoped' },
+  }));
+  fs.mkdirSync(path.dirname(data.claudeActiveLink), { recursive: true });
+  fs.symlinkSync(data.firstHome, data.claudeActiveLink, 'dir');
+  data.service.claudeSecureStorage = { status: 'active', value: fs.realpathSync(data.firstHome) };
+  const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome, isDefault: true });
+
+  await data.service.backfillClaudeIdentities();
+
+  const saved = data.store.getAccount(account.id);
+  assert.equal(saved.identity, 'scoped@example.invalid');
+  assert.equal(saved.metadata.claudeAccountUuid, 'uuid-scoped');
+  assert.equal(saved.metadata.identitySource, 'verified');
+});
+
+test('a reset landing mid-refresh is not undone by the refresh save', async (t) => {
+  const data = fixture();
+  t.after(() => data.close());
+  fs.writeFileSync(path.join(data.firstHome, '.claude.json'), JSON.stringify({}));
+  const account = data.store.saveAccount({
+    provider: 'claude', label: 'Work', identity: 'user@example.com', profileRef: data.firstHome,
+    metadata: { claudeAccountUuid: 'uuid-recorded', identitySource: 'seed' },
+  });
+  const originalReadTier = data.service.readClaudeTier.bind(data.service);
+  data.service.readClaudeTier = async (options) => {
+    data.service.resetClaudeIdentity(account.id);
+    return originalReadTier(options);
+  };
+  await data.service.refreshClaudeProfileMetadata(account);
+  const after = data.store.getAccount(account.id);
+  assert.equal(after.identity, '');
+  assert.equal(after.metadata.claudeAccountUuid, undefined);
+  assert.equal(after.metadata.identitySource, undefined);
+});
+
+test('Claude identity refresh never overwrites a recorded identity', async (t) => {
+  const data = fixture();
+  t.after(() => data.close());
+  fs.writeFileSync(path.join(data.firstHome, '.claude.json'), JSON.stringify({
+    oauthAccount: { emailAddress: 'other@example.com', accountUuid: 'uuid-other' },
+  }));
+  const account = data.store.saveAccount({
+    provider: 'claude', label: 'Work', identity: 'user@example.com', profileRef: data.firstHome,
+    metadata: { claudeAccountUuid: 'uuid-recorded' },
+  });
+  await data.service.refreshClaudeProfileMetadata(data.store.getAccount(account.id));
+  assert.equal(data.store.getAccount(account.id).identity, 'user@example.com');
+  assert.equal(data.store.getAccount(account.id).metadata.claudeAccountUuid, 'uuid-recorded');
+});
+
+test('Claude activation verifier distinguishes match, mismatch, and unknown identity', async (t) => {
+  const data = fixture();
+  t.after(() => data.close());
+  const account = data.store.saveAccount({
+    provider: 'claude', label: 'Work Claude', identity: 'user@example.com', profileRef: data.firstHome, isDefault: true,
+  });
+  fs.mkdirSync(path.dirname(data.claudeActiveLink), { recursive: true });
+  fs.symlinkSync(data.firstHome, data.claudeActiveLink, 'dir');
+
+  fs.writeFileSync(path.join(data.firstHome, '.claude.json'), JSON.stringify({ oauthAccount: { emailAddress: 'USER@example.com' } }));
+  assert.equal((await data.service.state()).activation.claude.state, 'effective');
+
+  fs.writeFileSync(path.join(data.firstHome, '.claude.json'), JSON.stringify({ oauthAccount: { emailAddress: 'other@example.com' } }));
+  const mismatch = (await data.service.state()).activation.claude;
+  assert.equal(mismatch.state, 'identity-mismatch');
+  assert.equal(mismatch.guidance, 'log out and run /login as Work Claude');
+  assert.doesNotMatch(mismatch.guidance, /user@example/);
+
+  fs.unlinkSync(path.join(data.firstHome, '.claude.json'));
+  const unknown = (await data.service.state()).activation.claude;
+  assert.equal(unknown.state, 'identity-unverified');
+  assert.match(unknown.guidance, /run one Claude session then refresh/);
+  assert.equal(data.store.getAccount(account.id).identity, 'user@example.com');
+});
+
+test('Claude secure-storage activation handles darwin success, failure, non-darwin, and version gate', async (t) => {
+  await t.test('darwin success', async () => {
+    const calls = [];
+    const data = fixture({
+      platform: 'darwin',
+      exec: async (binary, args) => {
+        calls.push([binary, args]);
+        if (args[0] === '--version') return { stdout: 'Claude Code 2.1.215' };
+        return { stdout: '' };
+      },
+    });
+    try {
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      await data.service.activateAccount(account.id);
+      assert.deepEqual(calls.at(-1), ['/bin/launchctl', ['setenv', 'CLAUDE_SECURESTORAGE_CONFIG_DIR', fs.realpathSync(data.firstHome)]]);
+      assert.equal(data.service.claudeSecureStorage.status, 'active');
+    } finally { data.close(); }
+  });
+
+  await t.test('launchctl failure degrades without failing activation', async () => {
+    const data = fixture({
+      platform: 'darwin',
+      exec: async (_binary, args) => {
+        if (args[0] === '--version') return { stdout: 'Claude Code 2.1.215' };
+        throw new Error('launchctl unavailable');
+      },
+    });
+    try {
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      assert.equal((await data.service.activateAccount(account.id)).isDefault, true);
+      const activation = (await data.service.state()).activation.claude;
+      assert.equal(activation.state, 'identity-unverified');
+      assert.equal(activation.secureStorage.status, 'degraded');
+    } finally { data.close(); }
+  });
+
+  await t.test('non-darwin is a no-op', async () => {
+    let calls = 0;
+    const data = fixture({ platform: 'linux', exec: async () => { calls += 1; } });
+    try {
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      await data.service.activateAccount(account.id);
+      assert.equal(calls, 0);
+      assert.equal(data.service.claudeSecureStorage.status, 'not-applicable');
+    } finally { data.close(); }
+  });
+
+  await t.test('older CLI is unsupported and probe reports the gate', async () => {
+    const data = fixture({
+      platform: 'darwin',
+      exec: async (binary, args) => ({ stdout: binary.includes('claude') ? 'Claude Code 2.1.214' : 'codex 1.0.0' }),
+      registryFetch: async () => ({ ok: true, json: async () => ({ version: '2.1.215' }) }),
+    });
+    try {
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      const tools = await data.service.probeTools();
+      assert.equal(tools.tools.claude.secureStorageScopingSupported, false);
+      await data.service.activateAccount(account.id);
+      assert.equal(data.service.claudeSecureStorage.status, 'unsupported-cli');
+      assert.equal((await data.service.state()).activation.claude.state, 'identity-unverified');
+    } finally { data.close(); }
+  });
 });
 
 test('tool probes share in-flight work, cache results, and isolate registry errors', async () => {

@@ -23,6 +23,7 @@ import {
   extractClaudeSubscriptionType,
   readClaudeAuthStatus,
   readClaudeRateLimitTier,
+  readClaudeProfileIdentity,
 } from '../src/adapters/claude.mjs';
 import { claudeCredentialServiceName, claudeCredentialsPresent } from '../src/adapters/claude-keychain.mjs';
 import { readClaudeCredentials } from '../src/adapters/claude-usage-probe.mjs';
@@ -116,6 +117,17 @@ test('reads the organization rate-limit tier from the profile .claude.json', asy
     oauthAccount: { organizationRateLimitTier: 'default_claude_max_20x' },
   }), { mode: 0o600 });
   assert.equal(await readClaudeRateLimitTier({ claudeConfigDir: profile }), 'default_claude_max_20x');
+});
+
+test('reads normalized Claude identity facts from the credential-free profile file', async (t) => {
+  const root = temporaryRoot(t);
+  fs.writeFileSync(path.join(root, '.claude.json'), JSON.stringify({
+    oauthAccount: { emailAddress: 'User@Example.com', accountUuid: 'account-placeholder' },
+  }));
+  assert.deepEqual(await readClaudeProfileIdentity({ claudeConfigDir: root }), {
+    identity: 'user@example.com', accountUuid: 'account-placeholder',
+  });
+  assert.equal(await readClaudeProfileIdentity({ claudeConfigDir: path.join(root, 'missing') }), null);
 });
 
 test('claude auth status captures the plan without extra provider calls', async (t) => {

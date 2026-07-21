@@ -41,6 +41,12 @@ public enum ProviderActivationState: Equatable, Sendable {
     case blocked
     case mismatched
     case unlinked
+    /// PRs #63/#64: the active link is right, but the provider's signed-in
+    /// identity belongs to a different account — only /login fixes this.
+    case identityMismatch
+    /// PRs #63/#64: the active link is right, but the identity can't be
+    /// verified (yet) — secure storage degraded or no session run so far.
+    case identityUnverified
     case unknown
 
     /// Lenient mapping from the daemon's state string.
@@ -50,7 +56,20 @@ public enum ProviderActivationState: Equatable, Sendable {
         case "blocked": return .blocked
         case "mismatched": return .mismatched
         case "unlinked": return .unlinked
+        case "identity-mismatch": return .identityMismatch
+        case "identity-unverified": return .identityUnverified
         default: return .unknown
+        }
+    }
+
+    /// Issue #61: states the Complete Activation button can actually fix by
+    /// re-running the daemon's activate — LINK-level problems only. The
+    /// identity states need /login (or a session run), never another
+    /// symlink flip, so the button stays away from them.
+    public var needsLinkCompletion: Bool {
+        switch self {
+        case .blocked, .mismatched, .unlinked: return true
+        case .effective, .identityMismatch, .identityUnverified, .unknown: return false
         }
     }
 }
@@ -64,16 +83,28 @@ public enum ActiveIndicator: Equatable, Sendable {
     case checkmark
     case pending(caption: String)
 
+    /// Issue #61: every pending caption states the distinction explicitly —
+    /// this account is SELECTED as active, but activation is not in effect
+    /// yet (the solid marker means active AND in effect).
     public static func indicator(for state: ProviderActivationState) -> ActiveIndicator {
         switch state {
         case .effective, .unknown:
             return .checkmark
         case .blocked:
-            return .pending(caption: "Activation pending — one-time migration needed")
+            return .pending(caption: "Selected as active, but not in effect yet — "
+                + "a one-time migration is needed first")
         case .mismatched:
-            return .pending(caption: "Active link points at a different account")
+            return .pending(caption: "Selected as active, but the active link "
+                + "points at a different account")
         case .unlinked:
-            return .pending(caption: "Activation pending — no active link yet")
+            return .pending(caption: "Selected as active, but not in effect yet — "
+                + "no active link exists")
+        case .identityMismatch:
+            return .pending(caption: "Selected as active, but the provider is signed in "
+                + "as a different identity — log out and run /login as this account")
+        case .identityUnverified:
+            return .pending(caption: "Activation link is in place, but the signed-in "
+                + "identity isn't verified yet — run one session or /login, then refresh")
         }
     }
 }
@@ -122,8 +153,18 @@ public struct ActivationNotice: Equatable, Identifiable, Sendable {
                 + "points at a different account than the one marked active, so "
                 + "switching accounts hasn't taken hold."
         case .unlinked:
-            return "\(name) usage tracking is accurate today, but no active link "
-                + "exists yet, so switching accounts isn't in effect."
+            // Issue #61: unlinked is the post-migration "ready" state (the
+            // blocker directory is gone) — say so, and point at the button.
+            return "\(name) usage tracking is accurate today, and the path is clear — "
+                + "use Complete Activation on the active account to finish switching."
+        case .identityMismatch:
+            return "\(name) usage tracking is accurate today, but the provider is "
+                + "signed in as a different identity than the active account — "
+                + "log out and run /login as that account."
+        case .identityUnverified:
+            // Soft state (fresh profile, or secure storage unreadable) — the
+            // marker tooltip explains it; a standing banner would be noise.
+            return nil
         }
     }
 }

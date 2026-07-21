@@ -55,7 +55,12 @@ public struct WorstRemaining: Equatable, Sendable {
 /// Menu bar icon states per the locked spec decision: plain template deck
 /// glyph when healthy; gold "N%" beside it below the warning threshold; red
 /// at critical; the percent auto-hides on recovery (back to `.plain`).
+/// Issue #58 adds `.loading` — the intentional cold-start state before the
+/// first fetch completes: a muted "–%" placeholder so the blank pre-data
+/// icon reads as "loading", never as "healthy".
 public enum MenuBarIconState: Equatable, Sendable {
+    /// Cold start: no state fetch has succeeded yet (issue #58).
+    case loading
     case plain
     case warning(percentRemaining: Int)
     case critical(percentRemaining: Int)
@@ -71,10 +76,12 @@ public enum MenuBarIconState: Equatable, Sendable {
         return .plain
     }
 
-    /// "N%" when the percent is shown; nil when the icon is plain.
+    /// "N%" when the percent is shown, the neutral "–%" placeholder while
+    /// loading; nil when the icon is plain.
     public var percentLabel: String? {
         switch self {
         case .plain: return nil
+        case .loading: return "–%"
         case .warning(let percent), .critical(let percent): return "\(percent)%"
         }
     }

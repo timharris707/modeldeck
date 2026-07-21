@@ -488,7 +488,10 @@ struct ActiveCheckmark: View {
         Image(systemName: "checkmark.circle.fill")
             .font(.system(size: 11, weight: .semibold))
             .foregroundStyle(Color.accentColor)
-            .help("Active account — new sessions use this account")
+            // Issue #61: state the solid/amber distinction on hover —
+            // solid means active AND in effect (the amber marker's tooltip
+            // carries the "selected but not in effect" side).
+            .help("Active and in effect — new sessions use this account")
             .accessibilityLabel("Active")
     }
 }

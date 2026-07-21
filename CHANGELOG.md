@@ -6,7 +6,34 @@ and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 
 ## Unreleased
 
+## 0.2.1 — Real Claude identity switching + launch polish
+
 ### Added
+- **Real per-account Claude identity switching (issue #62, PRs #63/#64)**:
+  activation now scopes Claude Code's Keychain credential storage per profile
+  (`CLAUDE_SECURESTORAGE_CONFIG_DIR` via `launchctl setenv` + a shell-env
+  block installed by `scripts/install-shell-env.sh`). Each profile holds its
+  own login after a one-time `/login` ceremony (`docs/CLAUDE_IDENTITY.md`).
+  ModelDeck never reads, copies, or stores credentials.
+- Honest activation verification: `effective` / `identity-mismatch` /
+  `identity-unverified` states with label-only guidance; identity captured
+  credential-free from each profile's `.claude.json` with trust-gated,
+  backfill-only seeding and provenance; token-gated
+  `POST /api/accounts/:id/reset-identity`.
+- Menu bar icon right-click context menu: Check for App Updates… and Quit
+  (issue #59).
+- Settings → General: "Check for updates automatically" — daily check against
+  the same public releases feed as the manual button, banner notification
+  only, never installs (issue #60).
+- Activation UX: tooltips explain the amber pending marker per state, and a
+  **Complete Activation** button appears on the DB-active row when the link
+  is pending (issue #61).
+
+### Changed
+- Cold launch renders an intentional muted "–%" placeholder instead of a
+  blank menu bar percent, and settings application no longer flashes the
+  filter buttons (issue #58).
+
 - **Phase 7 — add-account flow (issue #8)**: 3-step "Add Account…" in the
   Settings window's Accounts pane. Step 1 creates the isolated owner-only
   profile home (native Claude profile home / `CODEX_HOME`); step 2 runs the
@@ -22,7 +49,6 @@ and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 - Explicit per-home migration from legacy claude-swap profiles, with atomic
   copying, rollback, and symlink refusal.
 
-### Changed
 - Claude activation now atomically swaps the managed `~/.claude` symlink for
   new sessions and refuses to replace real data.
 - Claude usage refresh now reads Anthropic's native OAuth usage endpoint per
@@ -30,6 +56,10 @@ and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
   refreshes credentials, or falls back to ambient auth variables.
 - Claude launches now use the native CLI with a profile-scoped
   `CLAUDE_CONFIG_DIR`; the runtime dependency on `cswap` is removed.
+
+### Fixed
+- Claude CLI version gating: below the known-good floor (2.1.215) activation
+  reports identity-unverified instead of pretending.
 
 ## 0.2.0 — Mac menu bar app (Phases 2–6)
 

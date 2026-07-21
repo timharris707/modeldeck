@@ -20,6 +20,8 @@ struct SettingsWindowView: View {
     /// Issue #33: the app's own update check — a strictly separate surface
     /// from CLI updates (never a shared control or wording).
     @ObservedObject var appUpdateModel: AppUpdateModel
+    /// Issue #60: the "Check for updates automatically" toggle's model.
+    @ObservedObject var appUpdateAutoChecker: AppUpdateAutoChecker
 
     var body: some View {
         TabView {
@@ -37,7 +39,8 @@ struct SettingsWindowView: View {
                 toolsModel: toolsModel,
                 statusModel: statusModel,
                 updateModel: updateModel,
-                appUpdateModel: appUpdateModel
+                appUpdateModel: appUpdateModel,
+                appUpdateAutoChecker: appUpdateAutoChecker
             )
             .tabItem { Label("General", systemImage: "gearshape") }
         }
@@ -132,7 +135,11 @@ struct AccountsSettingsPane: View {
                             blockedActivationGuidance: deckModel.blockedActivationGuidance(for: account.id),
                             signInPhase: signInModel.phase(for: account.id),
                             signInError: signInModel.error(for: account.id),
-                            onActivate: deckModel.canActivate && !account.isDefault
+                            // Issue #61: the DB-active row gets the control
+                            // too when activation is link-pending — the
+                            // Complete Activation affordance.
+                            onActivate: deckModel.canActivate
+                                && (!account.isDefault || activationState(for: account).needsLinkCompletion)
                                 ? { Task { await deckModel.activate(activationRow(for: account)) } }
                                 : nil,
                             onSignIn: { Task { await signInModel.beginSignIn(account: account) } },
@@ -193,7 +200,8 @@ struct AccountsSettingsPane: View {
             account: account,
             provider: DeckProvider.from(account.provider),
             windows: [],
-            isActive: account.isDefault
+            isActive: account.isDefault,
+            activationState: activationState(for: account)
         )
     }
 
@@ -275,12 +283,20 @@ struct AccountRosterRow: View {
                 if isBusy || isActivating {
                     ProgressView().controlSize(.small)
                 }
-                if !account.isDefault, let onActivate {
-                    Button("Activate", action: onActivate)
+                // Issue #61: the DB-active row shows "Complete Activation"
+                // when its activation is link-pending (before, the control
+                // was simply hidden there and finishing required a raw API
+                // call); every other row keeps the plain Activate switch.
+                if let onActivate {
+                    Button(account.isDefault ? "Complete Activation" : "Activate", action: onActivate)
                         .controlSize(.small)
                         .disabled(isBusy || isActivating || isActivationInFlight)
-                        .help("Switch \(DeckProvider.from(account.provider)?.displayName ?? "this provider") to this account for new sessions. Running sessions are never touched.")
-                        .accessibilityLabel("Activate \(account.label)")
+                        .help(account.isDefault
+                            ? "This account is selected as active but activation isn't in effect yet. Once any blocker is cleared, this lays the active link for new sessions. Running sessions are never touched."
+                            : "Switch \(DeckProvider.from(account.provider)?.displayName ?? "this provider") to this account for new sessions. Running sessions are never touched.")
+                        .accessibilityLabel(account.isDefault
+                            ? "Complete activation for \(account.label)"
+                            : "Activate \(account.label)")
                 }
                 Button("Edit", action: onEdit)
                     .controlSize(.small)
@@ -511,6 +527,9 @@ struct GeneralSettingsPane: View {
     /// Issue #33: app-update check state (GitHub releases feed of the public
     /// repo). Deliberately separate from every CLI update control.
     @ObservedObject var appUpdateModel: AppUpdateModel
+    /// Issue #60: the "Check for updates automatically" toggle — daily check
+    /// of the SAME releases feed, notify only, never an install.
+    @ObservedObject var appUpdateAutoChecker: AppUpdateAutoChecker
 
     @State private var launchAtLogin = LaunchAtLogin.isEnabled
     @State private var launchAtLoginError: String?
@@ -656,6 +675,18 @@ struct GeneralSettingsPane: View {
                     }
                 }
                 appUpdateStatusLine
+                // Issue #60: automatic checks reuse the exact same feed and
+                // model as the manual button above — the only difference is
+                // who initiates. App-local preference (like Launch at
+                // Login); the daemon never stores it.
+                Toggle("Check for updates automatically", isOn: Binding(
+                    get: { appUpdateAutoChecker.isEnabled },
+                    set: { appUpdateAutoChecker.setEnabled($0) }
+                ))
+                .help("Once a day, check the releases feed and show a notification when a newer version is out. Nothing installs automatically.")
+                Text("Daily check with a notification when a new version exists — nothing installs automatically.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             if let error = settingsSync.lastError {

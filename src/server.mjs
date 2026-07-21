@@ -157,13 +157,25 @@ export function createApp({ store, service, host = HOST, port = PORT, publicDir 
         if (!account) return json(res, 404, { error: 'account not found' });
         return json(res, 200, await ownedService.verifyAccount(account.id));
       }
+      const resetIdentityMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/reset-identity$/);
+      if (req.method === 'POST' && resetIdentityMatch) {
+        const account = ownedStore.getAccount(decodeURIComponent(resetIdentityMatch[1]));
+        if (!account) return json(res, 404, { error: 'account not found' });
+        return json(res, 200, { account: ownedService.resetClaudeIdentity(account.id) });
+      }
       const activateMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/activate$/);
       if (req.method === 'POST' && activateMatch) {
         const id = decodeURIComponent(activateMatch[1]);
         const account = ownedStore.getAccount(id);
         if (!account) return json(res, 404, { error: 'account not found' });
         if (!account.enabled) return json(res, 400, { error: 'account is disabled' });
-        return json(res, 200, { account: await ownedService.activateAccount(id) });
+        const activated = await ownedService.activateAccount(id);
+        const state = await ownedService.state();
+        return json(res, 200, {
+          account: activated,
+          activation: state.activation[account.provider],
+          claudeSecureStorage: state.claudeSecureStorage,
+        });
       }
       const accountMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)$/);
       if (req.method === 'DELETE' && accountMatch) {

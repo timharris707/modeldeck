@@ -212,3 +212,172 @@ struct AppUpdateDialogTests {
         #expect(model.resultDialog?.releaseURL == releaseURL)
     }
 }
+
+// Issue #60 — the "Check for updates automatically" toggle: daily check of
+// the SAME releases feed as the manual button, banner-only outcome. The
+// scheduler math and notify-once rule are pure and tested here; the hourly
+// wake loop itself is a trivial sleep wrapper.
+@Suite("Automatic update checks (issue #60)")
+@MainActor
+struct AppUpdateAutoCheckerTests {
+    private let releaseURL = URL(string: "https://github.com/timharris707/modeldeck/releases/tag/v0.3.0")!
+
+    /// Mutable test clock — advance() moves "now" forward.
+    private final class TestClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var current = Date(timeIntervalSince1970: 1_800_000_000)
+        var now: Date {
+            lock.lock(); defer { lock.unlock() }
+            return current
+        }
+        func advance(_ interval: TimeInterval) {
+            lock.lock(); defer { lock.unlock() }
+            current = current.addingTimeInterval(interval)
+        }
+    }
+
+    private final class NotificationLog {
+        var posted: [AppUpdateNotification] = []
+    }
+
+    private func freshDefaults() -> UserDefaults {
+        let suite = "auto-update-tests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        return defaults
+    }
+
+    private func makeChecker(
+        checker: StubReleaseChecker,
+        defaults: UserDefaults,
+        clock: TestClock,
+        log: NotificationLog
+    ) -> AppUpdateAutoChecker {
+        AppUpdateAutoChecker(
+            model: AppUpdateModel(checker: checker, currentVersion: "0.2.0"),
+            defaults: defaults,
+            clock: { clock.now },
+            notify: { log.posted.append($0) }
+        )
+    }
+
+    @Test func disabledByDefaultAndTogglePersists() {
+        let defaults = freshDefaults()
+        let auto = makeChecker(
+            checker: StubReleaseChecker(), defaults: defaults,
+            clock: TestClock(), log: NotificationLog())
+        #expect(!auto.isEnabled)
+        auto.setEnabled(true)
+        #expect(auto.isEnabled)
+        #expect(defaults.bool(forKey: AppUpdateAutoChecker.enabledDefaultsKey))
+        auto.setEnabled(false)
+        #expect(!defaults.bool(forKey: AppUpdateAutoChecker.enabledDefaultsKey))
+    }
+
+    @Test func dueRuleIsDailyFromTheLastCheck() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        #expect(AppUpdateAutoChecker.isDue(now: now, lastCheck: nil))
+        #expect(!AppUpdateAutoChecker.isDue(now: now, lastCheck: now.addingTimeInterval(-3600)))
+        #expect(AppUpdateAutoChecker.isDue(
+            now: now, lastCheck: now.addingTimeInterval(-AppUpdateAutoChecker.checkInterval)))
+    }
+
+    @Test func disabledNeverTouchesTheFeed() async {
+        let checker = StubReleaseChecker()
+        let auto = makeChecker(
+            checker: checker, defaults: freshDefaults(),
+            clock: TestClock(), log: NotificationLog())
+        await auto.checkIfDue()
+        #expect(checker.callCount == 0)
+    }
+
+    @Test func newerReleaseNotifiesOnceThenStaysQuiet() async {
+        let checker = StubReleaseChecker()
+        checker.result = .success(AppReleaseInfo(version: "0.3.0", url: releaseURL))
+        let clock = TestClock()
+        let log = NotificationLog()
+        let auto = makeChecker(
+            checker: checker, defaults: freshDefaults(), clock: clock, log: log)
+        auto.setEnabled(true)
+
+        await auto.checkIfDue() // never checked → due immediately
+        #expect(checker.callCount == 1)
+        #expect(log.posted.count == 1)
+        #expect(log.posted.first?.title == "ModelDeck 0.3.0 is available")
+        // Notify only — the copy says so explicitly.
+        #expect(log.posted.first?.body.contains("nothing installs automatically") == true)
+
+        // Same version discovered again tomorrow: check runs, no re-banner.
+        clock.advance(AppUpdateAutoChecker.checkInterval)
+        await auto.checkIfDue()
+        #expect(checker.callCount == 2)
+        #expect(log.posted.count == 1)
+    }
+
+    @Test func withinTheDailyIntervalNoSecondCheckHappens() async {
+        let checker = StubReleaseChecker()
+        checker.result = .success(nil)
+        let clock = TestClock()
+        let auto = makeChecker(
+            checker: checker, defaults: freshDefaults(),
+            clock: clock, log: NotificationLog())
+        auto.setEnabled(true)
+
+        await auto.checkIfDue()
+        #expect(checker.callCount == 1)
+        // The hourly scheduler wake inside the same day is a no-op.
+        clock.advance(3600)
+        await auto.checkIfDue()
+        #expect(checker.callCount == 1)
+        clock.advance(AppUpdateAutoChecker.checkInterval)
+        await auto.checkIfDue()
+        #expect(checker.callCount == 2)
+    }
+
+    @Test func failedCheckStampsTheClockAndRetriesTomorrowNotInALoop() async {
+        let checker = StubReleaseChecker()
+        checker.result = .failure(URLError(.notConnectedToInternet))
+        let clock = TestClock()
+        let log = NotificationLog()
+        let auto = makeChecker(
+            checker: checker, defaults: freshDefaults(), clock: clock, log: log)
+        auto.setEnabled(true)
+
+        await auto.checkIfDue()
+        #expect(checker.callCount == 1)
+        #expect(log.posted.isEmpty)
+        await auto.checkIfDue() // immediately after failure: NOT due again
+        #expect(checker.callCount == 1)
+        clock.advance(AppUpdateAutoChecker.checkInterval)
+        await auto.checkIfDue()
+        #expect(checker.callCount == 2)
+    }
+
+    @Test func upToDateStaysSilent() async {
+        let checker = StubReleaseChecker()
+        checker.result = .success(AppReleaseInfo(version: "0.2.0", url: releaseURL))
+        let log = NotificationLog()
+        let auto = makeChecker(
+            checker: checker, defaults: freshDefaults(), clock: TestClock(), log: log)
+        auto.setEnabled(true)
+        await auto.checkIfDue()
+        #expect(checker.callCount == 1)
+        #expect(log.posted.isEmpty)
+    }
+
+    @Test func notificationCopyNamesBothVersionsAndTheManualPath() {
+        let note = AppUpdateAutoChecker.notification(
+            for: AppReleaseInfo(version: "0.3.0", url: releaseURL),
+            currentVersion: "0.2.0"
+        )
+        #expect(note.title == "ModelDeck 0.3.0 is available")
+        #expect(note.body.contains("v0.2.0"))
+        #expect(note.body.contains("Check for App Updates"))
+        // Unstamped dev build: the body simply omits the current version.
+        let devNote = AppUpdateAutoChecker.notification(
+            for: AppReleaseInfo(version: "0.3.0", url: releaseURL),
+            currentVersion: nil
+        )
+        #expect(!devNote.body.contains("You're running"))
+    }
+}
