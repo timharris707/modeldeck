@@ -109,6 +109,23 @@ public enum ActiveIndicator: Equatable, Sendable {
     }
 }
 
+/// Issue #65 (UI half): the duplicate-token marker's shared strings. The
+/// daemon's usage-fingerprint check (weekly resetsAt instants rounded to
+/// the second) flags every Claude account in a group whose fingerprints
+/// match — two profiles holding the same login. The marker follows the
+/// #55/#62 hollow-marker convention: a hollow, warning-tinted glyph whose
+/// tooltip carries the honest caption; VoiceOver reads the same state.
+/// Only /login fixes a shared credential — never a symlink flip.
+public enum DuplicateTokenMarker {
+    /// Tooltip per issue #65, verbatim.
+    public static let caption =
+        "Two profiles appear to hold the same login — redo /login for one"
+    /// VoiceOver label, mirroring the ActiveMarkerView pattern
+    /// ("state — caption").
+    public static let accessibilityLabel =
+        "Duplicate login warning — two profiles appear to hold the same login; redo /login for one"
+}
+
 /// Compact per-provider notice for Settings → Accounts (issue #55 item 3):
 /// when a provider's activation isn't effective, say honestly what works
 /// (usage tracking) and what doesn't (switching accounts) until the

@@ -88,13 +88,31 @@ public struct DaemonSession: Codable, Equatable, Sendable {
     }
 }
 
+/// The daemon's activate response (issue #93): the post-switch account plus
+/// the additive `warnings` array PR #92 introduced — e.g. "2 running Claude
+/// sessions may lose session storage if launched without ModelDeck's pinned
+/// environment". Informational only: by the time warnings arrive the switch
+/// has already happened. Absent on pre-#92 daemons, so decoding treats a
+/// missing field as "no warnings" — an old daemon must never break or
+/// invent notices.
+public struct AccountActivation: Equatable, Sendable {
+    public var account: DeckAccount
+    public var warnings: [String]
+
+    public init(account: DeckAccount, warnings: [String] = []) {
+        self.account = account
+        self.warnings = warnings
+    }
+}
+
 /// Seam for the popover's Activate action; `DaemonClient` conforms and
 /// tests stub it.
 public protocol AccountActivating: Sendable {
     /// Switch the account's provider to use it for **new sessions only**
     /// (the daemon guarantees running sessions are untouched). Returns the
-    /// daemon's post-switch view of the account.
-    func activateAccount(id: String) async throws -> DeckAccount
+    /// daemon's post-switch view of the account plus any informational
+    /// warnings it attached (issue #93).
+    func activateAccount(id: String) async throws -> AccountActivation
 }
 
 /// Small typed HTTP client for the local ModelDeck daemon. GET-only in
@@ -139,15 +157,20 @@ public struct DaemonClient: Sendable {
     /// `POST /api/accounts/:id/activate` — switch the account's provider to
     /// it for new sessions only. Acquires a fresh session token per call so a
     /// daemon restart (which rotates ephemeral tokens) never strands us with
-    /// a stale credential.
-    public func activateAccount(id: String) async throws -> DeckAccount {
-        struct Envelope: Decodable { var account: DeckAccount }
+    /// a stale credential. The `warnings` field (issue #93 / PR #92) is
+    /// decoded tolerantly: optional, so a pre-#92 daemon's response — no
+    /// such key — decodes to an empty list rather than failing.
+    public func activateAccount(id: String) async throws -> AccountActivation {
+        struct Envelope: Decodable {
+            var account: DeckAccount
+            var warnings: [String]?
+        }
         let request = try await authorizedRequest(
             method: "POST",
             pathComponents: ["api", "accounts", id, "activate"]
         )
         let envelope: Envelope = try await send(request)
-        return envelope.account
+        return AccountActivation(account: envelope.account, warnings: envelope.warnings ?? [])
     }
 
     // MARK: - Settings (issue #7)

@@ -155,6 +155,24 @@ export async function readCodexPlan({ codexHome, readFile = fs.promises.readFile
   }
 }
 
+/// Issue #108: reads ONLY the `tokens.account_id` IDENTIFIER from
+/// CODEX_HOME/auth.json so the service can detect two profiles holding the
+/// same account (duplicate-credential detection). Token values are never
+/// read into the result, logged, stored, or transmitted — the parsed object
+/// is discarded after the identifier is extracted. Every malformed/missing
+/// input (no home, unreadable file, invalid JSON, absent or blank
+/// account_id) is `{ accountId: null }`: absence of evidence, never a crash.
+export async function readCodexAccountId({ codexHome, readFile = fs.promises.readFile } = {}) {
+  if (!codexHome) return { accountId: null };
+  try {
+    const auth = JSON.parse(await readFile(path.join(codexHome, 'auth.json'), 'utf8'));
+    const accountId = auth?.tokens?.account_id;
+    return { accountId: typeof accountId === 'string' && accountId.trim() ? accountId.trim() : null };
+  } catch {
+    return { accountId: null };
+  }
+}
+
 /// Containment check mirroring the Claude adapter's
 /// `validateClaudeProfileHome`: the CODEX_HOME must be an owner-only real
 /// directory inside ModelDeck's managed Codex profiles directory. Returns the

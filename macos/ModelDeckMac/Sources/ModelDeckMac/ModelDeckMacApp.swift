@@ -14,6 +14,15 @@ struct ModelDeckMacApp: App {
     @StateObject private var appUpdateModel: AppUpdateModel
     @StateObject private var appUpdateAutoChecker: AppUpdateAutoChecker
     @StateObject private var notifications: UsageNotificationCoordinator
+    /// Issue #96: bundled-daemon lifecycle — first-run consent, SMAppService
+    /// registration, Keychain token, drift re-register, legacy takeover.
+    @StateObject private var daemonSetupModel: DaemonSetupModel
+    /// Launch-at-login state shared by the popover gear menu and the General
+    /// settings pane. The SMAppService.status XPC read happens once in the
+    /// model's load() (fired from a view .task) — NEVER in a view-struct
+    /// initializer, which this App body re-runs on every evaluation (the
+    /// hot stack behind the #68 re-render cost).
+    @StateObject private var launchAtLoginModel = LaunchAtLoginModel()
     /// Issue #59: right-click context menu on the menu bar icon (Quit +
     /// Check for App Updates). Class ref held for the app's lifetime;
     /// installed from the label's .task.
@@ -28,7 +37,10 @@ struct ModelDeckMacApp: App {
         let evaluator = DaemonWorstCapacityEvaluator(provider: client)
         let statusModel = MenuBarStatusModel(
             evaluator: evaluator,
-            stateProvider: client
+            stateProvider: client,
+            // Issue #72: the popover's manual Refresh asks the daemon for a
+            // real provider poll so the footer's data age visibly restarts.
+            usageRefresher: client
         )
         // Phase 5: the same loopback client powers Activate (POST) and the
         // post-switch verification read; a verified state is pushed straight
@@ -46,10 +58,14 @@ struct ModelDeckMacApp: App {
         // Phase 7 (issue #8): the 3-step add-account flow. The daemon creates
         // the isolated profile home; the provider's own login runs in
         // Terminal; the daemon reads back the identity.
+        // Issue #99: both sign-in flows carry the activator seam — on Claude
+        // Code >= 2.1.216 the daemon's login spec is activation-driven
+        // (activate target → plain login → verify → restore prior active).
         let addAccountModel = AddAccountModel(
             onboarding: client,
             launcher: TerminalLoginLauncher(),
-            stateProvider: client
+            stateProvider: client,
+            activator: client
         )
         // Issue #32: per-account "Sign in again" (same Terminal launcher as
         // add-account — the provider's login stays alive through the browser
@@ -57,7 +73,8 @@ struct ModelDeckMacApp: App {
         let signInModel = AccountSignInModel(
             reauth: client,
             launcher: TerminalLoginLauncher(),
-            stateProvider: client
+            stateProvider: client,
+            activator: client
         )
         let toolUpdateModel = ToolUpdateModel(updater: client)
         // Issue #33: the app's own update check against the PUBLIC repo's
@@ -70,6 +87,10 @@ struct ModelDeckMacApp: App {
             await AppUpdateNotificationPoster().post(notification)
         }
         let notifications = UsageNotificationCoordinator(poster: UserNotificationCenterPoster())
+        // Issue #96: all seams live (SMAppService agent, Keychain, launchctl,
+        // /api/health probe); in dev builds without a bundled daemon manifest
+        // the whole surface stays quiet.
+        let daemonSetupModel = DaemonSetupModel(dependencies: .live(client: client))
         // Issue #59: the status-item context menu shares the same update
         // model as the gear menu and Settings — one check state everywhere.
         contextMenuController = MenuBarContextMenuController(appUpdateModel: appUpdateModel)
@@ -160,6 +181,7 @@ struct ModelDeckMacApp: App {
         _appUpdateModel = StateObject(wrappedValue: appUpdateModel)
         _appUpdateAutoChecker = StateObject(wrappedValue: appUpdateAutoChecker)
         _notifications = StateObject(wrappedValue: notifications)
+        _daemonSetupModel = StateObject(wrappedValue: daemonSetupModel)
     }
 
     /// Issue #45 reopen diagnostics: log every status-bar window's frame and
@@ -194,7 +216,9 @@ struct ModelDeckMacApp: App {
             DeckPopoverView(
                 statusModel: statusModel,
                 deckModel: deckModel,
-                appUpdateModel: appUpdateModel
+                appUpdateModel: appUpdateModel,
+                setupModel: daemonSetupModel,
+                launchAtLoginModel: launchAtLoginModel
             )
         } label: {
             // Issue #45: the view observes the model ITSELF — passing a
@@ -206,6 +230,10 @@ struct ModelDeckMacApp: App {
                 .task {
                     IconDebugLog.log("label .task fired; starting initial refresh")
                     contextMenuController.install()
+                    // Issue #96: evaluate the bundled-service state before
+                    // the first refresh so a true first run shows the
+                    // consent card, not a bare "daemon unreachable".
+                    await daemonSetupModel.evaluateOnLaunch()
                     // Issue #60: honors the stored preference; no-op when
                     // automatic checks are off.
                     appUpdateAutoChecker.start()
@@ -242,7 +270,9 @@ struct ModelDeckMacApp: App {
                 signInModel: signInModel,
                 updateModel: toolUpdateModel,
                 appUpdateModel: appUpdateModel,
-                appUpdateAutoChecker: appUpdateAutoChecker
+                appUpdateAutoChecker: appUpdateAutoChecker,
+                daemonSetupModel: daemonSetupModel,
+                launchAtLoginModel: launchAtLoginModel
             )
         }
     }

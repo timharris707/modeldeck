@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   activateClaudeProfile,
+  claudePinnedEnvFileContent,
   claudeProfileEnv,
   createClaudeProfileHome,
   fetchClaudeUsage,
@@ -26,7 +27,7 @@ import {
   readClaudeProfileIdentity,
 } from '../src/adapters/claude.mjs';
 import { claudeCredentialServiceName, claudeCredentialsPresent } from '../src/adapters/claude-keychain.mjs';
-import { readClaudeCredentials } from '../src/adapters/claude-usage-probe.mjs';
+import { readClaudeCredentials, KEYCHAIN_DENIED_ERROR } from '../src/adapters/claude-usage-probe.mjs';
 import { extractIdentity } from '../src/adapters/identity.mjs';
 import { createProviderProfileHelpers } from '../src/adapters/provider-profile.mjs';
 
@@ -280,6 +281,76 @@ test('usage credential lookup keeps file fast path and Keychain failures secret'
   });
 });
 
+test('denied Keychain value read with an existing item reports the Always Allow recovery, not sign-in (issue #98)', async () => {
+  const calls = [];
+  const secret = 'must-never-appear';
+  await assert.rejects(readClaudeCredentials({
+    profile: '/profiles/selected',
+    platform: 'darwin',
+    homeDirectory: '/Users/fixture',
+    userInfo: () => ({ username: 'fixture-user' }),
+    readFile: async () => { const error = new Error('missing'); error.code = 'ENOENT'; throw error; },
+    runSecurity: async (binary, args) => {
+      calls.push(args);
+      if (args.includes('-w')) {
+        // The dismissed-prompt shape: value read refused by macOS.
+        const error = new Error(secret);
+        error.stdout = secret;
+        error.stderr = secret;
+        throw error;
+      }
+      // Metadata lookup (no ACL gate) still sees the item.
+      return { stdout: 'keychain: "/Users/fixture/Library/Keychains/login.keychain-db"' };
+    },
+  }), (error) => {
+    assert.equal(error.message, KEYCHAIN_DENIED_ERROR);
+    // The recovery message must never route users to a pointless re-login…
+    assert.doesNotMatch(error.message, /sign in explicitly before refreshing/);
+    // …and Keychain output stays secret on this path too.
+    assert.doesNotMatch(error.message, new RegExp(secret));
+    return true;
+  });
+  // Value read first (with -w), then the metadata-only existence probe.
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0], [
+    'find-generic-password', '-s', 'Claude Code-credentials-d2719532',
+    '-a', 'fixture-user', '-w',
+  ]);
+  assert.deepEqual(calls[1], [
+    'find-generic-password', '-s', 'Claude Code-credentials-d2719532',
+    '-a', 'fixture-user',
+  ]);
+});
+
+test('missing Keychain item still reports the sign-in state (issue #98)', async () => {
+  await assert.rejects(readClaudeCredentials({
+    profile: '/profiles/selected',
+    platform: 'darwin',
+    userInfo: () => ({ username: 'fixture-user' }),
+    readFile: async () => { throw new Error('unreadable'); },
+    runSecurity: async () => { throw new Error('item not found'); },
+  }), (error) => {
+    assert.match(error.message, /sign in explicitly before refreshing/);
+    assert.doesNotMatch(error.message, /Keychain blocked/);
+    return true;
+  });
+});
+
+test('readable but unparseable Keychain value is a credential problem, never keychain-denied (issue #98)', async () => {
+  let metadataProbes = 0;
+  await assert.rejects(readClaudeCredentials({
+    profile: '/profiles/selected',
+    platform: 'darwin',
+    userInfo: () => ({ username: 'fixture-user' }),
+    readFile: async () => { const error = new Error('missing'); error.code = 'ENOENT'; throw error; },
+    runSecurity: async (binary, args) => {
+      if (!args.includes('-w')) metadataProbes += 1;
+      return { stdout: 'not json at all' };
+    },
+  }), /sign in explicitly before refreshing/);
+  assert.equal(metadataProbes, 0);
+});
+
 test('darwin usage refresh lets the isolated probe resolve an absent credential file', async (t) => {
   const root = temporaryRoot(t);
   const profile = path.join(root, 'keychain-backed');
@@ -341,7 +412,32 @@ test('Claude usage probe environment is an explicit allowlist', () => {
     PATH: '/usr/bin:/bin',
     LANG: 'en_US.UTF-8',
     CLAUDE_CONFIG_DIR: '/profiles/selected',
+    // Issue #66: the secure-storage scope always equals the config dir so
+    // storage and credential scope can never point at different profiles.
+    CLAUDE_SECURESTORAGE_CONFIG_DIR: '/profiles/selected',
   });
+});
+
+test('Claude probe env pins the secure-storage scope even over an ambient value', () => {
+  const env = claudeProfileEnv('/profiles/selected', {
+    HOME: '/Users/fixture',
+    CLAUDE_SECURESTORAGE_CONFIG_DIR: '/profiles/other',
+  });
+  assert.equal(env.CLAUDE_SECURESTORAGE_CONFIG_DIR, '/profiles/selected');
+});
+
+test('pinned env file exports both variables with one identical quoted path', () => {
+  const content = claudePinnedEnvFileContent("/profiles/o'brien");
+  const lines = content.split('\n');
+  const expected = `'/profiles/o'\\''brien'`;
+  assert.ok(lines.includes(`export CLAUDE_CONFIG_DIR=${expected}`));
+  assert.ok(lines.includes(`export CLAUDE_SECURESTORAGE_CONFIG_DIR=${expected}`));
+  // Both vars must carry the exact same string (issue #66 spike caveat).
+  const values = lines.filter((line) => line.startsWith('export ')).map((line) => line.split('=').slice(1).join('='));
+  assert.equal(values.length, 2);
+  assert.equal(values[0], values[1]);
+  assert.ok(content.endsWith('\n'));
+  assert.throws(() => claudePinnedEnvFileContent(), /real path is required/);
 });
 
 test('shared profile helpers preserve provider-specific required and invalid-name errors', async (t) => {

@@ -1,6 +1,6 @@
 {
   "name": "modeldeck",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Local project-aware AI account and usage control plane.",
@@ -19,5 +19,9 @@
   },
   "engines": {
     "node": ">=24"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1",
+    "postject": "1.0.0-alpha.6"
   }
 }

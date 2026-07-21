@@ -13,6 +13,16 @@ extension DaemonClient: DeckStateProviding {
     }
 }
 
+/// Issue #72: seam for the daemon's forced usage refresh
+/// (`POST /api/refresh` — a real provider poll, which is what actually
+/// advances the snapshots' `observedAt`). `DaemonClient` conforms; tests
+/// stub it.
+public protocol UsageRefreshing: Sendable {
+    func refreshUsage() async throws
+}
+
+extension DaemonClient: UsageRefreshing {}
+
 /// Icon-path diagnostics (issue #45 reopen): opt-in via
 /// `MODELDECK_ICON_DEBUG=1`, silent otherwise. Kept permanently so a future
 /// "icon looks wrong" report can be diagnosed on a live install without a
@@ -73,17 +83,22 @@ public final class MenuBarStatusModel: ObservableObject {
 
     private let evaluator: any UsageEvaluating
     private let stateProvider: (any DeckStateProviding)?
+    /// Issue #72: the manual-Refresh provider poll; nil keeps every refresh
+    /// a cheap cached read (pre-#72 behavior).
+    private let usageRefresher: (any UsageRefreshing)?
     private let clock: @Sendable () -> Date
     private var autoRefreshTask: Task<Void, Never>?
 
     public init(
         evaluator: any UsageEvaluating,
         stateProvider: (any DeckStateProviding)? = nil,
+        usageRefresher: (any UsageRefreshing)? = nil,
         thresholds: UsageThresholds = .default,
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.evaluator = evaluator
         self.stateProvider = stateProvider
+        self.usageRefresher = usageRefresher
         self.thresholds = thresholds
         self.clock = clock
     }
@@ -100,6 +115,32 @@ public final class MenuBarStatusModel: ObservableObject {
         guard !isRefreshing else { return }
         isRefreshing = true
         defer { isRefreshing = false }
+        await loadState()
+    }
+
+    /// Issue #72: the manual Refresh button's path. The plain `refresh()`
+    /// only GETs the daemon's cached state, which never advances the usage
+    /// snapshots' `observedAt` — so the footer's "Data from N min ago"
+    /// counter visibly ignored the click. This first asks the daemon for a
+    /// real provider poll (`POST /api/refresh`), then re-reads state; the
+    /// footer age restarts because the fresh snapshots carry a new
+    /// `observedAt`. A failed poll (older daemon, transient error)
+    /// degrades to the cached read — never a dead button.
+    public func refreshFromProviders() async {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        defer { isRefreshing = false }
+        if let usageRefresher {
+            do {
+                try await usageRefresher.refreshUsage()
+            } catch {
+                IconDebugLog.log("forced usage refresh FAILED (\(error)); falling back to cached read")
+            }
+        }
+        await loadState()
+    }
+
+    private func loadState() async {
         // If apply(deckState:) lands while we await the daemon, this refresh
         // is stale — its result must not clobber the verified state.
         let generation = stateGeneration
@@ -187,9 +228,59 @@ public final class MenuBarStatusModel: ObservableObject {
 
     // MARK: - Footer freshness (issue #42)
 
-    /// The effective auto-refresh cadence (seconds); 0 while disabled. Feeds
-    /// the footer's staleness threshold (~2x this interval).
+    /// The app-configured auto-refresh cadence (seconds); 0 while disabled.
     public private(set) var autoRefreshInterval: TimeInterval = 0
+
+    /// Issue #90: the interval stale math runs against — the daemon-reported
+    /// EFFECTIVE cadence when it is slower than the configured one (e.g. the
+    /// active-session cap slowing the default interval to 30 min), so a
+    /// deliberately slowed scheduler can never falsely mark data stale.
+    /// Falls back to the configured interval on older daemons that don't
+    /// report an effective cadence.
+    public var stalenessInterval: TimeInterval {
+        if let seconds = deckState?.scheduler?.effectiveRefreshIntervalSeconds,
+           TimeInterval(seconds) > autoRefreshInterval {
+            return TimeInterval(seconds)
+        }
+        return autoRefreshInterval
+    }
+
+    // MARK: - Refresh-cadence honesty (issue #90)
+
+    /// The calm footer indicator shown only while the daemon's effective
+    /// refresh cadence is slower than the user's configured setting.
+    public struct RefreshCadenceNotice: Equatable, Sendable {
+        public var text: String
+        public var tooltip: String
+
+        public init(text: String, tooltip: String) {
+            self.text = text
+            self.tooltip = tooltip
+        }
+    }
+
+    /// Issue #90 (Tim's design call): when the active-session cap slows the
+    /// never-customized default interval, the deck says so instead of
+    /// silently serving old data. Nil whenever the daemon reports no
+    /// slowdown, reports an unknown reason, or is too old to report at all.
+    public var refreshCadenceNotice: RefreshCadenceNotice? {
+        guard let scheduler = deckState?.scheduler,
+              scheduler.effectiveRefreshReason == "active-session-cap",
+              let effective = scheduler.effectiveRefreshIntervalSeconds,
+              let configured = scheduler.configuredRefreshIntervalSeconds,
+              effective > configured
+        else { return nil }
+        let effectiveMinutes = max(1, Int((Double(effective) / 60).rounded()))
+        let configuredMinutes = max(1, Int((Double(configured) / 60).rounded()))
+        return RefreshCadenceNotice(
+            text: "Auto-refresh slowed",
+            tooltip: "A CLI session is running, so scheduled refresh is slowed to every "
+                + "\(effectiveMinutes) min instead of every \(configuredMinutes) min. "
+                + "Choosing a refresh interval in Settings — or clicking Keep to confirm "
+                + "your current \(configuredMinutes) min — lifts this cap permanently; "
+                + "the Refresh button always polls immediately."
+        )
+    }
 
     /// What the popover footer renders: the freshness line plus whether it
     /// should carry the muted warning tint.
@@ -203,26 +294,41 @@ public final class MenuBarStatusModel: ObservableObject {
         }
     }
 
-    /// Footer freshness derived from the newest usage snapshot's
-    /// `observedAt` — the provider observation, NOT this app's last GET of
-    /// the daemon cache (issue #42's exact complaint). Stale when that age
-    /// exceeds ~2x the auto-refresh interval or the daemon flags any row
-    /// stale. Falls back to the app-side "Updated…" text when no snapshot
-    /// carries observedAt (older daemons); nil before the first load.
+    /// Footer freshness derived from provider observations (`observedAt`),
+    /// NOT this app's last GET of the daemon cache (issue #42's exact
+    /// complaint). Issue #89 rebased it per account: the line reads "Oldest
+    /// data N min ago", keyed on the account whose newest snapshot is
+    /// OLDEST, so one silently failing account can no longer hide behind its
+    /// siblings' fresh data. Stale when that age exceeds ~2x the
+    /// auto-refresh interval or the daemon flags any row stale. Falls back
+    /// to the app-side "Updated…" text when no snapshot carries observedAt
+    /// (older daemons); nil before the first load.
     public func footerStatus(now: Date? = nil) -> FooterStatus? {
         let now = now ?? clock()
         let rowStale = deckState.map(DeckFreshness.anyRowStale(in:)) ?? false
-        if let state = deckState, let observedAt = DeckFreshness.newestObservedAt(in: state) {
+        if let state = deckState, let observedAt = DeckFreshness.oldestAccountObservation(in: state) {
             return FooterStatus(
                 text: DeckFreshness.text(observedAt: observedAt, now: now),
                 isStale: rowStale || DeckFreshness.isStale(
                     observedAt: observedAt,
                     now: now,
-                    autoRefreshInterval: autoRefreshInterval
+                    // Issue #90: EFFECTIVE cadence — a daemon deliberately
+                    // slowed by the active-session cap is not "stale".
+                    autoRefreshInterval: stalenessInterval
                 )
             )
         }
         guard let text = updatedAgoText(now: now) else { return nil }
         return FooterStatus(text: text, isStale: rowStale)
+    }
+
+    // MARK: - Per-card staleness (issue #89)
+
+    /// The staleness marker for one deck card, computed against this model's
+    /// effective auto-refresh interval; nil while the card's data is fresh.
+    public func cardStaleness(for row: DeckAccountRow, now: Date? = nil) -> DeckFreshness.CardStaleness? {
+        // Issue #90: same effective-cadence basis as the footer — the cap
+        // slowing refresh must never falsely mark cards stale.
+        row.staleness(now: now ?? clock(), autoRefreshInterval: stalenessInterval)
     }
 }

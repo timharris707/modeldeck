@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { isSea } from 'node:sea';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { extractIdentity } from './identity.mjs';
@@ -10,7 +11,7 @@ import { claudeCredentialsPresent } from './claude-keychain.mjs';
 import { createProviderProfileHelpers, activeLinkBlockedError } from './provider-profile.mjs';
 
 const execFileAsync = promisify(execFile);
-const usageProbePath = fileURLToPath(new URL('./claude-usage-probe.mjs', import.meta.url));
+const usageProbePath = isSea() ? null : fileURLToPath(new URL('./claude-usage-probe.mjs', import.meta.url));
 const claudeProfile = createProviderProfileHelpers({
   envVar: 'CLAUDE_CONFIG_DIR',
   envRequiredError: 'CLAUDE_CONFIG_DIR is required',
@@ -161,8 +162,42 @@ export function parseClaudeUsage(payload) {
 
 const assertOwnerOnlyDirectory = claudeProfile.assertOwnerOnlyDirectory;
 
+// Issue #66 — shell-layer session pinning. Claude Code resolves its config
+// dir once at startup without realpath(), then re-resolves the transcript
+// path (through any symlink) on every append. A session launched through the
+// managed ~/.claude symlink therefore splits its transcript across profiles
+// when ModelDeck flips the symlink, and a later resume silently loses the
+// pre-flip half. Exporting CLAUDE_CONFIG_DIR pinned to the profile's real
+// path insulates the session (and every subagent — the CLI forwards the var
+// into spawned subprocesses) from later flips.
+//
+// CLAUDE_SECURESTORAGE_CONFIG_DIR must ALWAYS carry the same string: a
+// global secure-storage scope pointing at a different profile would make a
+// pinned session store its transcript under one profile while authenticating
+// as another. Verified on Claude Code 2.1.216; the keychain-scope derivation
+// is an undocumented internal — revalidate on CLI upgrades.
+export function claudePinnedEnvFileContent(profileRealPath) {
+  if (!profileRealPath || typeof profileRealPath !== 'string') {
+    throw new Error('Claude profile real path is required');
+  }
+  const quoted = `'${profileRealPath.replaceAll("'", `'\\''`)}'`;
+  return [
+    '# Written by ModelDeck at account activation. Do not edit.',
+    '# Pins new Claude Code sessions to the active profile real path so a',
+    '# later account switch cannot split their session storage. Both',
+    '# variables must always carry the same value (issue #66).',
+    `export CLAUDE_CONFIG_DIR=${quoted}`,
+    `export CLAUDE_SECURESTORAGE_CONFIG_DIR=${quoted}`,
+    '',
+  ].join('\n');
+}
+
 export function claudeProfileEnv(claudeConfigDir, sourceEnv = process.env) {
-  return claudeProfile.profileEnv(claudeConfigDir, sourceEnv);
+  const env = claudeProfile.profileEnv(claudeConfigDir, sourceEnv);
+  // Issue #66: the secure-storage scope must always equal the config dir —
+  // never inherit an ambient value pointing at a different profile.
+  env.CLAUDE_SECURESTORAGE_CONFIG_DIR = claudeConfigDir;
+  return env;
 }
 
 export async function validateClaudeProfileHome({ profileRef, profilesDir } = {}) {
@@ -201,7 +236,8 @@ export async function fetchClaudeUsage({
   try {
     const env = claudeProfileEnv(claudeConfigDir);
     env.MODELDECK_CLAUDE_UA_VERSION = (await resolveClaudeCodeVersion()) ?? CLAUDE_CODE_UA_FALLBACK_VERSION;
-    result = await run(process.execPath, [usageProbePath], {
+    const probeArgs = isSea() ? ['modeldeck-internal-claude-usage-probe'] : [usageProbePath];
+    result = await run(process.execPath, probeArgs, {
       env,
       timeout: timeoutMs,
       maxBuffer: 2_000_000,

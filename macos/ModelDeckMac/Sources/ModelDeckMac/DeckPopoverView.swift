@@ -13,8 +13,13 @@ struct DeckPopoverView: View {
     /// "Check for App Updates…" affordance, wired to the same shared model
     /// as the Settings mirror — one check state, two entry points.
     @ObservedObject var appUpdateModel: AppUpdateModel
-    @State private var launchAtLogin = LaunchAtLogin.isEnabled
-    @State private var launchAtLoginError: String?
+    /// Issue #96: bundled background-service lifecycle. The popover hosts
+    /// the calm one-screen first-run consent and its follow-on states.
+    @ObservedObject var setupModel: DaemonSetupModel
+    /// Shared with the Settings pane; the SMAppService status read happens
+    /// once in the model's load(), never in this struct's initializer (an
+    /// XPC round-trip per App-body evaluation — the #68 re-render tax).
+    @ObservedObject var launchAtLoginModel: LaunchAtLoginModel
     /// Presents the standard result dialog once a gear-menu check finishes.
     @State private var updateDialog: AppUpdateModel.ResultDialog?
     @Environment(\.openURL) private var openURL
@@ -38,7 +43,10 @@ struct DeckPopoverView: View {
         // meter rows carry "Weekly · all models" left and
         // "Resets Wed 5:59 PM PDT" right on every card.
         .frame(width: deckModel.layout == .twoColumn ? 640 : 420)
-        .task { await statusModel.refresh() }
+        .task {
+            launchAtLoginModel.load()
+            await statusModel.refresh()
+        }
     }
 
     // MARK: - Header
@@ -87,7 +95,10 @@ struct DeckPopoverView: View {
                     SettingsWindowFronting.activateAndFront()
                 }
                 Divider()
-                Toggle("Launch at Login", isOn: $launchAtLogin)
+                Toggle("Launch at Login", isOn: Binding(
+                    get: { launchAtLoginModel.isEnabled },
+                    set: { launchAtLoginModel.setEnabled($0) }
+                ))
                 Picker("Layout", selection: $deckModel.layout) {
                     Text("Two columns").tag(DeckLayout.twoColumn)
                     Text("Single column").tag(DeckLayout.singleColumn)
@@ -132,27 +143,28 @@ struct DeckPopoverView: View {
             } message: { dialog in
                 Text(dialog.message)
             }
-            .onChange(of: launchAtLogin) { _, enabled in
-                do {
-                    try LaunchAtLogin.setEnabled(enabled)
-                    launchAtLoginError = nil
-                } catch {
-                    launchAtLoginError = error.localizedDescription
-                    launchAtLogin = LaunchAtLogin.isEnabled
-                }
-            }
         }
     }
 
     @ViewBuilder
     private var connectionBanner: some View {
-        if case .unreachable(let message) = statusModel.connection {
+        // Issue #96: when the setup card is up it owns the story — the
+        // orange unreachable label would just repeat it louder.
+        if setupModel.phase.needsPopoverCard {
+            DaemonSetupCard(model: setupModel)
+        } else if case .unreachable(let message) = statusModel.connection {
             Label("Daemon unreachable", systemImage: "exclamationmark.triangle")
                 .font(.caption)
                 .foregroundStyle(.orange)
                 .help(message)
         }
-        if let launchAtLoginError {
+        if setupModel.didReregisterForUpdate {
+            // Drift re-register happened this launch — note it subtly.
+            Text("Background service updated to match this app version.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        if let launchAtLoginError = launchAtLoginModel.lastError {
             Text(launchAtLoginError)
                 .font(.caption)
                 .foregroundStyle(.red)
@@ -168,8 +180,12 @@ struct DeckPopoverView: View {
             case .twoColumn:
                 HStack(alignment: .top, spacing: 12) {
                     ForEach(deckModel.columns(for: state)) { column in
-                        DeckColumnView(column: column, deckModel: deckModel)
-                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                        DeckColumnView(
+                            column: column,
+                            deckModel: deckModel,
+                            staleness: { statusModel.cardStaleness(for: $0) }
+                        )
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
                     }
                 }
             case .singleColumn:
@@ -178,7 +194,9 @@ struct DeckPopoverView: View {
                         DeckAccountRowView(
                             row: row,
                             showsProviderMark: true,
-                            isExpanded: deckModel.isExpanded(row.id)
+                            showsIdentity: deckModel.showAccountEmails,
+                            isExpanded: deckModel.isExpanded(row.id),
+                            staleness: statusModel.cardStaleness(for: row)
                         ) {
                             withAnimation(.easeOut(duration: 0.15)) {
                                 deckModel.toggleExpansion(of: row.id)
@@ -208,23 +226,48 @@ struct DeckPopoverView: View {
 
     private var footer: some View {
         HStack {
-            // Issue #42: the freshness line derives from the newest usage
-            // snapshot's observedAt (the provider observation), not this
-            // app's last GET of the daemon cache — and turns a muted warning
-            // gold once that age exceeds ~2x the auto-refresh interval or
-            // the daemon flags rows stale. TimelineView keeps it live while
-            // the popover stays open.
+            // Issue #42: the freshness line derives from provider
+            // observations (observedAt), not this app's last GET of the
+            // daemon cache — and turns a muted warning gold once the age
+            // exceeds ~2x the auto-refresh interval or the daemon flags
+            // rows stale. Issue #89: keyed on the OLDEST account's newest
+            // snapshot ("Oldest data N min ago"), so one failing account
+            // can't hide behind its siblings' fresh data. TimelineView
+            // keeps it live while the popover stays open.
             TimelineView(.periodic(from: .now, by: 30)) { context in
                 let status = statusModel.footerStatus(now: context.date)
                 HStack(spacing: 6) {
-                    Text(status?.text ?? "Not updated yet")
+                    // Issue #72: while the manual provider poll runs, say so —
+                    // the age line would otherwise look unresponsive for the
+                    // seconds the poll takes.
+                    Text(statusModel.isRefreshing
+                        ? "Refreshing…"
+                        : (status?.text ?? "Not updated yet"))
                         .font(.caption)
-                        .foregroundStyle(status?.isStale == true
+                        .foregroundStyle(status?.isStale == true && !statusModel.isRefreshing
                             ? AnyShapeStyle(severityColor(.warning))
                             : AnyShapeStyle(.secondary))
                         .help(status?.isStale == true
                             ? "Usage data is older than expected — Refresh forces a fresh provider poll."
-                            : "Age of the newest provider-reported usage snapshot")
+                            : "Age of the oldest account's newest provider-reported usage")
+                    // Issue #90: calm honesty indicator — shown only while
+                    // the daemon's effective refresh cadence is slower than
+                    // the configured setting (active-session cap on the
+                    // never-customized default interval). The tooltip
+                    // explains the cap and that an explicit interval lifts
+                    // it; footer family, Direction-A restraint.
+                    if let notice = statusModel.refreshCadenceNotice {
+                        HStack(spacing: 3) {
+                            Image(systemName: "tortoise")
+                                .font(.system(size: 9))
+                            Text(notice.text)
+                                .font(.caption)
+                        }
+                        .foregroundStyle(.secondary)
+                        .help(notice.tooltip)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("\(notice.text). \(notice.tooltip)")
+                    }
                     // Issue #33: the app's own version, muted and small,
                     // beside the freshness line (restraint bar applies).
                     if let appVersionText {
@@ -237,7 +280,10 @@ struct DeckPopoverView: View {
             }
             Spacer()
             Button {
-                Task { await statusModel.refresh() }
+                // Issue #72: manual Refresh = forced provider poll + state
+                // re-read, so the "Data from…" counter actually restarts
+                // (the plain cached read never advanced observedAt).
+                Task { await statusModel.refreshFromProviders() }
             } label: {
                 HStack(spacing: 4) {
                     if statusModel.isRefreshing {
@@ -249,6 +295,7 @@ struct DeckPopoverView: View {
                 }
             }
             .disabled(statusModel.isRefreshing)
+            .help("Ask the daemon to poll the providers for fresh usage now")
         }
     }
 }
@@ -258,6 +305,10 @@ struct DeckPopoverView: View {
 struct DeckColumnView: View {
     let column: DeckColumn
     @ObservedObject var deckModel: DeckPopoverModel
+    /// Issue #89: per-card staleness derivation, supplied by the popover so
+    /// the column stays free of the status model (interval + clock live
+    /// there). Defaults to no markers for previews/tests.
+    var staleness: (DeckAccountRow) -> DeckFreshness.CardStaleness? = { _ in nil }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -283,7 +334,9 @@ struct DeckColumnView: View {
                     DeckAccountRowView(
                         row: row,
                         showsProviderMark: false,
-                        isExpanded: deckModel.isExpanded(row.id)
+                        showsIdentity: deckModel.showAccountEmails,
+                        isExpanded: deckModel.isExpanded(row.id),
+                        staleness: staleness(row)
                     ) {
                         withAnimation(.easeOut(duration: 0.15)) {
                             deckModel.toggleExpansion(of: row.id)
@@ -325,7 +378,15 @@ enum DeckType {
 struct DeckAccountRowView: View {
     let row: DeckAccountRow
     let showsProviderMark: Bool
+    /// Issue #73: identity (email) under the label renders only when the
+    /// Settings → General "Show account emails" toggle is on (default off).
+    /// Uniform for both providers — no identity, no line.
+    var showsIdentity: Bool = false
     let isExpanded: Bool
+    /// Issue #89: non-nil when this card's newest snapshot is older than
+    /// ~2x the effective refresh interval — the card then carries a visible
+    /// warning-tinted age line so fossil data can never pass as fresh.
+    var staleness: DeckFreshness.CardStaleness? = nil
     let onToggle: () -> Void
 
     var body: some View {
@@ -335,18 +396,53 @@ struct DeckAccountRowView: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel({ () -> String in
-                // Issue #55 (CodeRabbit): VoiceOver must hear the pending
-                // state, not just silence, for a DB-active-but-blocked row.
-                if case .pending(let caption) = row.activeIndicator {
-                    return "\(row.account.label), marked active, pending — \(caption)"
-                }
-                return "\(row.account.label)\(row.isActive ? ", active" : "")"
-            }())
+            // Issue #55 (CodeRabbit): VoiceOver must hear the pending state,
+            // not just silence, for a DB-active-but-blocked row. Issue #73:
+            // opted-in emails are spoken too. Issue #65 (CodeRabbit): the
+            // explicit parent label suppresses the child markers' labels, so
+            // the duplicate-token warning is folded in here as well. The
+            // derivation lives in Core (DeckAccountRow) where it is tested.
+            .accessibilityLabel(row.accessibilityLabel(showsIdentity: showsIdentity))
             .accessibilityHint(isExpanded ? "Collapse usage windows" : "Expand usage windows")
 
             if isExpanded {
                 expandedWindows
+            }
+
+            // Issue #98: the Keychain recovery notice — macOS refused the
+            // daemon's read of this account's existing credentials (the
+            // dismissed-prompt state). Actionable, honest, and it OUTRANKS
+            // the bare stale line (row.staleness already yields nil while
+            // this is up): the tooltip says exactly what happened and what
+            // to click. Same visual family as the #89 stale line.
+            if let recovery = row.keychainRecovery {
+                HStack(spacing: 4) {
+                    Image(systemName: "key.slash")
+                        .font(.system(size: 9, weight: .semibold))
+                    Text(recovery.text)
+                        .font(.system(size: 10))
+                }
+                .foregroundStyle(severityColor(.warning))
+                .help(recovery.tooltip)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(recovery.accessibilityLabel)
+            }
+
+            // Issue #89: the stale line renders in BOTH collapsed and
+            // expanded states, outside the card button so it keeps its own
+            // accessibility element. Tooltip carries the data age plus the
+            // account's last refresh error (when the daemon reported one).
+            if let staleness {
+                HStack(spacing: 4) {
+                    Image(systemName: "clock.badge.exclamationmark")
+                        .font(.system(size: 9, weight: .semibold))
+                    Text(staleness.text)
+                        .font(.system(size: 10))
+                }
+                .foregroundStyle(severityColor(.warning))
+                .help(staleness.tooltip)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(staleness.accessibilityLabel)
             }
         }
         .padding(9)
@@ -385,6 +481,10 @@ struct DeckAccountRowView: View {
                     // effect (or didn't report activation at all).
                     ActiveMarkerView(indicator: row.activeIndicator)
                 }
+                if row.account.hasDuplicateToken {
+                    // Issue #65: two profiles appear to hold the same login.
+                    DuplicateTokenMarkerView()
+                }
                 Spacer(minLength: 8)
                 // Issue #33 amendment: the headline percent only exists
                 // while collapsed — expanded rows carry their own numbers.
@@ -396,7 +496,7 @@ struct DeckAccountRowView: View {
                         .monospacedDigit()
                 }
             }
-            if let identity = row.account.identity, !identity.isEmpty {
+            if showsIdentity, let identity = row.account.identity, !identity.isEmpty {
                 Text(identity)
                     .font(DeckType.tier)
                     .foregroundStyle(.secondary)
@@ -410,15 +510,31 @@ struct DeckAccountRowView: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                         Spacer(minLength: 8)
-                        Text(worst.resetText)
-                            .font(DeckType.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                        // Issue #67: the reset phrase never ellipsizes — the
+                        // window label truncates first; the phrase wraps if
+                        // it must. Tooltip carries the absolute timestamp.
+                        resetTextView(for: worst)
                     }
                 }
                 UsageBarView(window: row.worstWindow)
             }
         }
+    }
+
+    /// Issue #67: shared reset-text treatment for collapsed and expanded
+    /// rows. Layout priority keeps the phrase whole (the sibling label
+    /// truncates first); wrapping is allowed as the last resort — never an
+    /// ellipsis that hides the reset time. Every reset text carries a hover
+    /// tooltip with the full absolute timestamp as backstop.
+    private func resetTextView(for window: DeckWindow) -> some View {
+        Text(window.resetText)
+            .font(DeckType.caption)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.trailing)
+            .fixedSize(horizontal: false, vertical: true)
+            .layoutPriority(1)
+            .help(DeckBuilder.absoluteResetText(for: window.resetsAt)
+                ?? "The provider didn't report a reset time for this window")
     }
 
     /// "Studio · Max (20x)" — the plan tier inline beside the name, muted
@@ -455,14 +571,16 @@ struct DeckAccountRowView: View {
                                 .foregroundStyle(window.isSpend ? Color.secondary : Color.primary)
                                 .lineLimit(1)
                             Spacer(minLength: 8)
-                            Text(window.resetText)
-                                .font(DeckType.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
+                            // Issue #67: the complete reset phrase (weekday,
+                            // time, timezone) is the one thing expansion
+                            // exists to show — it must never ellipsize. The
+                            // label truncates first; the phrase may wrap.
+                            resetTextView(for: window)
                             Text(window.remainingText ?? "—")
                                 .font(DeckType.value)
                                 .foregroundStyle(valueColor(for: window))
                                 .monospacedDigit()
+                                .layoutPriority(2)
                         }
                         UsageBarView(window: window)
                         if window.stale {
@@ -514,6 +632,22 @@ struct ActiveMarkerView: View {
                 .help(caption)
                 .accessibilityLabel("Marked active, pending — \(caption)")
         }
+    }
+}
+
+/// Issue #65: duplicate-token marker — the daemon's usage-fingerprint check
+/// flagged this account as sharing a login with another profile. Same
+/// hollow-marker treatment as the pending active marker (#55/#62): hollow
+/// warning-tinted glyph, tooltip with the honest caption, VoiceOver carries
+/// the state. Renders on every flagged row — deck popover and Settings →
+/// Accounts alike — because the problem is per-account, not per-selection.
+struct DuplicateTokenMarkerView: View {
+    var body: some View {
+        Image(systemName: "exclamationmark.circle")
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(severityColor(.warning))
+            .help(DuplicateTokenMarker.caption)
+            .accessibilityLabel(DuplicateTokenMarker.accessibilityLabel)
     }
 }
 

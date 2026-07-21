@@ -504,6 +504,17 @@ struct DeckBuilderTests {
         #expect(!beyondWeek.contains("PST"), "date-only form stays zone-free: \(beyondWeek)")
     }
 
+    // Issue #67: the hover-tooltip backstop — the FULL absolute timestamp
+    // (weekday, date, clock time, zone) on every reset text.
+    @Test func absoluteResetTextCarriesWeekdayDateTimeAndZone() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "America/Los_Angeles")!
+        // 1_800_000_000 = 2027-01-15T08:00:00Z = Fri Jan 15, midnight PST.
+        let text = DeckBuilder.absoluteResetText(for: now, calendar: calendar)
+        #expect(text == "Fri Jan 15, 12:00 AM PST", "got \(String(describing: text))")
+        #expect(DeckBuilder.absoluteResetText(for: nil) == nil)
+    }
+
     @Test func lenientDateParsing() {
         #expect(DeckDateParsing.date(from: "2027-01-15T06:00:00Z") != nil)
         #expect(DeckDateParsing.date(from: "2027-01-15T06:00:00.123Z") != nil)
@@ -527,6 +538,22 @@ struct DeckPopoverModelTests {
         let model = DeckPopoverModel(defaults: freshDefaults())
         #expect(model.layout == .twoColumn)
         #expect(model.sortOrder == .nextReset)
+    }
+
+    // Issue #73: deck email visibility is opt-in — the toggle MUST default
+    // off (restores the pre-#62 look) and persist app-locally.
+    @Test func showAccountEmailsDefaultsOff() {
+        let model = DeckPopoverModel(defaults: freshDefaults())
+        #expect(model.showAccountEmails == false)
+    }
+
+    @Test func showAccountEmailsPersistsAcrossInstances() {
+        let defaults = freshDefaults()
+        let model = DeckPopoverModel(defaults: defaults)
+        model.showAccountEmails = true
+        #expect(DeckPopoverModel(defaults: defaults).showAccountEmails == true)
+        model.showAccountEmails = false
+        #expect(DeckPopoverModel(defaults: defaults).showAccountEmails == false)
     }
 
     @Test func layoutAndSortPersistAcrossInstances() {
@@ -643,22 +670,11 @@ struct MenuBarStatusModelDeckStateTests {
     }
 }
 
+// The vector brand-mark paths this suite used to cover were replaced by the
+// official desktop-app icons (issue #103) — see ProviderIconTests. The SVG
+// parser itself stays as a utility.
 @Suite("ProviderMarks")
 struct ProviderMarkTests {
-    @Test func brandMarkPathsParse() {
-        for provider in DeckProvider.allCases {
-            let path = ProviderMarkPaths.path(for: provider)
-            #expect(path != nil, "\(provider) mark should parse")
-            if let path {
-                let box = path.boundingBox
-                #expect(!path.isEmpty)
-                #expect(box.width > 4 && box.height > 4, "mark should have real extent")
-                #expect(box.maxX <= ProviderMarkPaths.viewBoxSize + 0.5)
-                #expect(box.maxY <= ProviderMarkPaths.viewBoxSize + 0.5)
-            }
-        }
-    }
-
     @Test func svgParserHandlesBasicCommands() {
         let path = SVGPath.cgPath("M0 0 L10 0 10 10 H0 V0 Z")
         #expect(path != nil)
@@ -708,11 +724,11 @@ private final class StubActivator: AccountActivating, @unchecked Sendable {
         self.gate = gate
     }
 
-    func activateAccount(id: String) async throws -> DeckAccount {
+    func activateAccount(id: String) async throws -> AccountActivation {
         await gate?.wait()
         let result = nextResult(recording: id)
         guard let result else { throw DaemonClientError.invalidResponse }
-        return try result.get()
+        return AccountActivation(account: try result.get())
     }
 
     private func nextResult(recording id: String) -> Result<DeckAccount, Error>? {

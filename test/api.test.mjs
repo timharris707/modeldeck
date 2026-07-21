@@ -37,6 +37,9 @@ async function startFixture(serviceOptions = {}) {
     setTimeout: () => 0,
     clearTimeout: () => {},
     platform: 'linux',
+    // Deterministic: never let the fixture shell out to /bin/ps for the
+    // issue #66 pre-flip running-session warning.
+    listProviderProcesses: async () => [],
     ...serviceOptions,
   });
   const app = createApp({ store, service, host: '127.0.0.1', port: 0 });
@@ -73,6 +76,18 @@ function requestWithHost(fixture, host) {
     req.end();
   });
 }
+
+test('retired dashboard paths return JSON 404 responses', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  for (const route of ['/', '/app.js']) {
+    const result = await request(fixture, route);
+    assert.equal(result.response.status, 404);
+    assert.match(result.response.headers.get('content-type'), /^application\/json\b/);
+    assert.deepEqual(result.body, { error: 'not found' });
+  }
+});
 
 test('health, scan, account, mapping, launch, and refresh APIs work together', async (t) => {
   const fixture = await startFixture();
@@ -170,6 +185,7 @@ test('activates Claude and Codex accounts without changing defaults when provide
   let result = await request(fixture, `/api/accounts/${secondClaude.id}/activate`, { method: 'POST', body: '{}' });
   assert.equal(result.response.status, 200);
   assert.equal(result.body.account.isDefault, true);
+  assert.deepEqual(result.body.warnings, []);
   assert.equal(result.body.activation.state, 'identity-unverified');
   assert.equal(result.body.claudeSecureStorage.value, fs.realpathSync(secondClaudeHome));
   assert.equal(result.body.claudeSecureStorage.status, 'not-applicable');
@@ -215,6 +231,17 @@ test('activates Claude and Codex accounts without changing defaults when provide
 
   const response = await fetch(`${fixture.base}/api/accounts/${secondClaude.id}/activate`, { method: 'POST' });
   assert.equal(response.status, 403);
+});
+
+test('Claude activation response warns about running unpinned sessions (issue #66)', async (t) => {
+  const fixture = await startFixture({ listProviderProcesses: async () => ['claude'] });
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  const result = await request(fixture, `/api/accounts/${claude.id}/activate`, { method: 'POST', body: '{}' });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.body.warnings.length, 1);
+  assert.match(result.body.warnings[0], /^1 running Claude session may lose session storage/);
 });
 
 test('tool probes compare versions, cache results, force refresh, and contain registry failures', async (t) => {
@@ -299,6 +326,34 @@ test('state exposes per-account auth and update endpoint returns 409 for an unsu
   assert.match(result.body.error, /unsupported direct\/native install method/);
 });
 
+// Issue #89: /api/state carries each account's last refresh failure
+// ({message, at}) and flips authState to signin-required when the failure
+// means the stored credentials are unusable — even though the presence
+// probe still sees the (expired) credentials.
+test('state surfaces per-account refresh errors and flips authState on expired stored OAuth', async (t) => {
+  const fixture = await startFixture({
+    claudeCredentialsPresent: async () => true,
+    fetchClaude: async () => {
+      throw new Error('Claude usage refresh failed: stored OAuth credentials have expired; sign in explicitly before refreshing');
+    },
+  });
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  // Before any refresh: no error field at all, presence says healthy.
+  let state = (await request(fixture, '/api/state')).body;
+  assert.equal(state.accounts[0].authState, 'ok');
+  assert.equal(state.accounts[0].lastRefreshError, undefined);
+
+  const refresh = await request(fixture, '/api/refresh', { method: 'POST', body: '{}' });
+  assert.equal(refresh.body.claude.ok, false);
+
+  state = (await request(fixture, '/api/state')).body;
+  const account = state.accounts[0];
+  assert.equal(account.authState, 'signin-required');
+  assert.match(account.lastRefreshError.message, /sign in explicitly before refreshing/);
+  assert.ok(!Number.isNaN(Date.parse(account.lastRefreshError.at)));
+});
+
 test('settings API validates partial updates and drives worst-capacity thresholds', async (t) => {
   const fixture = await startFixture();
   t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
@@ -313,6 +368,7 @@ test('settings API validates partial updates and drives worst-capacity threshold
   assert.deepEqual(result.body, {
     autoRefreshEnabled: true,
     autoRefreshIntervalSeconds: 300,
+    autoRefreshIntervalCustomized: false,
     pauseWhileActive: true,
     layout: 'two-column',
     defaultSort: 'next-reset',
@@ -355,6 +411,13 @@ test('settings API validates partial updates and drives worst-capacity threshold
 test('add-account flow: create, login spec, verify, and reference-only delete', async (t) => {
   const readCalls = { claude: 0, codex: 0 };
   const fixture = await startFixture({
+    // Issue #99: pin the detected CLI below the resolved-home floor so the
+    // login spec deterministically exercises the legacy env-scoped flow
+    // (never the machine's real `claude --version`).
+    exec: async (_binary, args) => {
+      if (args?.[0] === '--version') return { stdout: 'Claude Code 2.1.215' };
+      return { stdout: '' };
+    },
     readClaudeAuth: async ({ claudeConfigDir }) => {
       readCalls.claude += 1;
       readCalls.claudeConfigDir = claudeConfigDir;
@@ -390,14 +453,20 @@ test('add-account flow: create, login spec, verify, and reference-only delete', 
   assert.equal(result.response.status, 201);
   const claudeAccount = result.body.account;
 
-  // Step 2: login specs are provider-owned commands, never logouts.
+  // Step 2: login specs are provider-owned commands, never logouts. On a
+  // pre-2.1.216 CLI the Claude spec stays env-scoped (issue #99).
   result = await request(fixture, `/api/accounts/${claudeAccount.id}/login`);
   assert.equal(result.response.status, 200);
   assert.match(result.body.command, /CLAUDE_CONFIG_DIR=.*claude.* auth login$/);
   assert.ok(!result.body.command.includes('logout'));
+  assert.equal(result.body.flow, 'config-dir');
+  assert.equal(result.body.requiresActivation, false);
   result = await request(fixture, `/api/accounts/${codexAccount.id}/login`);
   assert.match(result.body.command, /CODEX_HOME=.*codex.* login$/);
   assert.ok(!result.body.command.includes('logout'));
+  // Codex steering is unaffected by #99 — no flow marker.
+  assert.equal('flow' in result.body, false);
+  assert.equal('requiresActivation' in result.body, false);
   result = await request(fixture, '/api/accounts/nope/login');
   assert.equal(result.response.status, 404);
 
@@ -444,6 +513,50 @@ test('add-account flow: create, login spec, verify, and reference-only delete', 
   result = await request(fixture, `/api/accounts/${codexAccount.id}`, { method: 'DELETE' });
   assert.equal(result.body.deleted, true);
   assert.ok(fs.existsSync(codexAccount.profileRef));
+});
+
+// Issue #99: on Claude Code >= 2.1.216 credentials key off the resolved
+// ~/.claude, so the login spec must be activation-driven (plain
+// `claude /login`, no env override) and verify must refuse a read-back
+// identity that contradicts the intended account instead of laundering it.
+test('resolved-home CLI: activation-driven login spec and identity-mismatch refusal', async (t) => {
+  const fixture = await startFixture({
+    exec: async (_binary, args) => {
+      if (args?.[0] === '--version') return { stdout: 'Claude Code 2.1.216' };
+      return { stdout: '' };
+    },
+    readClaudeAuth: async () => ({
+      authenticated: true,
+      identity: 'other@example.invalid',
+      plan: { subscriptionType: 'max', rateLimitTier: 'default_claude_max_20x' },
+    }),
+  });
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  const seeded = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  fixture.store.saveAccount({ ...seeded, identity: 'intended@example.invalid' });
+
+  // The spec drives sign-in through activation, never through env scoping.
+  let result = await request(fixture, `/api/accounts/${seeded.id}/login`);
+  assert.equal(result.response.status, 200);
+  assert.equal(result.body.flow, 'activation');
+  assert.equal(result.body.requiresActivation, true);
+  assert.match(result.body.command, /claude.* \/login$/);
+  assert.ok(!result.body.command.includes('CLAUDE_CONFIG_DIR'));
+  assert.ok(!result.body.command.includes('logout'));
+
+  // Post-login read-back disagrees with the intended account: the response
+  // names the mismatch, reports no bare success, and records nothing.
+  result = await request(fixture, `/api/accounts/${seeded.id}/verify`, { method: 'POST' });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.body.authenticated, true);
+  assert.deepEqual(result.body.identityMismatch, {
+    expected: 'intended@example.invalid',
+    actual: 'other@example.invalid',
+  });
+  const stored = fixture.store.getAccount(seeded.id);
+  assert.equal(stored.identity, 'intended@example.invalid');
+  assert.equal(stored.metadata.claudePlan, undefined);
 });
 
 test('codex profile homes outside the managed directory are rejected end to end', async (t) => {

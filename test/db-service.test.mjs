@@ -107,6 +107,84 @@ test('Claude refresh records native usage without rewriting ModelDeck presentati
   } finally { data.close(); }
 });
 
+test('Claude refresh sets and clears duplicate-token account health', async () => {
+  const data = fixture();
+  try {
+    let duplicate = true;
+    const service = new ModelDeckService(data.store, {
+      fetchClaude: async ({ claudeConfigDir }) => [{
+        scope: 'weekly',
+        usedPercent: 25,
+        resetsAt: duplicate || path.basename(claudeConfigDir) === 'business'
+          ? '2026-07-25T20:00:00.100Z'
+          : '2026-07-26T20:00:00.100Z',
+        source: 'fixture',
+      }],
+      claudeCredentialsPresent: async () => true,
+    });
+
+    await service.refreshClaude();
+    let accounts = (await service.state()).accounts.filter((account) => account.provider === 'claude');
+    assert.deepEqual(accounts.map((account) => account.authState), ['duplicate-token', 'duplicate-token']);
+
+    duplicate = false;
+    await service.refreshClaude();
+    accounts = (await service.state()).accounts.filter((account) => account.provider === 'claude');
+    assert.deepEqual(accounts.map((account) => account.authState), ['ok', 'ok']);
+  } finally { data.close(); }
+});
+
+test('duplicate-token flag survives incomplete refreshes and invalidates the tool probe on transitions', async () => {
+  const data = fixture();
+  try {
+    let mode = 'duplicate';
+    const service = new ModelDeckService(data.store, {
+      fetchClaude: async ({ claudeConfigDir }) => {
+        const profile = path.basename(claudeConfigDir);
+        if (mode === 'partial' && profile === 'personal') throw new Error('transient probe failure');
+        return [{
+          scope: 'weekly',
+          usedPercent: 25,
+          resetsAt: mode === 'separated' && profile === 'personal'
+            ? '2026-07-26T20:00:00.000Z'
+            : '2026-07-25T20:00:00.000Z',
+          source: 'fixture',
+        }];
+      },
+      claudeCredentialsPresent: async () => true,
+    });
+    let invalidations = 0;
+    const originalInvalidate = service.invalidateToolProbe.bind(service);
+    service.invalidateToolProbe = () => { invalidations += 1; originalInvalidate(); };
+    const claudeAuthStates = async () => (await service.state()).accounts
+      .filter((account) => account.provider === 'claude')
+      .map((account) => account.authState);
+
+    await service.refreshClaude();
+    assert.deepEqual(await claudeAuthStates(), ['duplicate-token', 'duplicate-token']);
+    assert.equal(invalidations, 1);
+
+    // A refresh where one flagged account fails to fetch is not evidence the
+    // fingerprints separated — flags must persist, and no probe churn.
+    mode = 'partial';
+    await service.refreshClaude();
+    assert.deepEqual(await claudeAuthStates(), ['duplicate-token', 'duplicate-token']);
+    assert.equal(invalidations, 1);
+
+    // Steady state with unchanged duplicate evidence: no probe churn either.
+    mode = 'duplicate';
+    await service.refreshClaude();
+    assert.equal(invalidations, 1);
+
+    // Real divergence (re-login separated the fingerprints) clears both flags
+    // and invalidates the cached provider authState.
+    mode = 'separated';
+    await service.refreshClaude();
+    assert.deepEqual(await claudeAuthStates(), ['ok', 'ok']);
+    assert.equal(invalidations, 2);
+  } finally { data.close(); }
+});
+
 // Issue #26 (Claude half): the refresh pass keeps the plan tier fresh from
 // the profile's local .claude.json — no extra provider calls, persisted only
 // on change.

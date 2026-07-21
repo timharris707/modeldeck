@@ -17,6 +17,14 @@ export const CLAUDE_PROFILES_DIR = path.resolve(
 export const CLAUDE_ACTIVE_LINK = path.resolve(
   process.env.MODELDECK_CLAUDE_ACTIVE_LINK || path.join(os.homedir(), '.claude'),
 );
+// Issue #66: shell snippet the install-shell-env.sh block sources so new
+// terminal sessions launch pinned to the active profile real path. The
+// generated ~/.zshenv block honors the same MODELDECK_CLAUDE_SHELL_ENV_FILE
+// override with the same default, so the daemon's write path and the path
+// shells source can never diverge; keep both sides in sync.
+export const CLAUDE_SHELL_ENV_FILE = path.resolve(
+  process.env.MODELDECK_CLAUDE_SHELL_ENV_FILE || path.join(DATA_DIR, 'claude-env.sh'),
+);
 export const CODEX_PATH = process.env.MODELDECK_CODEX_PATH || 'codex';
 // Owner-only per-account CODEX_HOME directories created by the add-account
 // flow (docs/ACCOUNT_ONBOARDING.md "Codex onboarding").
@@ -26,4 +34,3 @@ export const CODEX_PROFILES_DIR = path.resolve(
 export const CODEX_ACTIVE_LINK = path.resolve(
   process.env.MODELDECK_CODEX_ACTIVE_LINK || path.join(os.homedir(), '.codex'),
 );
-export const PUBLIC_DIR = path.resolve(new URL('../public', import.meta.url).pathname);

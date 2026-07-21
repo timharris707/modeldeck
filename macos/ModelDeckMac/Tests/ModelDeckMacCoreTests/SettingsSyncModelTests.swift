@@ -164,4 +164,92 @@ struct SettingsSyncModelTests {
         #expect(object?["pauseWhileActive"] as? Bool == false)
         #expect(object?["defaultSort"] as? String == "lowest-remaining")
     }
+
+    // MARK: - Interval provenance (issue #90)
+
+    @Test func intervalSelectionCarriesTheProvenanceFlag() async throws {
+        var merged = DaemonSettings.defaults
+        merged.autoRefreshIntervalSeconds = 600
+        merged.autoRefreshIntervalCustomized = true
+        let sync = StubSettingsSync(results: [.success(merged)])
+        let model = SettingsSyncModel(sync: sync)
+
+        await model.setAutoRefreshInterval(seconds: 600)
+
+        #expect(sync.pushedPatches.count == 1)
+        #expect(sync.pushedPatches.first?.autoRefreshIntervalSeconds == 600)
+        #expect(sync.pushedPatches.first?.autoRefreshIntervalCustomized == true)
+        let data = try JSONEncoder().encode(sync.pushedPatches.first)
+        let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        #expect(object?["autoRefreshIntervalCustomized"] as? Bool == true)
+    }
+
+    @Test func rePickingTheStoredValueStillAssertsProvenanceWhileUncustomized() async {
+        // Tim's case: the deliberate choice IS the default 300s. The picker
+        // selection must still reach the daemon so the flag flips and the
+        // active-session cap lifts permanently.
+        var merged = DaemonSettings.defaults
+        merged.autoRefreshIntervalCustomized = true
+        let sync = StubSettingsSync(results: [.success(merged)])
+        let model = SettingsSyncModel(sync: sync)
+        #expect(model.settings.autoRefreshIntervalCustomized == false)
+
+        await model.setAutoRefreshInterval(seconds: 300)
+
+        #expect(sync.pushedPatches.count == 1)
+        #expect(sync.pushedPatches.first?.autoRefreshIntervalSeconds == 300)
+        #expect(sync.pushedPatches.first?.autoRefreshIntervalCustomized == true)
+        #expect(model.settings.autoRefreshIntervalCustomized == true)
+    }
+
+    @Test func confirmedProvenanceMakesUnchangedSelectionsNoOpsAgain() async {
+        // Echo-loop safety is restored once the daemon confirms the flag:
+        // an unchanged value with the flag already true never PUTs.
+        var document = DaemonSettings.defaults
+        document.autoRefreshIntervalCustomized = true
+        let sync = StubSettingsSync(results: [.success(document)])
+        let model = SettingsSyncModel(sync: sync)
+        await model.load()
+
+        await model.setAutoRefreshInterval(seconds: 300)
+
+        #expect(sync.pushedPatches.isEmpty)
+    }
+
+    @Test func oldDaemonRejectingTheFlagGetsARetryWithoutIt() async {
+        // Pre-#90 daemons reject unknown settings keys. The interval choice
+        // must survive: strip the provenance flag and retry once.
+        var merged = DaemonSettings.defaults
+        merged.autoRefreshIntervalSeconds = 600
+        let sync = StubSettingsSync(results: [
+            .failure(DaemonClientError.daemonError(
+                message: "unknown setting: autoRefreshIntervalCustomized", status: 400
+            )),
+            .success(merged),
+        ])
+        let model = SettingsSyncModel(sync: sync)
+
+        await model.setAutoRefreshInterval(seconds: 600)
+
+        #expect(sync.pushedPatches.count == 2)
+        #expect(sync.pushedPatches.last?.autoRefreshIntervalSeconds == 600)
+        #expect(sync.pushedPatches.last?.autoRefreshIntervalCustomized == nil)
+        #expect(model.settings.autoRefreshIntervalSeconds == 600)
+        #expect(model.lastError == nil)
+    }
+
+    @Test func settingsDecodeToleratesTheMissingProvenanceKey() throws {
+        // Old daemons omit the key entirely — reads as false (uncustomized).
+        let old = try JSONDecoder().decode(
+            DaemonSettings.self,
+            from: Data(#"{"autoRefreshIntervalSeconds": 300}"#.utf8)
+        )
+        #expect(old.autoRefreshIntervalCustomized == false)
+
+        let new = try JSONDecoder().decode(
+            DaemonSettings.self,
+            from: Data(#"{"autoRefreshIntervalSeconds": 300, "autoRefreshIntervalCustomized": true}"#.utf8)
+        )
+        #expect(new.autoRefreshIntervalCustomized == true)
+    }
 }

@@ -99,6 +99,15 @@ struct AddAccountSheet: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Terminal is running \(providerDisplayName)'s login for this profile. Complete the sign-in in your browser exactly as normal, then come back here.")
                 .fixedSize(horizontal: false, vertical: true)
+            if model.didActivateForLogin {
+                // Issue #99: current Claude Code stores the credential in
+                // whichever profile is active, so the flow flipped
+                // activation to the new profile for this sign-in.
+                Text("ModelDeck activated this profile so the sign-in lands in the right account (required by current \(providerDisplayName) versions). If another profile was active, it's restored after verification.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if let command = model.loginCommand {
                 GroupBox {
                     HStack(alignment: .top) {

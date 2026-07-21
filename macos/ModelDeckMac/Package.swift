@@ -14,7 +14,16 @@ let package = Package(
         .executable(name: "ModelDeckMac", targets: ["ModelDeckMac"])
     ],
     targets: [
-        .target(name: "ModelDeckMacCore"),
+        .target(
+            name: "ModelDeckMacCore",
+            resources: [
+                // Issue #103: official provider desktop-app icons
+                // (provider-{claude,codex}-{32,64,128}.png). The build
+                // scripts stage the generated ModelDeckMac_ModelDeckMacCore
+                // .bundle into the app's Contents/Resources.
+                .process("Resources")
+            ]
+        ),
         .executableTarget(
             name: "ModelDeckMac",
             dependencies: ["ModelDeckMacCore"]

@@ -10,6 +10,8 @@
 	<string>app.modeldeck.mac</string>
 	<key>CFBundleExecutable</key>
 	<string>ModelDeckMac</string>
+	<key>CFBundleIconFile</key>
+	<string>ModelDeck</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

@@ -4,7 +4,74 @@ All notable changes to ModelDeck are documented here. Versioning follows the
 roadmap in `design/mac-app-roadmap.md`: `v0.1-web` tags the retired web MVP,
 and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 
-## Unreleased
+## 0.3.0 — 2026-07-21
+
+### Fixed
+- **Your refresh interval now always wins over active CLI sessions (issue
+  #90, Tim's design call)**: pause-while-active used to clamp scheduled
+  refresh to every 30 minutes whenever any `claude`/`codex` process ran —
+  silently overriding the configured interval exactly when usage was
+  burning. The cap now applies ONLY until you have ever explicitly chosen a
+  refresh interval (a new persisted `autoRefreshIntervalCustomized` flag,
+  set permanently the first time a settings write *changes* the interval or
+  the Settings pane asserts a selection — a "Keep N min" affordance in the
+  Refresh section confirms your current value explicitly, since a picker
+  cannot re-fire on the already-selected row). While the cap applies, the
+  scheduler runs `max(configured, 30 min)` — it slows fast cadences but
+  never polls faster than you configured — and the deck footer shows an
+  honest "Auto-refresh slowed" indicator whose tooltip explains it,
+  `/api/state` reports the effective cadence
+  (`scheduler.effectiveRefreshIntervalSeconds` + `effectiveRefreshReason`,
+  derived from the same function the scheduler runs), and stale markers key
+  on the effective interval so slowed refresh is never mislabeled as stale
+  data. **Migration note:** existing installs start with the flag unset, so
+  the cap still applies once — pick any interval in Settings, or click
+  "Keep" next to your current one, and it is lifted permanently; the new
+  indicator makes this discoverable.
+- **CRITICAL — per-profile sign-in on Claude Code ≥ 2.1.216 (issue #99)**:
+  current Claude Code keys Keychain credential storage off the resolved
+  `~/.claude`, ignoring `CLAUDE_CONFIG_DIR`/`CLAUDE_SECURESTORAGE_CONFIG_DIR`,
+  so the old env-scoped login guidance silently overwrote the ACTIVE
+  profile's credentials. The daemon now version-detects the installed CLI and
+  drives sign-ins through activation on affected versions (activate target →
+  plain `claude /login` → verify → restore prior active); both app sign-in
+  flows (add-account step 2/3 and the roster's "Sign in again") follow the
+  daemon's spec. Post-login verification now has teeth: the verify endpoint
+  compares the read-back identity against the intended account and refuses
+  the sign-in on mismatch (`identityMismatch` in the response, surfaced
+  loudly in the app) instead of recording the wrong login. `GET /api/tools`
+  additionally reports `credentialScoping` ("config-dir" / "resolved-home")
+  for the installed Claude CLI.
+
+### Added
+- Per-account staleness surfacing (issue #89): deck cards whose newest
+  snapshot is older than ~2x the effective refresh interval now carry a
+  visible warning-tinted "Data from N hr ago" line with a tooltip naming the
+  account's last refresh error; the daemon propagates per-account refresh
+  failures into `/api/state` (`lastRefreshError: {message, at}`); an
+  expired-stored-OAuth failure flips that account's health chip to "Sign in
+  again" even though the credential presence probe still sees the (expired)
+  credentials; the popover footer now reads "Oldest data N min ago", keyed
+  on the account whose data is oldest, so one silently failing account can
+  no longer hide behind fresh siblings.
+- DMG installer art (issue #69): the release DMG now opens as a proper
+  drag-to-Applications installer — deck-glyph brand mark, arrow, dashed
+  drop-zone ring on a committed background (`design/dmg/`), window sized and
+  icons pinned via a vendored Finder `.DS_Store`
+  (`scripts/generate-dmg-background.swift`,
+  `scripts/generate-dmg-ds-store.sh`). Volume name is now the fixed
+  "ModelDeck" (version stays in the DMG filename).
+
+### Changed
+- Retired the legacy `public/` web dashboard and its static-file routes. The
+  daemon is now API-only, and the native macOS menu-bar app is the sole
+  graphical interface; old dashboard paths return JSON 404 responses.
+- Retired the Mac mini staging deployment from the supported architecture;
+  the local laptop daemon now serves the native app.
+- README rewritten for the public mirror (issue #86): release-first install
+  (latest release DMG from Releases, daemon via launch agent), hero local-first/
+  no-telemetry callout, feature list matching the current app,
+  build-from-source demoted to Development, modeldeck.ai linked.
 
 ## 0.2.1 — Real Claude identity switching + launch polish
 
@@ -103,8 +170,9 @@ The native macOS menu bar app reaches parity with the web dashboard
   and requests notification authorization lazily on first use.
 
 ### Changed
-- `VERSION`/`package.json` to 0.2.0. The web dashboard retirement and the
-  add-account flow remain scheduled for later phases (issues #8, #9).
+- `VERSION`/`package.json` to 0.2.0. At release time, the web dashboard
+  retirement and add-account flow remained scheduled for later phases
+  (issues #8, #9).
 
 ## 0.1.1 — Phase 1: Persistence & service on the laptop (unreleased)
 

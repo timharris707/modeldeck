@@ -22,6 +22,11 @@ struct SettingsWindowView: View {
     @ObservedObject var appUpdateModel: AppUpdateModel
     /// Issue #60: the "Check for updates automatically" toggle's model.
     @ObservedObject var appUpdateAutoChecker: AppUpdateAutoChecker
+    /// Issue #96: bundled background-service status + legacy takeover.
+    @ObservedObject var daemonSetupModel: DaemonSetupModel
+    /// Shared launch-at-login state; the SMAppService status read lives in
+    /// the model's load(), not in any view-struct initializer.
+    @ObservedObject var launchAtLoginModel: LaunchAtLoginModel
 
     var body: some View {
         TabView {
@@ -38,9 +43,12 @@ struct SettingsWindowView: View {
                 settingsSync: settingsSync,
                 toolsModel: toolsModel,
                 statusModel: statusModel,
+                deckModel: deckModel,
                 updateModel: updateModel,
                 appUpdateModel: appUpdateModel,
-                appUpdateAutoChecker: appUpdateAutoChecker
+                appUpdateAutoChecker: appUpdateAutoChecker,
+                daemonSetupModel: daemonSetupModel,
+                launchAtLoginModel: launchAtLoginModel
             )
             .tabItem { Label("General", systemImage: "gearshape") }
         }
@@ -57,6 +65,12 @@ struct SettingsWindowView: View {
 
 // MARK: - Accounts pane
 
+/// Direction A (accounts-screen redesign, issue #61 thread): per-provider
+/// Sections with a trailing radio control for activation. Healthy rows are
+/// silent; Edit/Remove live in a context menu + hover ⋯; ALL activation
+/// trouble consolidates into one amber banner at the affected provider's
+/// section header. The activation machinery itself (optimistic flip,
+/// verify-then-revert, new-sessions-only) is untouched.
 struct AccountsSettingsPane: View {
     @ObservedObject var statusModel: MenuBarStatusModel
     @ObservedObject var accountsModel: AccountsSettingsModel
@@ -68,24 +82,14 @@ struct AccountsSettingsPane: View {
     @State private var removalCandidate: DeckAccount?
     @State private var isAddingAccount = false
 
-    private var accounts: [DeckAccount] {
-        let all = statusModel.deckState?.accounts ?? []
-        // Claude column order first, then Codex, then anything unknown —
-        // stable, mirrors the popover.
-        return all.sorted { lhs, rhs in
-            let l = providerRank(lhs.provider)
-            let r = providerRank(rhs.provider)
-            if l != r { return l < r }
-            return lhs.label.localizedCaseInsensitiveCompare(rhs.label) == .orderedAscending
-        }
-    }
-
-    private func providerRank(_ raw: String) -> Int {
-        switch DeckProvider.from(raw) {
-        case .claude: return 0
-        case .codex: return 1
-        case nil: return 2
-        }
+    private var sections: [AccountsRosterSection] {
+        guard let state = statusModel.deckState else { return [] }
+        return AccountsRoster.sections(
+            state: state,
+            guidanceForAccount: { deckModel.blockedActivationGuidance(for: $0) },
+            errorForAccount: { deckModel.activationError(for: $0) },
+            warningsForProvider: { deckModel.postActivationWarnings(for: $0) }
+        )
     }
 
     var body: some View {
@@ -97,23 +101,8 @@ struct AccountsSettingsPane: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 10)
             }
-            // Issue #55 item 3: when a provider's verified activation state
-            // isn't effective, say honestly what works (usage tracking) and
-            // what doesn't (switching accounts) until the one-time migration
-            // runs. Display + guidance only — no migration control here.
-            if let state = statusModel.deckState {
-                let notices = ActivationNotice.notices(for: state)
-                if !notices.isEmpty {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(notices) { notice in
-                            ActivationNoticeView(notice: notice)
-                        }
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 10)
-                }
-            }
-            if accounts.isEmpty {
+            let sections = self.sections
+            if sections.isEmpty {
                 Spacer()
                 Text(statusModel.deckState == nil
                     ? "Waiting for the daemon…"
@@ -123,32 +112,31 @@ struct AccountsSettingsPane: View {
                 Spacer()
             } else {
                 List {
-                    ForEach(accounts) { account in
-                        AccountRosterRow(
-                            account: account,
-                            isBusy: accountsModel.busyAccountID == account.id,
-                            canEdit: AccountsSettingsModel.canEdit(account),
-                            isActivating: deckModel.activatingAccountID == account.id,
-                            isActivationInFlight: deckModel.activatingAccountID != nil,
-                            activationState: activationState(for: account),
-                            activationError: deckModel.activationError(for: account.id),
-                            blockedActivationGuidance: deckModel.blockedActivationGuidance(for: account.id),
-                            signInPhase: signInModel.phase(for: account.id),
-                            signInError: signInModel.error(for: account.id),
-                            // Issue #61: the DB-active row gets the control
-                            // too when activation is link-pending — the
-                            // Complete Activation affordance.
-                            onActivate: deckModel.canActivate
-                                && (!account.isDefault || activationState(for: account).needsLinkCompletion)
-                                ? { Task { await deckModel.activate(activationRow(for: account)) } }
-                                : nil,
-                            onSignIn: { Task { await signInModel.beginSignIn(account: account) } },
-                            onVerifySignIn: { Task { await signInModel.confirmSignedIn(account: account) } },
-                            onRelaunchSignIn: { signInModel.relaunch(accountID: account.id) },
-                            onCancelSignIn: { signInModel.cancel(accountID: account.id) },
-                            onEdit: { editingAccount = account },
-                            onRemove: { removalCandidate = account }
-                        )
+                    ForEach(sections) { section in
+                        Section {
+                            if let banner = section.banner {
+                                ProviderActivationBannerView(
+                                    banner: banner,
+                                    isActivationInFlight: deckModel.activatingAccountID != nil,
+                                    onRetry: { retry(banner: banner, in: section) }
+                                )
+                                .listRowSeparator(.hidden)
+                            }
+                            if let notice = section.notice {
+                                PostActivationNoticeView(
+                                    notice: notice,
+                                    onDismiss: {
+                                        deckModel.dismissPostActivationWarnings(for: notice.provider)
+                                    }
+                                )
+                                .listRowSeparator(.hidden)
+                            }
+                            ForEach(section.accounts) { account in
+                                accountRow(account, in: section)
+                            }
+                        } header: {
+                            AccountsSectionHeader(section: section)
+                        }
                     }
                 }
                 .listStyle(.inset)
@@ -193,6 +181,51 @@ struct AccountsSettingsPane: View {
         .task { await statusModel.refresh() }
     }
 
+    @ViewBuilder
+    private func accountRow(_ account: DeckAccount, in section: AccountsRosterSection) -> some View {
+        let state = statusModel.deckState
+        let activationState = state?.activationState(for: section.provider) ?? .unknown
+        AccountRosterRow(
+            account: account,
+            isBusy: accountsModel.busyAccountID == account.id,
+            canEdit: AccountsSettingsModel.canEdit(account),
+            isActivating: deckModel.activatingAccountID == account.id,
+            isActivationInFlight: deckModel.activatingAccountID != nil,
+            activationState: activationState,
+            isRadioPending: state.map { AccountsRoster.radioIsPending(account: account, state: $0) } ?? false,
+            signInPhase: signInModel.phase(for: account.id),
+            signInError: signInModel.error(for: account.id),
+            // The radio drives activation for non-selected rows; the
+            // selected row keeps issue #61's Complete Activation button when
+            // its activation is link-pending. Both run the SAME unchanged
+            // machinery (optimistic flip → POST → verify-or-revert).
+            onActivate: deckModel.canActivate
+                && (!account.isDefault || activationState.needsLinkCompletion)
+                ? { Task { await deckModel.activate(activationRow(for: account)) } }
+                : nil,
+            onSignIn: { Task { await signInModel.beginSignIn(account: account) } },
+            onVerifySignIn: { Task { await signInModel.confirmSignedIn(account: account) } },
+            onRelaunchSignIn: { signInModel.relaunch(accountID: account.id) },
+            onCancelSignIn: { signInModel.cancel(accountID: account.id) },
+            onEdit: { editingAccount = account },
+            onRemove: { removalCandidate = account }
+        )
+    }
+
+    /// [Retry] on the section banner: re-runs the daemon activate on the
+    /// affected account for link-level trouble; for identity trouble (which
+    /// another symlink flip can never fix) it re-reads state instead so a
+    /// fix made outside the app is picked up.
+    private func retry(banner: ProviderActivationBanner, in section: AccountsRosterSection) {
+        if banner.retryRunsActivation,
+           deckModel.canActivate,
+           let account = section.accounts.first(where: { $0.id == banner.affectedAccountID }) {
+            Task { await deckModel.activate(activationRow(for: account)) }
+        } else {
+            Task { await statusModel.refresh() }
+        }
+    }
+
     /// Minimal deck row for the activate machinery — activation only needs
     /// the account identity/active flag, not usage windows.
     private func activationRow(for account: DeckAccount) -> DeckAccountRow {
@@ -216,29 +249,166 @@ struct AccountsSettingsPane: View {
     }
 }
 
-/// One Settings → Accounts roster row. This is the activation surface (spec
-/// amendment 2026-07-19): the active account shows the same checkmark glyph
-/// as the deck; every other account gets a small trailing Activate control
-/// wired to the unchanged new-sessions-only daemon switch.
+/// Direction A section header: provider mark + name + muted account count.
+struct AccountsSectionHeader: View {
+    let section: AccountsRosterSection
+
+    var body: some View {
+        HStack(spacing: 7) {
+            ProviderMarkView(provider: section.provider, size: 15)
+            Text(section.title)
+                .font(.system(size: 11.5, weight: .semibold))
+            Text("· \(section.countText)")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
+    }
+}
+
+/// Direction A's consolidated amber banner at a provider's section header:
+/// one surface for ALL activation trouble (link-pending states, identity
+/// states, the daemon's clobber-guard guidance verbatim), with [Retry] and
+/// [Why?]. Replaces the old per-row inline alerts and the roster-top
+/// ActivationNotice strip.
+struct ProviderActivationBannerView: View {
+    let banner: ProviderActivationBanner
+    var isActivationInFlight: Bool = false
+    let onRetry: () -> Void
+
+    @State private var isShowingWhy = false
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(severityColor(.warning))
+            Text(banner.message)
+                .font(.system(size: 11))
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 6) {
+                Button("Retry", action: onRetry)
+                    .controlSize(.small)
+                    .disabled(isActivationInFlight)
+                    .help(banner.retryRunsActivation
+                        ? "Run activation again for the affected account. New sessions only — running sessions are never touched."
+                        : "Re-check the provider's activation state")
+                Button("Why?") { isShowingWhy = true }
+                    .controlSize(.small)
+                    .buttonStyle(.borderless)
+                    .popover(isPresented: $isShowingWhy, arrowEdge: .bottom) {
+                        Text(banner.detail)
+                            .font(.system(size: 11))
+                            .frame(width: 260, alignment: .leading)
+                            .padding(12)
+                    }
+                    .help(banner.detail)
+            }
+        }
+        .padding(.vertical, 7)
+        .padding(.horizontal, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(severityColor(.warning).opacity(0.10))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(severityColor(.warning).opacity(0.28))
+        )
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(banner.provider.displayName) activation notice: \(banner.message) \(banner.detail)")
+    }
+}
+
+/// Issue #93: the calm post-activation notice — the daemon warned that some
+/// already-running sessions were launched without ModelDeck's pinned
+/// environment and may lose session storage. Same visual family as the
+/// Direction A banner (amber, section-level, [Why?]) but deliberately
+/// quieter: info glyph instead of the warning triangle, a Dismiss control
+/// instead of [Retry], because the switch already completed and nothing here
+/// is actionable inside the app. VoiceOver reads ONE derived label carrying
+/// the provider, the daemon's verbatim message, and the nuance (the #79
+/// lesson: never let an explicit container label suppress the state).
+struct PostActivationNoticeView: View {
+    let notice: PostActivationNotice
+    let onDismiss: () -> Void
+
+    @State private var isShowingWhy = false
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "info.circle")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(severityColor(.warning))
+            Text(notice.message)
+                .font(.system(size: 11))
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 6) {
+                Button("Why?") { isShowingWhy = true }
+                    .controlSize(.small)
+                    .buttonStyle(.borderless)
+                    .popover(isPresented: $isShowingWhy, arrowEdge: .bottom) {
+                        Text(PostActivationNotice.detail)
+                            .font(.system(size: 11))
+                            .frame(width: 260, alignment: .leading)
+                            .padding(12)
+                    }
+                    .help(PostActivationNotice.detail)
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9))
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .help("Dismiss this notice")
+                .accessibilityLabel("Dismiss \(notice.provider.displayName) activation notice")
+            }
+        }
+        .padding(.vertical, 7)
+        .padding(.horizontal, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(severityColor(.warning).opacity(0.07))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(severityColor(.warning).opacity(0.20))
+        )
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(notice.accessibilityLabel)
+    }
+}
+
+/// One Direction A roster row: label (+ honest active marker, + quiet
+/// "seeded" provenance marker), identity line (email · purpose — always
+/// shown on this management surface), and a trailing radio (◉/○) as the
+/// activation control — the native exclusive-choice idiom, amber when
+/// selected-but-pending. Healthy rows are silent; only degraded states show
+/// a chip. Edit/Remove live in the right-click context menu and the hover ⋯
+/// menu (both paths). No color dots anywhere.
 struct AccountRosterRow: View {
     let account: DeckAccount
     let isBusy: Bool
     let canEdit: Bool
     var isActivating: Bool = false
-    /// True while ANY activation is in flight — every Activate button disables.
+    /// True while ANY activation is in flight — every activation control disables.
     var isActivationInFlight: Bool = false
     /// Issue #55: this provider's verified physical activation state — the
-    /// active row's marker renders the full checkmark only when effective
+    /// selected row's marker renders the full checkmark only when effective
     /// (or unreported by an older daemon).
     var activationState: ProviderActivationState = .unknown
-    var activationError: String?
-    /// Issue #55: the daemon's clobber-guard guidance, rendered VERBATIM as
-    /// a prominent inline alert near the row.
-    var blockedActivationGuidance: String?
+    /// Whether the radio renders the amber selected-but-pending variant.
+    var isRadioPending: Bool = false
     /// Issue #32: this account's own sign-in-again flow state.
     var signInPhase: AccountSignInModel.Phase?
     var signInError: String?
-    /// Non-nil only for non-active rows with the activator wired up.
+    /// Activation entry point: the radio for non-selected rows, the Complete
+    /// Activation button for the selected-but-link-pending row (issue #61).
     var onActivate: (() -> Void)?
     var onSignIn: (() -> Void)?
     var onVerifySignIn: (() -> Void)?
@@ -247,122 +417,152 @@ struct AccountRosterRow: View {
     let onEdit: () -> Void
     let onRemove: () -> Void
 
+    @State private var isHovered = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 10) {
-                // Provider brand mark (issue #32 item 1) — the deck's own
-                // ProviderMarkView, alongside a smaller user-color dot.
-                if let provider = DeckProvider.from(account.provider) {
-                    ProviderMarkView(provider: provider, size: 18)
-                } else {
-                    Circle()
-                        .fill(Color(hexString: account.color) ?? .secondary)
-                        .frame(width: 10, height: 10)
-                }
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(spacing: 6) {
-                        if DeckProvider.from(account.provider) != nil {
-                            Circle()
-                                .fill(Color(hexString: account.color) ?? .secondary)
-                                .frame(width: 7, height: 7)
-                                .accessibilityHidden(true)
-                        }
                         Text(account.label)
                             .font(.system(size: 12.5, weight: .semibold))
                         if account.isDefault {
                             ActiveMarkerView(indicator: ActiveIndicator.indicator(for: activationState))
                         }
+                        if account.hasDuplicateToken {
+                            // Issue #65: the usage-fingerprint check says two
+                            // profiles hold the same login — hollow marker
+                            // here, details in the section banner below.
+                            DuplicateTokenMarkerView()
+                        }
+                        if account.isIdentitySeeded {
+                            Text("seeded")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1.5)
+                                .background(Capsule().fill(Color.primary.opacity(0.08)))
+                                .help("Identity was entered at setup and hasn't been verified against the provider yet")
+                                .accessibilityLabel("Identity seeded at setup, not yet verified")
+                        }
                     }
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                    if let subtitle = account.rosterSubtitle {
+                        Text(subtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                 }
                 Spacer()
                 signInControls
                 if isBusy || isActivating {
                     ProgressView().controlSize(.small)
                 }
-                // Issue #61: the DB-active row shows "Complete Activation"
-                // when its activation is link-pending (before, the control
-                // was simply hidden there and finishing required a raw API
-                // call); every other row keeps the plain Activate switch.
-                if let onActivate {
-                    Button(account.isDefault ? "Complete Activation" : "Activate", action: onActivate)
+                // Issue #61 semantics kept: the selected row shows Complete
+                // Activation when its activation is link-pending (blocked/
+                // mismatched/unlinked) — the radio can't re-select an
+                // already-selected account, so the button carries the finish.
+                if account.isDefault, activationState.needsLinkCompletion, let onActivate {
+                    Button("Complete Activation", action: onActivate)
                         .controlSize(.small)
                         .disabled(isBusy || isActivating || isActivationInFlight)
-                        .help(account.isDefault
-                            ? "This account is selected as active but activation isn't in effect yet. Once any blocker is cleared, this lays the active link for new sessions. Running sessions are never touched."
-                            : "Switch \(DeckProvider.from(account.provider)?.displayName ?? "this provider") to this account for new sessions. Running sessions are never touched.")
-                        .accessibilityLabel(account.isDefault
-                            ? "Complete activation for \(account.label)"
-                            : "Activate \(account.label)")
+                        .help("This account is selected as active but activation isn't in effect yet. Once any blocker is cleared, this lays the active link for new sessions. Running sessions are never touched.")
+                        .accessibilityLabel("Complete activation for \(account.label)")
                 }
-                Button("Edit", action: onEdit)
-                    .controlSize(.small)
-                    .disabled(isBusy || !canEdit)
-                    .help(canEdit
-                        ? "Rename, set purpose, or change color"
-                        : "This account can't be edited — the daemon didn't report its profile reference")
-                Button("Remove", role: .destructive, action: onRemove)
-                    .controlSize(.small)
-                    .disabled(isBusy)
-            }
-            if let blockedActivationGuidance {
-                // Issue #55 item 2: the clobber-guard refusal surfaces
-                // prominently — a calm, warning-tinted inline alert carrying
-                // the daemon's guidance verbatim (never a silent failure).
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(severityColor(.warning))
-                    Text(blockedActivationGuidance)
-                        .font(.system(size: 10.5))
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textSelection(.enabled)
+                // Hover ⋯ — the visible path to Edit/Remove (the row's
+                // right-click context menu is the second path).
+                Menu {
+                    editRemoveActions
+                } label: {
+                    Image(systemName: "ellipsis")
                 }
-                .padding(8)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(severityColor(.warning).opacity(0.10))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .strokeBorder(severityColor(.warning).opacity(0.25))
-                )
-                .padding(.leading, 28)
-                .padding(.top, 4)
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("Activation blocked: \(blockedActivationGuidance)")
-            }
-            if let activationError {
-                Text(activationError)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.leading, 28)
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .opacity(isHovered ? 1 : 0)
+                .help("Edit or remove this account (also on right-click)")
+                .accessibilityLabel("Actions for \(account.label)")
+                radio
             }
             if let signInError {
                 Text(signInError)
                     .font(.system(size: 10))
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
-                    .padding(.leading, 28)
             }
         }
         .padding(.vertical, 3)
+        .contentShape(Rectangle())
+        .onHover { isHovered = $0 }
+        .contextMenu { editRemoveActions }
     }
 
-    /// Per-account health chip + the sign-in-again flow it launches (issue
-    /// #32 items 2 and 5). The chip reads this account's OWN `authState`;
-    /// "Sign in again" is clickable and drives the Terminal login flow.
+    /// The trailing activation radio (◉/○) — one active account per
+    /// provider, made structural. Amber ring + dot when the selection isn't
+    /// physically in effect yet. Tooltips carry the new-sessions-only nuance.
+    private var radio: some View {
+        let color: Color = isRadioPending ? severityColor(.warning) : .accentColor
+        return Button {
+            if !account.isDefault { onActivate?() }
+        } label: {
+            ZStack {
+                Circle()
+                    .strokeBorder(account.isDefault ? color : Color.secondary, lineWidth: 1.5)
+                    .frame(width: 15, height: 15)
+                if account.isDefault {
+                    Circle()
+                        .fill(color)
+                        .frame(width: 7, height: 7)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(account.isDefault || onActivate == nil
+            || isBusy || isActivating || isActivationInFlight)
+        .help(radioHelp)
+        .accessibilityLabel(radioAccessibilityLabel)
+        .accessibilityAddTraits(account.isDefault ? [.isSelected] : [])
+    }
+
+    private var radioHelp: String {
+        let providerName = DeckProvider.from(account.provider)?.displayName ?? "this provider"
+        if account.isDefault {
+            return isRadioPending
+                ? "Selected as active, but activation isn't in effect yet — see the notice above. New sessions keep the previous account until activation completes."
+                : "Active — new \(providerName) sessions use this account. Running sessions are never touched."
+        }
+        return onActivate == nil
+            ? "Activation isn't available right now."
+            : "Activate \(account.label) for new \(providerName) sessions. Running sessions are never touched."
+    }
+
+    private var radioAccessibilityLabel: String {
+        if account.isDefault {
+            return isRadioPending
+                ? "\(account.label), selected as active, activation pending"
+                : "\(account.label), active"
+        }
+        return "Activate \(account.label)"
+    }
+
+    @ViewBuilder
+    private var editRemoveActions: some View {
+        Button("Edit…", action: onEdit)
+            .disabled(isBusy || !canEdit)
+        Button("Remove…", role: .destructive, action: onRemove)
+            .disabled(isBusy)
+    }
+
+    /// Sign-in-again flow (issue #32). Direction A: healthy rows are SILENT
+    /// — the chip appears only for the degraded sign-in-required state (and
+    /// stays clickable); "Healthy"/"Unknown" render nothing.
     @ViewBuilder
     private var signInControls: some View {
         switch signInPhase {
-        case .launching, .verifying:
+        case .launching, .activating, .verifying:
             HStack(spacing: 5) {
                 ProgressView().controlSize(.small)
-                Text(signInPhase == .verifying ? "Verifying…" : "Opening Terminal…")
+                Text(signInProgressText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -386,55 +586,40 @@ struct AccountRosterRow: View {
                 .accessibilityLabel("Cancel sign-in for \(account.label)")
             }
         case nil:
-            if account.healthChip == .signInAgain, let onSignIn {
-                Button(action: onSignIn) {
-                    HealthChipView(chip: account.healthChip)
+            if account.healthChip == .signInAgain {
+                if let onSignIn {
+                    Button(action: onSignIn) {
+                        HealthChipView(chip: .signInAgain)
+                    }
+                    .buttonStyle(.plain)
+                    .help(signInAgainHelp(
+                        base: "Launch \(DeckProvider.from(account.provider)?.displayName ?? "the provider")'s own login for this account in Terminal"
+                    ))
+                    .accessibilityLabel("Sign in again: \(account.label)")
+                } else {
+                    HealthChipView(chip: .signInAgain)
+                        .help(signInAgainHelp(base: "This account needs a fresh sign-in"))
                 }
-                .buttonStyle(.plain)
-                .help("Launch \(DeckProvider.from(account.provider)?.displayName ?? "the provider")'s own login for this account in Terminal")
-                .accessibilityLabel("Sign in again: \(account.label)")
-            } else {
-                HealthChipView(chip: account.healthChip)
-                    .help(account.authState == nil
-                        ? "The daemon didn't report this account's auth state"
-                        : "This account's own sign-in state")
             }
         }
     }
 
-    private var subtitle: String {
-        var parts: [String] = []
-        parts.append(DeckProvider.from(account.provider)?.displayName ?? account.provider)
-        if let identity = account.identity, !identity.isEmpty { parts.append(identity) }
-        if let purpose = account.purpose, !purpose.isEmpty { parts.append(purpose) }
-        return parts.joined(separator: " · ")
-    }
-}
-
-/// Issue #55 item 3: compact per-provider notice above the roster when the
-/// provider's activation isn't physically effective. Calm, informational
-/// tone (restraint bar — no scary red banners): usage tracking works today;
-/// account switching waits on the one-time migration.
-struct ActivationNoticeView: View {
-    let notice: ActivationNotice
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
-            ProviderMarkView(provider: notice.provider, size: 13)
-            Text(notice.message)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+    /// Issue #99: `.activating` names the pre-login account flip honestly
+    /// instead of pretending Terminal is already opening.
+    private var signInProgressText: String {
+        switch signInPhase {
+        case .verifying: return "Verifying…"
+        case .activating: return "Activating this account for sign-in…"
+        default: return "Opening Terminal…"
         }
-        .padding(.vertical, 6)
-        .padding(.horizontal, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(Color.primary.opacity(0.05))
-        )
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(notice.provider.displayName) activation notice: \(notice.message)")
+    }
+
+    /// Issue #89: the chip's tooltip carries the daemon's per-account
+    /// refresh error verbatim when one was reported — the WHY behind the
+    /// "Sign in again", not just the state.
+    private func signInAgainHelp(base: String) -> String {
+        guard let message = account.lastRefreshError?.message, !message.isEmpty else { return base }
+        return "\(base)\nLast refresh failed: \(message)"
     }
 }
 
@@ -523,6 +708,9 @@ struct GeneralSettingsPane: View {
     /// Issue #32 item 4: the CLI-row chip is the ACTIVE account's auth state
     /// (daemon contract), so the row names that account explicitly.
     @ObservedObject var statusModel: MenuBarStatusModel
+    /// Issue #73: owns the app-local "Show account emails" preference the
+    /// deck rows read (default off; never synced to the daemon).
+    @ObservedObject var deckModel: DeckPopoverModel
     @ObservedObject var updateModel: ToolUpdateModel
     /// Issue #33: app-update check state (GitHub releases feed of the public
     /// repo). Deliberately separate from every CLI update control.
@@ -530,9 +718,13 @@ struct GeneralSettingsPane: View {
     /// Issue #60: the "Check for updates automatically" toggle — daily check
     /// of the SAME releases feed, notify only, never an install.
     @ObservedObject var appUpdateAutoChecker: AppUpdateAutoChecker
+    /// Issue #96: bundled background-service status + the only home of the
+    /// legacy-LaunchAgent takeover action.
+    @ObservedObject var daemonSetupModel: DaemonSetupModel
+    /// Shared with the popover gear menu — one status read at load(), one
+    /// published value behind both toggles.
+    @ObservedObject var launchAtLoginModel: LaunchAtLoginModel
 
-    @State private var launchAtLogin = LaunchAtLogin.isEnabled
-    @State private var launchAtLoginError: String?
     @Environment(\.openURL) private var openURL
 
     /// Interval choices inside the daemon's validated 60–3600 s range.
@@ -558,7 +750,36 @@ struct GeneralSettingsPane: View {
                     get: { $0.pauseWhileActive },
                     set: { model, value in await model.setPauseWhileActive(value) }
                 ))
-                .help("Stored for the daemon; automatic pause takes effect once active-session detection ships.")
+                // Issue #90 semantics (Tim's call): a chosen interval always
+                // wins; the pause only slows the never-chosen default cadence.
+                .help("While a claude or codex CLI session is running, scheduled refresh slows to every 30 minutes — but only until you choose a refresh interval. Choosing one (or clicking Keep below) makes your cadence stick regardless of sessions.")
+                // Issue #90 affordance (CodeRabbit, PR #111): SwiftUI's
+                // Picker never fires its binding when the already-selected
+                // row is re-picked, so a user whose deliberate choice equals
+                // the stored value (Tim: 300s) had no working way to assert
+                // it. This one-line row is that way: it PUTs the current
+                // value + the provenance flag via the same model path a
+                // picker change uses, and disappears for good once the
+                // daemon confirms the flag.
+                if !settingsSync.settings.autoRefreshIntervalCustomized
+                    && settingsSync.settings.autoRefreshEnabled
+                    && settingsSync.settings.pauseWhileActive {
+                    HStack(spacing: 6) {
+                        Text("Sessions may slow refresh to every 30 min until you choose an interval.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Button("Keep \(Self.intervalLabel(settingsSync.settings.autoRefreshIntervalSeconds).lowercased())") {
+                            Task {
+                                await settingsSync.setAutoRefreshInterval(
+                                    seconds: settingsSync.settings.autoRefreshIntervalSeconds
+                                )
+                            }
+                        }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                        .help("Make the current interval your explicit choice — active sessions will no longer slow it.")
+                    }
+                }
             }
 
             Section("Popover") {
@@ -576,6 +797,12 @@ struct GeneralSettingsPane: View {
                     Text("Next reset").tag(DeckSortOrder.nextReset)
                     Text("Lowest remaining").tag(DeckSortOrder.lowestRemaining)
                 }
+                // Issue #73: identity display is a choice — OFF by default.
+                // App-local preference (like Launch at Login); the daemon
+                // never stores it. Settings → Accounts always shows
+                // identities: it's the management surface.
+                Toggle("Show account emails", isOn: $deckModel.showAccountEmails)
+                    .help("Show each account's identity (email) under its name in the popover. Off by default; applies to both providers. The Accounts pane always shows identities.")
             }
 
             Section("Notifications") {
@@ -632,18 +859,17 @@ struct GeneralSettingsPane: View {
                 }
             }
 
+            // Issue #96: bundled background-service status; when a dev
+            // LaunchAgent install exists this section is the ONLY place the
+            // takeover can be triggered (explicit, confirmed action).
+            BackgroundServiceSection(model: daemonSetupModel)
+
             Section {
-                Toggle("Launch at login", isOn: $launchAtLogin)
-                    .onChange(of: launchAtLogin) { _, enabled in
-                        do {
-                            try LaunchAtLogin.setEnabled(enabled)
-                            launchAtLoginError = nil
-                        } catch {
-                            launchAtLoginError = error.localizedDescription
-                            launchAtLogin = LaunchAtLogin.isEnabled
-                        }
-                    }
-                if let launchAtLoginError {
+                Toggle("Launch at login", isOn: Binding(
+                    get: { launchAtLoginModel.isEnabled },
+                    set: { launchAtLoginModel.setEnabled($0) }
+                ))
+                if let launchAtLoginError = launchAtLoginModel.lastError {
                     Text(launchAtLoginError)
                         .font(.caption)
                         .foregroundStyle(.red)
@@ -700,7 +926,13 @@ struct GeneralSettingsPane: View {
         // Issue #33: pane appear → automatic CLI re-probe (debounced in the
         // model; the daemon's /api/tools?refresh=1 cache absorbs the rest).
         // Users never have to ask the app to look for CLI updates.
-        .task { await toolsModel.probeOnPaneOpen() }
+        .task {
+            // Settings can open before the popover ever shows; load() is a
+            // one-shot, so whichever surface appears first pays the single
+            // SMAppService status read.
+            launchAtLoginModel.load()
+            await toolsModel.probeOnPaneOpen()
+        }
     }
 
     /// Outcome line under "Check for App Updates". On "update available" the

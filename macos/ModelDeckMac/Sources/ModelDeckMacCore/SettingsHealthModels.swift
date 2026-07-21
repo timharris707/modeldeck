@@ -33,6 +33,9 @@ public final class AccountSignInModel: ObservableObject {
     public enum Phase: Equatable, Sendable {
         /// Fetching the login command from the daemon.
         case launching
+        /// Issue #99: the daemon's spec demanded activation-driven sign-in;
+        /// the target account is being activated before the login runs.
+        case activating
         /// The provider's login is running in Terminal; the command is kept
         /// for relaunch/copy if the user closed the window.
         case awaitingSignIn(command: String)
@@ -44,6 +47,12 @@ public final class AccountSignInModel: ObservableObject {
     @Published public private(set) var phases: [String: Phase] = [:]
     @Published public private(set) var errors: [String: String] = [:]
 
+    /// Issue #99: per-account restore bookkeeping for activation-driven
+    /// sign-ins — the provider's previously active account id, captured
+    /// before the flip so the flow can put it back when it settles.
+    private var priorActiveByAccountID: [String: String] = [:]
+    private var activatedForLogin: Set<String> = []
+
     /// Fresh daemon state after a verified sign-in (per-account authState
     /// now healthy); pushed into `MenuBarStatusModel` by the app.
     public var onStateChanged: ((DeckState) -> Void)?
@@ -54,15 +63,18 @@ public final class AccountSignInModel: ObservableObject {
     private let reauth: any AccountReauthenticating
     private let launcher: any LoginLaunching
     private let stateProvider: any DeckStateProviding
+    private let activator: any AccountActivating
 
     public init(
         reauth: any AccountReauthenticating,
         launcher: any LoginLaunching,
-        stateProvider: any DeckStateProviding
+        stateProvider: any DeckStateProviding,
+        activator: any AccountActivating
     ) {
         self.reauth = reauth
         self.launcher = launcher
         self.stateProvider = stateProvider
+        self.activator = activator
     }
 
     public func phase(for accountID: String) -> Phase? { phases[accountID] }
@@ -72,6 +84,12 @@ public final class AccountSignInModel: ObservableObject {
     /// and run it in Terminal. A failed Terminal launch is not fatal — the
     /// command stays available for relaunch.
     ///
+    /// Issue #99: when the daemon's spec says `requiresActivation` (Claude
+    /// Code >= 2.1.216 keys credentials off the resolved ~/.claude), the
+    /// flow activates the target account first — after capturing the
+    /// previously active one for restore — and only then opens Terminal
+    /// with the plain login.
+    ///
     /// Every post-await write re-checks the phase first: if the user
     /// cancelled while the daemon call was in flight, the late result is
     /// dropped — no state resurrection and, crucially, no Terminal launch
@@ -80,9 +98,9 @@ public final class AccountSignInModel: ObservableObject {
         guard phases[account.id] == nil else { return }
         phases[account.id] = .launching
         errors[account.id] = nil
-        let command: String
+        let login: LoginCommand
         do {
-            command = try await reauth.loginCommand(accountID: account.id).command
+            login = try await reauth.loginCommand(accountID: account.id)
         } catch {
             guard phases[account.id] == .launching else { return } // cancelled mid-fetch
             phases[account.id] = nil
@@ -90,8 +108,71 @@ public final class AccountSignInModel: ObservableObject {
             return
         }
         guard phases[account.id] == .launching else { return } // cancelled mid-fetch
-        phases[account.id] = .awaitingSignIn(command: command)
-        launch(command: command, accountID: account.id)
+        if login.needsActivationFirst {
+            phases[account.id] = .activating
+            let prior = await priorActiveAccountID(provider: account.provider, excluding: account.id)
+            guard phases[account.id] == .activating else { return } // cancelled mid-read
+            do {
+                _ = try await activator.activateAccount(id: account.id)
+            } catch {
+                guard phases[account.id] == .activating else { return } // cancelled mid-activate
+                phases[account.id] = nil
+                errors[account.id] = SettingsSyncModel.message(for: error)
+                return
+            }
+            guard phases[account.id] == .activating else {
+                // Cancelled while the daemon was flipping: the flip happened,
+                // so put the prior account back rather than keeping a switch
+                // the user never asked to keep. The bookkeeping slots were
+                // never filled for this attempt, so restore the captured
+                // value directly.
+                await activatePrior(prior, accountID: account.id)
+                return
+            }
+            priorActiveByAccountID[account.id] = prior
+            activatedForLogin.insert(account.id)
+        }
+        phases[account.id] = .awaitingSignIn(command: login.command)
+        launch(command: login.command, accountID: account.id)
+    }
+
+    /// The provider's current default (active) account id, for restoring
+    /// after an activation-driven sign-in. Best effort: an unreadable state
+    /// simply means there is nothing to restore.
+    private func priorActiveAccountID(provider: String, excluding accountID: String) async -> String? {
+        guard let state = try? await stateProvider.deckState() else { return nil }
+        return state.accounts.first {
+            $0.provider == provider && $0.isDefault && $0.id != accountID
+        }?.id
+    }
+
+    /// Issue #99: put the previously active account back once the flow
+    /// settles. Reads AND clears this account's bookkeeping synchronously
+    /// (before the first await) so no concurrent reader can see stale slots.
+    @discardableResult
+    private func restorePriorActive(accountID: String) async -> Bool {
+        let prior = priorActiveByAccountID.removeValue(forKey: accountID)
+        activatedForLogin.remove(accountID)
+        return await activatePrior(prior, accountID: accountID)
+    }
+
+    /// Activates an explicitly captured prior account id. Deliberately never
+    /// touches the shared bookkeeping slots — a stale cancel task running
+    /// after a retry began must not clobber the newer flow's captured prior.
+    /// Best effort: a failed restore lands in the account's error slot,
+    /// never blocks the flow outcome.
+    @discardableResult
+    private func activatePrior(_ prior: String?, accountID: String) async -> Bool {
+        guard let prior else { return true }
+        do {
+            _ = try await activator.activateAccount(id: prior)
+            return true
+        } catch {
+            errors[accountID] = "The previously active account could not be restored — "
+                + "re-activate it from Settings → Accounts. "
+                + "(\(SettingsSyncModel.message(for: error)))"
+            return false
+        }
     }
 
     /// Re-open Terminal with the stored login command (e.g. after denying
@@ -126,8 +207,21 @@ public final class AccountSignInModel: ObservableObject {
             errors[account.id] = "Still signed out. Finish the provider's login in Terminal, then verify again."
             return false
         }
+        // Issue #99: the daemon refused the sign-in — the resulting identity
+        // belongs to a different account. Never a success. The target stays
+        // active (no restore) so a corrective /login lands in the right
+        // profile's credential slot.
+        if let mismatch = verification.identityMismatch {
+            phases[account.id] = .awaitingSignIn(command: command)
+            errors[account.id] = AddAccountModel.identityMismatchMessage(mismatch)
+            return false
+        }
         phases[account.id] = nil
         errors[account.id] = nil
+        // Issue #99: verified success — the previously active account comes
+        // back now. Strictly AFTER verification: the identity read-back is
+        // only trustworthy while the target profile is active.
+        await restorePriorActive(accountID: account.id)
         if let fresh = try? await stateProvider.deckState() {
             onStateChanged?(fresh)
         }
@@ -135,11 +229,29 @@ public final class AccountSignInModel: ObservableObject {
         return true
     }
 
-    /// Abandon the flow for this account (nothing to undo — the login ran,
-    /// or didn't, entirely in the provider's own Terminal session).
+    /// Abandon the flow for this account (the login ran, or didn't, entirely
+    /// in the provider's own Terminal session). Issue #99: if the flow had
+    /// activated the target for an activation-driven sign-in, the previously
+    /// active account is restored in the background — a cancelled sign-in
+    /// must not silently keep the switch.
     public func cancel(accountID: String) {
+        // Capture AND clear the restore bookkeeping synchronously: an
+        // immediate retry beginSignIn for this account must find clean
+        // slots, and the background restore below must use the value
+        // captured HERE — never re-read a shared slot a newer flow may have
+        // refilled in the meantime.
+        let needsRestore = activatedForLogin.remove(accountID) != nil
+        let prior = priorActiveByAccountID.removeValue(forKey: accountID)
         phases[accountID] = nil
         errors[accountID] = nil
+        guard needsRestore else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            await self.activatePrior(prior, accountID: accountID)
+            if let fresh = try? await self.stateProvider.deckState() {
+                self.onStateChanged?(fresh)
+            }
+        }
     }
 
     private func launch(command: String, accountID: String) {

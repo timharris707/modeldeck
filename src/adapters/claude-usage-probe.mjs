@@ -2,12 +2,22 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { isSea } from 'node:sea';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { claudeCredentialServiceName } from './claude-keychain.mjs';
 
 const execFileAsync = promisify(execFile);
 const SIGN_IN_ERROR = 'stored OAuth credentials are unavailable; sign in explicitly before refreshing';
+// Issue #98: a dismissed/denied macOS Keychain prompt is NOT a sign-out —
+// the credential item exists but the daemon isn't in its ACL yet. Surfacing
+// it as "sign in again" sent hand-test users down the wrong recovery path.
+// This message rides the per-account refresh-error channel (issue #89) up to
+// the app, which matches it (see KEYCHAIN_DENIED_ERROR_PATTERN in
+// src/service.mjs) to render the honest "click Refresh and choose Always
+// Allow" recovery state. Deliberately free of the "sign in explicitly before
+// refreshing" phrase so it can never trip the signin-required chip.
+export const KEYCHAIN_DENIED_ERROR = "macOS Keychain blocked ModelDeck's background service from reading this account's stored sign-in (a dismissed permission prompt does this); click Refresh and choose Always Allow when macOS asks again";
 
 function finiteNumber(value) {
   const parsed = typeof value === 'string' && value.trim() ? Number(value) : value;
@@ -42,19 +52,42 @@ export async function readClaudeCredentials({
     }
   }
 
+  const service = claudeCredentialServiceName(profile, homeDirectory);
+  const username = userInfo().username;
+  let result;
   try {
-    const service = claudeCredentialServiceName(profile, homeDirectory);
-    const username = userInfo().username;
-    const result = await runSecurity('/usr/bin/security', [
+    result = await runSecurity('/usr/bin/security', [
       'find-generic-password', '-s', service, '-a', username, '-w',
     ], {
       encoding: 'utf8',
       timeout: 5_000,
       maxBuffer: 2_000_000,
     });
-    return JSON.parse(String(result?.stdout ?? result));
   } catch {
     // Never surface security output: it can contain the credential value.
+    // Issue #98: distinguish a denied read from a missing item. A metadata
+    // lookup (no `-w`) needs no ACL approval and never prompts, so its
+    // success while the value read failed means the item EXISTS and macOS
+    // refused the secret — the dismissed-prompt state, not a sign-out.
+    let itemExists = false;
+    try {
+      await runSecurity('/usr/bin/security', [
+        'find-generic-password', '-s', service, '-a', username,
+      ], {
+        encoding: 'utf8',
+        timeout: 5_000,
+        maxBuffer: 65_536,
+      });
+      itemExists = true;
+    } catch {
+      // Item absent (or Keychain wholly unavailable): genuine sign-in state.
+    }
+    throw new Error(itemExists ? KEYCHAIN_DENIED_ERROR : SIGN_IN_ERROR);
+  }
+  try {
+    return JSON.parse(String(result?.stdout ?? result));
+  } catch {
+    // Readable but unparseable is a credential problem, not an ACL one.
     throw new Error(SIGN_IN_ERROR);
   }
 }
@@ -79,7 +112,7 @@ export async function main({ env = process.env, fetcher = globalThis.fetch, ...c
   process.stdout.write(text);
 }
 
-const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+const isMain = !isSea() && process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
   main().catch((error) => {
     process.stderr.write(`Claude usage probe failed: ${error.message}\n`);

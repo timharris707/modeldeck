@@ -43,6 +43,11 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
     /// without the per-account health backend simply omits the field, and
     /// the chip renders an honest "Unknown".
     public var authState: String?
+    /// Issue #89: the account's last failed refresh (`{message, at}`),
+    /// present only while its most recent refresh attempt failed — the
+    /// daemon clears it on the next success. Optional by design: a daemon
+    /// without the error-propagation backend omits it.
+    public var lastRefreshError: AccountRefreshError?
 
     public init(
         id: String,
@@ -55,7 +60,8 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         enabled: Bool = true,
         isDefault: Bool = false,
         metadata: DeckAccountMetadata? = nil,
-        authState: String? = nil
+        authState: String? = nil,
+        lastRefreshError: AccountRefreshError? = nil
     ) {
         self.id = id
         self.provider = provider
@@ -68,18 +74,45 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         self.isDefault = isDefault
         self.metadata = metadata
         self.authState = authState
+        self.lastRefreshError = lastRefreshError
     }
 
     /// Per-account health chip (issue #32): each roster row reads its OWN
     /// `authState` rather than the provider-wide probe. An absent field
     /// (daemon without the per-account backend) or an unrecognized value
-    /// maps to the honest "Unknown" chip.
+    /// maps to the honest "Unknown" chip. `duplicate-token` (issue #65)
+    /// deliberately stays on the "Unknown" chip too — the duplicate-login
+    /// warning renders as its own hollow marker, never as a false
+    /// "Sign in again" (the account IS signed in, just as the wrong login).
+    /// `keychain-denied` (issue #98) likewise never maps to "Sign in again"
+    /// — the account IS signed in; macOS refused the daemon's read. Its
+    /// dedicated recovery notice renders on the deck card, and the chip's
+    /// tooltip carries the honest `lastRefreshError` message.
     public var healthChip: ToolProbe.HealthChip {
         switch authState {
         case "ok": return .healthy
         case "signin-required": return .signInAgain
         default: return .unknown
         }
+    }
+
+    /// Issue #98: macOS refused the daemon's read of this account's
+    /// EXISTING Keychain credential item — the state a dismissed first-run
+    /// Keychain prompt leaves behind. Lenient by design: only the daemon's
+    /// explicit `keychain-denied` authState sets it, so older daemons never
+    /// trigger a false recovery notice.
+    public var keychainAccessDenied: Bool {
+        authState?.lowercased() == "keychain-denied"
+    }
+
+    /// Issue #65 (UI half): the daemon's duplicate-credential check flagged
+    /// this account — Claude via matching weekly-reset usage fingerprints,
+    /// Codex via matching credential identifiers (issue #108) — so two
+    /// profiles appear to hold the same login. Lenient by design:
+    /// a daemon without the check never sets the value, so this stays
+    /// false and nothing renders (no false warnings on older daemons).
+    public var hasDuplicateToken: Bool {
+        authState?.lowercased() == "duplicate-token"
     }
 
     /// Muted plan tier rendered inline beside the account name (issue #30,
@@ -102,6 +135,41 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
     }
 }
 
+/// Issue #89: one account's last failed refresh as the daemon reports it —
+/// `message` is the per-account fetch error refreshAll captured, `at` the
+/// ISO timestamp of the failed pass. Decoding is deliberately shape-tolerant
+/// (same policy as `ProviderPlanInfo`): a bare string reads as the message,
+/// and any other unexpected shape decodes as empty rather than failing the
+/// whole account decode.
+public struct AccountRefreshError: Codable, Equatable, Sendable {
+    public var message: String?
+    public var at: String?
+
+    public init(message: String? = nil, at: String? = nil) {
+        self.message = message
+        self.at = at
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case message, at
+    }
+
+    public init(from decoder: Decoder) throws {
+        if let single = try? decoder.singleValueContainer().decode(String.self) {
+            self.init(message: single)
+            return
+        }
+        guard let container = try? decoder.container(keyedBy: CodingKeys.self) else {
+            self.init()
+            return
+        }
+        self.init(
+            message: (try? container.decodeIfPresent(String.self, forKey: .message)) ?? nil,
+            at: (try? container.decodeIfPresent(String.self, forKey: .at)) ?? nil
+        )
+    }
+}
+
 /// The slice of the daemon's free-form account metadata the app reads.
 /// Unknown metadata keys are ignored by Codable's lenient decoding.
 ///
@@ -112,15 +180,22 @@ public struct DeckAccountMetadata: Codable, Equatable, Sendable {
     public var claudePlan: ProviderPlanInfo?
     public var codexPlan: ProviderPlanInfo?
     public var plan: ProviderPlanInfo?
+    /// Identity provenance (issue #62 daemon capture): "seed" when the
+    /// identity was read from a profile that isn't the verified active one,
+    /// "verified" when confirmed against the provider. Absent on accounts
+    /// whose identity came from onboarding verify (treated as verified).
+    public var identitySource: String?
 
     public init(
         claudePlan: ProviderPlanInfo? = nil,
         codexPlan: ProviderPlanInfo? = nil,
-        plan: ProviderPlanInfo? = nil
+        plan: ProviderPlanInfo? = nil,
+        identitySource: String? = nil
     ) {
         self.claudePlan = claudePlan
         self.codexPlan = codexPlan
         self.plan = plan
+        self.identitySource = identitySource
     }
 }
 
@@ -306,6 +381,33 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
     }
 }
 
+/// `GET /api/state` `scheduler` — the daemon's honest refresh-cadence surface
+/// (issue #90). `effectiveRefreshIntervalSeconds` is the cadence the daemon
+/// is ACTUALLY running (nil while auto-refresh is disabled);
+/// `effectiveRefreshReason` names why it is slower than the configured
+/// setting when it is ("active-session-cap": the 30-minute throttle on the
+/// never-customized default interval). Every field is optional so an older
+/// daemon (which sent only `pausedForActiveSessions`, or nothing) decodes
+/// cleanly with no indicator and no behavior change.
+public struct DeckScheduler: Codable, Equatable, Sendable {
+    public var pausedForActiveSessions: Bool?
+    public var configuredRefreshIntervalSeconds: Int?
+    public var effectiveRefreshIntervalSeconds: Int?
+    public var effectiveRefreshReason: String?
+
+    public init(
+        pausedForActiveSessions: Bool? = nil,
+        configuredRefreshIntervalSeconds: Int? = nil,
+        effectiveRefreshIntervalSeconds: Int? = nil,
+        effectiveRefreshReason: String? = nil
+    ) {
+        self.pausedForActiveSessions = pausedForActiveSessions
+        self.configuredRefreshIntervalSeconds = configuredRefreshIntervalSeconds
+        self.effectiveRefreshIntervalSeconds = effectiveRefreshIntervalSeconds
+        self.effectiveRefreshReason = effectiveRefreshReason
+    }
+}
+
 /// `GET /api/state` — only the slices Phase 3 needs. The daemon also returns
 /// `projects` and `launches`; they are ignored here and picked up in Phase 4+.
 public struct DeckState: Codable, Equatable, Sendable {
@@ -317,19 +419,25 @@ public struct DeckState: Codable, Equatable, Sendable {
     /// tolerantly — an unexpected shape reads as absent rather than failing
     /// the whole state decode.
     public var activation: DeckActivation?
+    /// Issue #90: the daemon's effective refresh cadence + why it differs
+    /// from the configured one. Same tolerant-decode contract as
+    /// `activation` — absent or unexpectedly shaped reads as nil.
+    public var scheduler: DeckScheduler?
 
     public init(
         accounts: [DeckAccount] = [],
         usage: [UsageSnapshot] = [],
-        activation: DeckActivation? = nil
+        activation: DeckActivation? = nil,
+        scheduler: DeckScheduler? = nil
     ) {
         self.accounts = accounts
         self.usage = usage
         self.activation = activation
+        self.scheduler = scheduler
     }
 
     private enum CodingKeys: String, CodingKey {
-        case accounts, usage, activation
+        case accounts, usage, activation, scheduler
     }
 
     public init(from decoder: Decoder) throws {
@@ -337,6 +445,7 @@ public struct DeckState: Codable, Equatable, Sendable {
         self.accounts = try container.decodeIfPresent([DeckAccount].self, forKey: .accounts) ?? []
         self.usage = try container.decodeIfPresent([UsageSnapshot].self, forKey: .usage) ?? []
         self.activation = try? container.decodeIfPresent(DeckActivation.self, forKey: .activation)
+        self.scheduler = try? container.decodeIfPresent(DeckScheduler.self, forKey: .scheduler)
     }
 }
 
@@ -367,10 +476,33 @@ public struct AccountCreate: Codable, Equatable, Sendable {
 public struct LoginCommand: Codable, Equatable, Sendable {
     public var provider: String
     public var command: String
+    /// Issue #99: the daemon's version-detected Claude sign-in flow —
+    /// "config-dir" (pre-2.1.216 env-scoped login) or "activation"
+    /// (>= 2.1.216: credentials key off the resolved ~/.claude, so the
+    /// target profile must be ACTIVATED before the plain login runs).
+    /// Absent on Codex specs and on pre-#99 daemons.
+    public var flow: String?
+    /// Issue #99: when true, the caller must activate this account before
+    /// launching `command`, verify identity while it is still active, and
+    /// only then optionally restore the previously active account. Optional
+    /// by design — an older daemon omits it and the flow stays login-only.
+    public var requiresActivation: Bool?
 
-    public init(provider: String, command: String) {
+    public init(
+        provider: String,
+        command: String,
+        flow: String? = nil,
+        requiresActivation: Bool? = nil
+    ) {
         self.provider = provider
         self.command = command
+        self.flow = flow
+        self.requiresActivation = requiresActivation
+    }
+
+    /// Whether the sign-in must be driven through activation first.
+    public var needsActivationFirst: Bool {
+        requiresActivation == true
     }
 }
 
@@ -378,13 +510,36 @@ public struct LoginCommand: Codable, Equatable, Sendable {
 /// the provider's status command chose to print (placeholder emails only in
 /// fixtures/docs); nil when the provider doesn't reveal one.
 public struct AccountVerification: Codable, Equatable, Sendable {
+    /// Issue #99 fix direction 2: the daemon compared the read-back identity
+    /// against the intended account and refused — nothing was recorded. The
+    /// UI must surface this loudly; it is never a success.
+    public struct IdentityMismatch: Codable, Equatable, Sendable {
+        public var expected: String?
+        public var actual: String?
+
+        public init(expected: String? = nil, actual: String? = nil) {
+            self.expected = expected
+            self.actual = actual
+        }
+    }
+
     public var account: DeckAccount
     public var authenticated: Bool
     public var identity: String?
+    /// Present only when the daemon refused the sign-in because the resulting
+    /// identity belongs to a different account (issue #99). Optional by
+    /// design: older daemons never send it.
+    public var identityMismatch: IdentityMismatch?
 
-    public init(account: DeckAccount, authenticated: Bool, identity: String? = nil) {
+    public init(
+        account: DeckAccount,
+        authenticated: Bool,
+        identity: String? = nil,
+        identityMismatch: IdentityMismatch? = nil
+    ) {
         self.account = account
         self.authenticated = authenticated
         self.identity = identity
+        self.identityMismatch = identityMismatch
     }
 }

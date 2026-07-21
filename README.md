@@ -6,8 +6,15 @@
 
 A native macOS menu bar app + local daemon that tracks usage limits across
 all of your Claude Code and Codex CLI accounts — live "% left" meters,
-reset countdowns, and one-click account switching. Everything stays on your
-machine.
+reset countdowns, and one-click account switching.
+
+**Local-first. No cloud backend. No telemetry. Your credentials are never
+copied, stored, or transmitted by ModelDeck.** The only optional outbound
+call of ModelDeck's own is the daily update check, which reads this
+repository's public releases feed — and it's off unless you enable it.
+
+[Download](https://github.com/timharris707/modeldeck/releases) ·
+[modeldeck.ai](https://modeldeck.ai)
 
 ![Platform](https://img.shields.io/badge/platform-macOS%2014%2B-blue)
 ![Swift](https://img.shields.io/badge/app-Swift%20%2B%20SwiftUI-F05138)
@@ -49,18 +56,25 @@ ModelDeck puts all of it in your menu bar:
 
 ## Features
 
-- **Live usage deck** — a popover with one card per account: worst-window
-  headline bar, plan tier ("Max (20x)", "Pro"), and expandable detail rows
-  for every rate-limit window with right-aligned reset countdowns in your
-  time zone.
+- **Multi-account usage deck** — a popover with one card per account:
+  worst-window headline bar, plan tier ("Max (20x)", "Pro"), and expandable
+  detail rows for every rate-limit window with right-aligned reset times
+  ("Resets Wed 5:59 PM PDT") in your time zone.
 - **Both providers, side by side** — Claude Code and Codex CLI columns with
   their brand marks, or a single-column layout if you prefer. Sort by next
   reset, lowest remaining, or provider.
 - **Model-scoped weekly limits** — per-model caps are parsed and shown as
   first-class meters, not buried in a tooltip.
-- **Account activation** — each provider has one active account for *new*
-  terminal sessions. Activation atomically swaps isolated per-account
-  profile homes; running sessions are never stopped, logged out, or touched.
+- **Account activation with honest states** — each provider has one active
+  account for *new* terminal sessions. Activation atomically swaps isolated
+  per-account profile homes, then verifies the result and reports it
+  truthfully (`effective` / `identity-mismatch` / `identity-unverified`)
+  instead of assuming success. Running sessions are never stopped, logged
+  out, or touched.
+- **Duplicate-token warning** — if two Claude accounts end up sharing the
+  same credential (a missed `/login` ceremony, a copied profile), the deck
+  flags them with a warning marker and banner instead of silently counting
+  the same limit twice.
 - **Isolated profile homes** — every account lives in its own owner-only
   config home (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`), macOS Keychain-aware,
   so identities never bleed into each other.
@@ -73,31 +87,12 @@ ModelDeck puts all of it in your menu bar:
   ModelDeck never sees your password or token.
 - **CLI health** — installed vs. latest versions of Claude Code and Codex
   CLI, with auth-state chips per account ("Healthy" / "Sign in again").
+- **Launch at login and update checks** — start with your Mac, and
+  optionally check the public releases feed daily for new app versions
+  (notification only; nothing installs itself).
 
 <!-- SCREENSHOT PLACEHOLDER: settings window, Accounts pane with health chips
      and Activate controls. Suggested path: docs/images/settings-accounts.png -->
-
-## How it works
-
-```mermaid
-flowchart LR
-    A["Menu bar app<br/>(SwiftUI)"] <-->|"HTTP<br/>127.0.0.1:3867"| D["Local daemon<br/>(Node.js + SQLite)"]
-    D --> C["Claude Code CLI<br/>per-account profile homes"]
-    D --> X["Codex CLI<br/>per-account CODEX_HOME"]
-```
-
-- **The app** (`macos/ModelDeckMac/`) is a SwiftPM `MenuBarExtra` app — no
-  Xcode project, no Electron. It is a pure client of the daemon's
-  localhost API.
-- **The daemon** (`src/`) binds to `127.0.0.1` only, rejects unexpected
-  Host/Origin headers, and requires a per-server token plus a
-  `SameSite=Strict` cookie for every mutation. State lives in an owner-only
-  SQLite database under `~/Library/Application Support/ModelDeck/`.
-- **Usage reads** go through each provider's own channel: Codex via the
-  official `codex app-server` stdio protocol, Claude via Anthropic's native
-  usage endpoint using only the credential already stored in that profile —
-  ModelDeck never initiates logins, never refreshes tokens, and never
-  persists credentials.
 
 ## Privacy: local-first, by design
 
@@ -113,31 +108,71 @@ This is the point of the tool, so it's worth being explicit:
 
 ## Install
 
-ModelDeck is build-from-source today. A signed, notarized DMG is on the
-[roadmap](design/mac-app-roadmap.md).
+**Requirements:** macOS 14+, Node.js 24+, and the Claude Code and/or Codex
+CLIs you want to track.
 
-**Requirements:** macOS 14+, Node.js 24+, Swift toolchain (Xcode Command
-Line Tools). The Claude Code and/or Codex CLIs for live usage tracking.
+**1. Download the app**
 
-**1. Start the daemon**
+Get the latest signed, notarized DMG from the
+[Releases page](https://github.com/timharris707/modeldeck/releases)
+(currently `v0.2.1`), open it, and drag ModelDeck to Applications.
+
+**2. Install the daemon**
+
+The app is a pure client of a local daemon that does the actual usage
+reads. It is not bundled in the DMG yet; install it as a login agent:
 
 ```bash
 git clone https://github.com/timharris707/modeldeck.git
 cd modeldeck
 npm install
-npm start        # daemon on 127.0.0.1:3867
-```
-
-To run it permanently as a login agent instead:
-
-```bash
 scripts/set-mutation-token.sh                # one-time Keychain token setup
 scripts/install-launch-agent.sh --port 3867  # installs + starts the launchd agent
 ```
 
-**2. Run the app**
+The daemon listens on `127.0.0.1:3867` only.
+
+**3. Add accounts**
+
+Launch ModelDeck, then open **Settings → Accounts → Add Account** and
+follow the three-step flow for each account — e.g. "Work", "Personal",
+"Side Project". Each gets its own isolated profile home and signs in
+through the provider's own login flow.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A["Menu bar app<br/>(SwiftUI)"] <-->|"HTTP<br/>127.0.0.1:3867"| D["Local daemon<br/>(Node.js + SQLite)"]
+    D --> C["Claude Code CLI<br/>per-account profile homes"]
+    D --> X["Codex CLI<br/>per-account CODEX_HOME"]
+```
+
+- **The app** (`macos/ModelDeckMac/`) is a SwiftPM `MenuBarExtra` app — no
+  Xcode project, no Electron. It is a pure client of the daemon's
+  localhost API.
+- **The daemon** (`src/`) is API-only: it binds to `127.0.0.1`, rejects
+  unexpected Host/Origin headers, and requires a per-server token plus a
+  `SameSite=Strict` cookie for every mutation. State lives in an owner-only
+  SQLite database under `~/Library/Application Support/ModelDeck/`. The
+  legacy web dashboard has been retired; the native app is the sole
+  graphical interface.
+- **Usage reads** go through each provider's own channel: Codex via the
+  official `codex app-server` stdio protocol, Claude via Anthropic's native
+  usage endpoint using only the credential already stored in that profile —
+  ModelDeck never initiates logins, never refreshes tokens, and never
+  persists credentials.
+
+## Development
+
+Building from source instead of using the released DMG:
 
 ```bash
+# daemon (foreground)
+npm install
+npm start                             # daemon on 127.0.0.1:3867
+
+# app
 cd macos/ModelDeckMac
 swift run ModelDeckMac
 ```
@@ -148,13 +183,7 @@ Or assemble a signed `.app` bundle (ad-hoc by default):
 macos/ModelDeckMac/Scripts/build_app.sh
 ```
 
-**3. Add accounts**
-
-Open **Settings → Accounts → Add Account** and follow the three-step flow
-for each account — e.g. "Work", "Personal", "Side Project". Each gets its
-own isolated profile home and its own browser sign-in.
-
-## Development
+Tests:
 
 ```bash
 npm test                              # daemon test suite
@@ -162,15 +191,17 @@ cd macos/ModelDeckMac && swift test   # app test suite
 ```
 
 See [`macos/ModelDeckMac/README.md`](macos/ModelDeckMac/README.md) for the
-app package layout and [`DESIGN.md`](DESIGN.md) for the daemon's safety
-contract and architecture decisions.
+app package layout, [`DESIGN.md`](DESIGN.md) for the daemon's safety
+contract and architecture decisions, and [`docs/RELEASE.md`](docs/RELEASE.md)
+for how release DMGs are cut.
 
 ## Roadmap
 
-The native app shipped as `v0.2.0` and is in active daily use. What's next —
-retiring the legacy web dashboard, packaging, and distribution — lives in
-[`design/mac-app-roadmap.md`](design/mac-app-roadmap.md), with the design
-authority in [`design/mac-app-spec.md`](design/mac-app-spec.md).
+The current release is `v0.2.1`; the legacy web dashboard is retired and
+the native app is the only interface. Release history lives in
+[`CHANGELOG.md`](CHANGELOG.md), with the app design authority in
+[`design/mac-app-spec.md`](design/mac-app-spec.md). Project news lands at
+[modeldeck.ai](https://modeldeck.ai).
 
 ## License
 

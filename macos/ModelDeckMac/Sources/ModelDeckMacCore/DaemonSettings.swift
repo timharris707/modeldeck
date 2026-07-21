@@ -11,6 +11,12 @@ import Foundation
 public struct DaemonSettings: Codable, Equatable, Sendable {
     public var autoRefreshEnabled: Bool
     public var autoRefreshIntervalSeconds: Int
+    /// Issue #90 change-event provenance: true once the user has ever
+    /// explicitly chosen a refresh interval (daemon flips it on a value
+    /// CHANGE; the interval picker also asserts it directly on selection).
+    /// While false, the daemon's active-session cap may slow the default
+    /// cadence. One-way — it never returns to false.
+    public var autoRefreshIntervalCustomized: Bool
     public var pauseWhileActive: Bool
     public var layout: String
     public var defaultSort: String
@@ -21,6 +27,7 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
     public static let defaults = DaemonSettings(
         autoRefreshEnabled: true,
         autoRefreshIntervalSeconds: 300,
+        autoRefreshIntervalCustomized: false,
         pauseWhileActive: true,
         layout: DeckLayout.twoColumn.rawValue,
         defaultSort: DeckSortOrder.nextReset.rawValue,
@@ -31,6 +38,7 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
     public init(
         autoRefreshEnabled: Bool,
         autoRefreshIntervalSeconds: Int,
+        autoRefreshIntervalCustomized: Bool = false,
         pauseWhileActive: Bool,
         layout: String,
         defaultSort: String,
@@ -39,6 +47,7 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
     ) {
         self.autoRefreshEnabled = autoRefreshEnabled
         self.autoRefreshIntervalSeconds = autoRefreshIntervalSeconds
+        self.autoRefreshIntervalCustomized = autoRefreshIntervalCustomized
         self.pauseWhileActive = pauseWhileActive
         self.layout = layout
         self.defaultSort = defaultSort
@@ -53,6 +62,8 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
             ?? defaults.autoRefreshEnabled
         autoRefreshIntervalSeconds = try container.decodeIfPresent(Int.self, forKey: .autoRefreshIntervalSeconds)
             ?? defaults.autoRefreshIntervalSeconds
+        autoRefreshIntervalCustomized = try container.decodeIfPresent(Bool.self, forKey: .autoRefreshIntervalCustomized)
+            ?? defaults.autoRefreshIntervalCustomized
         pauseWhileActive = try container.decodeIfPresent(Bool.self, forKey: .pauseWhileActive)
             ?? defaults.pauseWhileActive
         layout = try container.decodeIfPresent(String.self, forKey: .layout) ?? defaults.layout
@@ -94,6 +105,12 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
 public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
     public var autoRefreshEnabled: Bool?
     public var autoRefreshIntervalSeconds: Int?
+    /// Issue #90: sent as `true` alongside an explicit interval-picker
+    /// selection so the daemon records provenance even when the picked value
+    /// equals what's stored. Never sent as `false` (the flag is one-way).
+    /// Pre-#90 daemons reject unknown keys — SettingsSyncModel strips this
+    /// field and retries when that happens.
+    public var autoRefreshIntervalCustomized: Bool?
     public var pauseWhileActive: Bool?
     public var layout: String?
     public var defaultSort: String?
@@ -103,6 +120,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
     public init(
         autoRefreshEnabled: Bool? = nil,
         autoRefreshIntervalSeconds: Int? = nil,
+        autoRefreshIntervalCustomized: Bool? = nil,
         pauseWhileActive: Bool? = nil,
         layout: String? = nil,
         defaultSort: String? = nil,
@@ -111,6 +129,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
     ) {
         self.autoRefreshEnabled = autoRefreshEnabled
         self.autoRefreshIntervalSeconds = autoRefreshIntervalSeconds
+        self.autoRefreshIntervalCustomized = autoRefreshIntervalCustomized
         self.pauseWhileActive = pauseWhileActive
         self.layout = layout
         self.defaultSort = defaultSort
@@ -124,6 +143,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         DaemonSettingsPatch(
             autoRefreshEnabled: other.autoRefreshEnabled ?? autoRefreshEnabled,
             autoRefreshIntervalSeconds: other.autoRefreshIntervalSeconds ?? autoRefreshIntervalSeconds,
+            autoRefreshIntervalCustomized: other.autoRefreshIntervalCustomized ?? autoRefreshIntervalCustomized,
             pauseWhileActive: other.pauseWhileActive ?? pauseWhileActive,
             layout: other.layout ?? layout,
             defaultSort: other.defaultSort ?? defaultSort,
@@ -136,6 +156,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encodeIfPresent(autoRefreshEnabled, forKey: .autoRefreshEnabled)
         try container.encodeIfPresent(autoRefreshIntervalSeconds, forKey: .autoRefreshIntervalSeconds)
+        try container.encodeIfPresent(autoRefreshIntervalCustomized, forKey: .autoRefreshIntervalCustomized)
         try container.encodeIfPresent(pauseWhileActive, forKey: .pauseWhileActive)
         try container.encodeIfPresent(layout, forKey: .layout)
         try container.encodeIfPresent(defaultSort, forKey: .defaultSort)
@@ -144,12 +165,13 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case autoRefreshEnabled, autoRefreshIntervalSeconds, pauseWhileActive
+        case autoRefreshEnabled, autoRefreshIntervalSeconds, autoRefreshIntervalCustomized, pauseWhileActive
         case layout, defaultSort, notificationThresholdPercent, menuBarStyle
     }
 
     public var isEmpty: Bool {
-        autoRefreshEnabled == nil && autoRefreshIntervalSeconds == nil && pauseWhileActive == nil
+        autoRefreshEnabled == nil && autoRefreshIntervalSeconds == nil
+            && autoRefreshIntervalCustomized == nil && pauseWhileActive == nil
             && layout == nil && defaultSort == nil && notificationThresholdPercent == nil
             && menuBarStyle == nil
     }

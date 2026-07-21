@@ -135,9 +135,11 @@ struct DaemonClientTests {
             .init(status: 200, body: #"{"account":{"id":"acct-2","provider":"codex","label":"Deck Two","enabled":true,"isDefault":true}}"#),
         ])
         let client = DaemonClient(configuration: DaemonConfiguration(), transport: transport)
-        let account = try await client.activateAccount(id: "acct-2")
-        #expect(account.id == "acct-2")
-        #expect(account.isDefault)
+        let activation = try await client.activateAccount(id: "acct-2")
+        #expect(activation.account.id == "acct-2")
+        #expect(activation.account.isDefault)
+        // Pre-#92 daemon body — no `warnings` key — decodes to no warnings.
+        #expect(activation.warnings.isEmpty)
         #expect(transport.requests.count == 2)
         #expect(transport.requests[0].url?.path == "/api/session")
         let post = transport.requests[1]

@@ -7,6 +7,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import {
   activateClaudeProfile,
+  claudePinnedEnvFileContent,
   createClaudeProfileHome,
   fetchClaudeUsage,
   importClaudeSwapProfiles as migrateClaudeSwapProfiles,
@@ -19,6 +20,7 @@ import { claudeCredentialsPresent } from './adapters/claude-keychain.mjs';
 import {
   createCodexProfileHome,
   fetchCodexRateLimits,
+  readCodexAccountId,
   readCodexLoginStatus,
   readCodexPlan,
   validateCodexProfileHome,
@@ -30,11 +32,78 @@ const execFileAsync = promisify(execFile);
 
 // Active sessions throttle scheduled polling, but never for long enough to
 // let a continuously open provider session make the deck silently stale.
+//
+// Issue #90 (Tim's design call, 2026-07-21): this cap applies ONLY while the
+// user has never customized autoRefreshIntervalSeconds. An explicitly
+// configured interval always wins — it was set for a reason, and the account
+// being actively burned is precisely the one whose data must stay fresh.
+// Whenever the cap slows the effective cadence below the configured setting,
+// /api/state says so (scheduler.effectiveRefreshReason) so the deck can be
+// honest about it instead of silently starving.
 const ACTIVE_SESSION_REFRESH_CAP_MS = 30 * 60_000;
+
+// Issue #90 provenance: "customized" is the persisted change-event flag
+// (db.mjs saveSettings flips it — permanently — when a write CHANGES the
+// interval or the app asserts an explicit picker selection). Comparing the
+// value against the default would strand users whose deliberate choice IS
+// 300s (the issue's reporter) under the cap forever.
+function autoRefreshIntervalCustomized(settings) {
+  return settings.autoRefreshIntervalCustomized === true;
+}
 
 // Claude Code 2.1.215 is the first version verified against the undocumented
 // CLAUDE_SECURESTORAGE_CONFIG_DIR scoped-Keychain behavior.
 export const CLAUDE_SECURESTORAGE_MIN_VERSION = '2.1.215';
+
+// Issue #99: from 2.1.216 on, Claude Code keys Keychain CREDENTIAL storage
+// off the resolved (realpath) ~/.claude — CLAUDE_CONFIG_DIR and
+// CLAUDE_SECURESTORAGE_CONFIG_DIR no longer steer where a login lands, even
+// though config writes (.claude.json) still respect CLAUDE_CONFIG_DIR. An
+// env-scoped `claude auth login` on such a version silently overwrites the
+// ACTIVE profile's credential slot with a different account's token.
+export const CLAUDE_RESOLVED_HOME_CREDENTIALS_MIN_VERSION = '2.1.216';
+
+// Issue #89: refresh failures whose message carries this phrase mean the
+// stored credentials are unusable (missing or expired) — the account needs a
+// fresh provider login, no matter what the presence probe says. Expired OAuth
+// still LOOKS present to the Keychain/file probe, which is exactly how the
+// chip stayed "Healthy" while the card rendered fossils.
+export const SIGN_IN_REQUIRED_ERROR_PATTERN = /sign in explicitly before refreshing/i;
+
+// Issue #98: a refresh that failed because macOS refused the daemon's read of
+// an EXISTING Claude Keychain item (the dismissed first-run prompt). Matches
+// KEYCHAIN_DENIED_ERROR from src/adapters/claude-usage-probe.mjs as it
+// arrives via the probe's stderr wrapping. Distinct from signin-required on
+// purpose — the account IS signed in; the fix is "Refresh → Always Allow",
+// never a new provider login.
+export const KEYCHAIN_DENIED_ERROR_PATTERN = /keychain blocked modeldeck/i;
+
+export function weeklyResetFingerprint(snapshots) {
+  const weekly = snapshots.find((snapshot) => snapshot.scope === 'weekly');
+  if (!weekly?.resetsAt || weekly.stale) return null;
+  const resetMs = Date.parse(weekly.resetsAt);
+  if (!Number.isFinite(resetMs)) return null;
+  return Math.round(resetMs / 1_000);
+}
+
+export function duplicateAccountIdsByFingerprint(fingerprints) {
+  const accountsByResetSecond = new Map();
+  for (const [accountId, resetSecond] of fingerprints) {
+    const accountIds = accountsByResetSecond.get(resetSecond) || [];
+    accountIds.push(accountId);
+    accountsByResetSecond.set(resetSecond, accountIds);
+  }
+  return new Set([...accountsByResetSecond.values()].filter((ids) => ids.length > 1).flat());
+}
+
+export function duplicateClaudeTokenAccountIds(accountSnapshots) {
+  const fingerprints = new Map();
+  for (const [accountId, snapshots] of accountSnapshots) {
+    const fingerprint = weeklyResetFingerprint(snapshots);
+    if (fingerprint !== null) fingerprints.set(accountId, fingerprint);
+  }
+  return duplicateAccountIdsByFingerprint(fingerprints);
+}
 
 function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'\\''`)}'`;
@@ -138,6 +207,12 @@ export class ModelDeckService {
     this.claudePath = options.claudePath || 'claude';
     this.claudeProfilesDir = options.claudeProfilesDir || path.join(os.homedir(), 'Library', 'Application Support', 'ModelDeck', 'claude-profiles');
     this.claudeActiveLink = options.claudeActiveLink || path.join(os.homedir(), '.claude');
+    // Issue #66: shell snippet sourced by the install-shell-env.sh block so
+    // new terminal sessions launch pinned to the active profile real path.
+    // Defaults next to the profiles directory (production: the ModelDeck
+    // Application Support directory) so test fixtures stay inside their roots.
+    this.claudeShellEnvFile = options.claudeShellEnvFile
+      || path.join(path.dirname(this.claudeProfilesDir), 'claude-env.sh');
     this.codexPath = options.codexPath || 'codex';
     this.codexActiveLink = options.codexActiveLink || path.join(os.homedir(), '.codex');
     this.codexProfilesDir = options.codexProfilesDir || path.join(os.homedir(), '.codex-profiles');
@@ -151,6 +226,7 @@ export class ModelDeckService {
     this.readClaudeIdentity = options.readClaudeIdentity || readClaudeProfileIdentity;
     this.readCodexAuth = options.readCodexAuth || readCodexLoginStatus;
     this.readCodexPlan = options.readCodexPlan || readCodexPlan;
+    this.readCodexAccountId = options.readCodexAccountId || readCodexAccountId;
     this.claudeCredentialsPresent = options.claudeCredentialsPresent || claudeCredentialsPresent;
     this.migrateClaude = options.migrateClaude || migrateClaudeSwapProfiles;
     this.exec = options.exec || options.execFile || options.run || execFileAsync;
@@ -183,6 +259,18 @@ export class ModelDeckService {
     this.toolProbeGeneration = 0;
     this.authPresenceTtlMs = Number(options.authPresenceTtlMs ?? 5_000);
     this.authPresenceCache = new Map();
+    // Issue #89: last failed refresh per account id ({ message, at }); an
+    // entry is deleted the moment that account refreshes successfully.
+    // refreshAll used to compute exactly these errors and drop them.
+    this.accountRefreshErrors = new Map();
+    this.duplicateClaudeTokenAccountIds = new Set();
+    this.claudeWeeklyFingerprints = new Map();
+    // Issue #108: Codex twin of the Claude pair above. Values are
+    // `tokens.account_id` identifiers read from each profile's auth.json —
+    // identifiers only, never token values — remembered until fresh readable
+    // evidence replaces them (same PR #77 evidence-memory rule).
+    this.duplicateCodexTokenAccountIds = new Set();
+    this.codexAccountIdentifiers = new Map();
     this.toolUpdatePromises = new Map();
     this.realpath = options.realpath || fs.promises.realpath;
     this.platform = options.platform || process.platform;
@@ -219,7 +307,10 @@ export class ModelDeckService {
     this.autoRefreshTimer = null;
     // A stale pause flag must not outlive the setting that produced it —
     // /api/state would keep reporting a pause until the next tick fires.
-    if (!settings.autoRefreshEnabled || !settings.pauseWhileActive) {
+    // Issue #90: a customized interval lifts the cap immediately, so the
+    // pause flag (and the deck's slowed-cadence indicator) clears here too.
+    if (!settings.autoRefreshEnabled || !settings.pauseWhileActive
+      || autoRefreshIntervalCustomized(settings)) {
       this.pausedForActiveSessions = false;
       this.activeProviderSessionPresent = false;
     }
@@ -229,13 +320,35 @@ export class ModelDeckService {
     }
   }
 
+  // Issue #90 (CodeRabbit, PR #111): the SINGLE source of truth for the
+  // cadence the scheduler actually runs — the delay computation, the tick's
+  // skip decision, and /api/state's reported effective interval all derive
+  // from this one function, so report and reality can never diverge.
+  //
+  // Semantics while the cap applies (flag false + pauseWhileActive + session
+  // running): effective = max(configured, cap). The cap SLOWS a fast
+  // never-customized interval to 30 minutes; it never accelerates a slow
+  // one — ModelDeck never polls providers faster than configured (a 3600s
+  // interval persisted by a pre-#90 install stays 3600s, not 1800s).
+  effectiveAutoRefreshIntervalMs(settings, activeSessionPresent = this.activeProviderSessionPresent) {
+    const intervalMs = settings.autoRefreshIntervalSeconds * 1_000;
+    // An explicitly chosen interval always wins — the active-session cap
+    // only steers the never-customized cadence.
+    if (!settings.pauseWhileActive || autoRefreshIntervalCustomized(settings)
+      || !activeSessionPresent) return intervalMs;
+    return Math.max(intervalMs, ACTIVE_SESSION_REFRESH_CAP_MS);
+  }
+
   autoRefreshDelay(settings) {
     const intervalMs = settings.autoRefreshIntervalSeconds * 1_000;
-    if (!settings.pauseWhileActive || !this.activeProviderSessionPresent) return intervalMs;
+    const effectiveMs = this.effectiveAutoRefreshIntervalMs(settings);
+    if (effectiveMs === intervalMs) return intervalMs;
     const elapsedSinceRefresh = this.lastCompletedRefreshAt == null
-      ? ACTIVE_SESSION_REFRESH_CAP_MS
+      ? effectiveMs
       : this.now() - this.lastCompletedRefreshAt;
-    return Math.min(intervalMs, Math.max(0, ACTIVE_SESSION_REFRESH_CAP_MS - elapsedSinceRefresh));
+    // Wake at the configured interval to re-probe session presence, but
+    // never past the effective due time.
+    return Math.min(intervalMs, Math.max(0, effectiveMs - elapsedSinceRefresh));
   }
 
   armAutoRefresh(delayMs, generation, dueAt = this.now() + delayMs) {
@@ -268,7 +381,10 @@ export class ModelDeckService {
 
   async runAutoRefreshTick(settings, generation) {
     let activeSessionPresent = false;
-    if (settings.pauseWhileActive) {
+    // Issue #90: with a customized interval the cap never applies, so the
+    // process probe is skipped entirely — the configured cadence is honored
+    // as-is and no pause state can arise from it.
+    if (settings.pauseWhileActive && !autoRefreshIntervalCustomized(settings)) {
       try {
         activeSessionPresent = (await this.listProviderProcesses()).length > 0;
       } catch (error) {
@@ -280,10 +396,12 @@ export class ModelDeckService {
     if (!this.autoRefreshStarted || generation !== this.autoRefreshGeneration) return;
     this.activeProviderSessionPresent = activeSessionPresent;
 
+    // Same shared cadence source as autoRefreshDelay and /api/state.
+    const effectiveMs = this.effectiveAutoRefreshIntervalMs(settings, activeSessionPresent);
     const elapsedSinceRefresh = this.lastCompletedRefreshAt == null
-      ? ACTIVE_SESSION_REFRESH_CAP_MS
+      ? effectiveMs
       : this.now() - this.lastCompletedRefreshAt;
-    if (activeSessionPresent && elapsedSinceRefresh < ACTIVE_SESSION_REFRESH_CAP_MS) {
+    if (activeSessionPresent && elapsedSinceRefresh < effectiveMs) {
       this.pausedForActiveSessions = true;
       return;
     }
@@ -301,18 +419,80 @@ export class ModelDeckService {
     return detected.map((project) => this.store.saveProject(project));
   }
 
+  // Issue #89: which accounts' last refresh failure demands a fresh login.
+  // Issue #98: keychain-denied failures ride along — either kind flips the
+  // account's chip, so a transition in either must invalidate the cached
+  // tool probe the same way (recordAccountRefreshResults diffs this set).
+  signInRequiredByRefreshError() {
+    return new Set([...this.accountRefreshErrors]
+      .filter(([, entry]) => SIGN_IN_REQUIRED_ERROR_PATTERN.test(entry.message)
+        || KEYCHAIN_DENIED_ERROR_PATTERN.test(entry.message))
+      .map(([accountId]) => accountId));
+  }
+
+  // Issue #89: persist per-account refresh outcomes so /api/state can surface
+  // them (success clears; failure records message + timestamp). The tool
+  // probe payload caches provider-level authState for up to toolProbeTtlMs;
+  // a credentials-expired transition must not hide behind it — mirror the
+  // duplicate-token invalidation.
+  recordAccountRefreshResults(results) {
+    const before = this.signInRequiredByRefreshError();
+    const at = new Date(this.now()).toISOString();
+    // Mirror the claudeWeeklyFingerprints pruning: a disabled or removed
+    // account drops out of the refresh list, so a success can never clear
+    // its entry — without this prune the stale error (and any derived
+    // signin-required chip) would persist forever. Runs in the shared
+    // helper, so both refreshClaude and refreshCodex prune; keyed on the
+    // full enabled roster because the error map spans both providers.
+    const enabledIds = new Set(this.store.listAccounts()
+      .filter((account) => account.enabled)
+      .map((account) => account.id));
+    for (const accountId of [...this.accountRefreshErrors.keys()]) {
+      if (!enabledIds.has(accountId)) this.accountRefreshErrors.delete(accountId);
+    }
+    for (const result of results) {
+      if (result.ok) this.accountRefreshErrors.delete(result.accountId);
+      else this.accountRefreshErrors.set(result.accountId, { message: result.error, at });
+    }
+    const after = this.signInRequiredByRefreshError();
+    const changed = after.size !== before.size || [...after].some((id) => !before.has(id));
+    if (changed) this.invalidateToolProbe();
+  }
+
   async refreshClaude() {
     const accounts = this.store.listAccounts().filter((account) => account.provider === 'claude' && account.enabled);
-    return Promise.all(accounts.map(async (account) => {
+    const refreshedSnapshots = new Map();
+    const results = await Promise.all(accounts.map(async (account) => {
       await this.refreshClaudeProfileMetadata(account).catch(() => {});
       try {
         const snapshots = await this.fetchClaude({ claudeConfigDir: account.profileRef, profilesDir: this.claudeProfilesDir });
         for (const snapshot of snapshots) this.store.recordUsage(account.id, snapshot);
+        refreshedSnapshots.set(account.id, snapshots);
         return { accountId: account.id, ok: true, snapshotCount: snapshots.length };
       } catch (error) {
         return { accountId: account.id, ok: false, error: error.message };
       }
     }));
+    // Fingerprints update only on usable evidence: a failed fetch or a
+    // missing/stale/invalid weekly leaves the prior fingerprint — and any
+    // duplicate-token flag — in place rather than silently clearing it.
+    const enabledIds = new Set(accounts.map((account) => account.id));
+    for (const accountId of [...this.claudeWeeklyFingerprints.keys()]) {
+      if (!enabledIds.has(accountId)) this.claudeWeeklyFingerprints.delete(accountId);
+    }
+    for (const [accountId, snapshots] of refreshedSnapshots) {
+      const fingerprint = weeklyResetFingerprint(snapshots);
+      if (fingerprint !== null) this.claudeWeeklyFingerprints.set(accountId, fingerprint);
+    }
+    const next = duplicateAccountIdsByFingerprint(this.claudeWeeklyFingerprints);
+    const previous = this.duplicateClaudeTokenAccountIds;
+    this.duplicateClaudeTokenAccountIds = next;
+    // The tool probe payload caches provider-level authState for up to
+    // toolProbeTtlMs; a duplicate-token transition must not hide behind it.
+    const changed = next.size !== previous.size || [...next].some((id) => !previous.has(id));
+    if (changed) this.invalidateToolProbe();
+    this.recordAccountRefreshResults(results);
+    return results;
   }
 
   async refreshClaudeProfileMetadata(account) {
@@ -485,23 +665,73 @@ export class ModelDeckService {
     return account;
   }
 
+  // Issue #99: which sign-in mechanism actually steers where the Claude
+  // credential lands, decided from the installed CLI version.
+  //   'config-dir'  (< 2.1.216): CLAUDE_CONFIG_DIR +
+  //     CLAUDE_SECURESTORAGE_CONFIG_DIR scope the Keychain entry, so an
+  //     env-scoped login lands in the profile's own slot.
+  //   'activation'  (>= 2.1.216): credentials key off realpath(~/.claude)
+  //     regardless of environment. The only known-good steering (validated
+  //     2026-07-21) is activating the target profile FIRST — so ~/.claude
+  //     resolves to it — then running a plain `claude /login`. A fake-HOME
+  //     variant does NOT work: claude treats it as a fresh install and
+  //     resets the profile's .claude.json.
+  // An undetectable version fails toward 'activation': that flow steers
+  // correctly on every known version, while 'config-dir' silently
+  // cross-wires accounts on current CLIs.
+  async claudeLoginFlow() {
+    let version;
+    try {
+      version = await this.installedToolVersion(this.claudePath);
+    } catch {
+      return 'activation';
+    }
+    return compareSemver(version, CLAUDE_RESOLVED_HOME_CREDENTIALS_MIN_VERSION) >= 0
+      ? 'activation'
+      : 'config-dir';
+  }
+
   // Issue #8, step 2: the exact provider-owned login command for one account,
   // for the app to run in the user's own terminal. ModelDeck never performs
   // the login itself and never sees credentials. Known pitfall
   // (docs/HANDOFF.md): this must never construct a `logout` invocation.
-  loginSpec(accountId) {
+  async loginSpec(accountId) {
     const account = this.store.getAccount(accountId);
     if (!account) throw new Error('account not found');
     if (!account.enabled) throw new Error('account is disabled');
     if (account.provider === 'claude') {
       const profileRef = managedClaudeProfile(account.profileRef, this.claudeProfilesDir);
+      const flow = await this.claudeLoginFlow();
+      if (flow === 'activation') {
+        // Issue #99 fix direction 1: the caller must activate this account
+        // first (requiresActivation) so ~/.claude resolves to the target
+        // profile, then run the plain login below — no env override, because
+        // the environment no longer steers credential storage. Verify the
+        // identity while the target is still active; only then optionally
+        // restore the previously active account.
+        return {
+          provider: 'claude',
+          account,
+          flow,
+          requiresActivation: true,
+          command: this.claudePath,
+          args: ['/login'],
+          env: {},
+          preview: `${shellQuote(this.claudePath)} /login`,
+        };
+      }
       return {
         provider: 'claude',
         account,
+        flow,
+        requiresActivation: false,
         command: this.claudePath,
         args: ['auth', 'login'],
-        env: { CLAUDE_CONFIG_DIR: profileRef },
-        preview: `CLAUDE_CONFIG_DIR=${shellQuote(profileRef)} ${shellQuote(this.claudePath)} auth login`,
+        // Issue #66: both vars pinned to the same canonical profile path so
+        // the login session cannot pair one profile's storage with another's
+        // credential scope.
+        env: { CLAUDE_CONFIG_DIR: profileRef, CLAUDE_SECURESTORAGE_CONFIG_DIR: profileRef },
+        preview: `CLAUDE_CONFIG_DIR=${shellQuote(profileRef)} CLAUDE_SECURESTORAGE_CONFIG_DIR=${shellQuote(profileRef)} ${shellQuote(this.claudePath)} auth login`,
       };
     }
     const profileRef = managedCodexProfile(account.profileRef, this.codexProfilesDir);
@@ -524,6 +754,27 @@ export class ModelDeckService {
     const result = account.provider === 'claude'
       ? await this.readClaudeAuth({ claudePath: this.claudePath, claudeConfigDir: account.profileRef, profilesDir: this.claudeProfilesDir })
       : await this.readCodexAuth({ binary: this.codexPath, codexHome: account.profileRef, profilesDir: this.codexProfilesDir });
+    // Issue #99 fix direction 2 (the #65 blind spot's enforcement teeth):
+    // compare the read-back identity against the intended account BEFORE
+    // persisting anything. On mismatch, refuse: persisting would launder the
+    // wrong login into a recorded identity, and a bare success would leave
+    // the deck showing wrong data behind all-Healthy chips. The response
+    // names the mismatch explicitly so every caller can alert.
+    if (account.provider === 'claude' && result.authenticated) {
+      const expected = account.identity?.trim().toLowerCase() || null;
+      const actual = result.identity?.trim().toLowerCase() || null;
+      if (expected && actual && expected !== actual) {
+        // Credential presence did change even though nothing is recorded.
+        this.authPresenceCache.delete(`claude:${account.profileRef}`);
+        this.invalidateToolProbe();
+        return {
+          account,
+          authenticated: true,
+          identity: result.identity,
+          identityMismatch: { expected: account.identity, actual: result.identity },
+        };
+      }
+    }
     let saved = account;
     // Issue #26: persist the plan facts the status read surfaced alongside
     // the identity — same call, no extra provider work.
@@ -563,6 +814,9 @@ export class ModelDeckService {
     // signal that credential presence may have changed, so do not retain the
     // pre-login account or provider auth result.
     if (account.provider === 'claude') this.authPresenceCache.delete(`claude:${account.profileRef}`);
+    // Issue #89: an authenticated verify supersedes the recorded refresh
+    // failure — the chip must flip back without waiting for the next tick.
+    if (result.authenticated) this.accountRefreshErrors.delete(account.id);
     this.invalidateToolProbe();
     return {
       account: saved,
@@ -575,6 +829,7 @@ export class ModelDeckService {
     const accounts = this.store.listAccounts().filter((account) => account.provider === 'codex' && account.enabled);
     const results = await Promise.all(accounts.map(async (account) => {
       await this.refreshCodexPlanTier(account).catch(() => {});
+      await this.refreshCodexAccountIdentifier(account).catch(() => {});
       try {
         const snapshots = await this.fetchCodex({ binary: this.codexPath, codexHome: account.profileRef });
         for (const snapshot of snapshots) this.store.recordUsage(account.id, snapshot);
@@ -583,7 +838,35 @@ export class ModelDeckService {
         return { accountId: account.id, ok: false, error: error.message };
       }
     }));
+    // Issue #108 — mirror of the Claude fingerprint block in refreshClaude:
+    // prune identifiers for accounts no longer enabled, then recompute the
+    // duplicate set. Two enabled profiles whose auth.json carries the same
+    // tokens.account_id hold the same real account, so every member of a
+    // matching group is flagged.
+    const enabledIds = new Set(accounts.map((account) => account.id));
+    for (const accountId of [...this.codexAccountIdentifiers.keys()]) {
+      if (!enabledIds.has(accountId)) this.codexAccountIdentifiers.delete(accountId);
+    }
+    const next = duplicateAccountIdsByFingerprint(this.codexAccountIdentifiers);
+    const previous = this.duplicateCodexTokenAccountIds;
+    this.duplicateCodexTokenAccountIds = next;
+    // The tool probe payload caches provider-level authState for up to
+    // toolProbeTtlMs; a duplicate-token transition must not hide behind it.
+    const changed = next.size !== previous.size || [...next].some((id) => !previous.has(id));
+    if (changed) this.invalidateToolProbe();
+    this.recordAccountRefreshResults(results);
     return results;
+  }
+
+  // Issue #108: refresh one account's remembered auth.json identifier.
+  // Evidence memory (the PR #77 lesson): a missing/unreadable auth.json or an
+  // absent account_id is NOT evidence a duplicate resolved — the prior
+  // identifier (and any live duplicate-token flag) stays until a readable
+  // auth.json provides fresh evidence. A re-login writes a new auth.json, so
+  // the flag clears exactly when the credentials actually separate.
+  async refreshCodexAccountIdentifier(account) {
+    const { accountId } = await this.readCodexAccountId({ codexHome: account.profileRef });
+    if (accountId != null) this.codexAccountIdentifiers.set(account.id, accountId);
   }
 
   // Reads only the profile's existing auth.json during the normal refresh
@@ -633,7 +916,14 @@ export class ModelDeckService {
     if (!account) throw new Error('account not found');
     if (!account.enabled) throw new Error('account is disabled');
 
+    let warnings = [];
     if (account.provider === 'claude') {
+      // Pre-flip honesty (issue #66): sessions launched before the pinned
+      // env existed still resolve storage through the ~/.claude symlink and
+      // can silently lose transcript history when it flips. Detect them
+      // before the flip so the response can say so; best-effort only —
+      // detection failure must never block activation.
+      warnings = await this.claudeRunningSessionWarnings();
       await this.activateClaude({ profileRef: account.profileRef, activeLink: this.claudeActiveLink, profilesDir: this.claudeProfilesDir });
       await this.scopeClaudeSecureStorage(account.profileRef);
     } else {
@@ -641,7 +931,24 @@ export class ModelDeckService {
       await this.activateCodexProfile(account.profileRef);
     }
 
-    return this.setDefaultAccount(account.provider, account.id);
+    return { account: this.setDefaultAccount(account.provider, account.id), warnings };
+  }
+
+  // Issue #66: counts running `claude` processes at activation time. Pinned
+  // sessions (launched with CLAUDE_CONFIG_DIR exported) are insulated from
+  // the flip, but the daemon cannot distinguish pinned from unpinned
+  // processes cheaply, so the warning is phrased conditionally.
+  async claudeRunningSessionWarnings() {
+    let running = 0;
+    try {
+      running = (await this.listProviderProcesses()).filter((command) => command === 'claude').length;
+    } catch {
+      return [];
+    }
+    if (!running) return [];
+    return [
+      `${running} running Claude ${running === 1 ? 'session' : 'sessions'} may lose session storage if launched without ModelDeck's pinned environment. Pinned sessions are unaffected.`,
+    ];
   }
 
   async claudeScopingSupported() {
@@ -657,21 +964,62 @@ export class ModelDeckService {
 
   async scopeClaudeSecureStorage(profileRef) {
     const value = await fs.promises.realpath(profileRef);
+    // Issue #66: refresh the shell pin first so new terminal sessions export
+    // CLAUDE_CONFIG_DIR + CLAUDE_SECURESTORAGE_CONFIG_DIR (always the same
+    // string) resolved from ModelDeck's records at activation time — never a
+    // launch-time readlink of the symlink. Failure degrades verification but
+    // never blocks the home switch.
+    let shellPinError = null;
+    try {
+      await this.writeClaudeShellEnvFile(value);
+    } catch (error) {
+      shellPinError = errorMessage(error);
+    }
     if (this.platform !== 'darwin') {
-      this.claudeSecureStorage = { value, status: 'not-applicable' };
+      this.claudeSecureStorage = { value, status: 'not-applicable', ...(shellPinError ? { error: shellPinError } : {}) };
       return this.claudeSecureStorage;
     }
     if (!(await this.claudeScopingSupported())) {
-      this.claudeSecureStorage = { value, status: 'unsupported-cli' };
+      this.claudeSecureStorage = { value, status: 'unsupported-cli', ...(shellPinError ? { error: shellPinError } : {}) };
       return this.claudeSecureStorage;
     }
     try {
+      // GUI-launched apps inherit the launchd environment: pin both vars
+      // there too, and always together — a secure-storage scope diverging
+      // from the config dir would store session data under one profile while
+      // authenticating as another (issue #66 spike caveat).
+      //
+      // Known, accepted ordering window: launchctl cannot set two variables
+      // atomically, so a GUI app spawned between these two adjacent calls
+      // could observe a mixed pair (new config dir + previous scope). A real
+      // fix needs a different launch mechanism and is out of scope here.
+      // Terminal sessions are unaffected — they source the temp+rename
+      // atomic env file — so GUI-launch pinning is documented as
+      // best-effort (docs/CLAUDE_IDENTITY.md, "What is NOT protected").
+      await this.exec('/bin/launchctl', ['setenv', 'CLAUDE_CONFIG_DIR', value], { timeout: 5_000, maxBuffer: 65_536 });
       await this.exec('/bin/launchctl', ['setenv', 'CLAUDE_SECURESTORAGE_CONFIG_DIR', value], { timeout: 5_000, maxBuffer: 65_536 });
-      this.claudeSecureStorage = { value, status: 'active' };
+      this.claudeSecureStorage = shellPinError
+        ? { value, status: 'degraded', error: shellPinError }
+        : { value, status: 'active' };
     } catch (error) {
       this.claudeSecureStorage = { value, status: 'degraded', error: errorMessage(error) };
     }
     return this.claudeSecureStorage;
+  }
+
+  // Atomic write (temp + rename) so a shell sourcing the snippet mid-switch
+  // never sees a half-written file.
+  async writeClaudeShellEnvFile(profileRealPath) {
+    const file = this.claudeShellEnvFile;
+    await fs.promises.mkdir(path.dirname(file), { recursive: true });
+    const temporary = `${file}.modeldeck-${process.pid}-${crypto.randomUUID()}`;
+    try {
+      await fs.promises.writeFile(temporary, claudePinnedEnvFileContent(profileRealPath), { mode: 0o600 });
+      await fs.promises.rename(temporary, file);
+    } catch (error) {
+      await fs.promises.unlink(temporary).catch(() => {});
+      throw error;
+    }
   }
 
   setDefaultAccount(provider, accountId) {
@@ -683,6 +1031,7 @@ export class ModelDeckService {
   deleteAccount(accountId) {
     const account = this.store.getAccount(accountId);
     const deleted = this.store.deleteAccount(accountId);
+    if (deleted) this.accountRefreshErrors.delete(accountId);
     if (deleted && account?.isDefault) this.invalidateToolProbe();
     return deleted;
   }
@@ -755,7 +1104,27 @@ export class ModelDeckService {
 
   async accountAuthState(account) {
     if (!account?.profileRef) return 'unknown';
-    if (account.provider === 'claude') return this.claudeProfileAuthState(account.profileRef);
+    if (account.provider === 'claude' && this.duplicateClaudeTokenAccountIds.has(account.id)) {
+      return 'duplicate-token';
+    }
+    // Issue #108: same precedence as the Claude branch — a confirmed shared
+    // credential outranks signin-required and the presence probe, because it
+    // is the state that explains why every other signal looks healthy.
+    if (account.provider === 'codex' && this.duplicateCodexTokenAccountIds.has(account.id)) {
+      return 'duplicate-token';
+    }
+    // Issue #89: a refresh that failed because the stored credentials are
+    // unusable outranks the presence probe — expired OAuth still passes the
+    // presence check, which left the chip "Healthy" on a dead account.
+    const lastError = account.id != null && this.accountRefreshErrors.get(account.id);
+    // Issue #98: a denied Keychain read outranks both the sign-in check and
+    // the presence probe — the item exists (presence says "ok") and no
+    // re-login can fix an ACL denial, so any other chip would mislead.
+    if (lastError && KEYCHAIN_DENIED_ERROR_PATTERN.test(lastError.message)) return 'keychain-denied';
+    if (lastError && SIGN_IN_REQUIRED_ERROR_PATTERN.test(lastError.message)) return 'signin-required';
+    if (account.provider === 'claude') {
+      return this.claudeProfileAuthState(account.profileRef);
+    }
     if (account.provider === 'codex') {
       return fs.existsSync(path.join(account.profileRef, 'auth.json')) ? 'ok' : 'signin-required';
     }
@@ -763,10 +1132,16 @@ export class ModelDeckService {
   }
 
   async accountsWithAuthState(accounts = this.store.listAccounts()) {
-    return Promise.all(accounts.map(async (account) => ({
-      ...account,
-      authState: await this.accountAuthState(account),
-    })));
+    return Promise.all(accounts.map(async (account) => {
+      // Issue #89: surface the per-account refresh failure refreshAll used
+      // to drop, so the deck and Settings can render honest staleness.
+      const lastRefreshError = this.accountRefreshErrors.get(account.id) || null;
+      return {
+        ...account,
+        authState: await this.accountAuthState(account),
+        ...(lastRefreshError ? { lastRefreshError } : {}),
+      };
+    }));
   }
 
   async providerActivationState(provider, activeLink, accounts) {
@@ -824,6 +1199,29 @@ export class ModelDeckService {
       : { state: 'identity-mismatch', resolvedProfileRef, guidance, secureStorage: this.claudeSecureStorage };
   }
 
+  // Issue #90: the honest scheduler surface for /api/state. Reports the
+  // configured cadence, the EFFECTIVE cadence the scheduler is actually
+  // running, and why they differ when they do — so the deck can show a calm
+  // "auto-refresh slowed" indicator instead of silently starving. The only
+  // slowdown source today is the active-session cap on the never-customized
+  // default interval ('active-session-cap'); effective is null while
+  // auto-refresh is disabled (there is no cadence to report).
+  refreshSchedulerStatus(settings = this.store.getSettings()) {
+    const configured = settings.autoRefreshIntervalSeconds;
+    // Same shared cadence source the scheduler itself runs on (CodeRabbit,
+    // PR #111): what this reports is exactly what autoRefreshDelay and
+    // runAutoRefreshTick execute, in every branch.
+    const effective = settings.autoRefreshEnabled
+      ? this.effectiveAutoRefreshIntervalMs(settings) / 1_000
+      : null;
+    return {
+      pausedForActiveSessions: this.pausedForActiveSessions,
+      configuredRefreshIntervalSeconds: configured,
+      effectiveRefreshIntervalSeconds: effective,
+      effectiveRefreshReason: effective != null && effective > configured ? 'active-session-cap' : null,
+    };
+  }
+
   async state() {
     const value = this.store.state();
     const [accounts, claudeActivation, codexActivation] = await Promise.all([
@@ -839,7 +1237,7 @@ export class ModelDeckService {
       accounts,
       activation: { claude: claudeActivation, codex: codexActivation },
       claudeSecureStorage,
-      scheduler: { pausedForActiveSessions: this.pausedForActiveSessions },
+      scheduler: this.refreshSchedulerStatus(),
     };
   }
 
@@ -911,6 +1309,15 @@ export class ModelDeckService {
         ? compareSemver(claude.version, CLAUDE_SECURESTORAGE_MIN_VERSION) >= 0
         : false;
       this.claudeSecureStorageSupported = claude.secureStorageScopingSupported;
+      // Issue #99 (natural fallout of the same version read): which
+      // mechanism scopes CREDENTIAL storage on the installed CLI.
+      // 'resolved-home' means env-scoped sign-ins are broken and login
+      // guidance must be activation-driven; null when not installed.
+      claude.credentialScoping = claude.version
+        ? (compareSemver(claude.version, CLAUDE_RESOLVED_HOME_CREDENTIALS_MIN_VERSION) >= 0
+          ? 'resolved-home'
+          : 'config-dir')
+        : null;
       const value = { tools: { claude, codex }, checkedAt: new Date(this.now()).toISOString() };
       if (this.toolProbeGeneration === generation) {
         this.toolProbeCache = { value, expiresAt: this.now() + this.toolProbeTtlMs };
@@ -1038,8 +1445,10 @@ export class ModelDeckService {
         cwd,
         command: this.claudePath,
         args: extraArgs,
-        env: { CLAUDE_CONFIG_DIR: profileRef },
-        preview: `cd ${shellQuote(cwd)} && CLAUDE_CONFIG_DIR=${shellQuote(profileRef)} ${shellQuote(this.claudePath)}${extraArgs.length ? ` ${extraArgs.map(shellQuote).join(' ')}` : ''}`,
+        // Issue #66: pinned pair — see loginSpec. Resumes re-apply the same
+        // env so `claude -r` finds the transcript under the same pin.
+        env: { CLAUDE_CONFIG_DIR: profileRef, CLAUDE_SECURESTORAGE_CONFIG_DIR: profileRef },
+        preview: `cd ${shellQuote(cwd)} && CLAUDE_CONFIG_DIR=${shellQuote(profileRef)} CLAUDE_SECURESTORAGE_CONFIG_DIR=${shellQuote(profileRef)} ${shellQuote(this.claudePath)}${extraArgs.length ? ` ${extraArgs.map(shellQuote).join(' ')}` : ''}`,
       };
     }
 

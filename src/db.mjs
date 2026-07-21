@@ -25,6 +25,13 @@ function now() {
 export const DEFAULT_SETTINGS = Object.freeze({
   autoRefreshEnabled: true,
   autoRefreshIntervalSeconds: 300,
+  // Issue #90 change-event provenance: flips to true — permanently — the
+  // first time a settings write CHANGES autoRefreshIntervalSeconds (or the
+  // app asserts an explicit picker selection). Key presence alone can't
+  // carry this fact because the app PUTs full merged documents; a change
+  // event can't false-positive. While false, the active-session refresh cap
+  // may slow the default cadence; once true, the user's interval always wins.
+  autoRefreshIntervalCustomized: false,
   pauseWhileActive: true,
   layout: 'two-column',
   defaultSort: 'next-reset',
@@ -34,7 +41,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
 
 function validateSetting(key, value) {
   if (!Object.hasOwn(DEFAULT_SETTINGS, key)) throw new Error(`unknown setting: ${key}`);
-  if (['autoRefreshEnabled', 'pauseWhileActive'].includes(key) && typeof value !== 'boolean') {
+  if (['autoRefreshEnabled', 'autoRefreshIntervalCustomized', 'pauseWhileActive'].includes(key) && typeof value !== 'boolean') {
     throw new Error(`${key} must be a boolean`);
   }
   if (key === 'autoRefreshIntervalSeconds' && (!Number.isInteger(value) || value < 60 || value > 3600)) {
@@ -373,7 +380,18 @@ export class Store {
   saveSettings(input) {
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('settings must be a JSON object');
     for (const [key, value] of Object.entries(input)) validateSetting(key, value);
-    const settings = { ...this.getSettings(), ...input };
+    const current = this.getSettings();
+    const settings = { ...current, ...input };
+    // Issue #90 change-event provenance. The flag is one-way: it turns true
+    // when this write CHANGES the interval or when the app asserts an
+    // explicit user selection (autoRefreshIntervalCustomized: true in the
+    // patch), and it NEVER turns back false — an echoed full document
+    // (every key present, values unchanged) therefore cannot set it, and a
+    // stray `false` cannot clear it.
+    settings.autoRefreshIntervalCustomized = current.autoRefreshIntervalCustomized
+      || input.autoRefreshIntervalCustomized === true
+      || (input.autoRefreshIntervalSeconds != null
+        && input.autoRefreshIntervalSeconds !== current.autoRefreshIntervalSeconds);
     this.db.prepare('UPDATE settings SET value_json = ?, updated_at = ? WHERE id = 1')
       .run(JSON.stringify(settings), now());
     return settings;

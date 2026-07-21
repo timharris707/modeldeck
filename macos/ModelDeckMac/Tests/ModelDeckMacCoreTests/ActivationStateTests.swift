@@ -308,11 +308,11 @@ private final class QueueActivator: AccountActivating, @unchecked Sendable {
         self.results = results
     }
 
-    func activateAccount(id: String) async throws -> DeckAccount {
+    func activateAccount(id: String) async throws -> AccountActivation {
         guard let result = nextResult(recording: id) else {
             throw DaemonClientError.invalidResponse
         }
-        return try result.get()
+        return AccountActivation(account: try result.get())
     }
 
     private func nextResult(recording id: String) -> Result<DeckAccount, Error>? {

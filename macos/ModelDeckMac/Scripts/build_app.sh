@@ -32,6 +32,27 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/ModelDeckMac"
 cp "$PACKAGE_DIR/Support/Info.plist" "$APP/Contents/Info.plist"
 
+# SwiftPM resource bundle (issue #103: provider icons). Bundle.module resolves
+# it via Bundle.main.resourceURL, so it must sit in Contents/Resources.
+RESOURCE_BUNDLE="$(dirname "$BIN")/ModelDeckMac_ModelDeckMacCore.bundle"
+[[ -d "$RESOURCE_BUNDLE" ]] || { echo "build_app.sh: resource bundle not found at $RESOURCE_BUNDLE" >&2; exit 1; }
+cp -R "$RESOURCE_BUNDLE" "$APP/Contents/Resources/"
+
+# Issue #96 (optional in dev): when a daemon binary has been built
+# (scripts/build-daemon-binary.sh → dist/daemon/), stage it plus its
+# manifest and the SMAppService agent plist so the first-run flow can be
+# hand-tested from a dev bundle. Without it the app runs as a pure client
+# and the first-run surface stays off.
+REPO_ROOT="$(cd "$PACKAGE_DIR/../.." && pwd)"
+if [[ -x "$REPO_ROOT/dist/daemon/modeldeckd" && -f "$REPO_ROOT/dist/daemon/manifest.json" ]]; then
+  echo "==> staging bundled daemon from $REPO_ROOT/dist/daemon"
+  mkdir -p "$APP/Contents/Resources/daemon" "$APP/Contents/Library/LaunchAgents"
+  cp "$REPO_ROOT/dist/daemon/modeldeckd" "$APP/Contents/Resources/daemon/modeldeckd"
+  chmod 755 "$APP/Contents/Resources/daemon/modeldeckd"
+  cp "$REPO_ROOT/dist/daemon/manifest.json" "$APP/Contents/Resources/daemon/manifest.json"
+  cp "$PACKAGE_DIR/Support/ai.hermes.modeldeck.plist" "$APP/Contents/Library/LaunchAgents/ai.hermes.modeldeck.plist"
+fi
+
 echo "==> codesign (identity: $IDENTITY)"
 codesign --force --options runtime --sign "$IDENTITY" "$APP"
 codesign --verify --deep "$APP"

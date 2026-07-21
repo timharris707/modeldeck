@@ -71,19 +71,49 @@ public final class SettingsSyncModel: ObservableObject {
         isSaving = true
         var next: DaemonSettingsPatch? = patch
         while let current = next {
-            do {
-                let merged = try await sync.pushSettings(current)
-                settings = merged
-                isLoaded = true
-                lastError = nil
-                onApply?(merged)
-            } catch {
-                lastError = Self.message(for: error)
-            }
+            await push(current)
             next = pendingPatch.isEmpty ? nil : pendingPatch
             pendingPatch = DaemonSettingsPatch()
         }
         isSaving = false
+    }
+
+    private func push(_ patch: DaemonSettingsPatch) async {
+        do {
+            let merged = try await sync.pushSettings(patch)
+            settings = merged
+            isLoaded = true
+            lastError = nil
+            onApply?(merged)
+        } catch {
+            let message = Self.message(for: error)
+            // Issue #90 old-daemon tolerance: a pre-#90 daemon rejects the
+            // provenance key ("unknown setting: autoRefreshIntervalCustomized").
+            // The interval choice itself must not be lost to that — strip the
+            // flag and retry once. A flag-only patch simply becomes a no-op
+            // (that daemon has no cap keyed on the flag anyway).
+            if patch.autoRefreshIntervalCustomized != nil,
+               message.localizedCaseInsensitiveContains("unknown setting"),
+               message.localizedCaseInsensitiveContains("autoRefreshIntervalCustomized") {
+                var stripped = patch
+                stripped.autoRefreshIntervalCustomized = nil
+                guard !stripped.isEmpty else {
+                    lastError = nil
+                    return
+                }
+                do {
+                    let merged = try await sync.pushSettings(stripped)
+                    settings = merged
+                    isLoaded = true
+                    lastError = nil
+                    onApply?(merged)
+                } catch {
+                    lastError = Self.message(for: error)
+                }
+                return
+            }
+            lastError = message
+        }
     }
 
     private var pendingPatch = DaemonSettingsPatch()
@@ -97,8 +127,18 @@ public final class SettingsSyncModel: ObservableObject {
     }
 
     public func setAutoRefreshInterval(seconds: Int) async {
-        guard seconds != settings.autoRefreshIntervalSeconds else { return }
-        await update(DaemonSettingsPatch(autoRefreshIntervalSeconds: seconds))
+        // Issue #90: an interval-picker selection is user intent, so it
+        // carries the provenance flag — even a re-pick of the stored value
+        // counts while the flag is still false (that selection is exactly
+        // what lifts the active-session cap for a user whose deliberate
+        // choice equals the default). Once the daemon confirms the flag,
+        // unchanged echoes return to no-ops, preserving echo-loop safety.
+        guard seconds != settings.autoRefreshIntervalSeconds
+            || !settings.autoRefreshIntervalCustomized else { return }
+        await update(DaemonSettingsPatch(
+            autoRefreshIntervalSeconds: seconds,
+            autoRefreshIntervalCustomized: true
+        ))
     }
 
     public func setPauseWhileActive(_ pause: Bool) async {

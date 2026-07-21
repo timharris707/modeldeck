@@ -1,0 +1,6 @@
+# One extended regular expression per line. Blank lines and comments are ignored.
+# Keep the real pattern file outside the mirror or set MD_SCRUB_PATTERNS to a
+# repository-local file; sync-mirror.sh strips that exact file before scanning.
+person@example\.invalid
+private-label-[0-9]+
+internal-host\.example\.invalid

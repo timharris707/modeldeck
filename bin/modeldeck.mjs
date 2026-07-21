@@ -6,7 +6,7 @@ import { ModelDeckService } from '../src/service.mjs';
 import { evaluateCapacity } from '../src/capacity.mjs';
 import {
   DB_PATH, PROJECTS_ROOT, CLAUDE_PATH, CLAUDE_PROFILES_DIR, CLAUDE_ACTIVE_LINK,
-  CODEX_PATH, CODEX_ACTIVE_LINK, HOST, PORT,
+  CLAUDE_SHELL_ENV_FILE, CODEX_PATH, CODEX_ACTIVE_LINK, HOST, PORT,
 } from '../src/paths.mjs';
 
 function usage() {
@@ -49,6 +49,7 @@ if (command === 'serve') {
     claudePath: CLAUDE_PATH,
     claudeProfilesDir: CLAUDE_PROFILES_DIR,
     claudeActiveLink: CLAUDE_ACTIVE_LINK,
+    claudeShellEnvFile: CLAUDE_SHELL_ENV_FILE,
     codexPath: CODEX_PATH,
     codexActiveLink: CODEX_ACTIVE_LINK,
   });

@@ -1,24 +1,21 @@
-import fs from 'node:fs';
 import http from 'node:http';
-import path from 'node:path';
+import { isSea } from 'node:sea';
 import { fileURLToPath } from 'node:url';
+import packageMetadata from '../package.json' with { type: 'json' };
 import { Store } from './db.mjs';
 import { ModelDeckService } from './service.mjs';
 import { resolveMutationToken } from './token.mjs';
+import { main as runClaudeUsageProbe } from './adapters/claude-usage-probe.mjs';
 import {
   HOST, PORT, DB_PATH, PROJECTS_ROOT, CLAUDE_PATH, CLAUDE_PROFILES_DIR, CLAUDE_ACTIVE_LINK,
-  CODEX_PATH, CODEX_ACTIVE_LINK, CODEX_PROFILES_DIR, PUBLIC_DIR,
+  CLAUDE_SHELL_ENV_FILE, CODEX_PATH, CODEX_ACTIVE_LINK, CODEX_PROFILES_DIR,
 } from './paths.mjs';
 
-const VERSION = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
-
-const MIMES = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.json': 'application/json; charset=utf-8',
-};
+// esbuild replaces the build-only identifier with a string literal for SEA;
+// source-mode execution uses Node's JSON module loader instead.
+const VERSION = typeof __MODELDECK_VERSION__ === 'string'
+  ? __MODELDECK_VERSION__
+  : packageMetadata.version;
 
 function json(res, status, payload, extraHeaders = {}) {
   const body = JSON.stringify(payload);
@@ -62,20 +59,14 @@ function hostAllowed(req, port) {
   return value === `127.0.0.1:${port}` || value === `localhost:${port}`;
 }
 
-function staticFile(urlPath, publicDir) {
-  const requestPath = urlPath === '/' ? '/index.html' : urlPath;
-  const resolved = path.resolve(publicDir, `.${requestPath}`);
-  if (!resolved.startsWith(`${path.resolve(publicDir)}${path.sep}`)) return null;
-  return resolved;
-}
-
-export function createApp({ store, service, host = HOST, port = PORT, publicDir = PUBLIC_DIR, mutationToken } = {}) {
+export function createApp({ store, service, host = HOST, port = PORT, mutationToken } = {}) {
   const ownedStore = store || new Store(DB_PATH);
   const ownedService = service || new ModelDeckService(ownedStore, {
     projectsRoot: PROJECTS_ROOT,
     claudePath: CLAUDE_PATH,
     claudeProfilesDir: CLAUDE_PROFILES_DIR,
     claudeActiveLink: CLAUDE_ACTIVE_LINK,
+    claudeShellEnvFile: CLAUDE_SHELL_ENV_FILE,
     codexPath: CODEX_PATH,
     codexActiveLink: CODEX_ACTIVE_LINK,
     codexProfilesDir: CODEX_PROFILES_DIR,
@@ -146,8 +137,18 @@ export function createApp({ store, service, host = HOST, port = PORT, publicDir 
       if (req.method === 'GET' && loginMatch) {
         const account = ownedStore.getAccount(decodeURIComponent(loginMatch[1]));
         if (!account) return json(res, 404, { error: 'account not found' });
-        const spec = ownedService.loginSpec(account.id);
-        return json(res, 200, { provider: spec.provider, account: spec.account, command: spec.preview });
+        const spec = await ownedService.loginSpec(account.id);
+        return json(res, 200, {
+          provider: spec.provider,
+          account: spec.account,
+          command: spec.preview,
+          // Issue #99: Claude specs carry the version-detected flow. With
+          // requiresActivation the caller must activate this account BEFORE
+          // running the command, verify identity while it is still active,
+          // and only then optionally restore the previous active account.
+          ...(spec.flow ? { flow: spec.flow } : {}),
+          ...(spec.requiresActivation != null ? { requiresActivation: spec.requiresActivation } : {}),
+        });
       }
       // Issue #8, step 3: token-gated identity read-back (spawns the
       // provider's status command — never a login or logout).
@@ -172,7 +173,10 @@ export function createApp({ store, service, host = HOST, port = PORT, publicDir 
         const activated = await ownedService.activateAccount(id);
         const state = await ownedService.state();
         return json(res, 200, {
-          account: activated,
+          account: activated.account,
+          // Issue #66: pre-flip honesty — running Claude sessions launched
+          // without the pinned env may lose session storage on this switch.
+          warnings: activated.warnings,
           activation: state.activation[account.provider],
           claudeSecureStorage: state.claudeSecureStorage,
         });
@@ -197,19 +201,7 @@ export function createApp({ store, service, host = HOST, port = PORT, publicDir 
         });
       }
 
-      if (req.method !== 'GET') return json(res, 404, { error: 'not found' });
-      const file = staticFile(url.pathname, publicDir);
-      if (!file || !fs.existsSync(file) || !fs.statSync(file).isFile()) return json(res, 404, { error: 'not found' });
-      const content = fs.readFileSync(file);
-      res.writeHead(200, {
-        'Content-Type': MIMES[path.extname(file)] || 'application/octet-stream',
-        'Content-Length': content.length,
-        'Cache-Control': 'no-cache',
-        'X-Content-Type-Options': 'nosniff',
-        'X-Frame-Options': 'DENY',
-        'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
-      });
-      res.end(content);
+      return json(res, 404, { error: 'not found' });
     } catch (error) {
       json(res, error.statusCode || 400, {
         error: error.message,
@@ -237,9 +229,17 @@ export function createApp({ store, service, host = HOST, port = PORT, publicDir 
   };
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+async function main() {
+  if (isSea() && process.argv.includes('modeldeck-internal-claude-usage-probe')) {
+    await runClaudeUsageProbe();
+    return;
+  }
+
   const app = createApp();
-  app.listen(() => console.log(`ModelDeck running at http://${HOST}:${PORT} (db: ${DB_PATH}, mutation token source: ${app.tokenSource})`));
+  app.listen(() => {
+    const actualPort = app.server.address()?.port || PORT;
+    console.log(`ModelDeck running at http://${HOST}:${actualPort} (db: ${DB_PATH}, mutation token source: ${app.tokenSource})`);
+  });
   const shutdown = async () => {
     await app.close();
     app.store.close();
@@ -247,4 +247,12 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+}
+
+const isMain = isSea() || (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url));
+if (isMain) {
+  main().catch((error) => {
+    process.stderr.write(`ModelDeck failed to start: ${error.message}\n`);
+    process.exitCode = 1;
+  });
 }

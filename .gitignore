@@ -8,3 +8,5 @@ playwright-report/
 test-results/
 .claude/lane-logs/
 dist/
+.cache/
+.smoke-db.sqlite*

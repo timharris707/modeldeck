@@ -149,8 +149,38 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     /// `.unknown` when the daemon didn't report it (pre-#56) — the marker
     /// then renders the full checkmark exactly as before.
     public var activationState: ProviderActivationState
+    /// Issue #89: the newest provider observation across ALL of this
+    /// account's usage snapshots (computed by `DeckBuilder.rows` before any
+    /// window filtering). Feeds the per-card staleness marker; nil when no
+    /// snapshot carries a parseable `observedAt`.
+    public var newestObservedAt: Date?
 
     public var id: String { account.id }
+
+    /// Issue #89: this card's staleness marker, or nil while its data is
+    /// fresh. Pure derivation so the threshold math is unit-testable; the
+    /// view calls this with the app's effective auto-refresh interval.
+    /// Issue #98: suppressed while the keychain recovery notice is up — one
+    /// notice per card, and the actionable one wins over the bare age line
+    /// (the denial is WHY the data is aging).
+    public func staleness(now: Date, autoRefreshInterval: TimeInterval) -> DeckFreshness.CardStaleness? {
+        guard keychainRecovery == nil else { return nil }
+        return DeckFreshness.cardStaleness(
+            newestObservedAt: newestObservedAt,
+            lastRefreshError: account.lastRefreshError,
+            now: now,
+            autoRefreshInterval: autoRefreshInterval
+        )
+    }
+
+    /// Issue #98: non-nil when macOS denied the daemon's read of this
+    /// account's existing Keychain credentials (dismissed prompt). The card
+    /// renders it as an actionable warning line — "ModelDeck needs Keychain
+    /// access" with the Refresh + Always Allow coaching in the tooltip —
+    /// instead of silently stale-looking data.
+    public var keychainRecovery: DeckFreshness.KeychainAccessRecovery? {
+        DeckFreshness.keychainRecovery(for: account)
+    }
 
     /// How this row's active marker renders when `isActive`: the full
     /// checkmark only when activation is physically effective (or
@@ -213,18 +243,42 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
         return "\(worst.title) · \(worst.resetText)"
     }
 
+    /// VoiceOver label for the whole card button. The card's Button carries
+    /// an EXPLICIT accessibility label, which suppresses the child marker
+    /// views' own labels — so every state the row's markers show must be
+    /// spoken here (issue #55's pending caption, issue #73's opted-in
+    /// email, and issue #65's duplicate-token warning). Pure derivation so
+    /// it is directly unit testable; the view calls this verbatim.
+    public func accessibilityLabel(showsIdentity: Bool) -> String {
+        let identity = showsIdentity
+            ? (account.identity.flatMap { $0.isEmpty ? nil : ", \($0)" } ?? "")
+            : ""
+        var label: String
+        if case .pending(let caption) = activeIndicator {
+            label = "\(account.label)\(identity), marked active, pending — \(caption)"
+        } else {
+            label = "\(account.label)\(identity)\(isActive ? ", active" : "")"
+        }
+        if account.hasDuplicateToken {
+            label += ", \(DuplicateTokenMarker.accessibilityLabel)"
+        }
+        return label
+    }
+
     public init(
         account: DeckAccount,
         provider: DeckProvider?,
         windows: [DeckWindow],
         isActive: Bool,
-        activationState: ProviderActivationState = .unknown
+        activationState: ProviderActivationState = .unknown,
+        newestObservedAt: Date? = nil
     ) {
         self.account = account
         self.provider = provider
         self.windows = windows
         self.isActive = isActive
         self.activationState = activationState
+        self.newestObservedAt = newestObservedAt
     }
 }
 
@@ -257,7 +311,8 @@ public enum DeckBuilder {
         return state.accounts
             .filter(\.enabled)
             .map { account in
-                let windows = (usageByAccount[account.id] ?? [])
+                let snapshots = usageByAccount[account.id] ?? []
+                let windows = snapshots
                     .map { window(from: $0, thresholds: thresholds, now: now) }
                     .filter { !isMeaninglessSpend($0) }
                     .sorted { lhs, rhs in
@@ -272,7 +327,12 @@ public enum DeckBuilder {
                     provider: provider,
                     windows: windows,
                     isActive: account.isDefault,
-                    activationState: provider.map { state.activationState(for: $0) } ?? .unknown
+                    activationState: provider.map { state.activationState(for: $0) } ?? .unknown,
+                    // Issue #89: from ALL snapshots (pre-filter) — the card's
+                    // data age must not shift when a spend row is hidden.
+                    newestObservedAt: snapshots
+                        .compactMap { DeckDateParsing.date(from: $0.observedAt) }
+                        .max()
                 )
             }
     }
@@ -441,6 +501,19 @@ public enum DeckBuilder {
         }
         return "Resets \(formatter.string(from: date))"
     }
+
+    /// Issue #67: the full absolute reset timestamp for hover tooltips —
+    /// "Sun Jul 26, 6:59 AM PDT" — the backstop on every reset text
+    /// (collapsed and expanded) so the exact moment is always reachable
+    /// even where layout must compromise. Nil when no reset data exists.
+    public static func absoluteResetText(for date: Date?, calendar: Calendar = .current) -> String? {
+        guard let date else { return nil }
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.dateFormat = "EEE MMM d, h:mm a zzz"
+        return formatter.string(from: date)
+    }
 }
 
 /// Lenient ISO-8601 parsing for the daemon's timestamp strings.
@@ -479,6 +552,20 @@ public enum DeckActivationError: Error, Equatable, Sendable, LocalizedError {
     }
 }
 
+/// Issue #93: the daemon's informational activation warnings, remembered
+/// per provider after a successful switch. `accountID` is the row whose
+/// activation earned them (so the notice can attach to the right section
+/// even after a later state refresh).
+public struct PostActivationWarnings: Equatable, Sendable {
+    public var accountID: String
+    public var warnings: [String]
+
+    public init(accountID: String, warnings: [String]) {
+        self.accountID = accountID
+        self.warnings = warnings
+    }
+}
+
 /// UI state for the popover deck: layout, sort order, which rows are
 /// expanded, and the Activate flow (optimistic flip → POST → verify →
 /// commit-or-revert). Row/column content stays pure derivation over
@@ -489,6 +576,7 @@ public enum DeckActivationError: Error, Equatable, Sendable, LocalizedError {
 public final class DeckPopoverModel: ObservableObject {
     static let layoutDefaultsKey = "modeldeck.popover.layout"
     static let sortDefaultsKey = "modeldeck.popover.sort"
+    static let showEmailsDefaultsKey = "modeldeck.popover.showEmails"
 
     @Published public var layout: DeckLayout {
         didSet {
@@ -536,6 +624,17 @@ public final class DeckPopoverModel: ObservableObject {
     }
     @Published public private(set) var expandedAccountIDs: Set<String> = []
 
+    /// Issue #73: whether deck rows show the account identity (email) under
+    /// the label. DEFAULT OFF — identity appeared on Claude rows as a side
+    /// effect of #62's capture, unrequested and asymmetric. When ON, both
+    /// providers render uniformly (an account without a captured identity
+    /// simply shows nothing). App-local preference (UserDefaults), never
+    /// synced to the daemon; Settings → Accounts always shows identities —
+    /// it's the management surface.
+    @Published public var showAccountEmails: Bool {
+        didSet { defaults.set(showAccountEmails, forKey: Self.showEmailsDefaultsKey) }
+    }
+
     // MARK: Activation state (issue #6)
 
     /// Account currently mid-activation, or nil. One switch at a time.
@@ -547,6 +646,14 @@ public final class DeckPopoverModel: ObservableObject {
     /// a prominent inline alert near the row (never a silent console
     /// error), separate from generic activation failures.
     @Published public private(set) var blockedActivationGuidance: [String: String] = [:]
+    /// Issue #93: the daemon's informational `warnings` from the last
+    /// verified-successful activation, keyed by provider activation key (one
+    /// notice per provider — a newer switch supersedes the previous notice).
+    /// Purely informational: the switch has already happened by the time the
+    /// daemon attaches these, so they render as a calm post-activation
+    /// notice, never a blocker. Cleared when the user dismisses the notice
+    /// or the provider's next activation starts.
+    @Published public private(set) var postActivationWarnings: [String: PostActivationWarnings] = [:]
     /// Optimistic ACTIVE override, keyed by provider key. While set, rows of
     /// that provider render the override target as active regardless of what
     /// the (still stale) daemon state says. Cleared on verified success
@@ -577,6 +684,8 @@ public final class DeckPopoverModel: ObservableObject {
             .flatMap(DeckLayout.init(rawValue:)) ?? .twoColumn
         self.sortOrder = defaults.string(forKey: Self.sortDefaultsKey)
             .flatMap(DeckSortOrder.init(rawValue:)) ?? .nextReset
+        // Absent key reads false — the issue #73 default-off requirement.
+        self.showAccountEmails = defaults.bool(forKey: Self.showEmailsDefaultsKey)
     }
 
     public func isExpanded(_ accountID: String) -> Bool {
@@ -621,6 +730,18 @@ public final class DeckPopoverModel: ObservableObject {
         blockedActivationGuidance[accountID]
     }
 
+    /// Issue #93: the informational warnings from this provider's last
+    /// activation, or nil when there is nothing to show.
+    public func postActivationWarnings(for provider: DeckProvider) -> PostActivationWarnings? {
+        postActivationWarnings[provider.rawValue]
+    }
+
+    /// Issue #93: the user acknowledged the notice — it never comes back for
+    /// that activation (the next switch computes fresh warnings).
+    public func dismissPostActivationWarnings(for provider: DeckProvider) {
+        postActivationWarnings[provider.rawValue] = nil
+    }
+
     /// One-click switch for a non-active account (Settings → Accounts since
     /// the 2026-07-19 spec amendment): flip the active checkmark
     /// optimistically, `POST …/activate`, then verify against a fresh
@@ -640,11 +761,22 @@ public final class DeckPopoverModel: ObservableObject {
         let previous = optimisticActive[key]
         activationErrors[row.id] = nil
         blockedActivationGuidance[row.id] = nil
+        postActivationWarnings[key] = nil // a new switch supersedes the old notice
         activatingAccountID = row.id
         optimisticActive[key] = row.id // optimistic flip — badge moves now
         defer { activatingAccountID = nil }
         do {
-            _ = try await activator.activateAccount(id: row.id)
+            let outcome = try await activator.activateAccount(id: row.id)
+            // Issue #93: once the POST returned, the daemon has flipped —
+            // record its informational warnings NOW, before verification,
+            // so a later verification failure can't swallow an honest
+            // heads-up about running unpinned sessions.
+            if !outcome.warnings.isEmpty {
+                postActivationWarnings[key] = PostActivationWarnings(
+                    accountID: row.id,
+                    warnings: outcome.warnings
+                )
+            }
             let fresh = try await stateProvider.deckState()
             guard fresh.accounts.first(where: { $0.id == row.id })?.isDefault == true else {
                 throw DeckActivationError.verificationFailed

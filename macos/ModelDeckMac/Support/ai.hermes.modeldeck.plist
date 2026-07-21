@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Issue #96: SMAppService agent definition for the BUNDLED daemon.
+     Staged by release-dmg.sh at Contents/Library/LaunchAgents/ and
+     registered from the app (DaemonSetupLive.SMAppServiceAgentRegistrar).
+     Same label as the dev-path LaunchAgent (deploy/*.plist.template) so
+     launchd itself refuses to run two ModelDeck daemons in one session.
+     Static file — no template variables: HOME comes from the per-user
+     launchd context, and the daemon's own defaults (src/paths.mjs) resolve
+     the SQLite DB under ~/Library/Application Support/ModelDeck. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.hermes.modeldeck</string>
+
+  <!-- Relative to the app bundle root; SMAppService resolves it. The SEA
+       binary is self-contained — no Node on PATH required. -->
+  <key>BundleProgram</key>
+  <string>Contents/Resources/daemon/modeldeckd</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- System paths for `security` (Keychain token) plus the common CLI
+         install locations for `claude` / `codex` probes. -->
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin</string>
+    <key>MODELDECK_HOST</key>
+    <string>127.0.0.1</string>
+    <key>MODELDECK_PORT</key>
+    <string>3867</string>
+    <!-- No mutation token here: the daemon reads it from the macOS Keychain
+         (service "modeldeck", account "mutation-token"); the app creates it
+         before first registration. -->
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <!-- Attribute the login item to ModelDeck in System Settings. -->
+  <key>AssociatedBundleIdentifiers</key>
+  <array>
+    <string>app.modeldeck.mac</string>
+  </array>
+</dict>
+</plist>

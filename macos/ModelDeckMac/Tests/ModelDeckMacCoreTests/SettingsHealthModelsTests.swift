@@ -42,14 +42,18 @@ struct PerAccountHealthChipTests {
 
 // MARK: - Sign in again
 
-/// Scriptable reauth backend + launcher + state provider.
-final class StubSignInBackend: AccountReauthenticating, DeckStateProviding, LoginLaunching, @unchecked Sendable {
+/// Scriptable reauth backend + launcher + state provider + activator.
+final class StubSignInBackend: AccountReauthenticating, DeckStateProviding, LoginLaunching, AccountActivating, @unchecked Sendable {
     private let lock = NSLock()
     var loginCommandByID: [String: String] = [:]
+    /// Issue #99: full login specs by account id — takes precedence over
+    /// `loginCommandByID` so tests can demand the activation-driven flow.
+    var loginResultByID: [String: LoginCommand] = [:]
     var loginCommandError: Error?
     var verifyResult: AccountVerification?
     var verifyError: Error?
     var launchError: Error?
+    var activateError: Error?
     var stateAfterVerify = DeckState()
     /// When true, loginCommand/verifyAccount suspend until `release()` —
     /// lets tests interleave cancel() with an in-flight daemon call.
@@ -59,13 +63,25 @@ final class StubSignInBackend: AccountReauthenticating, DeckStateProviding, Logi
     private(set) var launchedCommands: [String] = []
     private(set) var verifiedIDs: [String] = []
     private(set) var stateReads = 0
+    private(set) var activatedIDs: [String] = []
 
     func loginCommand(accountID: String) async throws -> LoginCommand {
         await gateIfNeeded()
         return try locked {
             if let loginCommandError { throw loginCommandError }
+            if let login = loginResultByID[accountID] { return login }
             let command = loginCommandByID[accountID] ?? "true"
             return LoginCommand(provider: "claude", command: command)
+        }
+    }
+
+    func activateAccount(id: String) async throws -> AccountActivation {
+        try locked {
+            activatedIDs.append(id)
+            if let activateError { throw activateError }
+            return AccountActivation(
+                account: DeckAccount(id: id, provider: "claude", label: "Activated", isDefault: true)
+            )
         }
     }
 
@@ -129,7 +145,22 @@ struct AccountSignInModelTests {
     }
 
     private func makeModel(_ backend: StubSignInBackend) -> AccountSignInModel {
-        AccountSignInModel(reauth: backend, launcher: backend, stateProvider: backend)
+        AccountSignInModel(reauth: backend, launcher: backend, stateProvider: backend, activator: backend)
+    }
+
+    /// Issue #99: the daemon's activation-driven spec for current Claude
+    /// Code, plus a state whose claude default is a different account.
+    private func scriptActivationFlow(_ backend: StubSignInBackend) {
+        backend.loginResultByID["acct-1"] = LoginCommand(
+            provider: "claude",
+            command: "'claude' /login",
+            flow: "activation",
+            requiresActivation: true
+        )
+        backend.stateAfterVerify = DeckState(accounts: [
+            DeckAccount(id: "acct-prior", provider: "claude", label: "Prior", isDefault: true),
+            DeckAccount(id: "acct-1", provider: "claude", label: "Deck One", authState: "ok"),
+        ])
     }
 
     @Test func beginLaunchesTheDaemonsPerProfileLoginCommandVerbatim() async {
@@ -329,6 +360,147 @@ struct AccountSignInModelTests {
         // The late failure must not resurrect the awaiting step or its error.
         #expect(model.phase(for: "acct-1") == nil)
         #expect(model.error(for: "acct-1") == nil)
+    }
+
+    // MARK: - Issue #99: activation-driven re-sign-in
+
+    @Test func activationSpecActivatesTargetBeforeTerminalOpens() async {
+        let backend = StubSignInBackend()
+        scriptActivationFlow(backend)
+        let model = makeModel(backend)
+
+        await model.beginSignIn(account: account)
+
+        #expect(backend.activatedIDs == ["acct-1"])
+        #expect(backend.launchedCommands == ["'claude' /login"])
+        #expect(model.phase(for: "acct-1") == .awaitingSignIn(command: "'claude' /login"))
+        #expect(model.error(for: "acct-1") == nil)
+    }
+
+    @Test func verifiedActivationFlowRestoresPriorActive() async {
+        let backend = StubSignInBackend()
+        scriptActivationFlow(backend)
+        let model = makeModel(backend)
+        var signedIn = 0
+        model.onSignedIn = { signedIn += 1 }
+
+        await model.beginSignIn(account: account)
+        let confirmed = await model.confirmSignedIn(account: account)
+
+        #expect(confirmed)
+        // Restore strictly AFTER the verify read-back.
+        #expect(backend.activatedIDs == ["acct-1", "acct-prior"])
+        #expect(model.phase(for: "acct-1") == nil)
+        #expect(signedIn == 1)
+    }
+
+    @Test func identityMismatchIsARefusalAndKeepsTargetActive() async {
+        let backend = StubSignInBackend()
+        scriptActivationFlow(backend)
+        backend.verifyResult = AccountVerification(
+            account: DeckAccount(id: "acct-1", provider: "claude", label: "Deck One"),
+            authenticated: true,
+            identity: "wrong@example.invalid",
+            identityMismatch: .init(expected: "intended@example.invalid", actual: "wrong@example.invalid")
+        )
+        let model = makeModel(backend)
+        var signedIn = 0
+        model.onSignedIn = { signedIn += 1 }
+
+        await model.beginSignIn(account: account)
+        let confirmed = await model.confirmSignedIn(account: account)
+
+        #expect(!confirmed)
+        #expect(model.error(for: "acct-1")?.contains("intended@example.invalid") == true)
+        if case .awaitingSignIn? = model.phase(for: "acct-1") {} else {
+            Issue.record("expected to stay on awaitingSignIn for a corrective /login")
+        }
+        // No restore: the target must stay active so a retry lands right.
+        #expect(backend.activatedIDs == ["acct-1"])
+        #expect(signedIn == 0)
+    }
+
+    @Test func cancelAfterActivationRestoresPriorActive() async {
+        let backend = StubSignInBackend()
+        scriptActivationFlow(backend)
+        let model = makeModel(backend)
+
+        await model.beginSignIn(account: account)
+        model.cancel(accountID: "acct-1")
+
+        // The restore runs in a background task off the sync cancel.
+        for _ in 0..<200 {
+            if backend.activatedIDs.count == 2 { break }
+            await Task.yield()
+        }
+        #expect(backend.activatedIDs == ["acct-1", "acct-prior"])
+        #expect(model.phase(for: "acct-1") == nil)
+    }
+
+    // CodeRabbit PR #106: cancel clears phases synchronously, so an
+    // immediate retry passes the reentrancy guard while the cancel's restore
+    // task is still pending. The bookkeeping must be captured and cleared
+    // inside cancel itself — the stale task restores the RIGHT prior and
+    // never clobbers the retry's freshly captured slots.
+    @Test func cancelThenImmediateRetryDoesNotRaceTheRestore() async {
+        let backend = StubSignInBackend()
+        scriptActivationFlow(backend)
+        let model = makeModel(backend)
+
+        await model.beginSignIn(account: account)
+        #expect(backend.activatedIDs == ["acct-1"])
+        model.cancel(accountID: "acct-1")
+
+        // Immediate retry: gate its login-command fetch so the pending
+        // cancel-restore task deterministically lands mid-retry.
+        backend.waitForRelease = true
+        var retry: Task<Void, Never>?
+        await withCheckedContinuation { (ready: CheckedContinuation<Void, Never>) in
+            backend.onGated = { ready.resume() }
+            retry = Task { await model.beginSignIn(account: account) }
+        }
+        for _ in 0..<200 {
+            if backend.activatedIDs.count == 2 { break }
+            await Task.yield()
+        }
+        // The stale restore used the prior captured at cancel time.
+        #expect(backend.activatedIDs == ["acct-1", "acct-prior"])
+
+        backend.waitForRelease = false
+        backend.release()
+        await retry?.value
+
+        // The retry re-activated the target with its own fresh bookkeeping…
+        #expect(backend.activatedIDs == ["acct-1", "acct-prior", "acct-1"])
+        // …and a verified success restores the RIGHT prior, not a stale or
+        // dropped one.
+        let confirmed = await model.confirmSignedIn(account: account)
+        #expect(confirmed)
+        #expect(backend.activatedIDs == ["acct-1", "acct-prior", "acct-1", "acct-prior"])
+    }
+
+    @Test func activationFailureSurfacesAndNeverOpensTerminal() async {
+        let backend = StubSignInBackend()
+        scriptActivationFlow(backend)
+        backend.activateError = DaemonClientError.daemonError(message: "account is disabled", status: 400)
+        let model = makeModel(backend)
+
+        await model.beginSignIn(account: account)
+
+        #expect(model.phase(for: "acct-1") == nil)
+        #expect(model.error(for: "acct-1") == "account is disabled")
+        #expect(backend.launchedCommands.isEmpty)
+    }
+
+    @Test func legacySpecNeverActivates() async {
+        let backend = StubSignInBackend()
+        backend.loginCommandByID["acct-1"] = "CLAUDE_CONFIG_DIR='/placeholder/profiles/claude/acct-1' 'claude' auth login"
+        let model = makeModel(backend)
+
+        await model.beginSignIn(account: account)
+        _ = await model.confirmSignedIn(account: account)
+
+        #expect(backend.activatedIDs.isEmpty)
     }
 }
 
