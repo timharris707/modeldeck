@@ -4,6 +4,25 @@ All notable changes to ModelDeck are documented here. Versioning follows the
 roadmap in `design/mac-app-roadmap.md`: `v0.1-web` tags the retired web MVP,
 and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 
+## 0.3.1 — 2026-07-22
+
+### Fixed
+- **Deck cards now say "Sign in needed" instead of a bare stale age when an
+  account's stored sign-in is missing or expired (issue #114)**: the daemon
+  had been reporting `signin-required` per account all along, but the deck
+  card only rendered the #89 "Data from N hr ago" line, with the real cause
+  buried in a tooltip — on a multi-account deck this read as a silent
+  refresh failure. The card now shows an actionable warning in the same
+  visual family as the #98 Keychain notice, whose tooltip explains that
+  Claude keeps only the ACTIVE account's sign-in fresh (CLI ≥ 2.1.216, issue
+  #99) and points at Settings → Accounts to recover.
+- **Probe failures from the bundled daemon no longer masquerade as a daemon
+  crash (issue #114)**: the SEA binary dispatched the Claude usage probe
+  through the daemon entry point, so any probe error was recorded as
+  "ModelDeck failed to start: …" in per-account refresh errors. Both launch
+  modes now share one probe CLI wrapper and report
+  "Claude usage probe failed: …" identically.
+
 ## 0.3.0 — 2026-07-21
 
 ### Fixed

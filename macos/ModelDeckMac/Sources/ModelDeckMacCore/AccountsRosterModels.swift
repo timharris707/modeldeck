@@ -259,7 +259,10 @@ public enum AccountsRoster {
     /// (issue #108): Claude flags come from matching usage fingerprints,
     /// Codex flags from matching credential identifiers — both mean the
     /// profiles share one provider login.
-    static let duplicateTokenDetail =
+    /// Public since issue #113: the click-to-explain popover on the deck's
+    /// duplicate-login marker reuses this exact detail — one source of
+    /// truth for the duplicate-login WHY, banner and marker alike.
+    public static let duplicateTokenDetail =
         "These profiles appear to share the same provider login — the "
         + "evidence each one presents matches another profile's. Any usage "
         + "shown reflects one shared account. The warning clears on its "

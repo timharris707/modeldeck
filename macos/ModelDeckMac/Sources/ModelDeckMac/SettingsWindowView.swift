@@ -29,7 +29,10 @@ struct SettingsWindowView: View {
     @ObservedObject var launchAtLoginModel: LaunchAtLoginModel
 
     var body: some View {
-        TabView {
+        // Issue #118: the tab selection is model state so the deck's
+        // "Sign in again…" action can land the window on Accounts even
+        // when the user last viewed General.
+        TabView(selection: $deckModel.settingsPane) {
             AccountsSettingsPane(
                 statusModel: statusModel,
                 accountsModel: accountsModel,
@@ -38,6 +41,7 @@ struct SettingsWindowView: View {
                 signInModel: signInModel
             )
             .tabItem { Label("Accounts", systemImage: "person.2") }
+            .tag(SettingsPane.accounts)
 
             GeneralSettingsPane(
                 settingsSync: settingsSync,
@@ -51,6 +55,7 @@ struct SettingsWindowView: View {
                 launchAtLoginModel: launchAtLoginModel
             )
             .tabItem { Label("General", systemImage: "gearshape") }
+            .tag(SettingsPane.general)
         }
         .frame(width: 520, height: 520)
         .task {

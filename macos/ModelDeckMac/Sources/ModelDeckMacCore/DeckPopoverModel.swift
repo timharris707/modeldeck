@@ -163,8 +163,11 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     /// Issue #98: suppressed while the keychain recovery notice is up — one
     /// notice per card, and the actionable one wins over the bare age line
     /// (the denial is WHY the data is aging).
+    /// Issue #114: likewise suppressed while the sign-in recovery notice is
+    /// up — one notice per card, and "Sign in needed" explains the aging
+    /// data better than the age itself.
     public func staleness(now: Date, autoRefreshInterval: TimeInterval) -> DeckFreshness.CardStaleness? {
-        guard keychainRecovery == nil else { return nil }
+        guard keychainRecovery == nil, signInRecovery == nil else { return nil }
         return DeckFreshness.cardStaleness(
             newestObservedAt: newestObservedAt,
             lastRefreshError: account.lastRefreshError,
@@ -180,6 +183,15 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     /// instead of silently stale-looking data.
     public var keychainRecovery: DeckFreshness.KeychainAccessRecovery? {
         DeckFreshness.keychainRecovery(for: account)
+    }
+
+    /// Issue #114: non-nil when the daemon reported `signin-required` — the
+    /// stored sign-in is missing or expired (for Claude, the structural fate
+    /// of every non-active account under CLI ≥ 2.1.216). The card renders an
+    /// actionable "Sign in needed" line instead of a bare stale age.
+    /// Mutually exclusive with `keychainRecovery` (single-valued authState).
+    public var signInRecovery: DeckFreshness.SignInRecovery? {
+        DeckFreshness.signInRecovery(for: account)
     }
 
     /// How this row's active marker renders when `isActive`: the full
@@ -566,6 +578,14 @@ public struct PostActivationWarnings: Equatable, Sendable {
     }
 }
 
+/// The Settings window's panes (issue #118): the deck's "Sign in again…"
+/// action must open Settings ON the Accounts pane, so the tab selection is
+/// model state rather than view-local.
+public enum SettingsPane: Hashable, Sendable {
+    case accounts
+    case general
+}
+
 /// UI state for the popover deck: layout, sort order, which rows are
 /// expanded, and the Activate flow (optimistic flip → POST → verify →
 /// commit-or-revert). Row/column content stays pure derivation over
@@ -623,6 +643,136 @@ public final class DeckPopoverModel: ObservableObject {
         if let confirmedSortOrder { sortOrder = confirmedSortOrder }
     }
     @Published public private(set) var expandedAccountIDs: Set<String> = []
+
+    /// Issue #113: which warning affordance's explanation popover is up, or
+    /// nil. `.help` tooltips are unreliable inside a MenuBarExtra window,
+    /// so every warning affordance opens an anchored explanation on click.
+    /// At most ONE explanation is presented at a time — clicking the same
+    /// affordance again dismisses it, clicking a different one switches.
+    @Published public private(set) var presentedWarning: DeckWarningID?
+
+    /// Whether this affordance's explanation popover is currently up.
+    public func isWarningPresented(_ id: DeckWarningID) -> Bool {
+        presentedWarning == id
+    }
+
+    /// Click handler: present this affordance's explanation, or dismiss it
+    /// when it is already up.
+    public func toggleWarning(_ id: DeckWarningID) {
+        presentedWarning = presentedWarning == id ? nil : id
+    }
+
+    /// Binding-shaped setter for SwiftUI `.popover(isPresented:)`: a
+    /// dismissal (outside click, Escape) clears only the matching id — a
+    /// stale false from a popover that already lost the slot must never
+    /// dismiss its successor.
+    public func setWarningPresented(_ id: DeckWarningID, _ presented: Bool) {
+        if presented {
+            presentedWarning = id
+        } else if presentedWarning == id {
+            presentedWarning = nil
+        }
+    }
+
+    /// Issue #113 (CodeRabbit): SwiftUI does NOT reset an `isPresented`
+    /// binding when the anchoring `.popover` leaves the hierarchy — if a
+    /// warning affordance disappears while its explanation is up (a stale
+    /// account refreshes, keychain access is granted, the cadence cap
+    /// lifts), `presentedWarning` would stay set and desync the
+    /// one-at-a-time slot. Every fresh deck state runs this reconcile: a
+    /// presented warning whose affordance is no longer live is cleared.
+    public func reconcileWarnings(
+        rows: [DeckAccountRow],
+        staleness: (DeckAccountRow) -> DeckFreshness.CardStaleness?,
+        cadenceNoticeVisible: Bool
+    ) {
+        guard let presented = presentedWarning,
+              !Self.liveWarningIDs(
+                  rows: rows,
+                  staleness: staleness,
+                  cadenceNoticeVisible: cadenceNoticeVisible
+              ).contains(presented)
+        else { return }
+        presentedWarning = nil
+    }
+
+    /// Which warning affordances the deck currently renders — the mirror of
+    /// the view's `if` conditions, kept here so the reconcile is testable.
+    /// The footer's oldest-data line always renders (even "Not updated yet"
+    /// is clickable), so `.footerFreshness` is always live.
+    public static func liveWarningIDs(
+        rows: [DeckAccountRow],
+        staleness: (DeckAccountRow) -> DeckFreshness.CardStaleness?,
+        cadenceNoticeVisible: Bool
+    ) -> Set<DeckWarningID> {
+        var live: Set<DeckWarningID> = [DeckWarningID(topic: .footerFreshness)]
+        if cadenceNoticeVisible {
+            live.insert(DeckWarningID(topic: .refreshCadence))
+        }
+        for row in rows {
+            if row.account.hasDuplicateToken {
+                live.insert(DeckWarningID(topic: .duplicateToken, elementID: row.id))
+            }
+            if row.keychainRecovery != nil {
+                live.insert(DeckWarningID(topic: .keychainAccess, elementID: row.id))
+            }
+            if row.signInRecovery != nil {
+                live.insert(DeckWarningID(topic: .signInRequired, elementID: row.id))
+            }
+            if staleness(row) != nil {
+                live.insert(DeckWarningID(topic: .staleData, elementID: row.id))
+            }
+        }
+        return live
+    }
+
+    // MARK: Sign in again from the deck (issue #118)
+
+    /// Which Settings pane the Settings window shows. Held here because the
+    /// deck model is already the one model both windows share (activation
+    /// moved to Settings → Accounts on the same grounds) — the popover's
+    /// "Sign in again…" action must land the user ON the Accounts pane,
+    /// not wherever the tab selection last sat.
+    @Published public var settingsPane: SettingsPane = .accounts
+
+    /// Fired by `requestSignInAgain(for:)` with the target account's id.
+    /// The app resolves the id against the FRESH daemon state (via
+    /// `signInAgainTarget`) and hands the account to the roster's existing
+    /// `AccountSignInModel.beginSignIn` — the exact same code path as
+    /// clicking "Sign in again" on the roster row. No new credential
+    /// machinery: this is pure navigation plumbing.
+    public var onSignInAgain: ((String) -> Void)?
+
+    /// The #118 one-click path: the "Sign in again…" button inside the
+    /// sign-in-needed explanation popover. Dismisses whatever explanation is
+    /// up (the button IS inside it), routes Settings to the Accounts pane,
+    /// and fires `onSignInAgain`. No-op (beyond the dismissal) when the
+    /// row's notice has cleared — a state refresh may have landed a
+    /// verified sign-in between render and click, and re-launching the flow
+    /// for a healthy account would be noise.
+    public func requestSignInAgain(for row: DeckAccountRow) {
+        presentedWarning = nil
+        guard row.signInRecovery != nil else { return }
+        settingsPane = .accounts
+        onSignInAgain?(row.id)
+    }
+
+    /// Resolves a requested sign-in target against the freshest daemon
+    /// state. Nil when the account vanished (removed between click and
+    /// dispatch) — the flow then quietly does nothing rather than launching
+    /// a login for a ghost. Nil likewise when the account no longer needs a
+    /// sign-in (a verified sign-in landed between the render-time click and
+    /// this dispatch): the recovery check uses the SAME derivation the card
+    /// notice renders from (`DeckFreshness.signInRecovery`, issue #114), so
+    /// the action and the notice can never diverge on who needs signing in.
+    nonisolated public static func signInAgainTarget(
+        accountID: String,
+        state: DeckState?
+    ) -> DeckAccount? {
+        state?.accounts.first {
+            $0.id == accountID && DeckFreshness.signInRecovery(for: $0) != nil
+        }
+    }
 
     /// Issue #73: whether deck rows show the account identity (email) under
     /// the label. DEFAULT OFF — identity appeared on Claude rows as a side

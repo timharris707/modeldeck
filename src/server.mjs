@@ -5,7 +5,7 @@ import packageMetadata from '../package.json' with { type: 'json' };
 import { Store } from './db.mjs';
 import { ModelDeckService } from './service.mjs';
 import { resolveMutationToken } from './token.mjs';
-import { main as runClaudeUsageProbe } from './adapters/claude-usage-probe.mjs';
+import { runProbeCli as runClaudeUsageProbe } from './adapters/claude-usage-probe.mjs';
 import {
   HOST, PORT, DB_PATH, PROJECTS_ROOT, CLAUDE_PATH, CLAUDE_PROFILES_DIR, CLAUDE_ACTIVE_LINK,
   CLAUDE_SHELL_ENV_FILE, CODEX_PATH, CODEX_ACTIVE_LINK, CODEX_PROFILES_DIR,
@@ -231,7 +231,12 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
 
 async function main() {
   if (isSea() && process.argv.includes('modeldeck-internal-claude-usage-probe')) {
-    await runClaudeUsageProbe();
+    // Issue #114: the probe owns its error reporting (`Claude usage probe
+    // failed: <reason>`). Letting a probe error fall through to main()'s
+    // catch stamped it "ModelDeck failed to start:", which misread as a
+    // daemon crash in every recorded per-account refresh error.
+    const code = await runClaudeUsageProbe();
+    if (code !== 0) process.exitCode = code;
     return;
   }
 

@@ -160,4 +160,56 @@ public enum DeckFreshness {
             accessibilityLabel: "\(text) — \(keychainRecoveryDetail)"
         )
     }
+
+    // MARK: - Sign-in recovery (issue #114)
+
+    /// What a signin-required card renders instead of the bare stale line.
+    /// Issue #114 found three non-active Claude accounts sitting on plain
+    /// "Data from N hr ago" markers while the daemon had been reporting
+    /// `signin-required` (expired stored sign-in) the whole time — the only
+    /// honest signal lived in a tooltip and the Settings roster chip. Same
+    /// visual family as the #98 Keychain notice: the actionable state, not
+    /// the age, is the headline.
+    public struct SignInRecovery: Equatable, Sendable {
+        public var text: String
+        public var tooltip: String
+        public var accessibilityLabel: String
+
+        public init(text: String, tooltip: String, accessibilityLabel: String) {
+            self.text = text
+            self.tooltip = tooltip
+            self.accessibilityLabel = accessibilityLabel
+        }
+    }
+
+    /// Shared recovery coaching for the tooltip and VoiceOver label.
+    static let signInRecoveryDetail = "This account's stored sign-in is missing or has expired, so ModelDeck can't refresh its usage. Sign in again from Settings → Accounts."
+
+    /// Claude-only context (issue #114 root cause): Claude Code ≥ 2.1.216
+    /// renews only the ACTIVE account's stored sign-in, so every other
+    /// account's sign-in expires within hours of its last use and stays
+    /// expired. Worth saying on the card — otherwise a healthy-looking
+    /// multi-account deck decays into sign-in failures with no visible cause.
+    static let signInRecoveryClaudeDetail = "Claude keeps only the active account's sign-in fresh, so other accounts' sign-ins expire until they are next signed in. Activating this account and running Claude Code once may also renew it."
+
+    /// Non-nil exactly when the daemon reported `signin-required` for this
+    /// account (issue #89's authState) — pure derivation, no clock. The
+    /// keychain-denied notice never coexists with this one: `authState` is
+    /// single-valued, and the row model gives #98's notice precedence.
+    public static func signInRecovery(for account: DeckAccount) -> SignInRecovery? {
+        guard account.healthChip == .signInAgain else { return nil }
+        var detail = signInRecoveryDetail
+        if account.provider == "claude" {
+            detail += " \(signInRecoveryClaudeDetail)"
+        }
+        if let message = account.lastRefreshError?.message, !message.isEmpty {
+            detail += " Last refresh failed: \(message)"
+        }
+        let text = "Sign in needed"
+        return SignInRecovery(
+            text: text,
+            tooltip: detail,
+            accessibilityLabel: "\(text) — \(detail)"
+        )
+    }
 }

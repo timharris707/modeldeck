@@ -322,6 +322,18 @@ public final class MenuBarStatusModel: ObservableObject {
         return FooterStatus(text: text, isStale: rowStale)
     }
 
+    /// Issue #113 addendum: what clicking the footer's oldest-data line
+    /// explains — the oldest-account basis, naming the stale account(s)
+    /// with their ages. Same effective-cadence basis as `footerStatus` and
+    /// the per-card markers.
+    public func footerFreshnessExplanation(now: Date? = nil) -> DeckWarningExplanation {
+        DeckFreshness.footerFreshnessExplanation(
+            state: deckState,
+            now: now ?? clock(),
+            autoRefreshInterval: stalenessInterval
+        )
+    }
+
     // MARK: - Per-card staleness (issue #89)
 
     /// The staleness marker for one deck card, computed against this model's

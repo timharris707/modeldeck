@@ -136,9 +136,22 @@ struct ModelDeckMacApp: App {
             }
         }
         // Every fresh daemon state feeds the notification transition check.
-        statusModel.onStateUpdate = { [weak notifications] worst, state in
+        statusModel.onStateUpdate = { [weak notifications, weak statusModel, weak deckModel] worst, state in
             Task { @MainActor [weak notifications] in
                 await notifications?.evaluate(worst: worst, state: state)
+            }
+            // Issue #113 (CodeRabbit): SwiftUI never resets a popover's
+            // isPresented binding when its anchor leaves the hierarchy, so
+            // every fresh state reconciles the presented-warning slot —
+            // a warning whose affordance just cleared (stale account
+            // refreshed, keychain granted, cadence cap lifted) is dismissed
+            // at the model, and the one-at-a-time slot can never desync.
+            if let statusModel, let deckModel, let state {
+                deckModel.reconcileWarnings(
+                    rows: deckModel.interleavedRows(for: state),
+                    staleness: { statusModel.cardStaleness(for: $0) },
+                    cadenceNoticeVisible: statusModel.refreshCadenceNotice != nil
+                )
             }
         }
         // Account edits/removals verified against a fresh /api/state land in
@@ -156,6 +169,21 @@ struct ModelDeckMacApp: App {
         // cached CLI probe. Cached reads only — no forced provider probes.
         signInModel.onStateChanged = { [weak statusModel] state in
             statusModel?.apply(deckState: state)
+        }
+        // Issue #118: the deck's sign-in-needed notice offers a one-click
+        // "Sign in again…" that must run the SAME flow as the roster chip.
+        // Resolve the requested id against the freshest state (no-op when
+        // the account vanished between click and dispatch), then hand the
+        // account to the existing beginSignIn — activation-driven on
+        // Claude ≥ 2.1.216 (#99/#106), never any new credential machinery.
+        deckModel.onSignInAgain = { [weak statusModel, weak signInModel] accountID in
+            guard let account = DeckPopoverModel.signInAgainTarget(
+                accountID: accountID,
+                state: statusModel?.deckState
+            ) else { return }
+            Task { @MainActor [weak signInModel] in
+                await signInModel?.beginSignIn(account: account)
+            }
         }
         signInModel.onSignedIn = { [weak toolsModel] in
             Task { @MainActor [weak toolsModel] in

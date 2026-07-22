@@ -440,3 +440,107 @@ struct KeychainAccessRecoveryTests {
         #expect(DeckFreshness.keychainRecovery(for: account) == nil)
     }
 }
+
+// MARK: - Sign-in recovery (issue #114)
+
+@Suite("Sign-in recovery (issue #114)")
+struct SignInRecoveryTests {
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    /// The exact per-account error the live daemon recorded during the #114
+    /// forensics (expired stored sign-in on a non-active Claude account).
+    private static let expiredMessage = "Claude usage refresh failed: Claude usage probe failed: stored OAuth credentials have expired; sign in explicitly before refreshing"
+
+    private func row(
+        authState: String?,
+        provider: String = "claude",
+        errorMessage: String? = expiredMessage,
+        observedSecondsAgo: TimeInterval? = nil
+    ) -> DeckAccountRow {
+        DeckAccountRow(
+            account: DeckAccount(
+                id: "acct-1", provider: provider, label: "Studio",
+                authState: authState,
+                lastRefreshError: errorMessage.map {
+                    AccountRefreshError(message: $0, at: "2026-07-22T04:10:00.000Z")
+                }
+            ),
+            provider: provider == "claude" ? .claude : .codex,
+            windows: [],
+            isActive: false,
+            newestObservedAt: observedSecondsAgo.map { now.addingTimeInterval(-$0) }
+        )
+    }
+
+    @Test func signinRequiredGetsTheRecoveryNotice() {
+        let recovery = row(authState: "signin-required").signInRecovery
+        #expect(recovery?.text == "Sign in needed")
+        #expect(recovery?.tooltip.contains("Settings → Accounts") == true)
+        #expect(recovery?.accessibilityLabel.contains("Sign in needed") == true)
+    }
+
+    @Test func claudeRowExplainsTheActiveOnlyRenewal() {
+        // Issue #114 root cause: Claude Code ≥ 2.1.216 renews only the
+        // ACTIVE account's stored sign-in, so non-active accounts expire
+        // within hours. The card must say WHY, not just "sign in".
+        let recovery = row(authState: "signin-required").signInRecovery
+        #expect(recovery?.tooltip.contains("only the active account's sign-in") == true)
+    }
+
+    @Test func codexRowOmitsTheClaudeDetail() {
+        let recovery = row(authState: "signin-required", provider: "codex").signInRecovery
+        #expect(recovery != nil)
+        #expect(recovery?.tooltip.contains("active account's sign-in") == false)
+    }
+
+    @Test func daemonErrorMessageRidesAlongInTheTooltip() {
+        let recovery = row(authState: "signin-required").signInRecovery
+        #expect(recovery?.tooltip.contains("Last refresh failed:") == true)
+        #expect(recovery?.tooltip.contains("stored OAuth credentials have expired") == true)
+    }
+
+    @Test func missingErrorMessageAddsNoDanglingSuffix() {
+        let recovery = row(authState: "signin-required", errorMessage: nil).signInRecovery
+        #expect(recovery != nil)
+        #expect(recovery?.tooltip.contains("Last refresh failed:") == false)
+    }
+
+    @Test func otherStatesNeverShowRecovery() {
+        for state: String? in [nil, "ok", "keychain-denied", "unknown", "duplicate-token"] {
+            #expect(row(authState: state).signInRecovery == nil)
+        }
+    }
+
+    @Test func noticesAreMutuallyExclusive() {
+        // authState is single-valued: a keychain-denied row keeps #98's
+        // notice and never also renders "Sign in needed", and vice versa.
+        let denied = row(authState: "keychain-denied")
+        #expect(denied.keychainRecovery != nil)
+        #expect(denied.signInRecovery == nil)
+        let signin = row(authState: "signin-required")
+        #expect(signin.signInRecovery != nil)
+        #expect(signin.keychainRecovery == nil)
+    }
+
+    @Test func recoveryOutranksTheBareStaleLine() {
+        // The #114 live shape: ~14 hr old data on the capped 30 min cadence
+        // earned only a bare "Data from 14 hr ago" line while the daemon had
+        // been saying signin-required all along. The actionable notice now
+        // replaces the age line (one notice per card).
+        let signin = row(authState: "signin-required", observedSecondsAgo: 50_400)
+        #expect(signin.signInRecovery != nil)
+        #expect(signin.staleness(now: now, autoRefreshInterval: 1_800) == nil)
+
+        // Without the auth failure the same age still gets the stale marker.
+        let justStale = row(authState: "ok", observedSecondsAgo: 50_400)
+        #expect(justStale.signInRecovery == nil)
+        #expect(justStale.staleness(now: now, autoRefreshInterval: 1_800) != nil)
+    }
+
+    @Test func olderDaemonsNeverTriggerFalseRecovery() {
+        // A daemon that omits authState maps to the Unknown chip — no
+        // notice, exactly like #98's leniency rule.
+        let account = DeckAccount(id: "a", provider: "claude", label: "Work")
+        #expect(DeckFreshness.signInRecovery(for: account) == nil)
+    }
+}

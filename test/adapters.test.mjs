@@ -27,7 +27,7 @@ import {
   readClaudeProfileIdentity,
 } from '../src/adapters/claude.mjs';
 import { claudeCredentialServiceName, claudeCredentialsPresent } from '../src/adapters/claude-keychain.mjs';
-import { readClaudeCredentials, KEYCHAIN_DENIED_ERROR } from '../src/adapters/claude-usage-probe.mjs';
+import { readClaudeCredentials, runProbeCli, KEYCHAIN_DENIED_ERROR } from '../src/adapters/claude-usage-probe.mjs';
 import { extractIdentity } from '../src/adapters/identity.mjs';
 import { createProviderProfileHelpers } from '../src/adapters/provider-profile.mjs';
 
@@ -349,6 +349,44 @@ test('readable but unparseable Keychain value is a credential problem, never key
     },
   }), /sign in explicitly before refreshing/);
   assert.equal(metadataProbes, 0);
+});
+
+// Issue #114: the SEA daemon dispatches the probe through src/server.mjs's
+// main(); a probe failure that fell through to the generic entry catch was
+// stamped "ModelDeck failed to start:", which read as a daemon crash in
+// every recorded per-account refresh error on Tim's machine. Both launch
+// modes now share runProbeCli, so the error shape is identical everywhere.
+test('probe CLI failure keeps the probe error prefix, never a daemon-start shape (issue #114)', async () => {
+  const written = [];
+  const code = await runProbeCli({
+    stderr: { write: (chunk) => written.push(chunk) },
+    probe: async () => { throw new Error('stored OAuth credentials have expired; sign in explicitly before refreshing'); },
+  });
+  assert.equal(code, 1);
+  assert.equal(written.length, 1);
+  assert.match(written[0], /^Claude usage probe failed: stored OAuth credentials have expired/);
+  assert.doesNotMatch(written[0], /failed to start/i);
+});
+
+test('probe CLI success writes nothing to stderr and exits 0 (issue #114)', async () => {
+  const written = [];
+  const code = await runProbeCli({
+    stderr: { write: (chunk) => written.push(chunk) },
+    probe: async () => {},
+  });
+  assert.equal(code, 0);
+  assert.deepEqual(written, []);
+});
+
+test('probe CLI keeps the keychain-denied phrase intact for the service-layer pattern (issue #114)', async () => {
+  const written = [];
+  await runProbeCli({
+    stderr: { write: (chunk) => written.push(chunk) },
+    probe: async () => { throw new Error(KEYCHAIN_DENIED_ERROR); },
+  });
+  // KEYCHAIN_DENIED_ERROR_PATTERN (src/service.mjs) must still match after
+  // the CLI wrapping, whichever launch mode produced it.
+  assert.match(written[0], /keychain blocked modeldeck/i);
 });
 
 test('darwin usage refresh lets the isolated probe resolve an absent credential file', async (t) => {

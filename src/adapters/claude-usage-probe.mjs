@@ -112,10 +112,27 @@ export async function main({ env = process.env, fetcher = globalThis.fetch, ...c
   process.stdout.write(text);
 }
 
+// Issue #114: the ONE probe CLI error shape, shared by both launch modes.
+// The SEA binary dispatches the probe through src/server.mjs's main(), whose
+// generic catch used to stamp probe failures "ModelDeck failed to start:" —
+// on Tim's machine that read as a daemon crash and sent the #114
+// investigation toward the wrong subsystem. Every probe failure must reach
+// the parent process as `Claude usage probe failed: <reason>` so the
+// service-layer patterns (and humans reading /api/state) see the same
+// message regardless of how the probe was launched.
+export async function runProbeCli({ stderr = process.stderr, probe = main } = {}) {
+  try {
+    await probe();
+    return 0;
+  } catch (error) {
+    stderr.write(`Claude usage probe failed: ${error.message}\n`);
+    return 1;
+  }
+}
+
 const isMain = !isSea() && process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
-  main().catch((error) => {
-    process.stderr.write(`Claude usage probe failed: ${error.message}\n`);
-    process.exitCode = 1;
+  runProbeCli().then((code) => {
+    if (code !== 0) process.exitCode = code;
   });
 }

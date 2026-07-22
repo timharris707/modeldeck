@@ -193,6 +193,7 @@ struct DeckPopoverView: View {
                     ForEach(deckModel.interleavedRows(for: state)) { row in
                         DeckAccountRowView(
                             row: row,
+                            deckModel: deckModel,
                             showsProviderMark: true,
                             showsIdentity: deckModel.showAccountEmails,
                             isExpanded: deckModel.isExpanded(row.id),
@@ -240,33 +241,66 @@ struct DeckPopoverView: View {
                     // Issue #72: while the manual provider poll runs, say so —
                     // the age line would otherwise look unresponsive for the
                     // seconds the poll takes.
-                    Text(statusModel.isRefreshing
-                        ? "Refreshing…"
-                        : (status?.text ?? "Not updated yet"))
-                        .font(.caption)
-                        .foregroundStyle(status?.isStale == true && !statusModel.isRefreshing
-                            ? AnyShapeStyle(severityColor(.warning))
-                            : AnyShapeStyle(.secondary))
-                        .help(status?.isStale == true
-                            ? "Usage data is older than expected — Refresh forces a fresh provider poll."
-                            : "Age of the oldest account's newest provider-reported usage")
+                    // Issue #113 addendum (Tim, live): after a Refresh
+                    // updated some cards, the unchanged oldest-data line
+                    // read as a refresh bug. Clicking it now explains the
+                    // oldest-account basis and names the account(s)
+                    // dragging the number, with their ages.
+                    Button {
+                        deckModel.toggleWarning(DeckWarningID(topic: .footerFreshness))
+                    } label: {
+                        Text(statusModel.isRefreshing
+                            ? "Refreshing…"
+                            : (status?.text ?? "Not updated yet"))
+                            .font(.caption)
+                            .foregroundStyle(status?.isStale == true && !statusModel.isRefreshing
+                                ? AnyShapeStyle(severityColor(.warning))
+                                : AnyShapeStyle(.secondary))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(status?.isStale == true
+                        ? "Usage data is older than expected — Refresh forces a fresh provider poll."
+                        : "Age of the oldest account's newest provider-reported usage")
+                    .popover(
+                        isPresented: deckModel.warningBinding(DeckWarningID(topic: .footerFreshness)),
+                        arrowEdge: .bottom
+                    ) {
+                        WarningExplanationView(
+                            explanation: statusModel.footerFreshnessExplanation(now: context.date)
+                        )
+                    }
                     // Issue #90: calm honesty indicator — shown only while
                     // the daemon's effective refresh cadence is slower than
                     // the configured setting (active-session cap on the
                     // never-customized default interval). The tooltip
                     // explains the cap and that an explicit interval lifts
                     // it; footer family, Direction-A restraint.
+                    // Issue #113: clickable — the cap explanation must be
+                    // reachable without a working tooltip.
                     if let notice = statusModel.refreshCadenceNotice {
-                        HStack(spacing: 3) {
-                            Image(systemName: "tortoise")
-                                .font(.system(size: 9))
-                            Text(notice.text)
-                                .font(.caption)
+                        Button {
+                            deckModel.toggleWarning(DeckWarningID(topic: .refreshCadence))
+                        } label: {
+                            HStack(spacing: 3) {
+                                Image(systemName: "tortoise")
+                                    .font(.system(size: 9))
+                                Text(notice.text)
+                                    .font(.caption)
+                            }
+                            .foregroundStyle(.secondary)
+                            .contentShape(Rectangle())
                         }
-                        .foregroundStyle(.secondary)
+                        .buttonStyle(.plain)
                         .help(notice.tooltip)
                         .accessibilityElement(children: .combine)
                         .accessibilityLabel("\(notice.text). \(notice.tooltip)")
+                        .popover(
+                            isPresented: deckModel.warningBinding(DeckWarningID(topic: .refreshCadence)),
+                            arrowEdge: .bottom
+                        ) {
+                            WarningExplanationView(explanation: .cadence(notice))
+                        }
                     }
                     // Issue #33: the app's own version, muted and small,
                     // beside the freshness line (restraint bar applies).
@@ -333,6 +367,7 @@ struct DeckColumnView: View {
                 ForEach(column.rows) { row in
                     DeckAccountRowView(
                         row: row,
+                        deckModel: deckModel,
                         showsProviderMark: false,
                         showsIdentity: deckModel.showAccountEmails,
                         isExpanded: deckModel.isExpanded(row.id),
@@ -377,6 +412,10 @@ enum DeckType {
 /// headline slot carries the usage summary like every other card.
 struct DeckAccountRowView: View {
     let row: DeckAccountRow
+    /// Issue #113: the shared popover model also holds which warning
+    /// affordance's explanation is presented (one at a time, click to
+    /// toggle) — kept in the model so presentation state stays testable.
+    @ObservedObject var deckModel: DeckPopoverModel
     let showsProviderMark: Bool
     /// Issue #73: identity (email) under the label renders only when the
     /// Settings → General "Show account emails" toggle is on (default off).
@@ -388,6 +427,22 @@ struct DeckAccountRowView: View {
     /// warning-tinted age line so fossil data can never pass as fresh.
     var staleness: DeckFreshness.CardStaleness? = nil
     let onToggle: () -> Void
+    /// Issue #118: the "Sign in again…" action opens the Settings window
+    /// (Accounts pane, via the model's routed selection) — the environment
+    /// action lives here because only views can reach it.
+    @Environment(\.openSettings) private var openSettings
+
+    /// Issue #118 — the one-click path from the sign-in-needed notice into
+    /// the roster's existing re-login flow: dismiss the explanation, route
+    /// Settings to the Accounts pane, fire the model's sign-in request
+    /// (which the app hands to `AccountSignInModel.beginSignIn`, the same
+    /// path as the roster's own "Sign in again" chip), and front the
+    /// Settings window so the in-progress flow is visible.
+    private func beginSignInAgain() {
+        deckModel.requestSignInAgain(for: row)
+        openSettings()
+        SettingsWindowFronting.activateAndFront()
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -404,6 +459,19 @@ struct DeckAccountRowView: View {
             // derivation lives in Core (DeckAccountRow) where it is tested.
             .accessibilityLabel(row.accessibilityLabel(showsIdentity: showsIdentity))
             .accessibilityHint(isExpanded ? "Collapse usage windows" : "Expand usage windows")
+            // Issue #113 (CodeRabbit): the row button's explicit label
+            // suppresses the marker's own accessibility element, so the
+            // click-to-explain behavior is offered here as a named action
+            // whenever the marker renders.
+            .accessibilityActions {
+                if row.account.hasDuplicateToken {
+                    Button("Show duplicate login explanation") {
+                        deckModel.toggleWarning(
+                            DeckWarningID(topic: .duplicateToken, elementID: row.id)
+                        )
+                    }
+                }
+            }
 
             if isExpanded {
                 expandedWindows
@@ -415,34 +483,101 @@ struct DeckAccountRowView: View {
             // the bare stale line (row.staleness already yields nil while
             // this is up): the tooltip says exactly what happened and what
             // to click. Same visual family as the #89 stale line.
+            // Issue #113: clickable — the tooltip never appeared inside the
+            // MenuBarExtra window, so the coaching opens as an anchored
+            // popover on click (same strings).
             if let recovery = row.keychainRecovery {
-                HStack(spacing: 4) {
-                    Image(systemName: "key.slash")
-                        .font(.system(size: 9, weight: .semibold))
-                    Text(recovery.text)
-                        .font(.system(size: 10))
+                let warningID = DeckWarningID(topic: .keychainAccess, elementID: row.id)
+                Button {
+                    deckModel.toggleWarning(warningID)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "key.slash")
+                            .font(.system(size: 9, weight: .semibold))
+                        Text(recovery.text)
+                            .font(.system(size: 10))
+                    }
+                    .foregroundStyle(severityColor(.warning))
+                    .contentShape(Rectangle())
                 }
-                .foregroundStyle(severityColor(.warning))
+                .buttonStyle(.plain)
                 .help(recovery.tooltip)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(recovery.accessibilityLabel)
+                .popover(isPresented: deckModel.warningBinding(warningID), arrowEdge: .bottom) {
+                    WarningExplanationView(explanation: .keychain(recovery))
+                }
+            }
+
+            // Issue #114: the sign-in recovery notice — the daemon reported
+            // `signin-required` (stored sign-in missing or expired; for
+            // Claude, the fate of every non-active account under CLI
+            // ≥ 2.1.216). Same visual family as the #98 notice above, and it
+            // likewise OUTRANKS the bare stale line (row.staleness yields
+            // nil while this is up): "Sign in needed" is the cause, the age
+            // is only the symptom. Mutually exclusive with the Keychain
+            // notice — authState is single-valued.
+            // Issue #113/#118: clickable — the click opens the anchored
+            // explanation, whose primary "Sign in again…" button drops the
+            // user into the roster's EXISTING #99-correct sign-in flow for
+            // exactly this account (Settings → Accounts opens alongside).
+            if let recovery = row.signInRecovery {
+                let warningID = DeckWarningID(topic: .signInRequired, elementID: row.id)
+                Button {
+                    deckModel.toggleWarning(warningID)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "person.crop.circle.badge.exclamationmark")
+                            .font(.system(size: 9, weight: .semibold))
+                        Text(recovery.text)
+                            .font(.system(size: 10))
+                    }
+                    .foregroundStyle(severityColor(.warning))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(recovery.tooltip)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(recovery.accessibilityLabel)
+                // VoiceOver can skip the popover hop: the named action runs
+                // the same one-click path the popover's button offers.
+                .accessibilityAction(named: "Sign in again") {
+                    beginSignInAgain()
+                }
+                .popover(isPresented: deckModel.warningBinding(warningID), arrowEdge: .bottom) {
+                    SignInExplanationView(explanation: .signIn(recovery)) {
+                        beginSignInAgain()
+                    }
+                }
             }
 
             // Issue #89: the stale line renders in BOTH collapsed and
             // expanded states, outside the card button so it keeps its own
             // accessibility element. Tooltip carries the data age plus the
             // account's last refresh error (when the daemon reported one).
+            // Issue #113: clickable for the same reason — the age + last
+            // refresh error must be reachable, not tooltip-theoretical.
             if let staleness {
-                HStack(spacing: 4) {
-                    Image(systemName: "clock.badge.exclamationmark")
-                        .font(.system(size: 9, weight: .semibold))
-                    Text(staleness.text)
-                        .font(.system(size: 10))
+                let warningID = DeckWarningID(topic: .staleData, elementID: row.id)
+                Button {
+                    deckModel.toggleWarning(warningID)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "clock.badge.exclamationmark")
+                            .font(.system(size: 9, weight: .semibold))
+                        Text(staleness.text)
+                            .font(.system(size: 10))
+                    }
+                    .foregroundStyle(severityColor(.warning))
+                    .contentShape(Rectangle())
                 }
-                .foregroundStyle(severityColor(.warning))
+                .buttonStyle(.plain)
                 .help(staleness.tooltip)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(staleness.accessibilityLabel)
+                .popover(isPresented: deckModel.warningBinding(warningID), arrowEdge: .bottom) {
+                    WarningExplanationView(explanation: .stale(staleness))
+                }
             }
         }
         .padding(9)
@@ -483,7 +618,14 @@ struct DeckAccountRowView: View {
                 }
                 if row.account.hasDuplicateToken {
                     // Issue #65: two profiles appear to hold the same login.
-                    DuplicateTokenMarkerView()
+                    // Issue #113: clicking the marker opens the explanation
+                    // (a tap gesture on the marker's own hit area — never a
+                    // nested Button; see DuplicateTokenMarkerView).
+                    DuplicateTokenMarkerView(
+                        isExplaining: deckModel.warningBinding(
+                            DeckWarningID(topic: .duplicateToken, elementID: row.id)
+                        )
+                    )
                 }
                 Spacer(minLength: 8)
                 // Issue #33 amendment: the headline percent only exists
@@ -596,6 +738,73 @@ struct DeckAccountRowView: View {
     }
 }
 
+// MARK: - Reachable explanations (issue #113)
+
+/// The anchored explanation a warning affordance opens on click. `.help`
+/// tooltips are unreliable inside the MenuBarExtra window (hover produced
+/// nothing on Tim's live v0.3.0), so every warning affordance presents this
+/// small popover instead — calm Direction-A framing, existing strings only,
+/// dismissed by clicking anywhere outside (standard transient behavior).
+struct WarningExplanationView: View {
+    let explanation: DeckWarningExplanation
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(explanation.title)
+                .font(.system(size: 12, weight: .semibold))
+            Text(explanation.body)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .frame(width: 280, alignment: .leading)
+    }
+}
+
+/// Issue #118: the sign-in-needed notice's explanation popover — the same
+/// calm anatomy as WarningExplanationView (existing strings only) plus ONE
+/// primary action: "Sign in again…", the one-click path into the roster's
+/// existing re-login flow for this exact account. Direction-A restraint: a
+/// single small prominent button, no competing affordances.
+struct SignInExplanationView: View {
+    let explanation: DeckWarningExplanation
+    let onSignInAgain: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(explanation.title)
+                .font(.system(size: 12, weight: .semibold))
+            Text(explanation.body)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button(action: onSignInAgain) {
+                Text("Sign in again…")
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .padding(.top, 4)
+            .help("Opens Settings → Accounts and starts this account's sign-in flow")
+            .accessibilityLabel("Sign in again for this account")
+        }
+        .padding(12)
+        .frame(width: 280, alignment: .leading)
+    }
+}
+
+extension DeckPopoverModel {
+    /// SwiftUI presentation binding over the model's single presented-
+    /// warning slot, so which explanation is up stays unit-testable state
+    /// rather than scattered view-local `@State`.
+    func warningBinding(_ id: DeckWarningID) -> Binding<Bool> {
+        Binding(
+            get: { self.isWarningPresented(id) },
+            set: { self.setWarningPresented(id, $0) }
+        )
+    }
+}
+
 // MARK: - Pieces
 
 /// Active marker (spec amendment 2026-07-19): a small checkmark glyph
@@ -641,13 +850,48 @@ struct ActiveMarkerView: View {
 /// warning-tinted glyph, tooltip with the honest caption, VoiceOver carries
 /// the state. Renders on every flagged row — deck popover and Settings →
 /// Accounts alike — because the problem is per-account, not per-selection.
+/// Issue #113: the marker is now a click target — tooltips never appeared
+/// inside the MenuBarExtra window, so clicking opens an anchored
+/// explanation popover (marker caption + the banner's [Why?] detail, both
+/// verbatim). Deck rows pass a model-backed presentation binding (testable,
+/// one explanation at a time); Settings → Accounts uses local state. The
+/// `.help` tooltip stays as progressive enhancement and the VoiceOver label
+/// is unchanged.
 struct DuplicateTokenMarkerView: View {
+    /// Model-backed presentation when provided (deck popover); local state
+    /// otherwise (Settings roster, where the marker is self-contained).
+    var isExplaining: Binding<Bool>?
+    @State private var localExplaining = false
+
+    private var explaining: Binding<Bool> { isExplaining ?? $localExplaining }
+
     var body: some View {
         Image(systemName: "exclamationmark.circle")
             .font(.system(size: 11, weight: .semibold))
             .foregroundStyle(severityColor(.warning))
+            // The glyph alone is a ~11 pt target; pad the hit area so
+            // clicks land. 15 pt matches the title row's text height,
+            // so the row's vertical rhythm is unchanged.
+            .frame(width: 15, height: 15)
+            .contentShape(Rectangle())
+            // CodeRabbit on #113: NOT a Button — in the deck this marker
+            // sits inside the row's expand/collapse Button, and nested
+            // SwiftUI Buttons are an unsupported pattern (the parent can
+            // swallow or misroute the click). A tap gesture on the deepest
+            // view takes precedence over the enclosing plain-style button
+            // for exactly this hit area, which is the supported shape of
+            // "clickable region inside a clickable row".
+            .onTapGesture { explaining.wrappedValue.toggle() }
             .help(DuplicateTokenMarker.caption)
             .accessibilityLabel(DuplicateTokenMarker.accessibilityLabel)
+            // VoiceOver can invoke the explanation wherever the marker is
+            // its own element (Settings roster); in the deck the row button
+            // carries an equivalent named action (its explicit label
+            // suppresses this child element).
+            .accessibilityAction { explaining.wrappedValue.toggle() }
+            .popover(isPresented: explaining, arrowEdge: .bottom) {
+                WarningExplanationView(explanation: .duplicateToken())
+            }
     }
 }
 
