@@ -273,6 +273,33 @@ test('Claude secure-storage activation handles darwin success, failure, non-darw
     } finally { data.close(); }
   });
 
+  // Issue #129 (PR #135 review): a demo-fixture instance must never run
+  // `launchctl setenv` — that mutates the USER-GLOBAL launchd environment
+  // and would steer subsequently launched real GUI Claude processes at the
+  // demo profile. The seeded active link already establishes fixture state.
+  await t.test('demo fixture mode never touches the global launchd environment', async () => {
+    const calls = [];
+    const data = fixture({
+      platform: 'darwin',
+      demoFixtures: true,
+      exec: async (binary, args) => {
+        calls.push([binary, args]);
+        return { stdout: 'Claude Code 2.1.215' };
+      },
+    });
+    const envFile = path.join(data.root, 'claude-env.sh');
+    data.service.claudeShellEnvFile = envFile;
+    try {
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      await data.service.activateAccount(account.id);
+      assert.equal(calls.filter(([binary]) => binary === '/bin/launchctl').length, 0);
+      assert.equal(data.service.claudeSecureStorage.status, 'inactive');
+      // The shell env pin (pinned inside the demo dir by demo-daemon.sh)
+      // still lands, so demo terminals resolve the demo profile.
+      assert.ok(fs.existsSync(envFile));
+    } finally { data.close(); }
+  });
+
   await t.test('older CLI is unsupported and probe reports the gate', async () => {
     const data = fixture({
       platform: 'darwin',

@@ -415,6 +415,143 @@ struct DeckBuilderTests {
         #expect(withReset.windows.map(\.scope) == ["5h", "week", "spend"])
     }
 
+    // MARK: - Issue #139: payload-stated spend dollar amounts
+
+    private let enUS = Locale(identifier: "en_US")
+
+    private func spendAmountsState(
+        remaining: Double? = 51,
+        amounts: SpendAmounts?
+    ) -> DeckState {
+        DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio", isDefault: true)],
+            usage: [
+                snapshot("c1", scope: "5h", remaining: 71, resetsIn: 57 * 60),
+                UsageSnapshot(
+                    accountId: "c1",
+                    scope: "spend",
+                    remainingPercent: remaining,
+                    stale: false,
+                    detail: UsageSnapshotDetail(spend: amounts)
+                ),
+            ]
+        )
+    }
+
+    @Test func spendAmountTextMatchesClaudeCodePresentation() {
+        // Pinned locale (repo convention, PR #137) so the assertion is
+        // machine-independent. Placeholder amounts only.
+        let text = DeckBuilder.spendAmountText(
+            SpendAmounts(usedMinor: 24563, limitMinor: 50000, currency: "USD", exponent: 2),
+            locale: enUS
+        )
+        #expect(text == "$245.63 of $500.00")
+    }
+
+    @Test func spendAmountTextUsesThePayloadCurrencyNeverAssumes() {
+        // A non-USD budget renders with ITS currency symbol.
+        let eur = DeckBuilder.spendAmountText(
+            SpendAmounts(usedMinor: 1005, limitMinor: 20000, currency: "EUR", exponent: 2),
+            locale: enUS
+        )
+        #expect(eur == "€10.05 of €200.00")
+        // No stated currency → no dollar copy at all.
+        #expect(DeckBuilder.spendAmountText(
+            SpendAmounts(usedMinor: 24563, limitMinor: 50000, currency: nil, exponent: 2),
+            locale: enUS
+        ) == nil)
+        // Missing amounts or non-positive limit → nil.
+        #expect(DeckBuilder.spendAmountText(
+            SpendAmounts(usedMinor: nil, limitMinor: 50000, currency: "USD", exponent: 2),
+            locale: enUS
+        ) == nil)
+        #expect(DeckBuilder.spendAmountText(
+            SpendAmounts(usedMinor: 0, limitMinor: 0, currency: "USD", exponent: 2),
+            locale: enUS
+        ) == nil)
+        #expect(DeckBuilder.spendAmountText(nil, locale: enUS) == nil)
+    }
+
+    @Test func spendRowValueShowsDollarsWhenAmountsExist() {
+        let amounts = SpendAmounts(usedMinor: 24500, limitMinor: 50000, currency: "USD", exponent: 2)
+        let row = DeckBuilder.rows(state: spendAmountsState(amounts: amounts), now: now)[0]
+        let spend = row.windows.first { $0.isSpend }
+        // The value slot replaces the bare percent with the dollar copy…
+        #expect(spend?.spendText != nil)
+        #expect(spend?.valueText == spend?.spendText)
+        // …while the meter keeps the utilization fraction and non-spend rows
+        // keep the locked "% left" convention.
+        #expect(spend?.remainingPercent == 51)
+        let fiveHour = row.windows.first { !$0.isSpend }
+        #expect(fiveHour?.spendText == nil)
+        #expect(fiveHour?.valueText == "71% left")
+    }
+
+    @Test func spendRowWithoutAmountsKeepsPercentOnlyCopy() {
+        let row = DeckBuilder.rows(state: spendAmountsState(amounts: nil), now: now)[0]
+        let spend = row.windows.first { $0.isSpend }
+        #expect(spend?.spendText == nil)
+        #expect(spend?.valueText == "51% left")
+        #expect(spend?.resetText == "no reset data")
+    }
+
+    @Test func amountBearingSpendRowIsNeverMeaningless() {
+        let amounts = SpendAmounts(usedMinor: 0, limitMinor: 50000, currency: "USD", exponent: 2)
+        // Zero usage + no reset would hide an amount-free spend row (#28);
+        // "$0.00 of $500.00" is a live budget and must stay visible.
+        let zero = DeckBuilder.rows(state: spendAmountsState(remaining: 100, amounts: amounts), now: now)[0]
+        #expect(zero.windows.contains { $0.isSpend })
+        // Percent-less amounts-only row (daemon-created, #139) is visible too.
+        let unknown = DeckBuilder.rows(state: spendAmountsState(remaining: nil, amounts: amounts), now: now)[0]
+        #expect(unknown.windows.contains { $0.isSpend })
+        // CodeRabbit (PR #142): filter survival is not enough — the
+        // collapsed card must actually HEADLINE the dollars. But only as a
+        // last resort: here a percent-bearing 5-hour window exists, so it
+        // keeps the headline and the amount-only spend row stays tertiary.
+        #expect(unknown.headlineWindow(isExpanded: false)?.scope == "5h")
+        // Without amounts the #28 hiding rules stand.
+        let hidden = DeckBuilder.rows(state: spendAmountsState(remaining: nil, amounts: nil), now: now)[0]
+        #expect(!hidden.windows.contains { $0.isSpend })
+    }
+
+    @Test func amountOnlySpendRowHeadlinesItsDollarsWhenNothingElseIsMeasurable() {
+        // CodeRabbit (PR #142, Major): the daemon's amount-only spend row
+        // (dollars stated, no percent) left worstWindow nil, so the
+        // collapsed card rendered NO headline and the budget was invisible
+        // until expand. The fallback must surface the actual dollar copy.
+        let amounts = SpendAmounts(usedMinor: 0, limitMinor: 50000, currency: "USD", exponent: 2)
+        let state = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio", isDefault: true)],
+            usage: [
+                UsageSnapshot(
+                    accountId: "c1",
+                    scope: "spend",
+                    remainingPercent: nil,
+                    stale: false,
+                    detail: UsageSnapshotDetail(spend: amounts)
+                ),
+            ]
+        )
+        // Deterministic dollars for the assertion: build the row's windows
+        // via DeckBuilder, then check the headline against the en_US-pinned
+        // formatter output (DeckBuilder.window formats via .current, so the
+        // headline expectation compares to the same formatter's result).
+        let row = DeckBuilder.rows(state: state, now: now)[0]
+        let expected = DeckBuilder.spendAmountText(amounts)
+        #expect(expected != nil)
+        let headline = row.headlineWindow(isExpanded: false)
+        #expect(headline?.isSpend == true)
+        #expect(headline?.remainingPercent == nil)
+        #expect(headline?.valueText == expected)
+        #expect(DeckBuilder.spendAmountText(amounts, locale: enUS) == "$0.00 of $500.00")
+        // The truly empty card (no windows at all) still shows no headline.
+        let empty = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio")],
+            usage: [snapshot("c1", scope: "5h", remaining: nil)]
+        )
+        #expect(DeckBuilder.rows(state: empty, now: now)[0].headlineWindow(isExpanded: false) == nil)
+    }
+
     @Test func allUnknownUsageYieldsNoHeadlineWindow() {
         // Post-#53 tie-break: when every window's remaining is unknown there
         // is no honest worst pick — the headline shows nothing rather than an
@@ -486,29 +623,38 @@ struct DeckBuilderTests {
         #expect(DeckBuilder.resetText(for: now.addingTimeInterval(3 * 86_400), now: now).hasPrefix("Resets "))
     }
 
-    // Issue #30: absolute clock times carry the time-zone abbreviation
-    // ("Resets Wed 5:59 PM PST"); the beyond-a-week form is date-only so it
-    // stays zone-free.
-    @Test func resetTextCarriesTimeZoneAbbreviation() {
+    // Issue #137 (supersedes #30's zone suffix): reset times are always the
+    // viewer's local clock, so row copy carries NO time-zone abbreviation —
+    // "Resets Mon 12:00 AM", not "Resets Mon 12:00 AM PST".
+    @Test func resetTextRowCopyCarriesNoTimeZoneAbbreviation() {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(identifier: "America/Los_Angeles")!
-        // `now` is 2027-01-15 — Pacific standard time.
+        // Pin the locale so the exact weekday/month assertions below are
+        // deterministic on any host (CodeRabbit, PR #138).
+        calendar.locale = Locale(identifier: "en_US")
+        // `now` is 1_800_000_000 = 2027-01-15T08:00:00Z = Fri midnight PST.
         let withinWeek = DeckBuilder.resetText(
             for: now.addingTimeInterval(3 * 86_400), now: now, calendar: calendar
         )
-        #expect(withinWeek.hasPrefix("Resets "))
-        #expect(withinWeek.hasSuffix(" PST"), "got \(withinWeek)")
+        #expect(withinWeek == "Resets Mon 12:00 AM", "got \(withinWeek)")
+        #expect(!withinWeek.contains("PST") && !withinWeek.contains("PT"),
+                "row copy must be zone-free: \(withinWeek)")
         let beyondWeek = DeckBuilder.resetText(
             for: now.addingTimeInterval(10 * 86_400), now: now, calendar: calendar
         )
+        #expect(beyondWeek == "Resets Jan 25", "got \(beyondWeek)")
         #expect(!beyondWeek.contains("PST"), "date-only form stays zone-free: \(beyondWeek)")
     }
 
-    // Issue #67: the hover-tooltip backstop — the FULL absolute timestamp
-    // (weekday, date, clock time, zone) on every reset text.
-    @Test func absoluteResetTextCarriesWeekdayDateTimeAndZone() {
+    // Issue #67 + #137: the hover-tooltip backstop — the FULL absolute
+    // timestamp (weekday, date, clock time, zone). With row copy now
+    // zone-free (#137), the tooltip is the ONLY place the zone renders and
+    // MUST retain the abbreviation.
+    @Test func absoluteResetTooltipRetainsTimeZoneAbbreviation() {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(identifier: "America/Los_Angeles")!
+        // Pinned locale for deterministic symbols (CodeRabbit, PR #138).
+        calendar.locale = Locale(identifier: "en_US")
         // 1_800_000_000 = 2027-01-15T08:00:00Z = Fri Jan 15, midnight PST.
         let text = DeckBuilder.absoluteResetText(for: now, calendar: calendar)
         #expect(text == "Fri Jan 15, 12:00 AM PST", "got \(String(describing: text))")

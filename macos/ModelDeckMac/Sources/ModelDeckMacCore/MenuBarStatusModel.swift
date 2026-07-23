@@ -91,6 +91,21 @@ public final class MenuBarStatusModel: ObservableObject {
         return deckState?.accounts.first { $0.id == resolved }?.label
     }
 
+    /// Issue #131: the account whose window currently feeds the menu bar —
+    /// what the deck's single checkmark marks. Mirrors
+    /// `recomputeIconState`'s source order exactly (resolved pin first,
+    /// lowest-across fallback otherwise; see `MenuBarSourceResolver`). Nil
+    /// before the first load — the `.loading` placeholder comes from no
+    /// account — and when there is no measurable usage anywhere.
+    public var menuBarSourceAccountId: String? {
+        guard hasLoadedOnce else { return nil }
+        return MenuBarSourceResolver.sourceAccountID(
+            pinnedSetting: pinnedAccountId,
+            state: deckState,
+            worstRemaining: worstRemaining
+        )
+    }
+
     /// True once any state has landed (refresh success or `apply`); gates
     /// the `.loading` placeholder (issue #58).
     private var hasLoadedOnce = false

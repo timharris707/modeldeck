@@ -394,9 +394,37 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
 /// detail keys are ignored by Codable as usual.
 public struct UsageSnapshotDetail: Codable, Equatable, Sendable {
     public var windowDurationMins: Double?
+    /// Issue #139: payload-stated spend amounts for the `spend` scope
+    /// (src/adapters/claude.mjs `parseClaudeSpendAmounts`). Optional end to
+    /// end — older daemons and providers without amounts decode unchanged.
+    public var spend: SpendAmounts?
 
-    public init(windowDurationMins: Double? = nil) {
+    public init(windowDurationMins: Double? = nil, spend: SpendAmounts? = nil) {
         self.windowDurationMins = windowDurationMins
+        self.spend = spend
+    }
+}
+
+/// Issue #139: the provider-stated extra-usage budget in MINOR currency
+/// units (cents when `exponent` is 2), with the payload's own currency code.
+/// The deck renders "$X.XX of $Y.YY" from these ONLY when `currency` is
+/// present — a currency is never assumed.
+public struct SpendAmounts: Codable, Equatable, Sendable {
+    public var usedMinor: Double?
+    public var limitMinor: Double?
+    public var currency: String?
+    public var exponent: Double?
+
+    public init(
+        usedMinor: Double? = nil,
+        limitMinor: Double? = nil,
+        currency: String? = nil,
+        exponent: Double? = nil
+    ) {
+        self.usedMinor = usedMinor
+        self.limitMinor = limitMinor
+        self.currency = currency
+        self.exponent = exponent
     }
 }
 

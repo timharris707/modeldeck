@@ -106,6 +106,89 @@ function parseLimitEntries(limits, snapshots) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Issue #139 — spend dollar amounts. The payload's `extra_usage` object
+// (ignored by the window parser since #17) carries the extra-usage budget in
+// MINOR currency units: `used_credits` / `monthly_limit` (cents when the
+// exponent is 2), plus `currency` on the account variants that state it.
+// Variant shapes seen in the wild: a metered `spent_usd`/`limit_usd` pair
+// (major units; the field NAME states the currency) and money objects
+// `{ amount_minor, currency, exponent }` under a `spend` key. Amounts are
+// surfaced ONLY when the payload states the currency (explicit field, `_usd`
+// field name, or money-object currency) — the deck never assumes one — and
+// ride the spend snapshot's free-form `detail` additively, so old clients
+// decode unchanged.
+
+function statedCurrency(value) {
+  return typeof value === 'string' && value.trim() ? value.trim().toUpperCase() : null;
+}
+
+function moneyMinor(value) {
+  if (value && typeof value === 'object') {
+    const minor = number(value.amount_minor ?? value.amountMinor);
+    if (minor == null) return null;
+    return {
+      minor: Math.round(minor),
+      currency: statedCurrency(value.currency),
+      exponent: number(value.exponent) ?? 2,
+    };
+  }
+  const minor = number(value);
+  return minor == null ? null : { minor: Math.round(minor), currency: null, exponent: 2 };
+}
+
+function amountsFromExtraUsage(extra) {
+  if (!extra || typeof extra !== 'object') return null;
+  // CodeRabbit (#142): disabled extra usage can retain stale numeric values —
+  // is_enabled: false means the budget is not live, so no amounts at all.
+  if (extra.is_enabled === false || extra.isEnabled === false) return null;
+  const currency = statedCurrency(extra.currency);
+  if (currency) {
+    const used = number(extra.used_credits ?? extra.usedCredits);
+    const limit = number(extra.monthly_limit ?? extra.monthlyLimit ?? extra.monthly_credit_limit ?? extra.monthlyCreditLimit);
+    if (used != null && limit != null && limit > 0) {
+      return { usedMinor: Math.round(used), limitMinor: Math.round(limit), currency, exponent: 2 };
+    }
+  }
+  // Metered variant: major-unit dollars, currency stated by the field name.
+  const usedUsd = number(extra.spent_usd ?? extra.spentUsd ?? extra.used_usd ?? extra.usedUsd);
+  const limitUsd = number(extra.limit_usd ?? extra.limitUsd ?? extra.monthly_limit_usd ?? extra.monthlyLimitUsd);
+  if (usedUsd != null && limitUsd != null && limitUsd > 0) {
+    return { usedMinor: Math.round(usedUsd * 100), limitMinor: Math.round(limitUsd * 100), currency: 'USD', exponent: 2 };
+  }
+  return null;
+}
+
+function amountsFromSpendObject(spend) {
+  if (!spend || typeof spend !== 'object') return null;
+  const used = moneyMinor(spend.used);
+  const limit = moneyMinor(spend.limit ?? spend.monthly_limit ?? spend.monthlyLimit);
+  if (!used || !limit || limit.minor <= 0) return null;
+  const currency = used.currency ?? limit.currency;
+  if (!currency) return null; // unstated currency: never assumed
+  if (used.currency && limit.currency && used.currency !== limit.currency) return null;
+  // CodeRabbit (#142): each money object carries its OWN scale — combining a
+  // used at exponent 2 with a limit at exponent 3 under one exponent shows a
+  // wrong-by-10x dollar figure, which is worse than no figure. Normalize both
+  // minors to the larger exponent (exact integer scaling); reject exponents
+  // outside the sane 0..6 integer range rather than guess.
+  const exponents = [used.exponent, limit.exponent];
+  if (exponents.some((exp) => !Number.isInteger(exp) || exp < 0 || exp > 6)) return null;
+  const exponent = Math.max(...exponents);
+  const rescale = (money) => money.minor * 10 ** (exponent - money.exponent);
+  return { usedMinor: rescale(used), limitMinor: rescale(limit), currency, exponent };
+}
+
+export function parseClaudeSpendAmounts(data, usage) {
+  for (const source of [data, usage]) {
+    if (!source || typeof source !== 'object') continue;
+    const parsed = amountsFromExtraUsage(source.extra_usage ?? source.extraUsage)
+      ?? amountsFromSpendObject(source.spend);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
 function unwrapUsage(payload) {
   if (typeof payload !== 'string') return payload;
   const trimmed = payload.trim();
@@ -156,6 +239,24 @@ export function parseClaudeUsage(payload) {
     });
   }
   const unique = snapshots.filter((snapshot, index, all) => all.findIndex((item) => item.scope === snapshot.scope) === index);
+  // Issue #139: attach payload-stated spend amounts to the spend snapshot
+  // (additive detail — old clients ignore it). When the payload carries
+  // amounts but no percent-bearing spend entry, a percent-less spend
+  // snapshot is created so the amounts still reach the deck.
+  const spendAmounts = parseClaudeSpendAmounts(data, usage);
+  if (spendAmounts) {
+    const spendRow = unique.find((row) => row.scope.toLowerCase().includes('spend'));
+    if (spendRow) spendRow.detail = { ...spendRow.detail, spend: spendAmounts };
+    else {
+      unique.push({
+        scope: 'spend',
+        usedPercent: null,
+        resetsAt: null,
+        source: 'claude-oauth-api',
+        detail: { spend: spendAmounts },
+      });
+    }
+  }
   if (!unique.length) throw new Error('Claude usage output did not contain usage windows');
   return unique;
 }

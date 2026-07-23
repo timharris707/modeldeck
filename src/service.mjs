@@ -274,12 +274,20 @@ export class ModelDeckService {
     this.toolUpdatePromises = new Map();
     this.realpath = options.realpath || fs.promises.realpath;
     this.platform = options.platform || process.platform;
+    // DEMO/DEV ONLY (issue #129): when true, seeded fixture usage snapshots
+    // are authoritative. refreshAll() is a no-op (no provider calls, so
+    // fabricated demo accounts can never accumulate refresh errors that
+    // degrade their auth chips) and the auto-refresh scheduler never arms.
+    // Production installs never set this; scripts/demo-daemon.sh does.
+    this.demoFixtures = options.demoFixtures === true;
     this.claudeSecureStorage = { value: null, status: this.platform === 'darwin' ? 'inactive' : 'not-applicable' };
     this.claudeSecureStorageSupported = null;
   }
 
   startAutoRefresh() {
     if (this.autoRefreshStarted) return;
+    // Demo fixture mode: fixtures never refresh, so never arm the scheduler.
+    if (this.demoFixtures) return;
     this.autoRefreshStarted = true;
     // Local, credential-free startup migration for pre-#62 Claude rows.
     void this.backfillClaudeIdentities();
@@ -892,6 +900,12 @@ export class ModelDeckService {
   }
 
   async refreshAll() {
+    // Demo fixture mode: the seeded snapshots ARE the data — a provider
+    // refresh could only fail (placeholder accounts hold no credentials)
+    // and would wrongly degrade auth chips. Report a truthful no-op.
+    if (this.demoFixtures) {
+      return { demoFixtures: true, claude: null, codex: null, checkedAt: new Date().toISOString() };
+    }
     if (this.refreshPromise) return this.refreshPromise;
     this.refreshPromise = (async () => {
       const result = { claude: null, codex: null, checkedAt: new Date().toISOString() };
@@ -977,6 +991,16 @@ export class ModelDeckService {
     }
     if (this.platform !== 'darwin') {
       this.claudeSecureStorage = { value, status: 'not-applicable', ...(shellPinError ? { error: shellPinError } : {}) };
+      return this.claudeSecureStorage;
+    }
+    if (this.demoFixtures) {
+      // DEMO/DEV ONLY (issue #129): never mutate the user-global launchd
+      // environment from a demo instance — `launchctl setenv` below would
+      // steer every subsequently GUI-launched real Claude process at the
+      // demo profile. The shell env file written above is already pinned
+      // inside the demo dir by scripts/demo-daemon.sh, and the seeded
+      // active link fully establishes fixture state.
+      this.claudeSecureStorage = { value, status: 'inactive', ...(shellPinError ? { error: shellPinError } : {}) };
       return this.claudeSecureStorage;
     }
     if (!(await this.claudeScopingSupported())) {

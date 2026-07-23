@@ -8,10 +8,13 @@ A native macOS menu bar app + local daemon that tracks usage limits across
 all of your Claude Code and Codex CLI accounts — live "% left" meters,
 reset countdowns, and one-click account switching.
 
-**Local-first. No cloud backend. No telemetry. Your credentials are never
-copied, stored, or transmitted by ModelDeck.** The only optional outbound
-call of ModelDeck's own is the daily update check, which reads this
-repository's public releases feed — and it's off unless you enable it.
+**Local-first. No cloud backend. No telemetry. Your provider credentials
+are never copied, stored, or transmitted by ModelDeck.** The only secret
+ModelDeck creates is its own local Keychain token that guards the daemon's
+API — it contains nothing of yours. The only optional outbound calls of
+ModelDeck's own are the daily update check (reads this repository's public
+releases feed) and the update download you approve (fetches the release
+asset) — update checks are off unless you enable them.
 
 [Download](https://github.com/timharris707/modeldeck/releases) ·
 [modeldeck.ai](https://modeldeck.ai)
@@ -24,10 +27,9 @@ repository's public releases feed — and it's off unless you enable it.
 
 </div>
 
-<!-- SCREENSHOT PLACEHOLDER: hero shot — menu bar icon + open two-column deck
-     popover showing several accounts with % left bars and reset countdowns.
-     Suggested path: docs/images/deck-popover.png -->
-<!-- ![The ModelDeck popover](docs/images/deck-popover.png) -->
+![The ModelDeck deck popover — every account and limit window at a glance](docs/images/deck-popover.png)
+
+*All screenshots show a demo-seeded instance with placeholder accounts.*
 
 ---
 
@@ -71,10 +73,10 @@ ModelDeck puts all of it in your menu bar:
   truthfully (`effective` / `identity-mismatch` / `identity-unverified`)
   instead of assuming success. Running sessions are never stopped, logged
   out, or touched.
-- **Duplicate-token warning** — if two Claude accounts end up sharing the
-  same credential (a missed `/login` ceremony, a copied profile), the deck
-  flags them with a warning marker and banner instead of silently counting
-  the same limit twice.
+- **Duplicate-token warning** — if two accounts of either provider end up
+  sharing the same credential (a missed `/login` ceremony, a copied
+  profile), the deck flags them with a warning marker and banner instead of
+  silently counting the same limit twice.
 - **Isolated profile homes** — every account lives in its own owner-only
   config home (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`), macOS Keychain-aware,
   so identities never bleed into each other.
@@ -82,17 +84,23 @@ ModelDeck puts all of it in your menu bar:
   your remaining-% threshold, silence otherwise. Thresholds configurable.
 - **Menu bar at-a-glance state** — plain glyph when healthy, gold "% left"
   beside it when anything is low, red at critical, back to plain on recovery.
+  Or pin one account (or "the active account") from Settings or a card's
+  right-click menu and its percentage stays in the menu bar continuously.
 - **Guided add-account flow** — three steps: name it, sign in through the
   provider's own browser login, confirm the identity ModelDeck read back.
   ModelDeck never sees your password or token.
 - **CLI health** — installed vs. latest versions of Claude Code and Codex
   CLI, with auth-state chips per account ("Healthy" / "Sign in again").
-- **Launch at login and update checks** — start with your Mac, and
-  optionally check the public releases feed daily for new app versions
-  (notification only; nothing installs itself).
+- **Launch at login and one-click updates** — start with your Mac, and
+  optionally check the public releases feed daily for new versions. When one
+  is found, **Update Now** downloads, verifies (EdDSA + Apple signature),
+  installs, and relaunches in one click; an "Install updates automatically"
+  toggle (on by default once checks are enabled) installs quietly on the
+  next relaunch instead. Turn checks off and ModelDeck never phones out.
 
-<!-- SCREENSHOT PLACEHOLDER: settings window, Accounts pane with health chips
-     and Activate controls. Suggested path: docs/images/settings-accounts.png -->
+![Sort the deck by lowest remaining to see which account runs out first](docs/images/deck-popover-percent.png)
+
+![Settings → General — refresh cadence, layout, menu bar, and update controls](docs/images/settings-general.png)
 
 ## Privacy: local-first, by design
 
@@ -102,42 +110,35 @@ This is the point of the tool, so it's worth being explicit:
 |---|---|
 | Cloud services | **None.** No backend, no sync, no accounts. |
 | Telemetry | **None.** Nothing is phoned home, ever. |
-| Credentials | **Never copied or persisted by ModelDeck.** Sign-in happens in the provider's own browser flow, and credentials stay in the provider-managed profile/Keychain; ModelDeck uses them in place, at runtime, only for usage and auth-state reads. |
+| Provider credentials | **Never copied or persisted by ModelDeck.** Sign-in happens in the provider's own browser flow, and credentials stay in the provider-managed profile/Keychain; ModelDeck uses them in place, at runtime, only for usage and auth-state reads. |
+| ModelDeck's own secrets | One Keychain item of its own: a locally generated random token that authorizes the app to the daemon's localhost API. It contains no provider data. |
 | Network | Daemon binds to `127.0.0.1` only. Outbound calls go solely to the providers you already use, with credentials they already hold. |
 | Removal | Removing an account deletes only ModelDeck's reference — never your Keychain entries or provider auth state. |
 
 ## Install
 
-**Requirements:** macOS 14+, Node.js 24+, and the Claude Code and/or Codex
-CLIs you want to track.
+**Requirements:** macOS 14+ and the Claude Code and/or Codex CLIs you want
+to track. (Node.js is only needed if you build from source.)
 
 **1. Download the app**
 
 Get the latest signed, notarized DMG from the
-[Releases page](https://github.com/timharris707/modeldeck/releases)
-(currently `v0.2.1`), open it, and drag ModelDeck to Applications.
+[Releases page](https://github.com/timharris707/modeldeck/releases), open
+it, and drag ModelDeck to Applications.
 
-**2. Install the daemon**
+**2. Launch it**
 
-The app is a pure client of a local daemon that does the actual usage
-reads. It is not bundled in the DMG yet; install it as a login agent:
-
-```bash
-git clone https://github.com/timharris707/modeldeck.git
-cd modeldeck
-npm install
-scripts/set-mutation-token.sh                # one-time Keychain token setup
-scripts/install-launch-agent.sh --port 3867  # installs + starts the launchd agent
-```
-
-The daemon listens on `127.0.0.1:3867` only.
+The DMG is self-contained: on first launch ModelDeck asks your consent to
+register its bundled background service (the local daemon that does the
+actual usage reads, listening on `127.0.0.1:3867` only) and sets up its
+Keychain token — one approval, no Terminal.
 
 **3. Add accounts**
 
-Launch ModelDeck, then open **Settings → Accounts → Add Account** and
-follow the three-step flow for each account — e.g. "Work", "Personal",
-"Side Project". Each gets its own isolated profile home and signs in
-through the provider's own login flow.
+Open **Settings → Accounts → Add Account** and follow the three-step flow
+for each account — e.g. "Work", "Personal", "Side Project". Each gets its
+own isolated profile home and signs in through the provider's own login
+flow.
 
 ## How it works
 
@@ -165,7 +166,8 @@ flowchart LR
 
 ## Development
 
-Building from source instead of using the released DMG:
+Building from source instead of using the released DMG (requires Node.js
+24+ for the daemon):
 
 ```bash
 # daemon (foreground)
@@ -175,6 +177,14 @@ npm start                             # daemon on 127.0.0.1:3867
 # app
 cd macos/ModelDeckMac
 swift run ModelDeckMac
+```
+
+To keep a checkout's daemon running across logins instead of the bundled
+one, install it as a launch agent:
+
+```bash
+scripts/set-mutation-token.sh                # one-time Keychain token setup
+scripts/install-launch-agent.sh --port 3867  # installs + starts the launchd agent
 ```
 
 Or assemble a signed `.app` bundle (ad-hoc by default):
@@ -197,7 +207,7 @@ for how release DMGs are cut.
 
 ## Roadmap
 
-The current release is `v0.2.1`; the legacy web dashboard is retired and
+The legacy web dashboard is retired and
 the native app is the only interface. Release history lives in
 [`CHANGELOG.md`](CHANGELOG.md), with the app design authority in
 [`design/mac-app-spec.md`](design/mac-app-spec.md). Project news lands at

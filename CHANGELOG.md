@@ -4,6 +4,56 @@ All notable changes to ModelDeck are documented here. Versioning follows the
 roadmap in `design/mac-app-roadmap.md`: `v0.1-web` tags the retired web MVP,
 and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 
+## 0.3.3 — 2026-07-23
+
+The first release delivered **through** Sparkle: if you're running 0.3.2,
+the app offers **Update Now** (or installs this quietly on relaunch when
+"Install updates automatically" is on). Manual updates are history —
+and fresh installs still start from a DMG, but a much nicer one (see
+below).
+
+### Added
+- **Spend rows show dollar amounts (issue #139, Tim request)**: deck spend
+  rows now render the provider-stated extra-usage budget — "$245.63 of
+  $500.00" in the row's value slot, matching Claude Code's own
+  presentation — whenever the refresh payload carries the amounts and
+  states the currency. The daemon parses the payload's `extra_usage`
+  amounts (previously discarded) into the spend snapshot's `detail`
+  additively, so older app builds decode unchanged. No new provider
+  calls; amounts without a payload-stated currency keep the percent-only
+  copy (a currency is never assumed).
+- **Premium DMG installer window (issue #130, Tim directive)**: the flat
+  gray drag-to-Applications art is replaced with brand-blue gradient art —
+  tri-color deck-bar band, glyph + wordmark header, and a dashed
+  rounded-rect drop zone that fully clears the Applications label (the old
+  dotted circle collided with it). Verified in light and dark appearance.
+
+### Changed
+- **The deck checkmark now means exactly one thing (issue #131, Tim
+  directive)**: it marks the single account whose window currently feeds
+  the menu bar percentage — following the lowest across accounts in the
+  default mode, your pin in pinned mode, and the active account in
+  follow-active mode (fallbacks tracked honestly). It no longer indicates
+  CLI-active state, which lives in Settings → Accounts. One checkmark
+  total, always.
+- **Reset times drop the timezone suffix (issue #137, Tim directive)**:
+  deck rows show bare local times ("Resets Sat 4:38 AM") — they were
+  always rendered in your own time zone, so the abbreviation was
+  redundant. The full zone-stamped timestamp remains in each row's hover
+  tooltip. The reclaimed width lets window labels like "Weekly · all
+  models" render without truncation.
+- **README + screenshots overhaul (issue #129)**: install instructions
+  finally match the product (download the DMG, drag, done — the manual
+  daemon setup died in v0.3.0), update-check copy reflects Sparkle,
+  privacy wording precisely separates provider credentials (never touched)
+  from ModelDeck's own Keychain mutation token (disclosed), and the
+  screenshots are real captures of a demo-seeded deck with placeholder
+  identities — backed by committed, isolation-hardened demo tooling.
+
+### Fixed
+- **Expanded deck cards no longer bold their window labels (issue #134)**:
+  expanded rows use the same regular-weight font as collapsed rows.
+
 ## 0.3.2 — 2026-07-22
 
 The Sparkle debut: this release ships the in-app update machinery, so

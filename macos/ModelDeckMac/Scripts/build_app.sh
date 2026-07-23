@@ -32,6 +32,14 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/ModelDeckMac"
 cp "$PACKAGE_DIR/Support/Info.plist" "$APP/Contents/Info.plist"
 
+# Stamp the repo VERSION so dev bundles (and demo screenshots — issue #129)
+# report the current version instead of the placeholder in Support/Info.plist.
+# release-dmg.sh does its own stamping; this only covers dev assembly.
+REPO_VERSION_FILE="$(cd "$PACKAGE_DIR/../.." && pwd)/VERSION"
+if [[ -f "$REPO_VERSION_FILE" ]]; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(cat "$REPO_VERSION_FILE")" "$APP/Contents/Info.plist"
+fi
+
 # SwiftPM resource bundle (issue #103: provider icons). Bundle.module resolves
 # it via Bundle.main.resourceURL, so it must sit in Contents/Resources.
 RESOURCE_BUNDLE="$(dirname "$BIN")/ModelDeckMac_ModelDeckMacCore.bundle"
@@ -47,7 +55,10 @@ if [[ -d "$SPARKLE_FRAMEWORK" ]]; then
   mkdir -p "$APP/Contents/Frameworks"
   cp -R "$SPARKLE_FRAMEWORK" "$APP/Contents/Frameworks/"
   install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/ModelDeckMac" 2>/dev/null || true
-  codesign --force --sign - "$APP/Contents/Frameworks/Sparkle.framework" 2>/dev/null || true
+  # --deep: Sparkle embeds nested XPC services/helpers signed with the
+  # Sparkle project's Team ID; without re-signing them too, dyld refuses to
+  # load the framework into an ad-hoc-signed dev binary (different Team IDs).
+  codesign --force --deep --sign - "$APP/Contents/Frameworks/Sparkle.framework" 2>/dev/null || true
 fi
 
 # Issue #96 (optional in dev): when a daemon binary has been built
@@ -66,7 +77,15 @@ if [[ -x "$REPO_ROOT/dist/daemon/modeldeckd" && -f "$REPO_ROOT/dist/daemon/manif
 fi
 
 echo "==> codesign (identity: $IDENTITY)"
-codesign --force --options runtime --sign "$IDENTITY" "$APP"
+if [[ "$IDENTITY" == "-" ]]; then
+  # Ad-hoc dev signing: NO hardened runtime. Hardened runtime implies
+  # library validation, which refuses to load the embedded (ad-hoc re-signed)
+  # Sparkle framework — the Team IDs can never match without a real identity.
+  # Release bundles get hardened runtime + real identity in release-dmg.sh.
+  codesign --force --sign - "$APP"
+else
+  codesign --force --options runtime --sign "$IDENTITY" "$APP"
+fi
 codesign --verify --deep "$APP"
 
 echo "==> done: $APP"

@@ -99,6 +99,115 @@ test('parses the limits-array payload including model-scoped weekly entries', ()
   assert.ok(parsed.every((row) => row.source === 'claude-oauth-api'));
 });
 
+// Issue #139: payload-stated spend amounts ride the spend snapshot's detail
+// additively; every fixture uses placeholder values. The cents shape
+// (`used_credits`/`monthly_limit` in minor units) requires an explicit
+// `currency` — never assumed.
+test('attaches extra_usage amounts to the spend snapshot when currency is stated', () => {
+  const parsed = parseClaudeUsage({
+    limits: [
+      { kind: 'session', percent: 29, resets_at: '2026-07-19T20:00:00Z', is_active: true },
+      { kind: 'spend', group: 'spend', percent: 49, resets_at: null, is_active: true },
+    ],
+    extra_usage: { is_enabled: true, used_credits: 24563, monthly_limit: 50000, utilization: 49.1, currency: 'usd' },
+  });
+  const spend = parsed.find((row) => row.scope === 'spend');
+  assert.deepEqual(spend.detail.spend, { usedMinor: 24563, limitMinor: 50000, currency: 'USD', exponent: 2 });
+  assert.equal(spend.usedPercent, 49);
+  // Non-spend snapshots stay amount-free.
+  assert.equal(parsed.find((row) => row.scope === '5-hour').detail.spend, undefined);
+});
+
+test('never emits spend amounts without a payload-stated currency', () => {
+  const parsed = parseClaudeUsage({
+    limits: [{ kind: 'spend', group: 'spend', percent: 12, resets_at: null, is_active: true }],
+    extra_usage: { is_enabled: true, used_credits: 1200, monthly_limit: 10000, utilization: 12.0 },
+  });
+  assert.deepEqual(parsed.find((row) => row.scope === 'spend').detail, {});
+});
+
+test('parses the metered spent_usd variant (currency stated by field name)', () => {
+  const parsed = parseClaudeUsage({
+    limits: [{ kind: 'spend', group: 'spend', percent: 50, resets_at: null, is_active: true }],
+    extra_usage: { is_enabled: true, spent_usd: 245.63, limit_usd: 500 },
+  });
+  assert.deepEqual(parsed.find((row) => row.scope === 'spend').detail.spend, {
+    usedMinor: 24563,
+    limitMinor: 50000,
+    currency: 'USD',
+    exponent: 2,
+  });
+});
+
+test('parses money-object spend amounts and creates a percent-less spend row when needed', () => {
+  const parsed = parseClaudeUsage({
+    five_hour: { utilization: 25, resets_at: '2026-07-19T20:00:00Z' },
+    spend: {
+      used: { amount_minor: 1005, currency: 'EUR', exponent: 2 },
+      limit: { amount_minor: 20000, currency: 'EUR', exponent: 2 },
+    },
+  });
+  const spend = parsed.find((row) => row.scope === 'spend');
+  assert.equal(spend.usedPercent, null);
+  assert.equal(spend.resetsAt, null);
+  assert.equal(spend.source, 'claude-oauth-api');
+  assert.deepEqual(spend.detail.spend, { usedMinor: 1005, limitMinor: 20000, currency: 'EUR', exponent: 2 });
+});
+
+test('normalizes mismatched money-object exponents and rejects insane ones', () => {
+  // CodeRabbit (#142): used at exponent 2 + limit at exponent 3 must never
+  // share one exponent unscaled (a wrong-by-10x dollar display). Both minors
+  // normalize to the larger exponent by exact integer scaling.
+  const parsed = parseClaudeUsage({
+    five_hour: { utilization: 25, resets_at: '2026-07-19T20:00:00Z' },
+    spend: {
+      used: { amount_minor: 1005, currency: 'EUR', exponent: 2 },
+      limit: { amount_minor: 200000, currency: 'EUR', exponent: 3 },
+    },
+  });
+  assert.deepEqual(parsed.find((row) => row.scope === 'spend').detail.spend, {
+    usedMinor: 10050,
+    limitMinor: 200000,
+    currency: 'EUR',
+    exponent: 3,
+  });
+  // Non-integer or out-of-range exponents are rejected, never guessed at.
+  const insane = parseClaudeUsage({
+    five_hour: { utilization: 25, resets_at: '2026-07-19T20:00:00Z' },
+    spend: {
+      used: { amount_minor: 1005, currency: 'EUR', exponent: 2.5 },
+      limit: { amount_minor: 20000, currency: 'EUR', exponent: 2 },
+    },
+  });
+  assert.equal(insane.find((row) => row.scope === 'spend'), undefined);
+});
+
+test('ignores disabled/null extra_usage and non-positive limits', () => {
+  // CodeRabbit (#142): the disabled fixture carries VALID amounts + currency
+  // so this proves is_enabled: false wins over parseable numbers — a
+  // null-amounts fixture would pass even if the flag were ignored.
+  const parsed = parseClaudeUsage({
+    limits: [{ kind: 'spend', group: 'spend', percent: 0, resets_at: null, is_active: true }],
+    extra_usage: { is_enabled: false, used_credits: 24563, monthly_limit: 50000, currency: 'USD', utilization: null },
+  });
+  assert.deepEqual(parsed.find((row) => row.scope === 'spend').detail, {});
+  const nulls = parseClaudeUsage({
+    limits: [{ kind: 'spend', group: 'spend', percent: 0, resets_at: null, is_active: true }],
+    extra_usage: { is_enabled: true, used_credits: null, monthly_limit: null, utilization: null },
+  });
+  assert.deepEqual(nulls.find((row) => row.scope === 'spend').detail, {});
+  // CodeRabbit (#142, delta): isolate the non-positive-limit path — enabled,
+  // VALID credits and currency, only the limit is bad. A zero or negative
+  // limit alone must suppress spend details.
+  for (const monthlyLimit of [0, -50000]) {
+    const badLimit = parseClaudeUsage({
+      limits: [{ kind: 'spend', group: 'spend', percent: 0, resets_at: null, is_active: true }],
+      extra_usage: { is_enabled: true, used_credits: 24563, monthly_limit: monthlyLimit, currency: 'USD' },
+    });
+    assert.deepEqual(badLimit.find((row) => row.scope === 'spend').detail, {});
+  }
+});
+
 // Issue #26 (Claude half): plan facts come from output already in hand.
 test('extracts subscription type from auth status JSON output', () => {
   assert.equal(extractClaudeSubscriptionType(JSON.stringify({ subscriptionType: 'max' })), 'max');

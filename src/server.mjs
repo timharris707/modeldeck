@@ -70,6 +70,10 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
     codexPath: CODEX_PATH,
     codexActiveLink: CODEX_ACTIVE_LINK,
     codexProfilesDir: CODEX_PROFILES_DIR,
+    // DEMO/DEV ONLY (issue #129): seeded fixture snapshots are authoritative —
+    // provider refresh becomes a no-op and nothing is ever scheduled. Set by
+    // scripts/demo-daemon.sh for screenshot instances; never in production.
+    demoFixtures: process.env.MODELDECK_DEMO_FIXTURES === '1',
   });
   const { token: sessionToken, source: tokenSource } = resolveMutationToken({ token: mutationToken });
 

@@ -85,12 +85,15 @@ The identity string and profile name are labels, not secrets — the
 private key and Apple credentials stay in the keychain. Never commit or
 echo credential values.
 
-## Daemon activation is a separate app issue
+## Daemon activation (app half of #91 — shipped)
 
-The one-DMG artifact now contains the self-contained daemon binary. Registering
-and managing it from the Mac app with `SMAppService` is the app half of issue
-#91 and remains separate from this daemon/release build work. Until that app
-half lands, bundling alone does not activate the daemon on a fresh machine.
+The one-DMG artifact contains the self-contained daemon binary, and the app
+half of issue #91 is implemented: on first launch the app asks consent, then
+registers the bundled daemon as a launchd agent via `SMAppService`
+(`SMAppServiceAgentRegistrar` in
+`macos/ModelDeckMac/Sources/ModelDeckMacCore/DaemonSetupLive.swift`) and
+creates the `modeldeck` / `mutation-token` Keychain item if missing. A fresh
+machine needs no Terminal steps.
 
 ## Sparkle in-app updates (issue #121)
 
@@ -175,10 +178,65 @@ in sync with it:
 - The scrub-pattern file named by `MD_SCRUB_PATTERNS` when it is inside the
   source repository.
 
+## README screenshots (demo-seeded, issue #129)
+
+README images live in `docs/images/` and MUST come from a demo-seeded
+instance — never from a live deck. The safety contract (DESIGN.md) forbids
+real identities in anything published; the demo roster uses Tim's chosen
+placeholder labels (Personal / Business / Hobby Account / School, 4 Claude +
+3 Codex) with `…@example.invalid` identities and clearly-labelled
+placeholder marker files instead of credentials.
+
+To refresh the screenshots for a release:
+
+1. **Start the isolated demo daemon** (own data dir, own port; never 3867):
+
+   ```sh
+   scripts/demo-daemon.sh /tmp/modeldeck-demo 4867
+   ```
+
+   This seeds `scripts/seed-demo.mjs` on first run and starts the daemon
+   with every path pinned inside the demo dir and
+   `MODELDECK_DEMO_FIXTURES=1` — fixture snapshots are authoritative, the
+   provider-refresh scheduler never arms, and `/api/refresh` is a no-op, so
+   the placeholder accounts keep their healthy chips. Delete the demo dir
+   and rerun to reseed (reset times are anchored relative to seed time).
+
+2. **Build and launch the app against it** (`build_app.sh` stamps the repo
+   `VERSION` into the dev bundle so the popover footer shows the real
+   version):
+
+   ```sh
+   macos/ModelDeckMac/Scripts/build_app.sh --release
+   MODELDECK_PORT=4867 \
+     macos/ModelDeckMac/dist/ModelDeck.app/Contents/MacOS/ModelDeckMac
+   ```
+
+   If the production ModelDeck app is running you will have TWO menu bar
+   icons. Quit the real one first, or verify before every capture that the
+   open popover shows only the placeholder labels above.
+
+3. **Capture with `screencapture` window captures** (Retina resolution comes
+   from the display):
+
+   ```sh
+   # find the popover/settings window id of the demo app process
+   # (e.g. via CGWindowListCopyWindowInfo filtered by the demo app's PID)
+   screencapture -o -x -l <windowID> docs/images/<name>.png
+   ```
+
+   The three shipped shots: `deck-popover.png` (default next-reset sort,
+   one card per column expanded), `deck-popover-percent.png` (lowest-
+   remaining sort via the % segment), `settings-general.png` (Settings →
+   General).
+
+4. **Before committing**: confirm every visible label/identity is one of the
+   placeholders, the version chip matches the release, and no real account
+   data appears anywhere in the frame.
+
 ## Known gaps / future
 
 - No custom app icon yet: there is no vector/raster brand asset in the
   repo (`design/` holds HTML mockups only), so the bundle ships without
   an `.icns` rather than inventing artwork.
-- `SMAppService` registration and lifecycle management for the bundled daemon.
 - CI signing is out of scope; releases are cut from a provisioned Mac.

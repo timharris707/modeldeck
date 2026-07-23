@@ -106,6 +106,12 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
     /// Issue #101: the small "Week reset just now / at 10:19 AM" line for a
     /// recently rolled window, nil otherwise.
     public var rolloverText: String?
+    /// Issue #139: "$245.63 of $500.00" for a spend row whose snapshot
+    /// carries payload-stated amounts AND currency (never assumed). When
+    /// present it replaces the bare percent as the row's value — matching
+    /// Claude Code's own extra-usage presentation — while the meter keeps
+    /// showing the utilization fraction.
+    public var spendText: String?
 
     public var id: String { scope }
 
@@ -136,6 +142,14 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
         remainingPercent.map { "\(Int($0.rounded()))% left" }
     }
 
+    /// Issue #139: what the expanded row's value slot shows — the
+    /// payload-stated "$X.XX of $Y.YY" on spend rows that carry amounts,
+    /// the locked "% left" everywhere else (including spend rows whose
+    /// payload stated no amounts or no currency: unchanged presentation).
+    public var valueText: String? {
+        spendText ?? remainingText
+    }
+
     public init(
         scope: String,
         title: String,
@@ -145,7 +159,8 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
         severity: UsageSeverity,
         stale: Bool,
         anchor: WindowAnchor = .anchored,
-        rolloverText: String? = nil
+        rolloverText: String? = nil,
+        spendText: String? = nil
     ) {
         self.scope = scope
         self.title = title
@@ -156,6 +171,7 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
         self.stale = stale
         self.anchor = anchor
         self.rolloverText = rolloverText
+        self.spendText = spendText
     }
 }
 
@@ -223,7 +239,11 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     /// How this row's active marker renders when `isActive`: the full
     /// checkmark only when activation is physically effective (or
     /// unreported); a hollow warning-tinted marker with an honest caption
-    /// otherwise.
+    /// otherwise. Issue #131: deck cards no longer render this marker — the
+    /// deck checkmark now means "shown in menu bar" (see
+    /// `MenuBarSourceResolver`) — but the derivation stays because
+    /// Settings → Accounts renders the same indicator semantics beside the
+    /// activation radio.
     public var activeIndicator: ActiveIndicator {
         ActiveIndicator.indicator(for: activationState)
     }
@@ -243,7 +263,14 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
         let measurable = windows.filter { $0.remainingPercent != nil }
         let rateLimits = measurable.filter { !$0.isSpend }
         let eligible = rateLimits.isEmpty ? measurable : rateLimits
-        guard let worst = eligible.compactMap(\.remainingPercent).min() else { return nil }
+        guard let worst = eligible.compactMap(\.remainingPercent).min() else {
+            // Issue #139 (CodeRabbit, PR #142): an amount-only spend row —
+            // the daemon stated dollars but no percent — is still a live
+            // budget. Without this fallback the collapsed card renders no
+            // headline at all and the dollars are unreachable until expand.
+            // Percent-bearing windows always win above; this is last resort.
+            return windows.first { $0.spendText != nil }
+        }
         let tied = eligible.filter { $0.remainingPercent == worst }
         let withReset = tied
             .compactMap { window in window.resetsAt.map { (window, $0) } }
@@ -284,18 +311,21 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     /// VoiceOver label for the whole card button. The card's Button carries
     /// an EXPLICIT accessibility label, which suppresses the child marker
     /// views' own labels — so every state the row's markers show must be
-    /// spoken here (issue #55's pending caption, issue #73's opted-in
-    /// email, and issue #65's duplicate-token warning). Pure derivation so
-    /// it is directly unit testable; the view calls this verbatim.
-    public func accessibilityLabel(showsIdentity: Bool) -> String {
+    /// spoken here (issue #73's opted-in email, issue #65's duplicate-token
+    /// warning, and issue #131's menu-bar-source checkmark). Pure derivation
+    /// so it is directly unit testable; the view calls this verbatim.
+    ///
+    /// Issue #131: the label speaks what the card SHOWS — since deck cards
+    /// no longer render an activation marker, the old ", active" / pending
+    /// speech is gone (that state lives in Settings → Accounts); the single
+    /// checkmark's "shown in menu bar" meaning is spoken instead.
+    public func accessibilityLabel(showsIdentity: Bool, isMenuBarSource: Bool = false) -> String {
         let identity = showsIdentity
             ? (account.identity.flatMap { $0.isEmpty ? nil : ", \($0)" } ?? "")
             : ""
-        var label: String
-        if case .pending(let caption) = activeIndicator {
-            label = "\(account.label)\(identity), marked active, pending — \(caption)"
-        } else {
-            label = "\(account.label)\(identity)\(isActive ? ", active" : "")"
+        var label = "\(account.label)\(identity)"
+        if isMenuBarSource {
+            label += ", shown in menu bar"
         }
         if account.hasDuplicateToken {
             label += ", \(DuplicateTokenMarker.accessibilityLabel)"
@@ -487,16 +517,51 @@ public enum DeckBuilder {
             severity: UsageSeverity.severity(remainingPercent: remaining, thresholds: thresholds),
             stale: snapshot.stale,
             anchor: anchor,
-            rolloverText: rollover
+            rolloverText: rollover,
+            // Issue #139: dollar copy only on spend rows, only from
+            // payload-stated amounts + currency.
+            spendText: UsageScope.isSpend(snapshot.scope)
+                ? spendAmountText(snapshot.detail?.spend)
+                : nil
         )
     }
 
     /// Issue #28: a spend row with no reset data and zero/unknown usage is
     /// meaningless for subscription users — hide it entirely.
+    /// Issue #139: payload-stated amounts make the row meaningful again —
+    /// "$0.00 of $500.00" tells the user a live extra-usage budget exists.
     static func isMeaninglessSpend(_ window: DeckWindow) -> Bool {
-        guard window.isSpend, window.resetsAt == nil else { return false }
+        guard window.isSpend, window.resetsAt == nil, window.spendText == nil else { return false }
         guard let remaining = window.remainingPercent else { return true } // unknown usage
         return remaining >= 100 // zero usage
+    }
+
+    /// Issue #139: "$245.63 of $500.00" from the daemon's payload-stated
+    /// spend amounts. Nil — and therefore unchanged percent-only copy —
+    /// whenever the payload stated no amounts, a non-positive limit, or no
+    /// currency (a currency is NEVER assumed; formatting uses the payload's
+    /// ISO code via NumberFormatter, so non-USD budgets render honestly).
+    public static func spendAmountText(
+        _ spend: SpendAmounts?,
+        locale: Locale = .current
+    ) -> String? {
+        guard let spend,
+              let usedMinor = spend.usedMinor,
+              let limitMinor = spend.limitMinor,
+              limitMinor > 0,
+              let currency = spend.currency,
+              !currency.isEmpty
+        else { return nil }
+        let divisor = pow(10, spend.exponent ?? 2)
+        guard divisor > 0 else { return nil }
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .currency
+        formatter.currencyCode = currency
+        formatter.locale = locale
+        guard let used = formatter.string(from: NSNumber(value: usedMinor / divisor)),
+              let limit = formatter.string(from: NSNumber(value: limitMinor / divisor))
+        else { return nil }
+        return "\(used) of \(limit)"
     }
 
     /// Display title for a daemon scope: "5h" → "5-hour limit",
@@ -546,9 +611,11 @@ public enum DeckBuilder {
 
     /// Human reset text in Claude Code's usage-panel style (issue #28):
     /// "Resets in 57 min" within the hour, "Resets in 3 hr 10 min" within a
-    /// day, "Resets Wed 5:59 PM PDT" within a week (issue #30: absolute
-    /// clock times carry the time-zone abbreviation), "Resets Jul 24" beyond
-    /// (date only — no clock time, so no zone).
+    /// day, "Resets Wed 5:59 PM" within a week, "Resets Jul 24" beyond.
+    /// Issue #137 (Tim directive, supersedes #30's zone suffix): times are
+    /// always the viewer's local clock, so row copy carries NO time-zone
+    /// abbreviation — native macOS convention. The zone survives in the
+    /// hover tooltip (`absoluteResetText`) as the certainty backstop.
     public static func resetText(for date: Date?, now: Date, calendar: Calendar = .current) -> String {
         guard let date else { return "no reset data" }
         let interval = date.timeIntervalSince(now)
@@ -564,8 +631,12 @@ public enum DeckBuilder {
         let formatter = DateFormatter()
         formatter.calendar = calendar
         formatter.timeZone = calendar.timeZone
+        // CodeRabbit (PR #138): honor an injected calendar's locale so tests
+        // can pin en_US for deterministic weekday/month symbols. Production
+        // passes .current, whose locale IS the user's locale — unchanged.
+        formatter.locale = calendar.locale
         if interval < 7 * 86_400 {
-            formatter.dateFormat = "EEE h:mm a zzz"
+            formatter.dateFormat = "EEE h:mm a"
         } else {
             formatter.dateFormat = "MMM d"
         }
@@ -576,11 +647,15 @@ public enum DeckBuilder {
     /// "Sun Jul 26, 6:59 AM PDT" — the backstop on every reset text
     /// (collapsed and expanded) so the exact moment is always reachable
     /// even where layout must compromise. Nil when no reset data exists.
+    /// Issue #137: row copy dropped its zone suffix, so this tooltip is now
+    /// the ONLY place the zone renders — it must keep the abbreviation.
     public static func absoluteResetText(for date: Date?, calendar: Calendar = .current) -> String? {
         guard let date else { return nil }
         let formatter = DateFormatter()
         formatter.calendar = calendar
         formatter.timeZone = calendar.timeZone
+        // Same locale injection as resetText (CodeRabbit, PR #138).
+        formatter.locale = calendar.locale
         formatter.dateFormat = "EEE MMM d, h:mm a zzz"
         return formatter.string(from: date)
     }

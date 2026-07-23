@@ -61,9 +61,9 @@ hdiutil create -volname "$VOLNAME" -srcfolder "$STAGING" -ov -format UDRW \
 hdiutil attach "$DMG" -noautoopen >/dev/null
 [[ -d "$MOUNTPOINT" ]] || fail "mount point $MOUNTPOINT did not appear"
 
-# Window bounds 600x428 (content 600x400 with the title bar) matching the
-# 600x400pt background; icon centers at (150,195) and (450,195) matching
-# the arrow/ring anchors in generate-dmg-background.swift.
+# Window bounds 640x448 (content 640x420 with the title bar) matching the
+# 640x420pt background; icon centers at (170,210) and (470,210) matching
+# the arrow/drop-zone anchors in generate-dmg-background.swift (#130).
 osascript <<'APPLESCRIPT'
 tell application "Finder"
   tell disk "ModelDeck"
@@ -71,14 +71,14 @@ tell application "Finder"
     set current view of container window to icon view
     set toolbar visible of container window to false
     set statusbar visible of container window to false
-    set the bounds of container window to {200, 120, 800, 548}
+    set the bounds of container window to {200, 120, 840, 568}
     set viewOptions to the icon view options of container window
     set arrangement of viewOptions to not arranged
     set icon size of viewOptions to 100
     set text size of viewOptions to 12
     set background picture of viewOptions to file ".background:modeldeck-installer-bg.png"
-    set position of item "ModelDeck.app" of container window to {150, 195}
-    set position of item "Applications" of container window to {450, 195}
+    set position of item "ModelDeck.app" of container window to {170, 210}
+    set position of item "Applications" of container window to {470, 210}
     close
     open
     update without registering applications

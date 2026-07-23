@@ -62,6 +62,7 @@ function fixture({
   initialDelayMs = 100,
   pauseWhileActive = true,
   listProviderProcesses = async () => [],
+  demoFixtures = false,
 } = {}) {
   const store = new Store(':memory:');
   store.saveSettings({
@@ -76,6 +77,7 @@ function fixture({
     clearTimeout: clock.clearTimeout,
     autoRefreshInitialDelayMs: initialDelayMs,
     listProviderProcesses,
+    demoFixtures,
   });
   return { store, clock, service, close: () => { service.stopAutoRefresh(); store.close(); } };
 }
@@ -94,6 +96,28 @@ test('auto-refresh fires shortly after boot and once per configured interval', a
     assert.equal(refreshes, 1);
     await data.clock.advance(1);
     assert.equal(refreshes, 2);
+  } finally { data.close(); }
+});
+
+// Issue #129: demo screenshot instances run on seeded fixture snapshots.
+// Placeholder accounts hold no credentials, so a real provider refresh could
+// only fail and degrade their auth chips — demo mode therefore never arms
+// the scheduler and turns refreshAll into a truthful no-op.
+test('demo fixture mode never schedules and refreshAll is a provider-free no-op', async () => {
+  const data = fixture({ demoFixtures: true });
+  let providerCalls = 0;
+  data.service.refreshClaude = async () => { providerCalls += 1; return []; };
+  data.service.refreshCodex = async () => { providerCalls += 1; return []; };
+  try {
+    data.service.startAutoRefresh();
+    assert.equal(data.clock.timers.size, 0);
+    await data.clock.advance(3_600_000);
+    const result = await data.service.refreshAll();
+    assert.equal(result.demoFixtures, true);
+    assert.equal(result.claude, null);
+    assert.equal(result.codex, null);
+    assert.equal(providerCalls, 0);
+    assert.equal(data.clock.timers.size, 0);
   } finally { data.close(); }
 });
 

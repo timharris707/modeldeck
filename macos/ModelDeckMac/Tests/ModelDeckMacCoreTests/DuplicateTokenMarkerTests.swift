@@ -91,23 +91,37 @@ struct DuplicateTokenFlagTests {
         #expect(label == "Work, \(DuplicateTokenMarker.accessibilityLabel)")
     }
 
-    @Test func cardLabelAppendsTheWarningAfterActiveAndPendingStates() {
-        let active = row(authState: "duplicate-token", isActive: true, activationState: .effective)
-        #expect(active.accessibilityLabel(showsIdentity: false)
-            == "Work, active, \(DuplicateTokenMarker.accessibilityLabel)")
-        let pending = row(authState: "duplicate-token", isActive: true, activationState: .identityMismatch)
-        let pendingLabel = pending.accessibilityLabel(showsIdentity: false)
-        #expect(pendingLabel.contains("marked active, pending"))
-        #expect(pendingLabel.hasSuffix(DuplicateTokenMarker.accessibilityLabel))
+    @Test func cardLabelAppendsTheWarningAfterTheMenuBarSourceState() {
+        // Issue #131: cards no longer speak activation state (the deck
+        // renders no activation marker); the single checkmark's "shown in
+        // menu bar" meaning is spoken instead, and the duplicate warning
+        // still lands last.
+        let source = row(authState: "duplicate-token", isActive: true, activationState: .effective)
+        #expect(source.accessibilityLabel(showsIdentity: false, isMenuBarSource: true)
+            == "Work, shown in menu bar, \(DuplicateTokenMarker.accessibilityLabel)")
+    }
+
+    @Test func cardLabelNeverSpeaksActivationState() {
+        // Issue #131: an active-but-pending account shows NO marker on its
+        // deck card, so VoiceOver must not announce a state the eyes can't
+        // see. The pending caption lives in Settings → Accounts.
+        let pending = row(authState: nil, isActive: true, activationState: .identityMismatch)
+        let label = pending.accessibilityLabel(showsIdentity: false)
+        #expect(label == "Work")
+        #expect(!label.contains("active"))
     }
 
     @Test func unflaggedCardLabelsAreUntouched() {
         // Placeholder identity only — never real account data.
         #expect(row(authState: "ok").accessibilityLabel(showsIdentity: false) == "Work")
+        // Issue #131: isActive no longer surfaces in the card label.
         #expect(row(authState: nil, isActive: true, activationState: .effective)
-            .accessibilityLabel(showsIdentity: false) == "Work, active")
+            .accessibilityLabel(showsIdentity: false) == "Work")
         #expect(row(authState: "ok", identity: "user@example.com")
             .accessibilityLabel(showsIdentity: true) == "Work, user@example.com")
+        #expect(row(authState: "ok", identity: "user@example.com")
+            .accessibilityLabel(showsIdentity: true, isMenuBarSource: true)
+            == "Work, user@example.com, shown in menu bar")
     }
 }
 

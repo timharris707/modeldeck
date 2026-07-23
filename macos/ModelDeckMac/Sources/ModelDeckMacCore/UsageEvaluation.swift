@@ -127,6 +127,69 @@ public enum MenuBarPinResolver {
     }
 }
 
+/// Issue #131 (Tim directive 2026-07-22): the deck checkmark means "shown in
+/// the menu bar" — it marks exactly ONE account across the whole deck, the
+/// one whose window currently feeds the menu bar percentage. This resolver is
+/// the single derivation of that account, mirroring
+/// `MenuBarStatusModel.recomputeIconState`'s source order exactly so the
+/// checkmark can never point at an account the menu bar isn't actually
+/// showing:
+///
+/// 1. A stored pin that RESOLVES (plain account id, or a follow-active
+///    sentinel with a current active account) wins — including the spend-only
+///    edge, where the resolved account has no usable non-spend window and the
+///    menu bar shows the plain glyph: the pin is still in force and that
+///    account still owns the (empty) menu bar slot, so the checkmark stays on
+///    it rather than hiding or drifting to the global worst (documented lane
+///    decision on issue #131).
+/// 2. Otherwise — unpinned, or an unresolvable pin (account removed, no
+///    active account for the provider, unknown sentinel) — the source is the
+///    lowest-remaining account across the deck (`worstRemaining`), the same
+///    fallback the icon takes (#123). Nil when there is no worst either (no
+///    measurable usage anywhere): no account feeds the menu bar, so no card
+///    gets the checkmark.
+public enum MenuBarSourceResolver {
+    /// The account id whose window currently feeds the menu bar, or nil when
+    /// no account does.
+    public static func sourceAccountID(
+        pinnedSetting: String?,
+        state: DeckState?,
+        worstRemaining: WorstRemaining?
+    ) -> String? {
+        if let pinnedSetting, let state,
+           let resolved = MenuBarPinResolver.resolve(pinnedSetting, in: state) {
+            return resolved
+        }
+        return worstRemaining?.accountId
+    }
+
+    /// Hover tooltip for the deck's single source checkmark — honest per
+    /// mode, including the fallback case where a stored pin didn't resolve
+    /// and the lowest-across account is what the menu bar actually shows.
+    /// `resolvedPinnedAccountID` is `resolve(pinnedSetting, in: state)` —
+    /// passed in (rather than recomputed) so the copy is keyed on the same
+    /// resolution the marked row was chosen by.
+    public static func checkmarkTooltip(
+        pinnedSetting: String?,
+        resolvedPinnedAccountID: String?,
+        accountID: String
+    ) -> String {
+        guard let pinnedSetting, !pinnedSetting.isEmpty else {
+            return "Shown in the menu bar — currently the lowest % left across accounts"
+        }
+        guard resolvedPinnedAccountID == accountID else {
+            // The stored pin didn't resolve; this row won the lowest-across
+            // fallback (#123).
+            return "Shown in the menu bar — the pinned selection isn't available, "
+                + "so the lowest % left across accounts is shown"
+        }
+        if pinnedSetting.hasPrefix("active:") {
+            return "Shown in the menu bar — following the active account"
+        }
+        return "Shown in the menu bar — pinned (right-click to unpin)"
+    }
+}
+
 /// Client-side computation of worst-remaining from `GET /api/state`. The
 /// daemon grows a dedicated evaluation endpoint in Phase 2; this stays the
 /// fallback and the endpoint becomes another `UsageEvaluating` conformer.

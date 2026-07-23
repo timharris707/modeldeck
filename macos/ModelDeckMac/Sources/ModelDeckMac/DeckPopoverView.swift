@@ -3,9 +3,9 @@ import ModelDeckMacCore
 
 /// Phase 4 popover — the two-column deck (design/mac-app-spec.md, mockups
 /// §02). Claude column left, Codex right, brand-mark headers, collapsing
-/// account rows, per-column ACTIVE badge, sort control, footer with a live
-/// "Updated N min ago" and manual Refresh. The single-column alternate
-/// layout renders from the same view model.
+/// account rows, ONE menu-bar-source checkmark deck-wide (issue #131), sort
+/// control, footer with a live "Updated N min ago" and manual Refresh. The
+/// single-column alternate layout renders from the same view model.
 struct DeckPopoverView: View {
     @ObservedObject var statusModel: MenuBarStatusModel
     @ObservedObject var deckModel: DeckPopoverModel
@@ -46,7 +46,7 @@ struct DeckPopoverView: View {
         // Issue #30 widths: at the standard roster (7 accounts, longest
         // label ~"Side Project") nothing may truncate in either layout —
         // meter rows carry "Weekly · all models" left and
-        // "Resets Wed 5:59 PM PDT" right on every card.
+        // "Resets Wed 5:59 PM" right on every card (zone-free per #137).
         .frame(width: deckModel.layout == .twoColumn ? 640 : 420)
         .task {
             launchAtLoginModel.load()
@@ -211,6 +211,19 @@ struct DeckPopoverView: View {
     @ViewBuilder
     private var content: some View {
         if let state = statusModel.deckState {
+            // Issue #131: the ONE account whose window currently feeds the
+            // menu bar percentage — the deck's single checkmark. Resolved
+            // here (pin → fallback, MenuBarSourceResolver) so both layouts
+            // mark from the same value and can never disagree. The tooltip
+            // is likewise single-valued: only the source row renders it.
+            let sourceID = statusModel.menuBarSourceAccountId
+            let sourceTooltip = sourceID.map {
+                MenuBarSourceResolver.checkmarkTooltip(
+                    pinnedSetting: statusModel.pinnedAccountId,
+                    resolvedPinnedAccountID: statusModel.resolvedPinnedAccountId,
+                    accountID: $0
+                )
+            } ?? ""
             switch deckModel.layout {
             case .twoColumn:
                 HStack(alignment: .top, spacing: 12) {
@@ -218,6 +231,8 @@ struct DeckPopoverView: View {
                         DeckColumnView(
                             column: column,
                             deckModel: deckModel,
+                            menuBarSourceAccountID: sourceID,
+                            menuBarSourceTooltip: sourceTooltip,
                             staleness: { statusModel.cardStaleness(for: $0) }
                         )
                         .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -231,6 +246,8 @@ struct DeckPopoverView: View {
                             deckModel: deckModel,
                             showsProviderMark: true,
                             showsIdentity: deckModel.showAccountEmails,
+                            isMenuBarSource: row.id == sourceID,
+                            menuBarSourceTooltip: sourceTooltip,
                             isExpanded: deckModel.isExpanded(row.id),
                             staleness: statusModel.cardStaleness(for: row)
                         ) {
@@ -374,6 +391,13 @@ struct DeckPopoverView: View {
 struct DeckColumnView: View {
     let column: DeckColumn
     @ObservedObject var deckModel: DeckPopoverModel
+    /// Issue #131: the account whose window feeds the menu bar — at most one
+    /// row across the WHOLE deck matches, so the two columns can never show
+    /// two checkmarks.
+    var menuBarSourceAccountID: String? = nil
+    /// Issue #131: the source checkmark's tooltip (only the source row
+    /// renders it).
+    var menuBarSourceTooltip: String = ""
     /// Issue #89: per-card staleness derivation, supplied by the popover so
     /// the column stays free of the status model (interval + clock live
     /// there). Defaults to no markers for previews/tests.
@@ -405,6 +429,8 @@ struct DeckColumnView: View {
                         deckModel: deckModel,
                         showsProviderMark: false,
                         showsIdentity: deckModel.showAccountEmails,
+                        isMenuBarSource: row.id == menuBarSourceAccountID,
+                        menuBarSourceTooltip: menuBarSourceTooltip,
                         isExpanded: deckModel.isExpanded(row.id),
                         staleness: staleness(row)
                     ) {
@@ -426,15 +452,19 @@ struct DeckColumnView: View {
 /// tier, meter captions, reset info — is a muted 10.5; the "% left" value
 /// is an 11-semibold accent, right-aligned and color-coded but no longer
 /// dominant.
+///
+/// Issue #134 (Tim directive 2026-07-22, supersedes the #30 scale's
+/// "meter labels 11 medium" entry): expanded per-window labels use the
+/// SAME caption font and non-bold weight as the collapsed row's label —
+/// the dedicated heavier `meterLabel` style is gone.
 enum DeckType {
     /// Account name.
     static let name = Font.system(size: 12, weight: .semibold)
     /// Inline plan tier ("· Max (20x)") and identity line.
     static let tier = Font.system(size: 10.5)
-    /// Meter captions: limit labels and reset info.
+    /// Meter captions: limit labels (collapsed AND expanded, issue #134)
+    /// and reset info.
     static let caption = Font.system(size: 10.5)
-    /// Expanded meter row's limit label (primary color, per issue #28).
-    static let meterLabel = Font.system(size: 11, weight: .medium)
     /// "% left" values, collapsed headline and expanded rows alike.
     static let value = Font.system(size: 11, weight: .semibold)
 }
@@ -442,9 +472,12 @@ enum DeckType {
 // MARK: - Account row
 
 /// One deck card. Activation moved to Settings → Accounts (spec amendment
-/// 2026-07-19, Tim's call) — the popover carries zero activation controls;
-/// the active account shows a small checkmark beside its title and its
-/// headline slot carries the usage summary like every other card.
+/// 2026-07-19, Tim's call) — the popover carries zero activation controls.
+/// Issue #131 (Tim directive 2026-07-22): the card checkmark no longer marks
+/// CLI-active state — it marks the ONE account across the whole deck whose
+/// window currently feeds the menu bar percentage (resolved pin or
+/// lowest-across fallback). CLI-active state stays visible in Settings →
+/// Accounts (activation radio + marker) and the "Follow Active …" labels.
 struct DeckAccountRowView: View {
     let row: DeckAccountRow
     /// Issue #113: the shared popover model also holds which warning
@@ -456,6 +489,13 @@ struct DeckAccountRowView: View {
     /// Settings → General "Show account emails" toggle is on (default off).
     /// Uniform for both providers — no identity, no line.
     var showsIdentity: Bool = false
+    /// Issue #131: whether THIS account's window feeds the menu bar — the
+    /// deck's single checkmark. At most one row in the whole deck is true.
+    var isMenuBarSource: Bool = false
+    /// Issue #131: the checkmark's mode-honest tooltip (pinned /
+    /// follow-active / lowest-across / fallback), computed once at the
+    /// popover level from the same resolution that chose the source row.
+    var menuBarSourceTooltip: String = ""
     let isExpanded: Bool
     /// Issue #89: non-nil when this card's newest snapshot is older than
     /// ~2x the effective refresh interval — the card then carries a visible
@@ -492,7 +532,10 @@ struct DeckAccountRowView: View {
             // explicit parent label suppresses the child markers' labels, so
             // the duplicate-token warning is folded in here as well. The
             // derivation lives in Core (DeckAccountRow) where it is tested.
-            .accessibilityLabel(row.accessibilityLabel(showsIdentity: showsIdentity))
+            .accessibilityLabel(row.accessibilityLabel(
+                showsIdentity: showsIdentity,
+                isMenuBarSource: isMenuBarSource
+            ))
             .accessibilityHint(isExpanded ? "Collapse usage windows" : "Expand usage windows")
             // Issue #113 (CodeRabbit): the row button's explicit label
             // suppresses the marker's own accessibility element, so the
@@ -653,9 +696,10 @@ struct DeckAccountRowView: View {
 
     /// Collapsed card (issue #30 anatomy, both layouts): title row — inline
     /// provider mark, name with the muted plan tier inline ("Studio ·
-    /// Max (20x)"), active checkmark, right-aligned % left — then a meter
-    /// caption row with the limit label LEFT and reset info (incl. time
-    /// zone) RIGHT, then the thin bar. The provider mark stays inline in the
+    /// Max (20x)"), the menu-bar-source checkmark when this account feeds
+    /// the menu bar (issue #131), right-aligned % left — then a meter
+    /// caption row with the limit label LEFT and reset info (zone-free per
+    /// issue #137) RIGHT, then the thin bar. The provider mark stays inline in the
     /// title row — never a leading gutter — so every element shares one left
     /// edge (issue #28).
     private var collapsedLine: some View {
@@ -666,11 +710,13 @@ struct DeckAccountRowView: View {
                 }
                 titleText
                     .lineLimit(1)
-                if row.isActive {
-                    // Issue #55: the marker is honest — full checkmark only
-                    // when the daemon verified activation is physically in
-                    // effect (or didn't report activation at all).
-                    ActiveMarkerView(indicator: row.activeIndicator)
+                if isMenuBarSource {
+                    // Issue #131: the deck's ONE checkmark — this account's
+                    // window feeds the menu bar percentage (resolved pin,
+                    // follow-active, or lowest-across). Never an
+                    // activation/CLI-active marker; that state lives in
+                    // Settings → Accounts.
+                    MenuBarSourceCheckmark(tooltip: menuBarSourceTooltip)
                 }
                 if row.account.hasDuplicateToken {
                     // Issue #65: two profiles appear to hold the same login.
@@ -686,8 +732,10 @@ struct DeckAccountRowView: View {
                 Spacer(minLength: 8)
                 // Issue #33 amendment: the headline percent only exists
                 // while collapsed — expanded rows carry their own numbers.
+                // Issue #139: on a spend-headlined card (spend-only account)
+                // the value is the payload-stated dollars, like the row.
                 if let worst = row.headlineWindow(isExpanded: isExpanded),
-                   let remainingText = worst.remainingText {
+                   let remainingText = worst.valueText {
                     Text(remainingText)
                         .font(DeckType.value)
                         .foregroundStyle(valueColor(for: worst))
@@ -759,11 +807,15 @@ struct DeckAccountRowView: View {
 
     /// Expanded state — row anatomy modeled on Claude Code's own usage
     /// panel (issue #28), on issue #30's shared type scale: limit label left
-    /// in primary color, reset info (incl. time zone) and the semibold
+    /// in primary color, reset info (zone-free per issue #137; the tooltip
+    /// keeps the zone) and the semibold
     /// percent right-aligned on the same line, a thin full-width bar below,
     /// and generous vertical rhythm between rows. The number keeps the
     /// locked "% left" semantics. Spend rows render muted with no severity
-    /// color.
+    /// color. Issue #134 (Tim directive 2026-07-22): the window label uses
+    /// EXACTLY the collapsed row's caption font and non-bold weight — the
+    /// former 11-medium `meterLabel` read as bold next to the collapsed
+    /// presentation. Typography only; label color and layout unchanged.
     private var expandedWindows: some View {
         VStack(alignment: .leading, spacing: 12) {
             if row.windows.isEmpty {
@@ -775,16 +827,20 @@ struct DeckAccountRowView: View {
                     VStack(alignment: .leading, spacing: 5) {
                         HStack(alignment: .firstTextBaseline, spacing: 8) {
                             Text(window.title)
-                                .font(DeckType.meterLabel)
+                                .font(DeckType.caption)
                                 .foregroundStyle(window.isSpend ? Color.secondary : Color.primary)
                                 .lineLimit(1)
                             Spacer(minLength: 8)
-                            // Issue #67: the complete reset phrase (weekday,
-                            // time, timezone) is the one thing expansion
-                            // exists to show — it must never ellipsize. The
-                            // label truncates first; the phrase may wrap.
+                            // Issue #67: the complete reset phrase (weekday
+                            // and time; zone lives in the tooltip per #137)
+                            // is the one thing expansion exists to show — it
+                            // must never ellipsize. The label truncates
+                            // first; the phrase may wrap.
                             resetTextView(for: window)
-                            Text(window.remainingText ?? "—")
+                            // Issue #139: spend rows show "$X.XX of $Y.YY"
+                            // when the payload stated amounts + currency;
+                            // the bare percent otherwise (unchanged).
+                            Text(window.valueText ?? "—")
                                 .font(DeckType.value)
                                 .foregroundStyle(valueColor(for: window))
                                 .monospacedDigit()
@@ -880,9 +936,30 @@ extension DeckPopoverModel {
 
 // MARK: - Pieces
 
-/// Active marker (spec amendment 2026-07-19): a small checkmark glyph
-/// beside the account title replaces the ACTIVE pill, in the popover and in
-/// Settings → Accounts alike.
+/// Issue #131 (Tim directive 2026-07-22): the deck's single checkmark —
+/// "shown in menu bar". It marks exactly ONE account across the whole deck:
+/// the one whose window currently feeds the menu bar percentage (pinned,
+/// follow-active, or the lowest-across default, INCLUDING the #123 fallback
+/// when a pin doesn't resolve). Same quiet glyph the old active marker used
+/// — deliberately not a new visual language — but the meaning is the menu
+/// bar source, never CLI-active state (that lives in Settings → Accounts).
+struct MenuBarSourceCheckmark: View {
+    /// Mode-honest hover copy from `MenuBarSourceResolver.checkmarkTooltip`.
+    let tooltip: String
+
+    var body: some View {
+        Image(systemName: "checkmark.circle.fill")
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(Color.accentColor)
+            .help(tooltip)
+            .accessibilityLabel("Shown in menu bar")
+    }
+}
+
+/// Active marker (spec amendment 2026-07-19; re-scoped by issue #131): a
+/// small checkmark glyph beside the account title replaces the ACTIVE pill.
+/// Since #131 this activation marker renders ONLY in Settings → Accounts —
+/// deck cards carry the menu-bar-source checkmark instead.
 struct ActiveCheckmark: View {
     var body: some View {
         Image(systemName: "checkmark.circle.fill")
@@ -900,6 +977,7 @@ struct ActiveCheckmark: View {
 /// activation is physically effective (or the daemon didn't report
 /// activation — older daemon, no false warnings); otherwise a hollow,
 /// warning-tinted mark whose tooltip carries the honest caption.
+/// Issue #131: Settings → Accounts only — deck cards no longer render it.
 struct ActiveMarkerView: View {
     let indicator: ActiveIndicator
 
