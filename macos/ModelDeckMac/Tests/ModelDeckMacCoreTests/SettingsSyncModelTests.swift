@@ -252,4 +252,61 @@ struct SettingsSyncModelTests {
         )
         #expect(new.autoRefreshIntervalCustomized == true)
     }
+
+    // MARK: - Pinned menu-bar account (account percentage picker)
+
+    @Test func menuBarAccountSyncsAndEchoesAreNoOps() async {
+        var confirmed = daemonDocument
+        confirmed.menuBarAccountId = "acct-9"
+        let sync = StubSettingsSync(results: [
+            .success(daemonDocument),
+            .success(confirmed),
+        ])
+        let model = SettingsSyncModel(sync: sync)
+        await model.load()
+
+        // Echo of the stored default ("" = lowest across accounts): no PUT.
+        await model.setMenuBarAccount(id: "")
+        #expect(sync.pushedPatches.isEmpty)
+
+        await model.setMenuBarAccount(id: "acct-9")
+        #expect(sync.pushedPatches.count == 1)
+        #expect(sync.pushedPatches.first?.menuBarAccountId == "acct-9")
+        #expect(model.settings.menuBarAccountId == "acct-9")
+        #expect(model.settings.menuBarPinnedAccountId == "acct-9")
+
+        // Confirmed echo: no second PUT.
+        await model.setMenuBarAccount(id: "acct-9")
+        #expect(sync.pushedPatches.count == 1)
+    }
+
+    @Test func oldDaemonRejectingMenuBarAccountIsASuccessfulNoOp() async {
+        // A pre-#123 daemon rejects the pin key. It was the only field in
+        // the patch, so the stripped patch is empty: no retry PUT, no
+        // lastError — lowest-across behavior simply stays in effect.
+        let sync = StubSettingsSync(results: [
+            .failure(DaemonClientError.daemonError(
+                message: "unknown setting: menuBarAccountId", status: 400
+            )),
+        ])
+        let model = SettingsSyncModel(sync: sync)
+
+        await model.setMenuBarAccount(id: "acct-9")
+
+        #expect(sync.pushedPatches.count == 1)
+        #expect(model.lastError == nil)
+        #expect(model.settings.menuBarAccountId == "")
+    }
+
+    @Test func settingsDecodeToleratesTheMissingMenuBarAccountKey() throws {
+        let old = try JSONDecoder().decode(DaemonSettings.self, from: Data("{}".utf8))
+        #expect(old.menuBarAccountId == "")
+        #expect(old.menuBarPinnedAccountId == nil)
+
+        let pinned = try JSONDecoder().decode(
+            DaemonSettings.self,
+            from: Data(#"{"menuBarAccountId": "acct-3"}"#.utf8)
+        )
+        #expect(pinned.menuBarPinnedAccountId == "acct-3")
+    }
 }

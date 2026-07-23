@@ -66,14 +66,54 @@ public final class MenuBarStatusModel: ObservableObject {
         didSet { recomputeIconState() }
     }
 
+    /// The daemon-settings pinned menu-bar source (nil = lowest across all
+    /// accounts, the original behavior): a plain account id or an
+    /// "active:<provider>" follow-active sentinel (`MenuBarPinResolver`
+    /// grammar). While pinned and resolvable against the current deck
+    /// state, the icon shows THAT account's lowest non-spend window
+    /// continuously — `worstRemaining` itself stays the global worst so
+    /// notifications keep firing for any account.
+    @Published public var pinnedAccountId: String? {
+        didSet { recomputeIconState() }
+    }
+
+    /// The account id the stored pin currently resolves to; nil while
+    /// unpinned or unresolvable (account removed, no active account yet).
+    public var resolvedPinnedAccountId: String? {
+        guard let pinnedAccountId, let state = deckState else { return nil }
+        return MenuBarPinResolver.resolve(pinnedAccountId, in: state)
+    }
+
+    /// The pinned account's display label for accessibility; nil while
+    /// unpinned or when the pin doesn't resolve.
+    public var pinnedAccountLabel: String? {
+        guard let resolved = resolvedPinnedAccountId else { return nil }
+        return deckState?.accounts.first { $0.id == resolved }?.label
+    }
+
     /// True once any state has landed (refresh success or `apply`); gates
     /// the `.loading` placeholder (issue #58).
     private var hasLoadedOnce = false
 
     private func recomputeIconState() {
-        iconState = hasLoadedOnce
-            ? MenuBarIconState.state(for: worstRemaining, thresholds: thresholds)
-            : .loading
+        guard hasLoadedOnce else {
+            iconState = .loading
+            return
+        }
+        // Pinned mode is client-side by design: the daemon's
+        // /api/capacity/worst stays the global severity authority, and the
+        // deck state we already fetch every refresh carries everything a
+        // single account's windows need. A pin that no longer resolves
+        // (account removed, follow-active with no active account) falls
+        // back to the global-worst behavior; a resolvable account with no
+        // usable windows shows the plain glyph rather than borrowing
+        // another account's number.
+        if let state = deckState, let resolved = resolvedPinnedAccountId {
+            let pinned = WorstRemainingCalculator.worstRemaining(in: state, accountId: resolved)
+            iconState = MenuBarIconState.state(for: pinned, thresholds: thresholds, alwaysShowPercent: true)
+            return
+        }
+        iconState = MenuBarIconState.state(for: worstRemaining, thresholds: thresholds)
     }
 
     /// Called after every successful state update (manual/auto refresh and

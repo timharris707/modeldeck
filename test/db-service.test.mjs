@@ -373,3 +373,15 @@ test('settings reject inherited object names as unknown keys', () => {
     assert.throws(() => store.saveSettings({ constructor: 'unexpected' }), /unknown setting: constructor/);
   } finally { store.close(); }
 });
+
+test('menuBarAccountId accepts short strings and rejects everything else', () => {
+  const store = new Store(':memory:');
+  try {
+    assert.equal(store.getSettings().menuBarAccountId, '');
+    assert.equal(store.saveSettings({ menuBarAccountId: 'acc-1' }).menuBarAccountId, 'acc-1');
+    assert.equal(store.saveSettings({ menuBarAccountId: '' }).menuBarAccountId, '');
+    assert.throws(() => store.saveSettings({ menuBarAccountId: 42 }), /menuBarAccountId/);
+    assert.throws(() => store.saveSettings({ menuBarAccountId: null }), /menuBarAccountId/);
+    assert.throws(() => store.saveSettings({ menuBarAccountId: 'x'.repeat(129) }), /menuBarAccountId/);
+  } finally { store.close(); }
+});

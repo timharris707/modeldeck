@@ -39,6 +39,11 @@ struct MenuBarIconView: View {
             return "ModelDeck: loading usage data"
         case .plain:
             return "ModelDeck"
+        case .pinned(let percent):
+            if let label = statusModel.pinnedAccountLabel {
+                return "ModelDeck: \(percent) percent left on \(label)"
+            }
+            return "ModelDeck: \(percent) percent left on the pinned account"
         case .warning(let percent):
             return "ModelDeck: \(percent) percent left on the lowest window"
         case .critical(let percent):

@@ -374,6 +374,7 @@ test('settings API validates partial updates and drives worst-capacity threshold
     defaultSort: 'next-reset',
     notificationThresholdPercent: 25,
     menuBarStyle: 'icon-only',
+    menuBarAccountId: '',
   });
   result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ layout: 'single-column', notificationThresholdPercent: 30 }) });
   assert.equal(result.body.layout, 'single-column');
@@ -388,6 +389,16 @@ test('settings API validates partial updates and drives worst-capacity threshold
   assert.equal(result.response.status, 400);
   assert.match(result.body.error, /unknown setting: surprise/);
   assert.equal(reschedules.length, 1);
+
+  // Menu bar pinned account: any short string round-trips ('' = lowest
+  // across accounts); non-strings are rejected.
+  result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ menuBarAccountId: 'acc-42' }) });
+  assert.equal(result.body.menuBarAccountId, 'acc-42');
+  result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ menuBarAccountId: 7 }) });
+  assert.equal(result.response.status, 400);
+  assert.match(result.body.error, /menuBarAccountId/);
+  result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ menuBarAccountId: '' }) });
+  assert.equal(result.body.menuBarAccountId, '');
 
   const first = fixture.store.saveAccount({ provider: 'claude', label: 'First', profileRef: 'first' });
   const second = fixture.store.saveAccount({ provider: 'claude', label: 'Second', profileRef: 'second' });

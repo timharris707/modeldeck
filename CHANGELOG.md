@@ -4,6 +4,63 @@ All notable changes to ModelDeck are documented here. Versioning follows the
 roadmap in `design/mac-app-roadmap.md`: `v0.1-web` tags the retired web MVP,
 and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 
+## 0.3.2 — 2026-07-22
+
+The Sparkle debut: this release ships the in-app update machinery, so
+**0.3.2 itself must still be installed by hand from the DMG — the last
+manual install**. Releases *after* 0.3.2 arrive via in-app **Update Now**
+(see the migration note below).
+
+### Added
+- **Menu bar account picker (Tim, 2026-07-22)**: Settings → General → Menu
+  bar now offers "Show percentage for" — either the original **Lowest
+  across all accounts** (percent appears only below the warning threshold)
+  or **one pinned account**, whose lowest usage window shows in the menu
+  bar **continuously**: neutral label color while healthy, gold at warning,
+  red at critical. The pin is a daemon-stored setting
+  (`menuBarAccountId`), so it survives restarts; a pinned account that is
+  later removed falls back to lowest-across. Threshold notifications keep
+  watching every account regardless of the pin. Two quick paths beyond the
+  Settings picker (Tim's follow-up, same day): **right-click any deck card**
+  to "Pin to Menu Bar" (or unpin) without opening Settings, and a
+  **"Follow Active … Account"** mode (per provider, in both the context
+  menu and the picker as "Active Claude/Codex account") that automatically
+  tracks whichever account is currently active — so switching accounts
+  moves the menu bar percentage with you.
+- **One-click in-app updates via Sparkle 2 (issue #121, Tim directive
+  2026-07-22)**: when a newer version is found, both the deck gear dialog
+  and Settings → General now offer **Update Now** — download, EdDSA +
+  Apple-signature verification, atomic install, relaunch — with "Release
+  Notes" as the secondary link to the release page (which was previously the
+  only path). A new **"Install updates automatically"** toggle (default ON)
+  downloads found updates quietly and installs them on the next relaunch;
+  turn it off and nothing installs without an explicit Update Now. The
+  issue #60 daily check cadence and its Settings toggle are unchanged and
+  remain the scheduler — Sparkle's own timer is disabled. Release pipeline:
+  `release-dmg.sh` now generates and signs an `appcast.xml` per release
+  (EdDSA key in the release Mac's Keychain only) and stamps the Sparkle
+  public key into the app.
+- **Migration note**: installs of 0.3.x (no Sparkle) keep discovering
+  updates through the existing daily check and its "View Release" dialog —
+  the first Sparkle-carrying release still installs by hand from the DMG,
+  exactly like before; in-app installs begin with the FOLLOWING release.
+
+### Fixed
+- **Honest copy for unanchored usage windows (issue #101)**: a deck card
+  whose window has never been anchored by real use said "Resets <timestamp>"
+  with a floating, meaningless time that silently slid forward. It now says
+  **"Resets 7 days after first use"** until an anchor exists, and a window
+  that rolled over recently shows **"Week reset just now" / "Week reset at
+  HH:MM"** so a suddenly-full quota bar comes with its explanation. The
+  classification heuristics are documented in `WindowPresentation.swift`.
+- **Activation attempts can no longer end silently (issue #100)**: clicking
+  the Accounts-pane activation radio could appear to do nothing — a stale
+  trouble banner from an earlier failure masked the new attempt's outcome.
+  Trouble records now live in a single per-provider slot that is superseded
+  at attempt start and on verified success, every `activate()` early-out
+  path ends in a visible outcome (banner or verified switch), and the radio
+  dims while activation is unavailable instead of swallowing clicks.
+
 ## 0.3.1 — 2026-07-22
 
 ### Fixed

@@ -161,24 +161,39 @@ public final class AppUpdateModel: ObservableObject {
 
     /// What the gear-menu "Check for App Updates…" flow presents once a
     /// check finishes: a standard small dialog. `releaseURL` non-nil means
-    /// the dialog offers "View Release" (opens the release page) beside
-    /// Cancel; otherwise it's a plain OK dialog.
+    /// the dialog carries a release-page action; `offersInstall` (issue
+    /// #121, Sparkle builds) upgrades the primary action to "Update Now"
+    /// with "Release Notes" secondary. Otherwise it's a plain OK dialog.
     public struct ResultDialog: Equatable, Sendable {
         public var title: String
         public var message: String
         public var releaseURL: URL?
+        /// True only when this build can install in-app (a Sparkle driver is
+        /// attached) — the dialog's primary button becomes "Update Now".
+        public var offersInstall: Bool
 
-        public init(title: String, message: String, releaseURL: URL? = nil) {
+        public init(title: String, message: String, releaseURL: URL? = nil, offersInstall: Bool = false) {
             self.title = title
             self.message = message
             self.releaseURL = releaseURL
+            self.offersInstall = offersInstall
         }
     }
+
+    /// Whether this build carries a working in-app installer (issue #121).
+    /// Set once at launch from `AppUpdateInstallModel.canInstall`; stays
+    /// false in dev builds and pre-Sparkle releases so every surface keeps
+    /// the honest "View Release" hand-off.
+    public var canInstallUpdates: Bool = false
 
     /// Pure derivation of the result dialog for a finished check; nil while
     /// idle or still checking (nothing to present yet). Nonisolated — no
     /// model state involved, so it's callable (and testable) anywhere.
-    nonisolated public static func dialog(for phase: Phase, currentVersion: String?) -> ResultDialog? {
+    nonisolated public static func dialog(
+        for phase: Phase,
+        currentVersion: String?,
+        canInstall: Bool = false
+    ) -> ResultDialog? {
         switch phase {
         case .idle, .checking:
             return nil
@@ -188,20 +203,23 @@ public final class AppUpdateModel: ObservableObject {
                 message: "ModelDeck v\(latest) is the latest release."
             )
         case .updateAvailable(let release):
+            let running = currentVersion.map { "You're running v\($0). " } ?? ""
             return ResultDialog(
                 title: "Version \(release.version) is available",
-                message: currentVersion.map { "You're running v\($0). View the release to download it." }
-                    ?? "View the release to download it.",
-                releaseURL: release.url
+                message: canInstall
+                    ? running + "Update Now downloads, verifies, and installs it, then relaunches ModelDeck."
+                    : running + "View the release to download it.",
+                releaseURL: release.url,
+                offersInstall: canInstall
             )
         case .unavailable(let message):
             return ResultDialog(title: "Couldn't check for updates", message: message)
         }
     }
 
-    /// The dialog for the current phase (see `dialog(for:currentVersion:)`).
+    /// The dialog for the current phase (see `dialog(for:currentVersion:canInstall:)`).
     public var resultDialog: ResultDialog? {
-        Self.dialog(for: phase, currentVersion: currentVersion)
+        Self.dialog(for: phase, currentVersion: currentVersion, canInstall: canInstallUpdates)
     }
 }
 
@@ -220,13 +238,18 @@ public struct AppUpdateNotification: Equatable, Sendable {
 }
 
 /// Issue #60 — the Settings → General "Check for updates automatically"
-/// toggle. Periodic check + notify ONLY: hits the same public GitHub
-/// releases feed as the manual check (never any other endpoint) and posts a
-/// banner when a newer version exists; nothing ever installs automatically
-/// (a self-replacing updater is issue #16's signed-DMG territory). Daily
-/// cadence per the app's restraint bar — never a tight loop. The preference
-/// is app-local (UserDefaults), like Launch at Login: the daemon never
-/// stores it.
+/// toggle. Periodic check against the same public GitHub releases feed as
+/// the manual check (never any other endpoint), daily cadence per the app's
+/// restraint bar — never a tight loop. The preference is app-local
+/// (UserDefaults), like Launch at Login: the daemon never stores it.
+///
+/// Issue #121 (Tim directive 2026-07-22): this checker stays the scheduling
+/// brain. Sparkle's own timer is disabled (`SUEnableAutomaticChecks` NO);
+/// when a newer version is found AND a Sparkle driver is attached, the daily
+/// tick hands off to `AppUpdateInstallModel.backgroundCheck()` — quiet
+/// download + stage when "Install updates automatically" is on, availability
+/// notice otherwise. Without a driver (dev builds, pre-Sparkle releases) the
+/// original notify-only behavior is unchanged.
 @MainActor
 public final class AppUpdateAutoChecker: ObservableObject {
     nonisolated public static let enabledDefaultsKey = "modeldeck.appupdate.autoCheckEnabled"
@@ -241,6 +264,8 @@ public final class AppUpdateAutoChecker: ObservableObject {
     @Published public private(set) var isEnabled: Bool
 
     private let model: AppUpdateModel
+    /// Issue #121: optional install hand-off; nil keeps notify-only behavior.
+    private let installModel: AppUpdateInstallModel?
     private let defaults: UserDefaults
     private let clock: @Sendable () -> Date
     private let notify: @MainActor (AppUpdateNotification) async -> Void
@@ -248,11 +273,13 @@ public final class AppUpdateAutoChecker: ObservableObject {
 
     public init(
         model: AppUpdateModel,
+        installModel: AppUpdateInstallModel? = nil,
         defaults: UserDefaults = .standard,
         clock: @escaping @Sendable () -> Date = { Date() },
         notify: @escaping @MainActor (AppUpdateNotification) async -> Void
     ) {
         self.model = model
+        self.installModel = installModel
         self.defaults = defaults
         self.clock = clock
         self.notify = notify
@@ -323,9 +350,32 @@ public final class AppUpdateAutoChecker: ObservableObject {
         await model.check()
         defaults.set(clock(), forKey: Self.lastCheckDefaultsKey)
         guard case .updateAvailable(let release) = model.phase else { return }
+        // Issue #121: with a Sparkle driver attached and auto-install on,
+        // every due tick hands off to the quiet background install — even a
+        // version that was already announced (a notified-but-uninstalled
+        // update must still install once the toggle allows it).
+        let mode = notificationMode
+        if mode == .automaticInstall {
+            installModel?.backgroundCheck()
+        }
         guard release.version != defaults.string(forKey: Self.lastNotifiedDefaultsKey) else { return }
         defaults.set(release.version, forKey: Self.lastNotifiedDefaultsKey)
-        await notify(Self.notification(for: release, currentVersion: model.currentVersion))
+        await notify(Self.notification(for: release, currentVersion: model.currentVersion, mode: mode))
+    }
+
+    /// How a discovered update proceeds in this build (issue #121).
+    public enum UpdateHandOff: Equatable, Sendable {
+        /// No installer in this build — notify with the manual-check path.
+        case notifyOnly
+        /// Installer present, automatic install off — notify about Update Now.
+        case updateNow
+        /// Installer present, automatic install on — install quietly.
+        case automaticInstall
+    }
+
+    private var notificationMode: UpdateHandOff {
+        guard let installModel, installModel.canInstall else { return .notifyOnly }
+        return installModel.isAutoInstallEnabled ? .automaticInstall : .updateNow
     }
 
     /// Banner copy — explicit that nothing installs by itself.
@@ -333,10 +383,29 @@ public final class AppUpdateAutoChecker: ObservableObject {
         for release: AppReleaseInfo,
         currentVersion: String?
     ) -> AppUpdateNotification {
-        AppUpdateNotification(
+        notification(for: release, currentVersion: currentVersion, mode: .notifyOnly)
+    }
+
+    /// Banner copy per hand-off mode. Always states exactly what happens
+    /// next — "nothing installs automatically" only when that is true.
+    nonisolated public static func notification(
+        for release: AppReleaseInfo,
+        currentVersion: String?,
+        mode: UpdateHandOff
+    ) -> AppUpdateNotification {
+        let running = currentVersion.map { "You're running v\($0). " } ?? ""
+        let body: String
+        switch mode {
+        case .notifyOnly:
+            body = running + "Use Check for App Updates to view the release — nothing installs automatically."
+        case .updateNow:
+            body = running + "Use Update Now in ModelDeck to install it — nothing installs until you do."
+        case .automaticInstall:
+            body = running + "It's downloading in the background and installs the next time ModelDeck relaunches."
+        }
+        return AppUpdateNotification(
             title: "ModelDeck \(release.version) is available",
-            body: (currentVersion.map { "You're running v\($0). " } ?? "")
-                + "Use Check for App Updates to view the release — nothing installs automatically."
+            body: body
         )
     }
 }

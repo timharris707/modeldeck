@@ -15,10 +15,14 @@ import ModelDeckMacCore
 @MainActor
 final class MenuBarContextMenuController: NSObject {
     private let appUpdateModel: AppUpdateModel
+    /// Issue #121: "Update Now" from the context-menu result alert drives
+    /// the same shared install model as the deck dialog and Settings.
+    private let installModel: AppUpdateInstallModel
     private var monitor: Any?
 
-    init(appUpdateModel: AppUpdateModel) {
+    init(appUpdateModel: AppUpdateModel, installModel: AppUpdateInstallModel) {
         self.appUpdateModel = appUpdateModel
+        self.installModel = installModel
     }
 
     /// Installs the event monitor once; safe to call repeatedly. The
@@ -79,19 +83,35 @@ final class MenuBarContextMenuController: NSObject {
     /// present the standard result dialog (as an NSAlert here — no SwiftUI
     /// presentation context exists for a status-item context menu).
     @objc private func checkForAppUpdates() {
-        Task { @MainActor [appUpdateModel] in
+        Task { @MainActor [appUpdateModel, installModel] in
             await appUpdateModel.check()
             SettingsWindowFronting.activateForDialog()
-            Self.presentResultAlert(appUpdateModel.resultDialog)
+            Self.presentResultAlert(appUpdateModel.resultDialog, installModel: installModel)
         }
     }
 
-    private static func presentResultAlert(_ dialog: AppUpdateModel.ResultDialog?) {
+    private static func presentResultAlert(
+        _ dialog: AppUpdateModel.ResultDialog?,
+        installModel: AppUpdateInstallModel
+    ) {
         guard let dialog else { return }
         let alert = NSAlert()
         alert.messageText = dialog.title
         alert.informativeText = dialog.message
-        if let releaseURL = dialog.releaseURL {
+        if dialog.offersInstall, let releaseURL = dialog.releaseURL {
+            // Issue #121: Update Now primary, release page secondary.
+            alert.addButton(withTitle: "Update Now")
+            alert.addButton(withTitle: "Release Notes")
+            alert.addButton(withTitle: "Cancel")
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                installModel.updateNow()
+            case .alertSecondButtonReturn:
+                NSWorkspace.shared.open(releaseURL)
+            default:
+                break
+            }
+        } else if let releaseURL = dialog.releaseURL {
             alert.addButton(withTitle: "View Release")
             alert.addButton(withTitle: "Cancel")
             if alert.runModal() == .alertFirstButtonReturn {

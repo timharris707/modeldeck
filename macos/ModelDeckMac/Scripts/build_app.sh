@@ -38,6 +38,18 @@ RESOURCE_BUNDLE="$(dirname "$BIN")/ModelDeckMac_ModelDeckMacCore.bundle"
 [[ -d "$RESOURCE_BUNDLE" ]] || { echo "build_app.sh: resource bundle not found at $RESOURCE_BUNDLE" >&2; exit 1; }
 cp -R "$RESOURCE_BUNDLE" "$APP/Contents/Resources/"
 
+# Issue #121: the binary links Sparkle via @rpath; embed the framework and
+# point the rpath into the bundle so the dev app launches standalone. Dev
+# bundles still carry NO SUPublicEDKey, so the in-app updater stays off —
+# this is only the dynamic-linker requirement.
+SPARKLE_FRAMEWORK="$(dirname "$BIN")/Sparkle.framework"
+if [[ -d "$SPARKLE_FRAMEWORK" ]]; then
+  mkdir -p "$APP/Contents/Frameworks"
+  cp -R "$SPARKLE_FRAMEWORK" "$APP/Contents/Frameworks/"
+  install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/ModelDeckMac" 2>/dev/null || true
+  codesign --force --sign - "$APP/Contents/Frameworks/Sparkle.framework" 2>/dev/null || true
+fi
+
 # Issue #96 (optional in dev): when a daemon binary has been built
 # (scripts/build-daemon-binary.sh → dist/daemon/), stage it plus its
 # manifest and the SMAppService agent plist so the first-run flow can be

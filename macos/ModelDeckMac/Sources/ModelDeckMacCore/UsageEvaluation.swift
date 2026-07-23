@@ -62,10 +62,21 @@ public enum MenuBarIconState: Equatable, Sendable {
     /// Cold start: no state fetch has succeeded yet (issue #58).
     case loading
     case plain
+    /// A pinned account above the warning threshold: the percent is shown
+    /// continuously (Tim's picker request), in the neutral label color so
+    /// it never reads as a severity signal.
+    case pinned(percentRemaining: Int)
     case warning(percentRemaining: Int)
     case critical(percentRemaining: Int)
 
-    public static func state(for worst: WorstRemaining?, thresholds: UsageThresholds = .default) -> MenuBarIconState {
+    /// `alwaysShowPercent` is the pinned-account mode: a healthy percent
+    /// renders as `.pinned` instead of hiding behind the plain glyph.
+    /// Warning/critical severities are unchanged either way.
+    public static func state(
+        for worst: WorstRemaining?,
+        thresholds: UsageThresholds = .default,
+        alwaysShowPercent: Bool = false
+    ) -> MenuBarIconState {
         guard let worst else { return .plain }
         if worst.percent <= thresholds.criticalPercent {
             return .critical(percentRemaining: worst.displayPercent)
@@ -73,7 +84,7 @@ public enum MenuBarIconState: Equatable, Sendable {
         if worst.percent <= thresholds.warningPercent {
             return .warning(percentRemaining: worst.displayPercent)
         }
-        return .plain
+        return alwaysShowPercent ? .pinned(percentRemaining: worst.displayPercent) : .plain
     }
 
     /// "N%" when the percent is shown, the neutral "–%" placeholder while
@@ -82,8 +93,37 @@ public enum MenuBarIconState: Equatable, Sendable {
         switch self {
         case .plain: return nil
         case .loading: return "–%"
-        case .warning(let percent), .critical(let percent): return "\(percent)%"
+        case .pinned(let percent), .warning(let percent), .critical(let percent): return "\(percent)%"
         }
+    }
+}
+
+/// The stored `menuBarAccountId` setting's grammar (account percentage
+/// picker): "" = lowest across accounts, a plain account id = that account,
+/// and the "active:<provider>" sentinels = whichever account is currently
+/// ACTIVE for that provider — Tim's "track my current active account" mode,
+/// which follows every activation switch automatically.
+public enum MenuBarPinResolver {
+    /// The stored value that follows a provider's active account.
+    public static func followActiveSentinel(for provider: DeckProvider) -> String {
+        "active:\(provider.rawValue)"
+    }
+
+    /// Resolves a stored pin to a concrete account id against the current
+    /// deck state; nil when it doesn't resolve (empty/unpinned, account
+    /// removed, no active account for the provider, unknown sentinel) — the
+    /// caller then falls back to lowest-across behavior.
+    public static func resolve(_ stored: String, in state: DeckState) -> String? {
+        guard !stored.isEmpty else { return nil }
+        if stored.hasPrefix("active:") {
+            guard let provider = DeckProvider(rawValue: String(stored.dropFirst("active:".count))) else {
+                return nil
+            }
+            return state.accounts.first {
+                DeckProvider.from($0.provider) == provider && $0.isDefault
+            }?.id
+        }
+        return state.accounts.contains { $0.id == stored } ? stored : nil
     }
 }
 
@@ -93,6 +133,20 @@ public enum MenuBarIconState: Equatable, Sendable {
 public enum WorstRemainingCalculator {
     public static func worstRemaining(in state: DeckState) -> WorstRemaining? {
         worstRemaining(accounts: state.accounts, usage: state.usage)
+    }
+
+    /// The pinned-account variant: the same lowest-non-spend-window rule,
+    /// restricted to one account. Nil when the account is missing, disabled,
+    /// or has no usable NON-SPEND usage — unlike the global fallback, a
+    /// spend-only pinned account never surfaces a spend percentage: the menu
+    /// bar shows the plain glyph instead (issue #28's spend rule, pinned).
+    public static func worstRemaining(in state: DeckState, accountId: String) -> WorstRemaining? {
+        worstRemaining(
+            accounts: state.accounts.filter { $0.id == accountId },
+            usage: state.usage.filter {
+                $0.accountId == accountId && !UsageScope.isSpend($0.scope)
+            }
+        )
     }
 
     public static func worstRemaining(accounts: [DeckAccount], usage: [UsageSnapshot]) -> WorstRemaining? {

@@ -37,6 +37,13 @@ export const DEFAULT_SETTINGS = Object.freeze({
   defaultSort: 'next-reset',
   notificationThresholdPercent: 25,
   menuBarStyle: 'icon-only',
+  // Menu bar percent source: '' = lowest remaining across all enabled
+  // accounts (the original behavior); an account id pins the menu bar
+  // percentage to that single account, shown continuously. The id is not
+  // validated against the accounts table — accounts can be removed after
+  // being pinned, and the app falls back to lowest-across when the id no
+  // longer resolves.
+  menuBarAccountId: '',
 });
 
 function validateSetting(key, value) {
@@ -58,6 +65,9 @@ function validateSetting(key, value) {
   }
   if (key === 'menuBarStyle' && !['icon-only', 'icon-and-percent'].includes(value)) {
     throw new Error('menuBarStyle must be icon-only or icon-and-percent');
+  }
+  if (key === 'menuBarAccountId' && (typeof value !== 'string' || value.length > 128)) {
+    throw new Error('menuBarAccountId must be a string of at most 128 characters');
   }
 }
 

@@ -26,5 +26,22 @@
 	<string>NSApplication</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<!-- Issue #121 — Sparkle 2 in-app updates.
+	     SUFeedURL: STABLE appcast URL; GitHub's releases/latest/download/
+	     redirect always serves the newest release's appcast.xml asset.
+	     SUEnableAutomaticChecks NO: Sparkle's own scheduler stays off —
+	     AppUpdateAutoChecker (issue #60 daily cadence + Settings toggle) is
+	     the scheduling brain, and this also suppresses Sparkle's first-run
+	     permission prompt.
+	     SUPublicEDKey is deliberately ABSENT here: scripts/release-dmg.sh
+	     stamps the real public key at release time (from Tim's one-time
+	     generate_keys run). Dev bundles therefore have no key, the Sparkle
+	     driver declines to construct, and the app keeps the pre-#121
+	     "View Release" path. Not sandboxed → no XPC installer services
+	     (SUEnableInstallerLauncherService) needed. -->
+	<key>SUFeedURL</key>
+	<string>https://github.com/timharris707/modeldeck/releases/latest/download/appcast.xml</string>
+	<key>SUEnableAutomaticChecks</key>
+	<false/>
 </dict>
 </plist>

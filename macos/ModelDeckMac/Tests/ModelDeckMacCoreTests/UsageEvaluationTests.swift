@@ -250,3 +250,119 @@ struct MenuBarIconStateTests {
         #expect(MenuBarIconState.state(for: worst(9.4)) == .critical(percentRemaining: 9))
     }
 }
+
+@Suite("Pinned menu-bar account (account percentage picker)")
+struct PinnedMenuBarAccountTests {
+    private let accounts = [
+        DeckAccount(id: "acct-a", provider: "claude", label: "Deck A"),
+        DeckAccount(id: "acct-b", provider: "codex", label: "Deck B"),
+    ]
+
+    private func worst(_ percent: Double) -> WorstRemaining {
+        WorstRemaining(percent: percent, accountId: "acct-b", scope: "week")
+    }
+
+    @Test func restrictsToThePinnedAccount() {
+        // Another account being far lower must not leak into a pinned read.
+        let state = DeckState(accounts: accounts, usage: [
+            UsageSnapshot(accountId: "acct-a", scope: "week", remainingPercent: 7),
+            UsageSnapshot(accountId: "acct-b", scope: "5h", remainingPercent: 63),
+            UsageSnapshot(accountId: "acct-b", scope: "week", remainingPercent: 48),
+        ])
+        let pinned = WorstRemainingCalculator.worstRemaining(in: state, accountId: "acct-b")
+        #expect(pinned?.accountId == "acct-b")
+        #expect(pinned?.percent == 48)
+    }
+
+    @Test func spendStaysExcludedWithinThePinnedAccount() {
+        let state = DeckState(accounts: accounts, usage: [
+            UsageSnapshot(accountId: "acct-b", scope: "spend", remainingPercent: 0),
+            UsageSnapshot(accountId: "acct-b", scope: "week", remainingPercent: 52),
+        ])
+        let pinned = WorstRemainingCalculator.worstRemaining(in: state, accountId: "acct-b")
+        #expect(pinned?.scope == "week")
+        #expect(pinned?.percent == 52)
+    }
+
+    @Test func spendOnlyPinnedAccountYieldsNil() {
+        // A pinned account with ONLY spend data never borrows the global
+        // spend fallback: nil → plain glyph, not a spend percentage.
+        let state = DeckState(accounts: accounts, usage: [
+            UsageSnapshot(accountId: "acct-b", scope: "spend", remainingPercent: 12),
+            UsageSnapshot(accountId: "acct-a", scope: "week", remainingPercent: 40),
+        ])
+        #expect(WorstRemainingCalculator.worstRemaining(in: state, accountId: "acct-b") == nil)
+    }
+
+    @Test func unknownOrDataLessAccountYieldsNil() {
+        let state = DeckState(accounts: accounts, usage: [
+            UsageSnapshot(accountId: "acct-a", scope: "week", remainingPercent: 40),
+        ])
+        #expect(WorstRemainingCalculator.worstRemaining(in: state, accountId: "acct-ghost") == nil)
+        #expect(WorstRemainingCalculator.worstRemaining(in: state, accountId: "acct-b") == nil)
+    }
+
+    @Test func alwaysShowPercentRendersHealthyAsPinned() {
+        #expect(MenuBarIconState.state(for: worst(63), alwaysShowPercent: true)
+            == .pinned(percentRemaining: 63))
+        #expect(MenuBarIconState.state(for: worst(100), alwaysShowPercent: true)
+            == .pinned(percentRemaining: 100))
+    }
+
+    @Test func severityStatesAreUnchangedInPinnedMode() {
+        #expect(MenuBarIconState.state(for: worst(25), alwaysShowPercent: true)
+            == .warning(percentRemaining: 25))
+        #expect(MenuBarIconState.state(for: worst(10), alwaysShowPercent: true)
+            == .critical(percentRemaining: 10))
+        // No usable data: plain glyph, never a borrowed number.
+        #expect(MenuBarIconState.state(for: nil, alwaysShowPercent: true) == .plain)
+    }
+
+    @Test func pinnedPercentLabelFormats() {
+        #expect(MenuBarIconState.pinned(percentRemaining: 52).percentLabel == "52%")
+    }
+}
+
+@Suite("Menu bar pin resolver (follow-active sentinels)")
+struct MenuBarPinResolverTests {
+    private var state: DeckState {
+        DeckState(accounts: [
+            DeckAccount(id: "cl-1", provider: "claude", label: "Insight"),
+            DeckAccount(id: "cl-2", provider: "claude", label: "Medved Instead", isDefault: true),
+            DeckAccount(id: "cx-1", provider: "codex", label: "Insight", isDefault: true),
+        ])
+    }
+
+    @Test func emptyMeansUnpinned() {
+        #expect(MenuBarPinResolver.resolve("", in: state) == nil)
+    }
+
+    @Test func plainAccountIdResolvesOnlyWhilePresent() {
+        #expect(MenuBarPinResolver.resolve("cl-1", in: state) == "cl-1")
+        #expect(MenuBarPinResolver.resolve("gone", in: state) == nil)
+    }
+
+    @Test func followActiveResolvesTheProvidersDefaultAccount() {
+        #expect(MenuBarPinResolver.resolve("active:claude", in: state) == "cl-2")
+        #expect(MenuBarPinResolver.resolve("active:codex", in: state) == "cx-1")
+    }
+
+    @Test func followActiveWithoutAnActiveAccountYieldsNil() {
+        var noDefault = state
+        noDefault.accounts = noDefault.accounts.map {
+            var account = $0
+            account.isDefault = false
+            return account
+        }
+        #expect(MenuBarPinResolver.resolve("active:claude", in: noDefault) == nil)
+    }
+
+    @Test func unknownSentinelYieldsNil() {
+        #expect(MenuBarPinResolver.resolve("active:gemini", in: state) == nil)
+    }
+
+    @Test func sentinelRoundTripsThroughTheHelper() {
+        #expect(MenuBarPinResolver.followActiveSentinel(for: .claude) == "active:claude")
+        #expect(MenuBarPinResolver.followActiveSentinel(for: .codex) == "active:codex")
+    }
+}

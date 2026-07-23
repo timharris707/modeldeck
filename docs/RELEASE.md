@@ -92,14 +92,53 @@ and managing it from the Mac app with `SMAppService` is the app half of issue
 #91 and remains separate from this daemon/release build work. Until that app
 half lands, bundling alone does not activate the daemon on a fresh machine.
 
+## Sparkle in-app updates (issue #121)
+
+The script's final step generates `dist/appcast.xml` — the Sparkle 2 feed for
+in-app updates — and, during assembly, embeds `Sparkle.framework` and stamps
+the Sparkle EdDSA **public** key into the app's `Info.plist`
+(`SUPublicEDKey`). The app's `SUFeedURL` is the stable redirect
+`https://github.com/timharris707/modeldeck/releases/latest/download/appcast.xml`,
+so the appcast **must be uploaded as an asset named `appcast.xml` on every
+release** (see Publishing below); GitHub's `releases/latest/download/`
+redirect then always serves the newest release's feed.
+
+One-time provisioning (release Mac, in addition to the identity/notary
+profile):
+
+```sh
+# after swift package resolve has run at least once:
+GENERATE_KEYS="$(find macos/ModelDeckMac/.build/artifacts -type f -name generate_keys | head -1)"
+"$GENERATE_KEYS"        # stores the EdDSA private key in the login Keychain
+"$GENERATE_KEYS" -p     # prints the PUBLIC key (used for SUPublicEDKey stamping)
+```
+
+The private key never leaves the Keychain — never commit, echo, or export
+it. The script auto-derives the public key via `generate_keys -p` (override
+with `MD_SPARKLE_PUBLIC_ED_KEY`) and signs the DMG's appcast entry with
+Sparkle's `sign_update` (auto-located in the SwiftPM artifacts; override
+with `MD_SPARKLE_SIGN_UPDATE`). Both preflight checks fail loudly with these
+instructions when the key or tool is missing.
+
+`scripts/release-dmg.sh --appcast-only <dmg>` regenerates just the appcast
+for an existing DMG (also the test hook — `MD_SPARKLE_KEY_FILE` may inject
+the fake fixture key for tests, never for real releases).
+
 ## Publishing
 
-Attach the DMG to a GitHub Release for the version tag:
+Attach the DMG **and the appcast** to a GitHub Release for the version tag:
 
 ```sh
 VERSION="$(cat VERSION)"
-gh release create "v$VERSION" "dist/ModelDeck-$VERSION.dmg"
+gh release create -R timharris707/modeldeck "v$VERSION" \
+  "dist/ModelDeck-$VERSION.dmg" "dist/appcast.xml"
 ```
+
+The release must live on the **public mirror repo** (`-R
+timharris707/modeldeck`): that is where the app's update checker and the
+Sparkle `SUFeedURL` both point. Both assets are required: the DMG is what
+the appcast's enclosure URL points at, and `appcast.xml` is what installed
+apps poll via the stable `releases/latest/download/appcast.xml` URL.
 
 ## Syncing the public mirror
 

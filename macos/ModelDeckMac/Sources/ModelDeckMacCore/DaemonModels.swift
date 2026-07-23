@@ -359,6 +359,10 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
     public var observedAt: String?
     public var source: String?
     public var stale: Bool
+    /// Issue #101: the slice of the daemon's per-snapshot `detail` JSON the
+    /// deck needs. Optional end to end so states from older daemons (or
+    /// providers whose adapters send `detail: {}`) decode unchanged.
+    public var detail: UsageSnapshotDetail?
 
     public init(
         accountId: String,
@@ -368,7 +372,8 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
         resetsAt: String? = nil,
         observedAt: String? = nil,
         source: String? = nil,
-        stale: Bool = false
+        stale: Bool = false,
+        detail: UsageSnapshotDetail? = nil
     ) {
         self.accountId = accountId
         self.scope = scope
@@ -378,6 +383,20 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
         self.observedAt = observedAt
         self.source = source
         self.stale = stale
+        self.detail = detail
+    }
+}
+
+/// The deck-relevant subset of a usage snapshot's `detail` JSON. The Codex
+/// adapter records the provider-reported window length here
+/// (`detail.windowDurationMins`, src/adapters/codex.mjs); issue #101's
+/// window-anchor heuristics prefer it over the scope-name fallback. Unknown
+/// detail keys are ignored by Codable as usual.
+public struct UsageSnapshotDetail: Codable, Equatable, Sendable {
+    public var windowDurationMins: Double?
+
+    public init(windowDurationMins: Double? = nil) {
+        self.windowDurationMins = windowDurationMins
     }
 }
 

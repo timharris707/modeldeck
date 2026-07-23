@@ -883,11 +883,291 @@ struct DeckPopoverModelActivationTests {
         #expect(model.activatingAccountID == nil)
     }
 
-    @Test func withoutWiringActivateIsUnavailableAndDoesNothing() async {
+    @Test func withoutWiringActivateSurfacesAVisibleErrorInsteadOfSilence() async {
+        // Issue #100: the unwired guard used to swallow the attempt with no
+        // state change at all — a silent terminal state. Now it must record
+        // visible trouble on the clicked account.
         let model = DeckPopoverModel(defaults: freshDefaults())
         #expect(!model.canActivate)
         await model.activate(nonActiveClaudeRow(model))
         #expect(model.activatingAccountID == nil)
+        #expect(model.activationError(for: "c2")?.contains("isn't available") == true)
+    }
+}
+
+// MARK: - No silent activation outcomes (issue #100)
+
+private struct FailingStateProvider: DeckStateProviding {
+    func deckState() async throws -> DeckState {
+        throw DaemonClientError.httpStatus(503)
+    }
+}
+
+@Suite("No silent activation outcomes (issue #100)")
+@MainActor
+struct SilentActivationOutcomeTests {
+    private func freshDefaults() -> UserDefaults {
+        let suite = "silent-activation-tests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        return defaults
+    }
+
+    private func claudeRow(_ model: DeckPopoverModel, id: String) -> DeckAccountRow {
+        model.columns(for: fixtureState(), now: now)[0].rows.first { $0.id == id }!
+    }
+
+    /// Derive the roster sections the Settings pane would render, from the
+    /// model's own accessors — the full path a failure must travel to become
+    /// a visible banner.
+    private func claudeBanner(_ model: DeckPopoverModel, state: DeckState) -> ProviderActivationBanner? {
+        AccountsRoster.sections(
+            state: state,
+            guidanceForAccount: { model.blockedActivationGuidance(for: $0) },
+            errorForAccount: { model.activationError(for: $0) },
+            troubleForProvider: { model.activationTrouble(for: $0) },
+            warningsForProvider: { model.postActivationWarnings(for: $0) }
+        ).first { $0.provider == .claude }?.banner
+    }
+
+    @Test func daemonRefusalSurfacesOnTheRosterBanner() async {
+        // The issue's named regression: daemon returns an error/refusal →
+        // the roster section banner surfaces it on the clicked account.
+        let guidance = "claude activation requires a one-time migration: "
+            + "move the existing directory aside before activating."
+        let activator = StubActivator(results: [
+            .failure(DaemonClientError.daemonCodedError(
+                message: guidance, code: "active-link-blocked", status: 409)),
+        ])
+        let model = DeckPopoverModel(
+            defaults: freshDefaults(),
+            activator: activator,
+            stateProvider: StubDeckStateProvider(state: fixtureState())
+        )
+
+        await model.activate(claudeRow(model, id: "c2"))
+
+        let banner = claudeBanner(model, state: fixtureState())
+        #expect(banner?.message == guidance, "daemon guidance renders verbatim")
+        #expect(banner?.affectedAccountID == "c2")
+        #expect(banner?.retryRunsActivation == true)
+    }
+
+    @Test func staleTroubleOnAnotherAccountNeverMasksANewFailure() async {
+        // The issue #100 silence: a stale guidance record for one account
+        // (label-sorted ahead) used to keep the single section banner's
+        // pixels frozen while a NEW failure on another account landed
+        // invisibly beside it. One trouble slot per provider fixes it:
+        // the latest attempt's outcome always owns the banner.
+        let guidance = "Move ~/.claude aside, then retry."
+        let activator = StubActivator(results: [
+            .failure(DaemonClientError.daemonCodedError(
+                message: guidance, code: "active-link-blocked", status: 409)),
+            .failure(DaemonClientError.daemonError(message: "account not found", status: 404)),
+        ])
+        let model = DeckPopoverModel(
+            defaults: freshDefaults(),
+            activator: activator,
+            stateProvider: StubDeckStateProvider(state: fixtureState())
+        )
+
+        await model.activate(claudeRow(model, id: "c2"))
+        #expect(model.blockedActivationGuidance(for: "c2") == guidance)
+
+        await model.activate(claudeRow(model, id: "c3"))
+
+        // The new failure owns the provider's single trouble slot…
+        #expect(model.blockedActivationGuidance(for: "c2") == nil)
+        #expect(model.activationError(for: "c3")?.contains("account not found") == true)
+        // …and therefore the banner: the visible outcome is the NEW failure.
+        let banner = claudeBanner(model, state: fixtureState())
+        #expect(banner?.message.contains("account not found") == true)
+        #expect(banner?.affectedAccountID == "c3")
+    }
+
+    @Test func clickDuringInFlightActivationRecordsVisibleTrouble() async {
+        // The in-flight guard used to swallow the click silently. A stale
+        // render racing an in-flight switch now records visible trouble.
+        let gate = ActivationGate()
+        let activator = StubActivator(
+            results: [.success(account("c2", provider: "claude", label: "Client", isDefault: true))],
+            gate: gate
+        )
+        let model = DeckPopoverModel(
+            defaults: freshDefaults(),
+            activator: activator,
+            stateProvider: StubDeckStateProvider(state: switchedState(claudeDefault: "c2"))
+        )
+
+        let first = claudeRow(model, id: "c2")
+        let task = Task { await model.activate(first) }
+        while model.activatingAccountID == nil { await Task.yield() }
+
+        await model.activate(claudeRow(model, id: "c3"))
+        #expect(model.activationError(for: "c3")?.contains("still running") == true)
+
+        await gate.open()
+        await task.value
+        #expect(model.activatingAccountID == nil)
+        // CodeRabbit on #126: once the in-flight switch completes
+        // successfully, the raced click's "still running" record would be a
+        // STALE banner beside an already-flipped radio — the verified
+        // success supersedes it.
+        #expect(model.activationError(for: "c3") == nil)
+        #expect(model.activationTrouble(for: .claude) == nil)
+    }
+
+    @Test func successfulResyncClearsStaleProviderTrouble() async {
+        // CodeRabbit on #126: the stale-already-active resync used to push
+        // fresh state while an older failure record kept rendering beside
+        // it. The new attempt supersedes the provider's record up front.
+        let activator = StubActivator(results: [
+            .failure(DaemonClientError.httpStatus(500)),
+        ])
+        let model = DeckPopoverModel(
+            defaults: freshDefaults(),
+            activator: activator,
+            stateProvider: StubDeckStateProvider(state: switchedState(claudeDefault: "c2"))
+        )
+        var verified: DeckState?
+        model.onVerifiedState = { verified = $0 }
+
+        await model.activate(claudeRow(model, id: "c2"))
+        #expect(model.activationError(for: "c2") != nil)
+
+        let staleActiveRow = DeckAccountRow(
+            account: account("c1", provider: "claude", label: "Studio", isDefault: true),
+            provider: .claude,
+            windows: [],
+            isActive: true,
+            activationState: .effective
+        )
+        await model.activate(staleActiveRow)
+
+        #expect(verified != nil, "the resync still pushes the fresh state")
         #expect(model.activationError(for: "c2") == nil)
+        #expect(model.activationTrouble(for: .claude) == nil)
+    }
+
+    @Test func staleAlreadyActiveClickResyncsToDaemonTruth() async {
+        // The already-active guard (reachable only from a stale render) used
+        // to return with zero state change. Now it re-reads the daemon state
+        // and pushes it, so the radio snaps to the truth.
+        let activator = StubActivator(results: [])
+        let fresh = switchedState(claudeDefault: "c2")
+        let model = DeckPopoverModel(
+            defaults: freshDefaults(),
+            activator: activator,
+            stateProvider: StubDeckStateProvider(state: fresh)
+        )
+        var verified: DeckState?
+        model.onVerifiedState = { verified = $0 }
+
+        let staleActiveRow = DeckAccountRow(
+            account: account("c1", provider: "claude", label: "Studio", isDefault: true),
+            provider: .claude,
+            windows: [],
+            isActive: true,
+            activationState: .effective
+        )
+        await model.activate(staleActiveRow)
+
+        #expect(activator.calls.isEmpty, "a resync never re-POSTs")
+        #expect(verified?.accounts.first { $0.id == "c2" }?.isDefault == true)
+        #expect(model.activationError(for: "c1") == nil)
+    }
+
+    @Test func staleAlreadyActiveClickWithFailingStateReadSurfacesError() async {
+        let model = DeckPopoverModel(
+            defaults: freshDefaults(),
+            activator: StubActivator(results: []),
+            stateProvider: FailingStateProvider()
+        )
+        let staleActiveRow = DeckAccountRow(
+            account: account("c1", provider: "claude", label: "Studio", isDefault: true),
+            provider: .claude,
+            windows: [],
+            isActive: true,
+            activationState: .effective
+        )
+        await model.activate(staleActiveRow)
+        #expect(model.activationError(for: "c1") != nil)
+    }
+
+    @Test func newAttemptOnTheSameProviderSupersedesTheOldTrouble() async {
+        // Retry semantics kept from before, now provider-wide: the moment a
+        // new attempt starts, the provider's stale record is gone, and a
+        // SUCCESS leaves no trouble behind.
+        let activator = StubActivator(results: [
+            .failure(DaemonClientError.httpStatus(500)),
+            .success(account("c3", provider: "claude", label: "Personal", isDefault: true)),
+        ])
+        let model = DeckPopoverModel(
+            defaults: freshDefaults(),
+            activator: activator,
+            stateProvider: StubDeckStateProvider(state: switchedState(claudeDefault: "c3"))
+        )
+
+        await model.activate(claudeRow(model, id: "c2"))
+        #expect(model.activationError(for: "c2") != nil)
+
+        await model.activate(claudeRow(model, id: "c3"))
+        #expect(model.activationError(for: "c2") == nil)
+        #expect(model.activationError(for: "c3") == nil)
+        #expect(model.activationTrouble(for: .claude) == nil)
+        #expect(claudeBanner(model, state: switchedState(claudeDefault: "c3")) == nil)
+    }
+}
+
+@Suite("Menu bar pin from the deck cards (account percentage picker)")
+@MainActor
+struct DeckMenuBarPinTests {
+    private func freshDefaults() -> UserDefaults {
+        let suite = "deck-pin-tests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        return defaults
+    }
+
+    @Test func togglePinPinsThenUnpins() {
+        let model = DeckPopoverModel(defaults: freshDefaults())
+        var pushed: [String] = []
+        model.onPinMenuBarAccount = { pushed.append($0) }
+
+        model.toggleMenuBarPin(accountID: "acct-1")
+        #expect(pushed == ["acct-1"])
+
+        // The daemon-confirmed document lands via the settings apply…
+        model.menuBarPinnedSetting = "acct-1"
+        #expect(model.isMenuBarPinned("acct-1"))
+        // …after which the same menu item unpins.
+        model.toggleMenuBarPin(accountID: "acct-1")
+        #expect(pushed == ["acct-1", ""])
+    }
+
+    @Test func toggleFollowActiveUsesTheSentinelAndNeverMatchesPlainPins() {
+        let model = DeckPopoverModel(defaults: freshDefaults())
+        var pushed: [String] = []
+        model.onPinMenuBarAccount = { pushed.append($0) }
+
+        model.toggleMenuBarFollowActive(provider: .claude)
+        #expect(pushed == ["active:claude"])
+
+        model.menuBarPinnedSetting = "active:claude"
+        #expect(model.isMenuBarFollowingActive(provider: .claude))
+        #expect(!model.isMenuBarFollowingActive(provider: .codex))
+        // A follow-active pin is not any single card's pin.
+        #expect(!model.isMenuBarPinned("acct-1"))
+
+        model.toggleMenuBarFollowActive(provider: .claude)
+        #expect(pushed == ["active:claude", ""])
+    }
+
+    @Test func adoptingAConfirmedSettingNeverFiresTheCallback() {
+        let model = DeckPopoverModel(defaults: freshDefaults())
+        var pushed: [String] = []
+        model.onPinMenuBarAccount = { pushed.append($0) }
+        model.menuBarPinnedSetting = "acct-9"
+        #expect(pushed.isEmpty)
     }
 }

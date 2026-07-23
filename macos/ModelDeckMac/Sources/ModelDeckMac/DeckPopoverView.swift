@@ -13,6 +13,10 @@ struct DeckPopoverView: View {
     /// "Check for App Updates…" affordance, wired to the same shared model
     /// as the Settings mirror — one check state, two entry points.
     @ObservedObject var appUpdateModel: AppUpdateModel
+    /// Issue #121: in-app install state — "Update Now" in the result dialog
+    /// drives this; progress/failure render in the dialog re-summon and the
+    /// Settings row (both read the same shared model).
+    @ObservedObject var appUpdateInstallModel: AppUpdateInstallModel
     /// Issue #96: bundled background-service lifecycle. The popover hosts
     /// the calm one-screen first-run consent and its follow-on states.
     @ObservedObject var setupModel: DaemonSetupModel
@@ -33,6 +37,7 @@ struct DeckPopoverView: View {
         VStack(alignment: .leading, spacing: 10) {
             header
             connectionBanner
+            installProgressLine
             content
             Divider()
             footer
@@ -134,7 +139,14 @@ struct DeckPopoverView: View {
                 ),
                 presenting: updateDialog
             ) { dialog in
-                if let releaseURL = dialog.releaseURL {
+                if dialog.offersInstall, let releaseURL = dialog.releaseURL {
+                    // Issue #121 (Tim directive 2026-07-22): Update Now is
+                    // the primary action; the release page demotes to a
+                    // secondary "Release Notes" link.
+                    Button("Update Now") { appUpdateInstallModel.updateNow() }
+                    Button("Release Notes") { openURL(releaseURL) }
+                    Button("Cancel", role: .cancel) {}
+                } else if let releaseURL = dialog.releaseURL {
                     Button("View Release") { openURL(releaseURL) }
                     Button("Cancel", role: .cancel) {}
                 } else {
@@ -144,6 +156,29 @@ struct DeckPopoverView: View {
                 Text(dialog.message)
             }
         }
+    }
+
+    /// Issue #121: once "Update Now" starts (the dialog closes on press),
+    /// the install's progress/failure lives HERE so it never disappears —
+    /// the same honest status line the Settings row renders.
+    @ViewBuilder
+    private var installProgressLine: some View {
+        if let status = AppUpdateInstallModel.statusText(for: appUpdateInstallModel.phase) {
+            HStack(spacing: 6) {
+                if appUpdateInstallModel.isBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(installStatusIsFailure ? .red : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var installStatusIsFailure: Bool {
+        if case .failed = appUpdateInstallModel.phase { return true }
+        return false
     }
 
     @ViewBuilder
@@ -593,6 +628,27 @@ struct DeckAccountRowView: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.07))
         )
+        // Menu bar pin (account percentage picker follow-up, Tim's call):
+        // right-click a card to pin its percentage to the menu bar — or
+        // follow the provider's ACTIVE account so the menu bar tracks every
+        // activation switch — without opening Settings. Same daemon-backed
+        // setting as the Settings → General picker.
+        .contextMenu {
+            Button(deckModel.isMenuBarPinned(row.account.id)
+                ? "Unpin from Menu Bar"
+                : "Pin to Menu Bar") {
+                deckModel.toggleMenuBarPin(accountID: row.account.id)
+            }
+            if let provider = DeckProvider.from(row.account.provider) {
+                Toggle(
+                    "Follow Active \(provider.displayName) Account",
+                    isOn: Binding(
+                        get: { deckModel.isMenuBarFollowingActive(provider: provider) },
+                        set: { _ in deckModel.toggleMenuBarFollowActive(provider: provider) }
+                    )
+                )
+            }
+        }
     }
 
     /// Collapsed card (issue #30 anatomy, both layouts): title row — inline
@@ -659,6 +715,14 @@ struct DeckAccountRowView: View {
                     }
                 }
                 UsageBarView(window: row.worstWindow)
+                // Issue #101: "100% left" minutes after heavy use is
+                // factually right but cognitively wrong — the rollover
+                // annotation supplies the missing context.
+                if let rollover = row.worstWindow?.rolloverText {
+                    Text(rollover)
+                        .font(DeckType.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -675,8 +739,10 @@ struct DeckAccountRowView: View {
             .multilineTextAlignment(.trailing)
             .fixedSize(horizontal: false, vertical: true)
             .layoutPriority(1)
-            .help(DeckBuilder.absoluteResetText(for: window.resetsAt)
-                ?? "The provider didn't report a reset time for this window")
+            // Issue #101: unanchored windows explain the fresh-window state
+            // here instead of surfacing the placeholder timestamp; anchored
+            // windows keep the issue #67 absolute-timestamp backstop.
+            .help(window.resetTooltip)
     }
 
     /// "Studio · Max (20x)" — the plan tier inline beside the name, muted
@@ -725,6 +791,13 @@ struct DeckAccountRowView: View {
                                 .layoutPriority(2)
                         }
                         UsageBarView(window: window)
+                        // Issue #101: rollover context for a window that
+                        // just rolled — "Week reset just now / at 10:19 AM".
+                        if let rollover = window.rolloverText {
+                            Text(rollover)
+                                .font(DeckType.caption)
+                                .foregroundStyle(.secondary)
+                        }
                         if window.stale {
                             Text("stale")
                                 .font(.system(size: 9))

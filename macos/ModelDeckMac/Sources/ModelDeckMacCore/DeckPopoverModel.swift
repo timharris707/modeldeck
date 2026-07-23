@@ -96,8 +96,30 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
     public var resetText: String
     public var severity: UsageSeverity
     public var stale: Bool
+    /// Issue #101: how this window's reset presents — `.anchored` (normal
+    /// timestamp), `.unanchored` (no usage this period; the provider's
+    /// resetsAt is a drifting placeholder, so `resetText` carries the
+    /// "resets N after first use" copy instead), or `.recentlyRolled`
+    /// (annotated via `rolloverText`). See WindowPresentation.swift for
+    /// the detection heuristics.
+    public var anchor: WindowAnchor
+    /// Issue #101: the small "Week reset just now / at 10:19 AM" line for a
+    /// recently rolled window, nil otherwise.
+    public var rolloverText: String?
 
     public var id: String { scope }
+
+    /// Issue #101: hover tooltip for the reset text. Anchored windows keep
+    /// the absolute-timestamp backstop (issue #67); unanchored windows
+    /// explain the fresh-window state instead of surfacing the placeholder
+    /// timestamp the copy just declined to show.
+    public var resetTooltip: String {
+        if case .unanchored(let duration) = anchor {
+            return WindowPresentation.unanchoredTooltip(windowDuration: duration)
+        }
+        return DeckBuilder.absoluteResetText(for: resetsAt)
+            ?? "The provider didn't report a reset time for this window"
+    }
 
     /// Issue #28: spend renders as a tertiary row — last, muted, never the
     /// headline — and hides entirely when it carries no meaningful data.
@@ -121,7 +143,9 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
         resetsAt: Date?,
         resetText: String,
         severity: UsageSeverity,
-        stale: Bool
+        stale: Bool,
+        anchor: WindowAnchor = .anchored,
+        rolloverText: String? = nil
     ) {
         self.scope = scope
         self.title = title
@@ -130,6 +154,8 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
         self.resetText = resetText
         self.severity = severity
         self.stale = stale
+        self.anchor = anchor
+        self.rolloverText = rolloverText
     }
 }
 
@@ -422,14 +448,46 @@ public enum DeckBuilder {
     static func window(from snapshot: UsageSnapshot, thresholds: UsageThresholds, now: Date) -> DeckWindow {
         let remaining = snapshot.remainingPercent ?? snapshot.usedPercent.map { 100 - $0 }
         let resetDate = DeckDateParsing.date(from: snapshot.resetsAt)
+        // Issue #101: classify the window (anchored / unanchored /
+        // recently rolled) so correct-but-confusing states get honest copy.
+        // Spend rows are excluded — they carry no rate-limit window.
+        let anchor: WindowAnchor = UsageScope.isSpend(snapshot.scope) ? .anchored : WindowPresentation.anchor(
+            remainingPercent: remaining,
+            resetsAt: resetDate,
+            observedAt: DeckDateParsing.date(from: snapshot.observedAt),
+            windowDuration: WindowPresentation.windowDuration(
+                scope: snapshot.scope,
+                detailMinutes: snapshot.detail?.windowDurationMins
+            ),
+            now: now
+        )
+        let text: String
+        var rollover: String?
+        switch anchor {
+        case .unanchored(let duration):
+            // The provider's resetsAt is a placeholder that drifts on every
+            // refresh — never show it as a timestamp.
+            text = WindowPresentation.unanchoredResetText(windowDuration: duration)
+        case .recentlyRolled(let rolledAt, let duration):
+            text = resetText(for: resetDate, now: now)
+            rollover = WindowPresentation.rolloverText(
+                rolledAt: rolledAt,
+                windowDuration: duration,
+                now: now
+            )
+        case .anchored:
+            text = resetText(for: resetDate, now: now)
+        }
         return DeckWindow(
             scope: snapshot.scope,
             title: windowTitle(for: snapshot.scope),
             remainingPercent: remaining,
             resetsAt: resetDate,
-            resetText: resetText(for: resetDate, now: now),
+            resetText: text,
             severity: UsageSeverity.severity(remainingPercent: remaining, thresholds: thresholds),
-            stale: snapshot.stale
+            stale: snapshot.stale,
+            anchor: anchor,
+            rolloverText: rollover
         )
     }
 
@@ -561,6 +619,33 @@ public enum DeckActivationError: Error, Equatable, Sendable, LocalizedError {
         case .verificationFailed:
             return "The daemon did not confirm the switch."
         }
+    }
+}
+
+/// Issue #100: one provider's live activation-trouble record — the daemon's
+/// verbatim clobber-guard guidance (issue #55) or a generic activation
+/// failure, attached to the account whose attempt earned it. Kept as a
+/// single record per provider so the roster's one-banner-per-section surface
+/// always renders the LATEST outcome; a stale record can never mask a newer
+/// failure, and an orphaned record (its account removed from the roster)
+/// stays surfaceable at the provider level.
+public struct ActivationTrouble: Equatable, Sendable {
+    public enum Kind: Equatable, Sendable {
+        /// The daemon's `code: "active-link-blocked"` refusal — rendered
+        /// verbatim as guidance (issue #55), never as a generic failure.
+        case guidance
+        /// Any other activation failure.
+        case error
+    }
+
+    public var accountID: String
+    public var kind: Kind
+    public var message: String
+
+    public init(accountID: String, kind: Kind, message: String) {
+        self.accountID = accountID
+        self.kind = kind
+        self.message = message
     }
 }
 
@@ -743,6 +828,48 @@ public final class DeckPopoverModel: ObservableObject {
     /// machinery: this is pure navigation plumbing.
     public var onSignInAgain: ((String) -> Void)?
 
+    // MARK: - Menu bar pin (account percentage picker)
+
+    /// The daemon-confirmed `menuBarAccountId` mirrored here (set by the
+    /// app's settings apply, same as thresholds) so the cards' context
+    /// menus can render and toggle the pin. "" = lowest across accounts;
+    /// `MenuBarPinResolver` grammar otherwise. Plain assignment — adopting
+    /// a confirmed document never echoes back to the daemon because pin
+    /// changes go through `onPinMenuBarAccount`, never through this
+    /// property's setter.
+    @Published public var menuBarPinnedSetting: String = ""
+
+    /// Fired when a card's context menu picks a new pin value ("" = unpin,
+    /// account id, or a follow-active sentinel). The app wires it to
+    /// `SettingsSyncModel.setMenuBarAccount`, whose confirmed document then
+    /// flows back into `menuBarPinnedSetting` via the settings apply.
+    public var onPinMenuBarAccount: ((String) -> Void)?
+
+    /// Whether this exact account id is the stored pin (follow-active
+    /// sentinels deliberately don't match: the context menu shows the
+    /// follow-active checkmark on its own item instead).
+    public func isMenuBarPinned(_ accountID: String) -> Bool {
+        menuBarPinnedSetting == accountID
+    }
+
+    public func isMenuBarFollowingActive(provider: DeckProvider) -> Bool {
+        menuBarPinnedSetting == MenuBarPinResolver.followActiveSentinel(for: provider)
+    }
+
+    /// Pin/unpin this specific account from a card's context menu.
+    public func toggleMenuBarPin(accountID: String) {
+        onPinMenuBarAccount?(isMenuBarPinned(accountID) ? "" : accountID)
+    }
+
+    /// Toggle the provider's follow-active mode from a card's context menu.
+    public func toggleMenuBarFollowActive(provider: DeckProvider) {
+        onPinMenuBarAccount?(
+            isMenuBarFollowingActive(provider: provider)
+                ? ""
+                : MenuBarPinResolver.followActiveSentinel(for: provider)
+        )
+    }
+
     /// The #118 one-click path: the "Sign in again…" button inside the
     /// sign-in-needed explanation popover. Dismisses whatever explanation is
     /// up (the button IS inside it), routes Settings to the Accounts pane,
@@ -789,13 +916,14 @@ public final class DeckPopoverModel: ObservableObject {
 
     /// Account currently mid-activation, or nil. One switch at a time.
     @Published public private(set) var activatingAccountID: String?
-    /// Inline error text per account id, shown under the Activate button.
-    @Published public private(set) var activationErrors: [String: String] = [:]
-    /// Issue #55: the clobber-guard's own guidance per account id, VERBATIM
-    /// from the daemon's `code: "active-link-blocked"` refusal. Rendered as
-    /// a prominent inline alert near the row (never a silent console
-    /// error), separate from generic activation failures.
-    @Published public private(set) var blockedActivationGuidance: [String: String] = [:]
+    /// Issue #100: ONE live activation-trouble record per provider key —
+    /// the daemon's verbatim clobber-guard guidance (issue #55) or a generic
+    /// failure, attached to the account whose attempt earned it. Single-slot
+    /// BY DESIGN: activation runs one switch at a time and the roster shows
+    /// one banner per provider section, so a stale record for one account
+    /// must never linger and mask a newer failure on another — the exact
+    /// mechanism behind issue #100's "clicked the radio, nothing happened".
+    @Published private var activationTroubleByProvider: [String: ActivationTrouble] = [:]
     /// Issue #93: the daemon's informational `warnings` from the last
     /// verified-successful activation, keyed by provider activation key (one
     /// notice per provider — a newer switch supersedes the previous notice).
@@ -871,13 +999,23 @@ public final class DeckPopoverModel: ObservableObject {
     }
 
     public func activationError(for accountID: String) -> String? {
-        activationErrors[accountID]
+        activationTroubleByProvider.values
+            .first { $0.accountID == accountID && $0.kind == .error }?.message
     }
 
     /// The daemon's one-time-migration guidance for a refused activation of
     /// this account (issue #55), or nil.
     public func blockedActivationGuidance(for accountID: String) -> String? {
-        blockedActivationGuidance[accountID]
+        activationTroubleByProvider.values
+            .first { $0.accountID == accountID && $0.kind == .guidance }?.message
+    }
+
+    /// Issue #100: the provider's live activation-trouble record, whichever
+    /// account earned it. The roster's banner derivation uses this to keep a
+    /// failure visible even when its account has since left the roster —
+    /// the per-account lookups above can never find an orphaned record.
+    public func activationTrouble(for provider: DeckProvider) -> ActivationTrouble? {
+        activationTroubleByProvider[provider.rawValue]
     }
 
     /// Issue #93: the informational warnings from this provider's last
@@ -904,13 +1042,51 @@ public final class DeckPopoverModel: ObservableObject {
     /// Activation affordance re-runs the same daemon activate to lay the
     /// symlink once the user has cleared the blocker.
     public func activate(_ row: DeckAccountRow) async {
-        guard !row.isActive || row.activationState.needsLinkCompletion,
-              activatingAccountID == nil else { return }
-        guard let activator, let stateProvider else { return }
         let key = Self.activationKey(for: row.account)
+        // Issue #100: NO silent terminal states, and no STALE ones either.
+        // A new attempt supersedes the provider's previous trouble record
+        // immediately — every path below either succeeds (leaving no stale
+        // record on screen) or re-records its own outcome. An attempt that
+        // ends in "nothing happened" is the bug.
+        activationTroubleByProvider[key] = nil
+        guard activatingAccountID == nil else {
+            // The roster disables activation controls while a switch runs,
+            // so reaching here means a stale render raced an in-flight
+            // switch. Say so instead of swallowing the click.
+            activationTroubleByProvider[key] = ActivationTrouble(
+                accountID: row.id,
+                kind: .error,
+                message: "Another activation is still running — try again once it finishes."
+            )
+            return
+        }
+        guard let activator, let stateProvider else {
+            activationTroubleByProvider[key] = ActivationTrouble(
+                accountID: row.id,
+                kind: .error,
+                message: "Activation isn't available — this build has no daemon connection."
+            )
+            return
+        }
+        guard !row.isActive || row.activationState.needsLinkCompletion else {
+            // The app already believes this account is active with nothing
+            // left to complete, so the click can only have come from a stale
+            // render. Resync so the radio/marker snaps to the daemon's truth
+            // (a no-op re-render when nothing actually changed); a failed
+            // read surfaces like any other activation failure.
+            do {
+                let fresh = try await stateProvider.deckState()
+                onVerifiedState?(fresh)
+            } catch {
+                activationTroubleByProvider[key] = ActivationTrouble(
+                    accountID: row.id,
+                    kind: .error,
+                    message: Self.activationMessage(for: error)
+                )
+            }
+            return
+        }
         let previous = optimisticActive[key]
-        activationErrors[row.id] = nil
-        blockedActivationGuidance[row.id] = nil
         postActivationWarnings[key] = nil // a new switch supersedes the old notice
         activatingAccountID = row.id
         optimisticActive[key] = row.id // optimistic flip — badge moves now
@@ -934,6 +1110,10 @@ public final class DeckPopoverModel: ObservableObject {
             // Verified: the fresh state carries the badge itself, so the
             // override can go before the state is pushed to the UI.
             optimisticActive[key] = nil
+            // A click raced against THIS flight may have recorded "still
+            // running" trouble mid-flight — the verified success supersedes
+            // it, same no-stale-record principle as the top-of-attempt clear.
+            activationTroubleByProvider[key] = nil
             onVerifiedState?(fresh)
         } catch {
             optimisticActive[key] = previous // revert the flip
@@ -941,9 +1121,13 @@ public final class DeckPopoverModel: ObservableObject {
                 // Issue #55: the clobber-guard refusal is guidance, not a
                 // generic failure — the daemon's message renders VERBATIM
                 // in a prominent inline alert near the row.
-                blockedActivationGuidance[row.id] = guidance
+                activationTroubleByProvider[key] = ActivationTrouble(
+                    accountID: row.id, kind: .guidance, message: guidance
+                )
             } else {
-                activationErrors[row.id] = Self.activationMessage(for: error)
+                activationTroubleByProvider[key] = ActivationTrouble(
+                    accountID: row.id, kind: .error, message: Self.activationMessage(for: error)
+                )
             }
         }
     }

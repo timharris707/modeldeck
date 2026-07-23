@@ -62,6 +62,10 @@ public enum MenuBarIconRenderer {
             // muted — dynamic secondaryLabelColor, resolved at draw time
             // like the glyph, so it never reads as a severity signal.
             color = .secondaryLabelColor
+        case .pinned:
+            // A healthy pinned account renders in the same dynamic label
+            // color as the glyph: informational, not a severity signal.
+            color = .labelColor
         case .plain, .warning:
             color = warningColor
         }

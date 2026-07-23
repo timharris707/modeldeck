@@ -19,15 +19,36 @@
 # background reference is a Finder alias that records the volume name, so a
 # per-version volname would orphan it.
 #
+# Appcast (issue #121, Sparkle 2 in-app updates): after the DMG is stapled,
+# the script generates dist/appcast.xml — EdDSA-signed via Sparkle's
+# sign_update (private key in the login Keychain from Tim's one-time
+# generate_keys run; never in the repo) — and stamps the Sparkle PUBLIC key
+# into the app's Info.plist (SUPublicEDKey) before signing. Publish BOTH the
+# DMG and appcast.xml as assets on the version's GitHub release; the app's
+# SUFeedURL points at the stable releases/latest/download/appcast.xml
+# redirect.
+#
 # Usage:
 #   scripts/release-dmg.sh [--dry-run] [--check-only] [--allow-dirty]
 #                          [--ref <ref>]
+#   scripts/release-dmg.sh --appcast-only <dmg>
+#       Regenerate only the appcast for an existing ModelDeck-<ver>.dmg
+#       (written beside it). No git guard, no identities — this is also the
+#       test hook: inject MD_SPARKLE_SIGN_UPDATE (+ MD_SPARKLE_KEY_FILE with
+#       the fake fixture key) to verify the step without real credentials.
 #
 # Environment (names, never secret values):
 #   MD_SIGN_IDENTITY            codesign identity name. Required for signing;
 #                               the committed default is a placeholder.
 #   MODELDECK_NOTARY_PROFILE    notarytool keychain profile name.
 #                               Default: "modeldeck-notary"
+#   MD_SPARKLE_SIGN_UPDATE      path to Sparkle's sign_update tool. Default:
+#                               auto-located in the SwiftPM artifacts dir.
+#   MD_SPARKLE_KEY_FILE         EdDSA private key FILE for sign_update -f.
+#                               TESTS ONLY (fake fixture key) — real releases
+#                               leave it unset so the Keychain key is used.
+#   MD_SPARKLE_PUBLIC_ED_KEY    Sparkle EdDSA PUBLIC key for Info.plist.
+#                               Default: derived via `generate_keys -p`.
 #
 # The identity name and profile name are labels, not secrets; the private
 # key and Apple credentials live only in the login keychain. This script
@@ -63,9 +84,61 @@ DEFAULT_IDENTITY="Developer ID Application: EXAMPLE DEVELOPER (TEAMID1234)"
 IDENTITY="${MD_SIGN_IDENTITY:-$DEFAULT_IDENTITY}"
 NOTARY_PROFILE="${MODELDECK_NOTARY_PROFILE:-modeldeck-notary}"
 
+# ------------------------------------------------- Sparkle appcast helpers
+# Issue #121. sign_update ships inside the resolved SwiftPM Sparkle artifact;
+# the private key lives ONLY in the login Keychain (generate_keys, one-time).
+SPARKLE_ONE_TIME_HELP="Sparkle EdDSA key setup (ONE TIME, on the release Mac):
+  1. swift package resolve --package-path $PACKAGE_DIR
+  2. run the generate_keys tool from the resolved artifact:
+       find $PACKAGE_DIR/.build/artifacts -type f -name generate_keys
+     -> stores the private key in the login Keychain (item 'Private key for signing Sparkle updates').
+  3. generate_keys -p prints the PUBLIC key (for Info.plist SUPublicEDKey stamping).
+Never copy the private key into the repo, environment files, or scripts."
+
+locate_sign_update() {
+  if [[ -n "${MD_SPARKLE_SIGN_UPDATE:-}" ]]; then
+    echo "$MD_SPARKLE_SIGN_UPDATE"
+    return
+  fi
+  find "$PACKAGE_DIR/.build/artifacts" -type f -name sign_update 2>/dev/null | head -1
+}
+
+# Generates <dir-of-dmg>/appcast.xml for a ModelDeck-<version>.dmg.
+# $1 = dmg path, $2 = sparkle build number (CFBundleVersion).
+generate_appcast() {
+  local dmg="$1" build="$2" version base sign_update out
+  base="$(basename "$dmg")"
+  version="${base#ModelDeck-}"; version="${version%.dmg}"
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
+    || fail "cannot derive a version from DMG name '$base' (expected ModelDeck-<version>.dmg)"
+  sign_update="$(locate_sign_update)"
+  [[ -n "$sign_update" && -x "$sign_update" ]] || fail "Sparkle sign_update tool not found (set MD_SPARKLE_SIGN_UPDATE or resolve SwiftPM packages).
+$SPARKLE_ONE_TIME_HELP"
+  out="$(cd "$(dirname "$dmg")" && pwd)/appcast.xml"
+  local key_args=()
+  # TESTS ONLY: an injected key FILE (fake fixture). Real releases use the
+  # Keychain — sign_update's default — and fail loudly when it is absent.
+  if [[ -n "${MD_SPARKLE_KEY_FILE:-}" ]]; then
+    key_args=(--key-file "$MD_SPARKLE_KEY_FILE")
+  fi
+  node "$REPO_ROOT/scripts/generate-appcast.mjs" \
+    --version "$version" \
+    --build "$build" \
+    --dmg "$dmg" \
+    --url "https://github.com/timharris707/modeldeck/releases/download/v$version/ModelDeck-$version.dmg" \
+    --release-notes-url "https://github.com/timharris707/modeldeck/releases/tag/v$version" \
+    --sign-update "$sign_update" \
+    "${key_args[@]+"${key_args[@]}"}" \
+    --out "$out" \
+    || fail "appcast generation failed.
+$SPARKLE_ONE_TIME_HELP"
+  echo "==> appcast written: $out"
+}
+
 DRY_RUN=0
 CHECK_ONLY=0
 ALLOW_DIRTY=0
+APPCAST_ONLY=""
 RELEASE_REF="origin/main"
 REF_OVERRIDDEN=0
 while [[ $# -gt 0 ]]; do
@@ -73,6 +146,11 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=1 ;;
     --check-only) CHECK_ONLY=1 ;;
     --allow-dirty) ALLOW_DIRTY=1 ;;
+    --appcast-only)
+      [[ $# -ge 2 ]] || fail "--appcast-only requires a DMG path"
+      APPCAST_ONLY="$2"
+      shift
+      ;;
     --ref)
       [[ $# -ge 2 ]] || fail "--ref requires a git ref"
       RELEASE_REF="$2"
@@ -84,6 +162,17 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+# --------------------------------------- appcast-only mode (issue #121)
+# Regenerates the feed for an already-built DMG. Deliberately BEFORE the
+# repository guard: no build, no signing identities, no git required — this
+# is the test hook for the new release step.
+if [[ -n "$APPCAST_ONLY" ]]; then
+  [[ -f "$APPCAST_ONLY" ]] || fail "DMG not found: $APPCAST_ONLY"
+  BUILD_NUMBER="$(git -C "$REPO_ROOT" rev-list --count HEAD 2>/dev/null || echo 0)"
+  generate_appcast "$APPCAST_ONLY" "$BUILD_NUMBER"
+  exit 0
+fi
 
 # ------------------------------------------------ repository safety guard
 git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 \
@@ -169,7 +258,24 @@ security find-identity -v -p codesigning | grep -Fq "$IDENTITY" \
   || fail "signing identity not found in keychain: $IDENTITY"
 xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1 \
   || fail "notarytool profile '$NOTARY_PROFILE' missing or not accepted by Apple"
-echo "==> preflight OK (identity present, notary profile accepted)"
+
+# Issue #121: the Sparkle EdDSA PUBLIC key must be stamped into the app's
+# Info.plist (SUPublicEDKey) or shipped updates can never verify. Explicit
+# env wins; otherwise derive it from the Keychain via generate_keys -p.
+SPARKLE_PUBLIC_KEY="${MD_SPARKLE_PUBLIC_ED_KEY:-}"
+if [[ -z "$SPARKLE_PUBLIC_KEY" ]]; then
+  GENERATE_KEYS="$(find "$PACKAGE_DIR/.build/artifacts" -type f -name generate_keys 2>/dev/null | head -1)"
+  if [[ -n "$GENERATE_KEYS" && -x "$GENERATE_KEYS" ]]; then
+    SPARKLE_PUBLIC_KEY="$("$GENERATE_KEYS" -p 2>/dev/null | tail -1 | tr -d '[:space:]')" || true
+  fi
+fi
+[[ -n "$SPARKLE_PUBLIC_KEY" ]] || fail "Sparkle public key unavailable (no MD_SPARKLE_PUBLIC_ED_KEY and generate_keys -p produced nothing).
+$SPARKLE_ONE_TIME_HELP"
+SIGN_UPDATE_TOOL="$(locate_sign_update)"
+[[ -n "$SIGN_UPDATE_TOOL" && -x "$SIGN_UPDATE_TOOL" ]] \
+  || fail "Sparkle sign_update tool not found — the appcast step would fail after notarization; resolve SwiftPM packages first.
+$SPARKLE_ONE_TIME_HELP"
+echo "==> preflight OK (identity present, notary profile accepted, Sparkle key + sign_update present)"
 
 if [[ "$DRY_RUN" == 1 ]]; then
   echo "==> dry run: would perform:"
@@ -180,6 +286,8 @@ if [[ "$DRY_RUN" == 1 ]]; then
   echo "    5. hdiutil create $DMG (app + /Applications symlink + installer background/layout from design/dmg)"
   echo "    6. codesign the DMG, notarize (submit --wait), staple the DMG"
   echo "    7. verify: codesign --verify --deep --strict, spctl app + dmg"
+  echo "    8. generate dist/appcast.xml (EdDSA signature via sign_update; key from the login Keychain)"
+  echo "    NB: step 2 also embeds Sparkle.framework in Contents/Frameworks and stamps SUPublicEDKey"
   echo "==> dry run complete; nothing was built"
   exit 0
 fi
@@ -239,6 +347,35 @@ echo "==> stamping version $VERSION (build $BUILD_NUMBER), commit $GIT_COMMIT in
 /usr/libexec/PlistBuddy -c "Set :MDGitCommit $GIT_COMMIT" "$APP/Contents/Info.plist" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Add :MDGitCommit string $GIT_COMMIT" "$APP/Contents/Info.plist"
 
+# Issue #121: Sparkle. Embed the framework the SwiftPM build linked against
+# and stamp the PUBLIC EdDSA key (the app refuses to build its updater
+# without SUFeedURL + SUPublicEDKey — dev bundles stay updater-less).
+SPARKLE_FRAMEWORK="$(dirname "$BIN")/Sparkle.framework"
+[[ -d "$SPARKLE_FRAMEWORK" ]] || fail "Sparkle.framework not found beside the built binary at $SPARKLE_FRAMEWORK"
+echo "==> embedding Sparkle.framework + stamping SUPublicEDKey"
+mkdir -p "$APP/Contents/Frameworks"
+cp -R "$SPARKLE_FRAMEWORK" "$APP/Contents/Frameworks/"
+# The SwiftPM binary references @rpath/Sparkle.framework/... with an rpath
+# pointing into .build; make the bundle self-contained and drop the
+# build-dir rpath so the shipped app can never resolve outside itself.
+APP_MAIN_BIN="$APP/Contents/MacOS/ModelDeckMac"
+BUILD_RPATH="$(dirname "$BIN")"
+if ! otool -l "$APP_MAIN_BIN" | grep -q "path @executable_path/../Frameworks "; then
+  install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_MAIN_BIN" \
+    || fail "could not add the Frameworks rpath to the app binary"
+fi
+if otool -l "$APP_MAIN_BIN" | grep -q "path $BUILD_RPATH "; then
+  install_name_tool -delete_rpath "$BUILD_RPATH" "$APP_MAIN_BIN" \
+    || fail "could not remove the build-dir rpath from the app binary"
+fi
+otool -l "$APP_MAIN_BIN" | grep -q "path @executable_path/../Frameworks " \
+  || fail "app binary lacks the Frameworks rpath after cleanup"
+if otool -l "$APP_MAIN_BIN" | grep -q "path $BUILD_RPATH "; then
+  fail "build-dir rpath still present in the app binary after cleanup"
+fi
+/usr/libexec/PlistBuddy -c "Set :SUPublicEDKey $SPARKLE_PUBLIC_KEY" "$APP/Contents/Info.plist" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $SPARKLE_PUBLIC_KEY" "$APP/Contents/Info.plist"
+
 # ------------------------------------------------------------- 3. sign
 # Sign nested code inside-out. The daemon build's ad-hoc signature is replaced
 # here with the same Developer ID identity used for the outer app.
@@ -246,6 +383,24 @@ echo "==> codesign embedded modeldeckd (hardened runtime, timestamp)"
 codesign --force --options runtime --timestamp \
   --entitlements "$REPO_ROOT/scripts/daemon-entitlements.plist" --sign "$IDENTITY" \
   "$APP/Contents/Resources/daemon/modeldeckd"
+# Issue #121: re-sign Sparkle's nested executables with OUR Developer ID
+# (hardened runtime — notarization requires every nested Mach-O to carry
+# it). Sparkle's documented non-sandboxed order: Autoupdate, Updater.app,
+# then the framework itself. --preserve-metadata keeps Sparkle's own
+# entitlements on its helpers.
+SPARKLE_EMBEDDED="$APP/Contents/Frameworks/Sparkle.framework"
+echo "==> codesign embedded Sparkle.framework (hardened runtime, timestamp)"
+codesign --force --options runtime --timestamp --preserve-metadata=entitlements \
+  --sign "$IDENTITY" "$SPARKLE_EMBEDDED/Versions/B/Autoupdate"
+codesign --force --options runtime --timestamp --preserve-metadata=entitlements \
+  --sign "$IDENTITY" "$SPARKLE_EMBEDDED/Versions/B/Updater.app"
+if compgen -G "$SPARKLE_EMBEDDED/Versions/B/XPCServices/*.xpc" >/dev/null 2>&1; then
+  for xpc in "$SPARKLE_EMBEDDED"/Versions/B/XPCServices/*.xpc; do
+    codesign --force --options runtime --timestamp --preserve-metadata=entitlements \
+      --sign "$IDENTITY" "$xpc"
+  done
+fi
+codesign --force --options runtime --timestamp --sign "$IDENTITY" "$SPARKLE_EMBEDDED"
 echo "==> codesign app (hardened runtime, timestamp)"
 codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
@@ -322,4 +477,13 @@ codesign --verify --deep --strict --verbose=2 "$APP"
 spctl -a -vv "$APP"
 spctl -a -t open --context context:primary-signature -vv "$DMG"
 
+# ---------------------------------------------------- 8. appcast (issue #121)
+# Signed AFTER stapling: the EdDSA signature must cover the exact bytes
+# users download. Publish appcast.xml as an asset on the SAME release as
+# the DMG (SUFeedURL reads releases/latest/download/appcast.xml).
+echo "==> generating Sparkle appcast"
+generate_appcast "$DMG" "$BUILD_NUMBER"
+
 echo "==> done: $DMG"
+echo "    publish BOTH assets on the release:"
+echo "    gh release create v$VERSION \"$DMG\" \"$DIST_DIR/appcast.xml\""

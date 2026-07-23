@@ -13,6 +13,11 @@ let package = Package(
         .library(name: "ModelDeckMacCore", targets: ["ModelDeckMacCore"]),
         .executable(name: "ModelDeckMac", targets: ["ModelDeckMac"])
     ],
+    dependencies: [
+        // Issue #121 — in-app updates. Pinned EXACT so a release build can
+        // never silently pick up a new updater; bumps are deliberate PRs.
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.8.0")
+    ],
     targets: [
         .target(
             name: "ModelDeckMacCore",
@@ -26,7 +31,13 @@ let package = Package(
         ),
         .executableTarget(
             name: "ModelDeckMac",
-            dependencies: ["ModelDeckMacCore"]
+            dependencies: [
+                "ModelDeckMacCore",
+                // Sparkle stays OUT of ModelDeckMacCore on purpose: the core
+                // library holds the testable state machines; only the app
+                // target links the updater framework (seam: AppUpdateInstalling).
+                .product(name: "Sparkle", package: "Sparkle")
+            ]
         ),
         .testTarget(
             name: "ModelDeckMacCoreTests",

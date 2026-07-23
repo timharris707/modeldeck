@@ -13,6 +13,12 @@ struct ModelDeckMacApp: App {
     @StateObject private var toolUpdateModel: ToolUpdateModel
     @StateObject private var appUpdateModel: AppUpdateModel
     @StateObject private var appUpdateAutoChecker: AppUpdateAutoChecker
+    /// Issue #121: in-app install state ("Update Now" + the automatic-install
+    /// toggle). The Sparkle driver only exists in fully configured bundles.
+    @StateObject private var appUpdateInstallModel: AppUpdateInstallModel
+    /// Keeps the SPUUpdater alive for the app's lifetime (the install model
+    /// holds it weakly on purpose — the seam must never own Sparkle).
+    private let sparkleDriver: SparkleUpdateDriver?
     @StateObject private var notifications: UsageNotificationCoordinator
     /// Issue #96: bundled-daemon lifecycle — first-run consent, SMAppService
     /// registration, Keychain token, drift re-register, legacy takeover.
@@ -81,9 +87,24 @@ struct ModelDeckMacApp: App {
         // GitHub releases feed. Strictly separate from CLI updates; no
         // self-replacing installer (that's issue #16's signed DMG work).
         let appUpdateModel = AppUpdateModel(checker: GitHubReleaseChecker())
-        // Issue #60: optional daily check of the same releases feed, banner
-        // on a newer version — notify only, never an install.
-        let appUpdateAutoChecker = AppUpdateAutoChecker(model: appUpdateModel) { notification in
+        // Issue #121 (Tim directive 2026-07-22): Sparkle 2 one-click install.
+        // The driver exists only when the bundle carries SUFeedURL +
+        // SUPublicEDKey (release-dmg.sh stamps the key) — dev builds and
+        // pre-Sparkle installs keep the honest "View Release" hand-off.
+        let appUpdateInstallModel = AppUpdateInstallModel()
+        let sparkleDriver = SparkleUpdateDriver.makeIfConfigured(installModel: appUpdateInstallModel)
+        if let sparkleDriver {
+            appUpdateInstallModel.attach(driver: sparkleDriver)
+            appUpdateModel.canInstallUpdates = true
+        }
+        // Issue #60: optional daily check of the same releases feed — still
+        // the scheduling brain. With Sparkle attached it hands a found
+        // update to the install model (quiet install when the automatic
+        // toggle allows); without, it stays notify-only.
+        let appUpdateAutoChecker = AppUpdateAutoChecker(
+            model: appUpdateModel,
+            installModel: appUpdateInstallModel
+        ) { notification in
             await AppUpdateNotificationPoster().post(notification)
         }
         let notifications = UsageNotificationCoordinator(poster: UserNotificationCenterPoster())
@@ -93,7 +114,10 @@ struct ModelDeckMacApp: App {
         let daemonSetupModel = DaemonSetupModel(dependencies: .live(client: client))
         // Issue #59: the status-item context menu shares the same update
         // model as the gear menu and Settings — one check state everywhere.
-        contextMenuController = MenuBarContextMenuController(appUpdateModel: appUpdateModel)
+        contextMenuController = MenuBarContextMenuController(
+            appUpdateModel: appUpdateModel,
+            installModel: appUpdateInstallModel
+        )
 
         // Every daemon-confirmed settings document applies live to the
         // running models: popover layout/sort, severity thresholds
@@ -123,9 +147,23 @@ struct ModelDeckMacApp: App {
                 )
                 deckModel?.thresholds = settings.usageThresholds
                 statusModel?.thresholds = settings.usageThresholds
+                // Pinned menu-bar account (nil = lowest across accounts) —
+                // display-only; notifications keep watching every account.
+                // The deck model mirrors the raw setting for the cards'
+                // right-click pin menus.
+                statusModel?.pinnedAccountId = settings.menuBarPinnedAccountId
+                deckModel?.menuBarPinnedSetting = settings.menuBarAccountId
                 notifications?.thresholds = settings.usageThresholds
             }
             statusModel?.startAutoRefresh(interval: settings.effectiveAutoRefreshInterval)
+        }
+        // A card's right-click pin goes through the same daemon-backed
+        // setting as the Settings picker; the confirmed document then flows
+        // back through onApply above (icon + mirror update together).
+        deckModel.onPinMenuBarAccount = { [weak settingsSync] value in
+            Task { @MainActor [weak settingsSync] in
+                await settingsSync?.setMenuBarAccount(id: value)
+            }
         }
         // Popover-side layout/sort changes sync back to the daemon; the
         // per-field no-op guards in the sync model break the echo loop.
@@ -208,6 +246,8 @@ struct ModelDeckMacApp: App {
         _toolUpdateModel = StateObject(wrappedValue: toolUpdateModel)
         _appUpdateModel = StateObject(wrappedValue: appUpdateModel)
         _appUpdateAutoChecker = StateObject(wrappedValue: appUpdateAutoChecker)
+        _appUpdateInstallModel = StateObject(wrappedValue: appUpdateInstallModel)
+        self.sparkleDriver = sparkleDriver
         _notifications = StateObject(wrappedValue: notifications)
         _daemonSetupModel = StateObject(wrappedValue: daemonSetupModel)
     }
@@ -245,6 +285,7 @@ struct ModelDeckMacApp: App {
                 statusModel: statusModel,
                 deckModel: deckModel,
                 appUpdateModel: appUpdateModel,
+                appUpdateInstallModel: appUpdateInstallModel,
                 setupModel: daemonSetupModel,
                 launchAtLoginModel: launchAtLoginModel
             )
@@ -299,6 +340,7 @@ struct ModelDeckMacApp: App {
                 updateModel: toolUpdateModel,
                 appUpdateModel: appUpdateModel,
                 appUpdateAutoChecker: appUpdateAutoChecker,
+                appUpdateInstallModel: appUpdateInstallModel,
                 daemonSetupModel: daemonSetupModel,
                 launchAtLoginModel: launchAtLoginModel
             )

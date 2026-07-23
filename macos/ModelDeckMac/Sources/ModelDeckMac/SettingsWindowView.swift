@@ -22,6 +22,8 @@ struct SettingsWindowView: View {
     @ObservedObject var appUpdateModel: AppUpdateModel
     /// Issue #60: the "Check for updates automatically" toggle's model.
     @ObservedObject var appUpdateAutoChecker: AppUpdateAutoChecker
+    /// Issue #121: in-app install state + "Install updates automatically".
+    @ObservedObject var appUpdateInstallModel: AppUpdateInstallModel
     /// Issue #96: bundled background-service status + legacy takeover.
     @ObservedObject var daemonSetupModel: DaemonSetupModel
     /// Shared launch-at-login state; the SMAppService status read lives in
@@ -51,6 +53,7 @@ struct SettingsWindowView: View {
                 updateModel: updateModel,
                 appUpdateModel: appUpdateModel,
                 appUpdateAutoChecker: appUpdateAutoChecker,
+                appUpdateInstallModel: appUpdateInstallModel,
                 daemonSetupModel: daemonSetupModel,
                 launchAtLoginModel: launchAtLoginModel
             )
@@ -93,6 +96,9 @@ struct AccountsSettingsPane: View {
             state: state,
             guidanceForAccount: { deckModel.blockedActivationGuidance(for: $0) },
             errorForAccount: { deckModel.activationError(for: $0) },
+            // Issue #100: keeps a failure visible even when the account it
+            // concerns has since left the roster.
+            troubleForProvider: { deckModel.activationTrouble(for: $0) },
             warningsForProvider: { deckModel.postActivationWarnings(for: $0) }
         )
     }
@@ -507,6 +513,15 @@ struct AccountRosterRow: View {
     /// physically in effect yet. Tooltips carry the new-sessions-only nuance.
     private var radio: some View {
         let color: Color = isRadioPending ? severityColor(.warning) : .accentColor
+        // Issue #100: a disabled `.plain`-style button with a custom label
+        // renders pixel-identical to an enabled one — the invisible state
+        // that swallows clicks with zero feedback. Dim the radio whenever a
+        // non-selected row can't accept a click (activation unavailable,
+        // row busy, or another switch in flight) so unavailability is
+        // visible; the selected row's radio IS the state display and keeps
+        // full opacity.
+        let isUnavailable = !account.isDefault
+            && (onActivate == nil || isBusy || isActivating || isActivationInFlight)
         return Button {
             if !account.isDefault { onActivate?() }
         } label: {
@@ -524,6 +539,7 @@ struct AccountRosterRow: View {
         .buttonStyle(.plain)
         .disabled(account.isDefault || onActivate == nil
             || isBusy || isActivating || isActivationInFlight)
+        .opacity(isUnavailable ? 0.35 : 1)
         .help(radioHelp)
         .accessibilityLabel(radioAccessibilityLabel)
         .accessibilityAddTraits(account.isDefault ? [.isSelected] : [])
@@ -721,8 +737,11 @@ struct GeneralSettingsPane: View {
     /// repo). Deliberately separate from every CLI update control.
     @ObservedObject var appUpdateModel: AppUpdateModel
     /// Issue #60: the "Check for updates automatically" toggle — daily check
-    /// of the SAME releases feed, notify only, never an install.
+    /// of the SAME releases feed; issue #121 made it the scheduling brain
+    /// for Sparkle's quiet install as well.
     @ObservedObject var appUpdateAutoChecker: AppUpdateAutoChecker
+    /// Issue #121: "Update Now" + "Install updates automatically" state.
+    @ObservedObject var appUpdateInstallModel: AppUpdateInstallModel
     /// Issue #96: bundled background-service status + the only home of the
     /// legacy-LaunchAgent takeover action.
     @ObservedObject var daemonSetupModel: DaemonSetupModel
@@ -808,6 +827,35 @@ struct GeneralSettingsPane: View {
                 // identities: it's the management surface.
                 Toggle("Show account emails", isOn: $deckModel.showAccountEmails)
                     .help("Show each account's identity (email) under its name in the popover. Off by default; applies to both providers. The Accounts pane always shows identities.")
+            }
+
+            // Menu bar percent source (Tim, 2026-07-22): "lowest across
+            // accounts" only helps when you're actually using the lowest
+            // account — pinning one account makes the menu bar answer
+            // "where am I on MY account" at a glance, continuously.
+            Section("Menu bar") {
+                Picker("Show percentage for", selection: binding(
+                    get: { $0.menuBarAccountId },
+                    set: { model, value in await model.setMenuBarAccount(id: value) }
+                )) {
+                    Text("Lowest across all accounts").tag("")
+                    // Tim's follow-up: after an account switch the menu bar
+                    // should usually track the newly active account — these
+                    // follow the provider's ACTIVE account automatically.
+                    Text("Active Claude account")
+                        .tag(MenuBarPinResolver.followActiveSentinel(for: .claude))
+                    Text("Active Codex account")
+                        .tag(MenuBarPinResolver.followActiveSentinel(for: .codex))
+                    ForEach(menuBarAccountOptions, id: \.id) { option in
+                        Text(option.title).tag(option.id)
+                    }
+                }
+                .help("A pinned account shows its lowest non-spend usage window in the menu bar continuously when one is available — normal color while healthy, gold at warning, red at critical; without a usable window the plain glyph is shown. \"Active … account\" follows whichever account is currently active for that provider. \"Lowest across all accounts\" shows a percentage only when some account drops below the warning threshold.")
+                Text(settingsSync.settings.menuBarAccountId.isEmpty
+                    ? "The percentage appears only when any account drops below the warning threshold."
+                    : "The pinned account's percentage stays visible while it has a usable non-spend window; otherwise the plain glyph is shown. Notifications still watch every account.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Notifications") {
@@ -900,12 +948,15 @@ struct GeneralSettingsPane: View {
                         Task { await appUpdateModel.check() }
                     }
                     .disabled(appUpdateModel.isChecking)
-                    .help("Check the ModelDeck releases feed on GitHub. Nothing installs automatically.")
+                    .help(appUpdateInstallModel.canInstall
+                        ? "Check the ModelDeck releases feed on GitHub. Installing is a separate, explicit step."
+                        : "Check the ModelDeck releases feed on GitHub. Nothing installs automatically.")
                     if appUpdateModel.isChecking {
                         ProgressView().controlSize(.small)
                     }
                 }
                 appUpdateStatusLine
+                installStatusLine
                 // Issue #60: automatic checks reuse the exact same feed and
                 // model as the manual button above — the only difference is
                 // who initiates. App-local preference (like Launch at
@@ -914,10 +965,30 @@ struct GeneralSettingsPane: View {
                     get: { appUpdateAutoChecker.isEnabled },
                     set: { appUpdateAutoChecker.setEnabled($0) }
                 ))
-                .help("Once a day, check the releases feed and show a notification when a newer version is out. Nothing installs automatically.")
-                Text("Daily check with a notification when a new version exists — nothing installs automatically.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                .help(appUpdateInstallModel.canInstall
+                    ? "Once a day, check the update feed for a newer version."
+                    : "Once a day, check the releases feed and show a notification when a newer version is out. Nothing installs automatically.")
+                if appUpdateInstallModel.canInstall {
+                    // Issue #121 (Tim directive 2026-07-22, default ON):
+                    // quiet install on relaunch. App-local preference; the
+                    // daemon never stores it.
+                    Toggle("Install updates automatically", isOn: Binding(
+                        get: { appUpdateInstallModel.isAutoInstallEnabled },
+                        set: { appUpdateInstallModel.setAutoInstall($0) }
+                    ))
+                    .help("Downloads a found update in the background and installs it the next time ModelDeck relaunches. Off: updates wait for Update Now.")
+                    Text(appUpdateAutoChecker.isEnabled
+                        ? (appUpdateInstallModel.isAutoInstallEnabled
+                            ? "Daily check; new versions download quietly and install when ModelDeck relaunches."
+                            : "Daily check with a notification when a new version exists — installs only when you choose Update Now.")
+                        : "Automatic checks are off — updates are found only when you check manually.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Daily check with a notification when a new version exists — nothing installs automatically in this build.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             if let error = settingsSync.lastError {
@@ -940,10 +1011,11 @@ struct GeneralSettingsPane: View {
         }
     }
 
-    /// Outcome line under "Check for App Updates". On "update available" the
-    /// action is opening the release page — a self-replacing installer is
-    /// deliberately NOT built here; real auto-update install lands with
-    /// issue #16's signed, notarized DMG pipeline.
+    /// Outcome line under "Check for App Updates". Issue #121 (Tim
+    /// directive 2026-07-22): in Sparkle-configured builds the primary
+    /// action is "Update Now" (download → verify → install → relaunch) with
+    /// "Release Notes" secondary; builds without the installer keep the
+    /// honest "View Release" hand-off.
     @ViewBuilder
     private var appUpdateStatusLine: some View {
         switch appUpdateModel.phase {
@@ -960,9 +1032,19 @@ struct GeneralSettingsPane: View {
                 Text("Version \(release.version) is available.")
                     .font(.caption)
                     .foregroundStyle(.orange)
-                Button("View Release") { openURL(release.url) }
-                    .controlSize(.small)
-                    .help("Opens the GitHub release page — download and install from there.")
+                if appUpdateModel.canInstallUpdates {
+                    Button("Update Now") { appUpdateInstallModel.updateNow() }
+                        .controlSize(.small)
+                        .disabled(appUpdateInstallModel.isBusy)
+                        .help("Downloads, verifies, and installs the update, then relaunches ModelDeck.")
+                    Button("Release Notes") { openURL(release.url) }
+                        .controlSize(.small)
+                        .help("Opens the GitHub release page.")
+                } else {
+                    Button("View Release") { openURL(release.url) }
+                        .controlSize(.small)
+                        .help("Opens the GitHub release page — download and install from there.")
+                }
             }
         case .unavailable(let message):
             Text(message)
@@ -970,6 +1052,28 @@ struct GeneralSettingsPane: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    /// Issue #121: honest install progress/outcome under the row — the same
+    /// shared state the deck popover renders, so the surfaces always agree.
+    @ViewBuilder
+    private var installStatusLine: some View {
+        if let status = AppUpdateInstallModel.statusText(for: appUpdateInstallModel.phase) {
+            HStack(spacing: 6) {
+                if appUpdateInstallModel.isBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(installFailed ? .red : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var installFailed: Bool {
+        if case .failed = appUpdateInstallModel.phase { return true }
+        return false
     }
 
     /// The provider's active (default) account, for the CLI-row chip
@@ -984,6 +1088,26 @@ struct GeneralSettingsPane: View {
             return .active(label: active.label)
         }
         return accounts.isEmpty ? .noAccounts : .noneActive
+    }
+
+    /// The menu-bar pin picker's account rows: every account in the deck
+    /// (provider-prefixed so same-named accounts across providers stay
+    /// distinguishable), plus a placeholder row for a pinned id that no
+    /// longer resolves — SwiftUI Pickers must always contain their current
+    /// selection, and the fallback row keeps a removed account's pin
+    /// visible (and re-pickable away from) instead of rendering blank.
+    private var menuBarAccountOptions: [(id: String, title: String)] {
+        var options = (statusModel.deckState?.accounts ?? []).map { account in
+            let provider = DeckProvider.from(account.provider)?.displayName ?? account.provider
+            return (id: account.id, title: "\(provider) — \(account.label)")
+        }
+        let current = settingsSync.settings.menuBarAccountId
+        // Follow-active sentinels have their own static rows above.
+        if !current.isEmpty && !current.hasPrefix("active:")
+            && !options.contains(where: { $0.id == current }) {
+            options.append((id: current, title: "Removed account"))
+        }
+        return options
     }
 
     /// Threshold choices (daemon validates 1–99). Includes the current value

@@ -130,16 +130,34 @@ public enum AccountsRoster {
     /// `guidanceForAccount` / `errorForAccount` are the deck model's per-
     /// account clobber-guard guidance and generic activation errors — they
     /// fold into the section banner instead of per-row alerts.
+    ///
+    /// `troubleForProvider` (issue #100) is the deck model's provider-level
+    /// trouble record. It backs the per-account lookups up: when the record's
+    /// account has left the roster (removed/re-added mid-recovery, daemon-
+    /// side surgery), the per-account closures can never find it — the
+    /// banner then surfaces the record at the provider level instead of
+    /// letting the activation outcome vanish.
     public static func sections(
         state: DeckState,
         guidanceForAccount: (String) -> String? = { _ in nil },
         errorForAccount: (String) -> String? = { _ in nil },
+        troubleForProvider: (DeckProvider) -> ActivationTrouble? = { _ in nil },
         warningsForProvider: (DeckProvider) -> PostActivationWarnings? = { _ in nil }
     ) -> [AccountsRosterSection] {
         DeckProvider.allCases.compactMap { provider in
             let accounts = state.accounts
                 .filter { DeckProvider.from($0.provider) == provider }
                 .sorted { $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending }
+            // A provider with no accounts renders no section (Direction A
+            // contract) — DELIBERATELY including any orphaned trouble record
+            // it may still hold. Removing the provider's last account is an
+            // explicit, confirmation-gated action whose visible outcome is
+            // the whole section disappearing; a trouble banner in an
+            // otherwise empty section would be a permanent dead end (no
+            // account left to activate means no attempt could ever supersede
+            // it, and its Retry only re-reads state). The record itself
+            // survives in the deck model, so a mid-recovery re-add brings
+            // the orphan fallback back the moment the section exists again.
             guard !accounts.isEmpty else { return nil }
             return AccountsRosterSection(
                 provider: provider,
@@ -149,7 +167,8 @@ public enum AccountsRoster {
                     state: state,
                     accounts: accounts,
                     guidanceForAccount: guidanceForAccount,
-                    errorForAccount: errorForAccount
+                    errorForAccount: errorForAccount,
+                    troubleForProvider: troubleForProvider
                 ),
                 notice: notice(for: provider, warnings: warningsForProvider(provider))
             )
@@ -193,7 +212,8 @@ public enum AccountsRoster {
         state: DeckState,
         accounts: [DeckAccount],
         guidanceForAccount: (String) -> String?,
-        errorForAccount: (String) -> String?
+        errorForAccount: (String) -> String?,
+        troubleForProvider: (DeckProvider) -> ActivationTrouble? = { _ in nil }
     ) -> ProviderActivationBanner? {
         let selected = accounts.first(where: \.isDefault)
         let detail = detailText(for: provider, selectedLabel: selected?.label)
@@ -217,6 +237,22 @@ public enum AccountsRoster {
                 detail: detail,
                 retryRunsActivation: true,
                 affectedAccountID: accountID
+            )
+        }
+        // 2.5 (issue #100): trouble whose account has since left the roster.
+        //    The per-account lookups above can never find it, so surface the
+        //    record at the provider level rather than letting the outcome of
+        //    an activation attempt vanish. [Retry] can't re-run activation
+        //    for an account that no longer exists — it re-reads state.
+        if let trouble = troubleForProvider(provider),
+           !accounts.contains(where: { $0.id == trouble.accountID }) {
+            return ProviderActivationBanner(
+                provider: provider,
+                message: trouble.message
+                    + " (The account this concerns is no longer in the roster.)",
+                detail: detail,
+                retryRunsActivation: false,
+                affectedAccountID: nil
             )
         }
         // 3. The verified activation state. Only providers with an enabled

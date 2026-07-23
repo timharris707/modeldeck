@@ -165,8 +165,42 @@ struct MenuBarIconRendererTests {
         #expect(visible > 10, "placeholder pixels missing")
     }
 
+    /// Pinned account (account percentage picker): the healthy percent is a
+    /// continuous, neutral readout — visible pixels right of the glyph that
+    /// adapt to the menu bar appearance like the glyph, never red/gold.
+    @Test func pinnedStateShowsANeutralAdaptivePercent() throws {
+        let image = MenuBarIconRenderer.labelImage(for: .pinned(percentRemaining: 52))
+        #expect(image.size.width > MenuBarIconRenderer.deckGlyph.size.width + 4)
+        #expect(!image.isTemplate)
+
+        func percentBrightness(_ appearance: NSAppearance.Name) throws -> CGFloat {
+            let rep = try rasterize(image, appearance: appearance)
+            var total: CGFloat = 0
+            var count: CGFloat = 0
+            for x in 19..<rep.pixelsWide {
+                for y in 0..<rep.pixelsHigh {
+                    guard let color = rep.colorAt(x: x, y: y), color.alphaComponent > 0.8 else { continue }
+                    let rgb = color.usingColorSpace(.deviceRGB) ?? color
+                    #expect(!(rgb.redComponent > 0.6 && rgb.blueComponent < 0.4),
+                        "pinned percent must stay neutral, not warm")
+                    total += (rgb.redComponent + rgb.greenComponent + rgb.blueComponent) / 3
+                    count += 1
+                }
+            }
+            #expect(count > 20, "percent pixels missing under \(appearance.rawValue)")
+            return count > 0 ? total / count : 0
+        }
+
+        #expect(try percentBrightness(.aqua) < 0.5, "percent should be dark on the light menu bar")
+        #expect(try percentBrightness(.darkAqua) > 0.5, "percent should be light on the dark menu bar")
+    }
+
     @Test func accessibilityDescriptionsCarryTheState() {
         #expect(MenuBarIconRenderer.labelImage(for: .plain).accessibilityDescription == "ModelDeck")
+        #expect(
+            MenuBarIconRenderer.labelImage(for: .pinned(percentRemaining: 52)).accessibilityDescription
+                == "ModelDeck 52%"
+        )
         #expect(
             MenuBarIconRenderer.labelImage(for: .critical(percentRemaining: 3)).accessibilityDescription
                 == "ModelDeck 3%"

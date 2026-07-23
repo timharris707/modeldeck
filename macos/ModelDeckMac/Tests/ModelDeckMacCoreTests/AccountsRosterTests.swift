@@ -159,6 +159,79 @@ struct AccountsRosterSectionTests {
         #expect(banner?.affectedAccountID == "a2")
     }
 
+    @Test func orphanedTroubleSurfacesAtTheProviderLevel() {
+        // Issue #100: a failure recorded for an account that has since left
+        // the roster (removed/re-added mid-recovery) can never be found by
+        // the per-account lookups — the banner surfaces the record at the
+        // provider level instead of letting the outcome vanish.
+        let s = state(claudeState: "effective", accounts: [
+            account(id: "a1", label: "Work", isDefault: true),
+        ])
+        let sections = AccountsRoster.sections(
+            state: s,
+            troubleForProvider: { provider in
+                provider == .claude
+                    ? ActivationTrouble(
+                        accountID: "ghost",
+                        kind: .error,
+                        message: "Couldn't activate: account not found"
+                    )
+                    : nil
+            }
+        )
+        let banner = sections[0].banner
+        #expect(banner?.message.contains("Couldn't activate: account not found") == true)
+        #expect(banner?.message.contains("no longer in the roster") == true)
+        #expect(banner?.retryRunsActivation == false, "cannot re-activate a vanished account")
+        #expect(banner?.affectedAccountID == nil)
+    }
+
+    @Test func emptyProviderYieldsNoSectionEvenWithOrphanedTrouble() {
+        // Deliberate (CodeRabbit on #126): removing a provider's LAST
+        // account is a confirmation-gated action whose visible outcome is
+        // the whole section disappearing. A trouble banner in an otherwise
+        // empty section would be a permanent dead end — no account left to
+        // activate means nothing could ever supersede it. The record stays
+        // in the model, so re-adding an account surfaces it again (the
+        // remove/re-add recovery case the orphan fallback exists for).
+        let s = state(claudeState: nil, accounts: [
+            account(id: "x1", provider: "codex", label: "Only", isDefault: true),
+        ])
+        let sections = AccountsRoster.sections(
+            state: s,
+            troubleForProvider: { provider in
+                provider == .claude
+                    ? ActivationTrouble(
+                        accountID: "ghost", kind: .error,
+                        message: "Couldn't activate: account not found"
+                    )
+                    : nil
+            }
+        )
+        #expect(sections.map(\.provider) == [.codex])
+        #expect(sections[0].banner == nil)
+    }
+
+    @Test func liveAccountTroubleNeverTakesTheOrphanPath() {
+        // When the trouble's account is still in the roster, the per-account
+        // lookups own the banner — no orphan suffix, row attribution kept.
+        let s = state(claudeState: "effective", accounts: [
+            account(id: "a1", label: "Work", isDefault: true),
+            account(id: "a2", label: "Other"),
+        ])
+        let trouble = ActivationTrouble(
+            accountID: "a2", kind: .error, message: "Couldn't activate: daemon said no."
+        )
+        let sections = AccountsRoster.sections(
+            state: s,
+            errorForAccount: { $0 == trouble.accountID ? trouble.message : nil },
+            troubleForProvider: { $0 == .claude ? trouble : nil }
+        )
+        let banner = sections[0].banner
+        #expect(banner?.message == "Couldn't activate: daemon said no.")
+        #expect(banner?.affectedAccountID == "a2")
+    }
+
     @Test func disabledOnlyProviderGetsNoStateBanner() {
         let s = state(claudeState: "mismatched", accounts: [
             account(id: "a1", label: "Off", enabled: false),

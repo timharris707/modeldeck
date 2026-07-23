@@ -78,41 +78,58 @@ public final class SettingsSyncModel: ObservableObject {
         isSaving = false
     }
 
+    /// Old-daemon tolerance: keys newer than the daemon's settings schema
+    /// come back as "unknown setting: <key>". Each such key is stripped and
+    /// the patch retried, so the rest of the change survives; a patch reduced
+    /// to nothing is a successful no-op (that daemon has no behavior keyed on
+    /// the field anyway). Covers the issue #90 provenance flag and the issue
+    /// #123 menu bar pin.
+    private static let strippableUnknownKeys: [(
+        name: String,
+        isPresent: (DaemonSettingsPatch) -> Bool,
+        strip: (inout DaemonSettingsPatch) -> Void
+    )] = [
+        (
+            "autoRefreshIntervalCustomized",
+            { $0.autoRefreshIntervalCustomized != nil },
+            { $0.autoRefreshIntervalCustomized = nil }
+        ),
+        (
+            "menuBarAccountId",
+            { $0.menuBarAccountId != nil },
+            { $0.menuBarAccountId = nil }
+        ),
+    ]
+
     private func push(_ patch: DaemonSettingsPatch) async {
-        do {
-            let merged = try await sync.pushSettings(patch)
-            settings = merged
-            isLoaded = true
-            lastError = nil
-            onApply?(merged)
-        } catch {
-            let message = Self.message(for: error)
-            // Issue #90 old-daemon tolerance: a pre-#90 daemon rejects the
-            // provenance key ("unknown setting: autoRefreshIntervalCustomized").
-            // The interval choice itself must not be lost to that — strip the
-            // flag and retry once. A flag-only patch simply becomes a no-op
-            // (that daemon has no cap keyed on the flag anyway).
-            if patch.autoRefreshIntervalCustomized != nil,
-               message.localizedCaseInsensitiveContains("unknown setting"),
-               message.localizedCaseInsensitiveContains("autoRefreshIntervalCustomized") {
-                var stripped = patch
-                stripped.autoRefreshIntervalCustomized = nil
-                guard !stripped.isEmpty else {
+        var current = patch
+        // One initial attempt plus at most one retry per strippable key.
+        for _ in 0...Self.strippableUnknownKeys.count {
+            do {
+                let merged = try await sync.pushSettings(current)
+                settings = merged
+                isLoaded = true
+                lastError = nil
+                onApply?(merged)
+                return
+            } catch {
+                let message = Self.message(for: error)
+                guard message.localizedCaseInsensitiveContains("unknown setting"),
+                      let rejected = Self.strippableUnknownKeys.first(where: {
+                          $0.isPresent(current)
+                              && message.localizedCaseInsensitiveContains($0.name)
+                      })
+                else {
+                    lastError = message
+                    return
+                }
+                rejected.strip(&current)
+                guard !current.isEmpty else {
+                    // The rejected key was the whole patch: successful no-op.
                     lastError = nil
                     return
                 }
-                do {
-                    let merged = try await sync.pushSettings(stripped)
-                    settings = merged
-                    isLoaded = true
-                    lastError = nil
-                    onApply?(merged)
-                } catch {
-                    lastError = Self.message(for: error)
-                }
-                return
             }
-            lastError = message
         }
     }
 
@@ -163,6 +180,13 @@ public final class SettingsSyncModel: ObservableObject {
     public func setNotificationThreshold(percent: Int) async {
         guard percent != settings.notificationThresholdPercent else { return }
         await update(DaemonSettingsPatch(notificationThresholdPercent: percent))
+    }
+
+    /// Menu bar percent source: an account id pins the menu bar percentage
+    /// to that account; "" returns to lowest-across-all-accounts.
+    public func setMenuBarAccount(id: String) async {
+        guard id != settings.menuBarAccountId else { return }
+        await update(DaemonSettingsPatch(menuBarAccountId: id))
     }
 
     static func message(for error: Error) -> String {

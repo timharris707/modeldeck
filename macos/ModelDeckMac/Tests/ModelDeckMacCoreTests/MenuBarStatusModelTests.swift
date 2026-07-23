@@ -143,4 +143,92 @@ struct MenuBarStatusModelTests {
         #expect(MenuBarIconState.loading.percentLabel == "–%")
         #expect(MenuBarIconState.plain.percentLabel == nil)
     }
+
+    // MARK: - Pinned menu-bar account (account percentage picker)
+
+    private var pinnedFixtureState: DeckState {
+        DeckState(
+            accounts: [
+                DeckAccount(id: "acct-1", provider: "claude", label: "Medved Instead"),
+                DeckAccount(id: "acct-2", provider: "codex", label: "Insight"),
+            ],
+            usage: [
+                UsageSnapshot(accountId: "acct-1", scope: "week", remainingPercent: 7),
+                UsageSnapshot(accountId: "acct-2", scope: "week", remainingPercent: 52),
+            ]
+        )
+    }
+
+    @Test func pinnedAccountShowsItsPercentContinuously() async {
+        let model = MenuBarStatusModel(evaluator: StubEvaluator(results: []))
+        model.apply(deckState: pinnedFixtureState)
+        // Unpinned: the global worst (7%) drives the icon.
+        #expect(model.iconState == .critical(percentRemaining: 7))
+
+        model.pinnedAccountId = "acct-2"
+        #expect(model.iconState == .pinned(percentRemaining: 52))
+        #expect(model.pinnedAccountLabel == "Insight")
+        // Notifications keep watching the global worst.
+        #expect(model.worstRemaining?.accountId == "acct-1")
+
+        model.pinnedAccountId = nil
+        #expect(model.iconState == .critical(percentRemaining: 7))
+    }
+
+    @Test func pinnedAccountKeepsSeverityColorsBelowThresholds() async {
+        let model = MenuBarStatusModel(evaluator: StubEvaluator(results: []))
+        var state = pinnedFixtureState
+        state.usage = [UsageSnapshot(accountId: "acct-2", scope: "week", remainingPercent: 18)]
+        model.pinnedAccountId = "acct-2"
+        model.apply(deckState: state)
+        #expect(model.iconState == .warning(percentRemaining: 18))
+    }
+
+    @Test func removedPinnedAccountFallsBackToGlobalWorst() async {
+        let model = MenuBarStatusModel(evaluator: StubEvaluator(results: []))
+        model.pinnedAccountId = "acct-gone"
+        model.apply(deckState: pinnedFixtureState)
+        #expect(model.iconState == .critical(percentRemaining: 7))
+        #expect(model.pinnedAccountLabel == nil)
+    }
+
+    @Test func pinnedAccountWithoutUsableDataShowsPlainNotABorrowedNumber() async {
+        let model = MenuBarStatusModel(evaluator: StubEvaluator(results: []))
+        var state = pinnedFixtureState
+        state.usage = [UsageSnapshot(accountId: "acct-1", scope: "week", remainingPercent: 47)]
+        model.pinnedAccountId = "acct-2"
+        model.apply(deckState: state)
+        #expect(model.iconState == .plain)
+    }
+
+    @Test func pinningBeforeFirstLoadKeepsTheLoadingPlaceholder() async {
+        let model = MenuBarStatusModel(evaluator: StubEvaluator(results: []))
+        model.pinnedAccountId = "acct-2"
+        #expect(model.iconState == .loading)
+    }
+
+    @Test func followActivePinTracksActivationSwitches() async {
+        let model = MenuBarStatusModel(evaluator: StubEvaluator(results: []))
+        model.pinnedAccountId = "active:claude"
+        var state = DeckState(
+            accounts: [
+                DeckAccount(id: "cl-1", provider: "claude", label: "Insight", isDefault: true),
+                DeckAccount(id: "cl-2", provider: "claude", label: "Medved Instead"),
+            ],
+            usage: [
+                UsageSnapshot(accountId: "cl-1", scope: "week", remainingPercent: 74),
+                UsageSnapshot(accountId: "cl-2", scope: "week", remainingPercent: 52),
+            ]
+        )
+        model.apply(deckState: state)
+        #expect(model.iconState == .pinned(percentRemaining: 74))
+        #expect(model.pinnedAccountLabel == "Insight")
+
+        // Activation flips to the other account — the pin follows.
+        state.accounts[0].isDefault = false
+        state.accounts[1].isDefault = true
+        model.apply(deckState: state)
+        #expect(model.iconState == .pinned(percentRemaining: 52))
+        #expect(model.pinnedAccountLabel == "Medved Instead")
+    }
 }

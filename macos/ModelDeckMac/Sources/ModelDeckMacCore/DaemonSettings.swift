@@ -22,6 +22,10 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
     public var defaultSort: String
     public var notificationThresholdPercent: Int
     public var menuBarStyle: String
+    /// Menu bar percent source: "" = lowest remaining across all enabled
+    /// accounts (original behavior); an account id pins the menu bar
+    /// percentage to that single account, shown continuously.
+    public var menuBarAccountId: String
 
     /// Mirrors src/db.mjs DEFAULT_SETTINGS exactly.
     public static let defaults = DaemonSettings(
@@ -32,7 +36,8 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         layout: DeckLayout.twoColumn.rawValue,
         defaultSort: DeckSortOrder.nextReset.rawValue,
         notificationThresholdPercent: 25,
-        menuBarStyle: "icon-only"
+        menuBarStyle: "icon-only",
+        menuBarAccountId: ""
     )
 
     public init(
@@ -43,7 +48,8 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         layout: String,
         defaultSort: String,
         notificationThresholdPercent: Int,
-        menuBarStyle: String
+        menuBarStyle: String,
+        menuBarAccountId: String = ""
     ) {
         self.autoRefreshEnabled = autoRefreshEnabled
         self.autoRefreshIntervalSeconds = autoRefreshIntervalSeconds
@@ -53,6 +59,7 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         self.defaultSort = defaultSort
         self.notificationThresholdPercent = notificationThresholdPercent
         self.menuBarStyle = menuBarStyle
+        self.menuBarAccountId = menuBarAccountId
     }
 
     public init(from decoder: Decoder) throws {
@@ -71,6 +78,8 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         notificationThresholdPercent = try container.decodeIfPresent(Int.self, forKey: .notificationThresholdPercent)
             ?? defaults.notificationThresholdPercent
         menuBarStyle = try container.decodeIfPresent(String.self, forKey: .menuBarStyle) ?? defaults.menuBarStyle
+        menuBarAccountId = try container.decodeIfPresent(String.self, forKey: .menuBarAccountId)
+            ?? defaults.menuBarAccountId
     }
 
     /// Typed view of `layout`; falls back to the locked two-column default.
@@ -97,6 +106,12 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
     public var effectiveAutoRefreshInterval: TimeInterval {
         autoRefreshEnabled ? TimeInterval(autoRefreshIntervalSeconds) : 0
     }
+
+    /// The pinned menu-bar account id; nil when the menu bar follows the
+    /// lowest remaining % across all accounts (the "" sentinel).
+    public var menuBarPinnedAccountId: String? {
+        menuBarAccountId.isEmpty ? nil : menuBarAccountId
+    }
 }
 
 /// A partial update for `PUT /api/settings`. Only non-nil fields are encoded,
@@ -116,6 +131,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
     public var defaultSort: String?
     public var notificationThresholdPercent: Int?
     public var menuBarStyle: String?
+    public var menuBarAccountId: String?
 
     public init(
         autoRefreshEnabled: Bool? = nil,
@@ -125,7 +141,8 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         layout: String? = nil,
         defaultSort: String? = nil,
         notificationThresholdPercent: Int? = nil,
-        menuBarStyle: String? = nil
+        menuBarStyle: String? = nil,
+        menuBarAccountId: String? = nil
     ) {
         self.autoRefreshEnabled = autoRefreshEnabled
         self.autoRefreshIntervalSeconds = autoRefreshIntervalSeconds
@@ -135,6 +152,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         self.defaultSort = defaultSort
         self.notificationThresholdPercent = notificationThresholdPercent
         self.menuBarStyle = menuBarStyle
+        self.menuBarAccountId = menuBarAccountId
     }
 
     /// Later fields win; used to coalesce patches queued behind an
@@ -148,7 +166,8 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
             layout: other.layout ?? layout,
             defaultSort: other.defaultSort ?? defaultSort,
             notificationThresholdPercent: other.notificationThresholdPercent ?? notificationThresholdPercent,
-            menuBarStyle: other.menuBarStyle ?? menuBarStyle
+            menuBarStyle: other.menuBarStyle ?? menuBarStyle,
+            menuBarAccountId: other.menuBarAccountId ?? menuBarAccountId
         )
     }
 
@@ -162,17 +181,18 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         try container.encodeIfPresent(defaultSort, forKey: .defaultSort)
         try container.encodeIfPresent(notificationThresholdPercent, forKey: .notificationThresholdPercent)
         try container.encodeIfPresent(menuBarStyle, forKey: .menuBarStyle)
+        try container.encodeIfPresent(menuBarAccountId, forKey: .menuBarAccountId)
     }
 
     enum CodingKeys: String, CodingKey {
         case autoRefreshEnabled, autoRefreshIntervalSeconds, autoRefreshIntervalCustomized, pauseWhileActive
-        case layout, defaultSort, notificationThresholdPercent, menuBarStyle
+        case layout, defaultSort, notificationThresholdPercent, menuBarStyle, menuBarAccountId
     }
 
     public var isEmpty: Bool {
         autoRefreshEnabled == nil && autoRefreshIntervalSeconds == nil
             && autoRefreshIntervalCustomized == nil && pauseWhileActive == nil
             && layout == nil && defaultSort == nil && notificationThresholdPercent == nil
-            && menuBarStyle == nil
+            && menuBarStyle == nil && menuBarAccountId == nil
     }
 }
