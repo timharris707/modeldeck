@@ -444,7 +444,17 @@ struct AccountRosterRow: View {
                             // Issue #65: the usage-fingerprint check says two
                             // profiles hold the same login — hollow marker
                             // here, details in the section banner below.
-                            DuplicateTokenMarkerView()
+                            // Issue #152: the marker's explanation names this
+                            // profile and carries the same "Re-log in…"
+                            // action as the row's button — it starts the
+                            // roster's existing sign-in flow directly.
+                            DuplicateTokenMarkerView(
+                                explanation: .duplicateToken(
+                                    reloginLabel: account.label,
+                                    provider: DeckProvider.from(account.provider)
+                                ),
+                                onRelogin: onSignIn
+                            )
                         }
                         if account.isIdentitySeeded {
                             Text("seeded")
@@ -607,22 +617,59 @@ struct AccountRosterRow: View {
                 .accessibilityLabel("Cancel sign-in for \(account.label)")
             }
         case nil:
-            if account.healthChip == .signInAgain {
+            // Issue #149: the idle-decay chip shares this branch verbatim —
+            // same one-click flow, same slot; only wording and color calm
+            // down. `.signInAgain` (genuine sign-out, or an old daemon
+            // without the reason field) keeps the amber chip unchanged.
+            if account.healthChip == .signInAgain || account.healthChip == .idleSignIn {
                 if let onSignIn {
                     Button(action: onSignIn) {
-                        HealthChipView(chip: .signInAgain)
+                        HealthChipView(chip: account.healthChip)
                     }
                     .buttonStyle(.plain)
-                    .help(signInAgainHelp(
-                        base: "Launch \(DeckProvider.from(account.provider)?.displayName ?? "the provider")'s own login for this account in Terminal"
-                    ))
-                    .accessibilityLabel("Sign in again: \(account.label)")
+                    .help(signInAgainHelp(base: signInChipActionableHelp))
+                    .accessibilityLabel(signInChipAccessibilityLabel)
                 } else {
-                    HealthChipView(chip: .signInAgain)
-                        .help(signInAgainHelp(base: "This account needs a fresh sign-in"))
+                    HealthChipView(chip: account.healthChip)
+                        .help(signInAgainHelp(base: account.healthChip == .idleSignIn
+                            ? "This account's sign-in renews when it is next used; its usage data is paused until then"
+                            : "This account needs a fresh sign-in"))
                 }
+            } else if account.hasDuplicateToken, let onSignIn {
+                // Issue #152 (Tim: "I need something clickable to fix the
+                // issue"): a duplicate-flagged row keeps its honest Unknown
+                // chip semantics (the account IS signed in — just as a
+                // shared login), so the clickable remedy renders as its own
+                // small button in the same slot. It runs the roster's
+                // EXISTING sign-in flow (daemon-built profile-scoped login
+                // in Terminal); re-logging either duplicate under its
+                // correct account clears both. Nothing automatic.
+                Button("Re-log in", action: onSignIn)
+                    .controlSize(.small)
+                    .help(DuplicateTokenMarker.reloginHint(
+                        label: account.label,
+                        providerName: DeckProvider.from(account.provider)?.displayName ?? "the provider"
+                    ))
+                    .accessibilityLabel("Re-log in \(account.label)")
             }
         }
+    }
+
+    /// Issue #149: the clickable chip's base tooltip, honest per tone. Both
+    /// launch the exact same provider login in Terminal.
+    private var signInChipActionableHelp: String {
+        let providerName = DeckProvider.from(account.provider)?.displayName ?? "the provider"
+        if account.healthChip == .idleSignIn {
+            return "This account's sign-in renews when it is next used; its usage data is paused until then. Launch \(providerName)'s own login in Terminal to refresh now"
+        }
+        return "Launch \(providerName)'s own login for this account in Terminal"
+    }
+
+    /// Issue #149: VoiceOver hears WHICH case it is, then the same action.
+    private var signInChipAccessibilityLabel: String {
+        account.healthChip == .idleSignIn
+            ? "Idle, sign-in renews on next use. Sign in now: \(account.label)"
+            : "Sign in again: \(account.label)"
     }
 
     /// Issue #99: `.activating` names the pre-login account flip honestly
@@ -660,6 +707,8 @@ struct HealthChipView: View {
         switch chip {
         case .healthy: return .green
         case .signInAgain: return .orange
+        // Issue #149: idle-decay is calm by design — neutral, never amber.
+        case .idleSignIn: return .secondary
         case .unknown: return .secondary
         }
     }

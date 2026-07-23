@@ -223,6 +223,22 @@ struct ModelDeckMacApp: App {
                 await signInModel?.beginSignIn(account: account)
             }
         }
+        // Issue #152: the duplicate-login warning's "Re-log in" button runs
+        // the SAME flow — resolve the id against fresh state (no-op when the
+        // flag cleared or the account vanished), then the existing
+        // beginSignIn launches the provider's own profile-scoped login
+        // (CODEX_HOME=<profileRef> codex login / the Claude equivalent) in
+        // Terminal for the user to complete. Never touches tokens or
+        // running sessions; nothing automatic.
+        deckModel.onDuplicateRelogin = { [weak statusModel, weak signInModel] accountID in
+            guard let account = DeckPopoverModel.duplicateReloginTarget(
+                accountID: accountID,
+                state: statusModel?.deckState
+            ) else { return }
+            Task { @MainActor [weak signInModel] in
+                await signInModel?.beginSignIn(account: account)
+            }
+        }
         signInModel.onSignedIn = { [weak toolsModel] in
             Task { @MainActor [weak toolsModel] in
                 await toolsModel?.load(refresh: false)

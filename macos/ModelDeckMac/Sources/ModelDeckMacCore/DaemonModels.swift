@@ -48,6 +48,12 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
     /// daemon clears it on the next success. Optional by design: a daemon
     /// without the error-propagation backend omits it.
     public var lastRefreshError: AccountRefreshError?
+    /// Issue #149: WHY the daemon reported `signin-required` — "expired"
+    /// (stored sign-in present but idle-decayed; the provider CLI renews it
+    /// the next time the account is used) vs "missing" (the only genuine
+    /// sign-out). Optional by design: an old daemon omits it and the account
+    /// renders exactly the pre-#149 alarming treatment.
+    public var signinReason: String?
 
     public init(
         id: String,
@@ -61,7 +67,8 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         isDefault: Bool = false,
         metadata: DeckAccountMetadata? = nil,
         authState: String? = nil,
-        lastRefreshError: AccountRefreshError? = nil
+        lastRefreshError: AccountRefreshError? = nil,
+        signinReason: String? = nil
     ) {
         self.id = id
         self.provider = provider
@@ -75,6 +82,7 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         self.metadata = metadata
         self.authState = authState
         self.lastRefreshError = lastRefreshError
+        self.signinReason = signinReason
     }
 
     /// Per-account health chip (issue #32): each roster row reads its OWN
@@ -88,10 +96,18 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
     /// — the account IS signed in; macOS refused the daemon's read. Its
     /// dedicated recovery notice renders on the deck card, and the chip's
     /// tooltip carries the honest `lastRefreshError` message.
+    /// Issue #149: `signin-required` splits by the daemon's additive
+    /// `signinReason` — "expired" is idle-decay (credentials present, the
+    /// provider CLI renews them on next use) and earns the calm idle chip;
+    /// any other reason, or none at all (old daemon), keeps the alarming
+    /// "Sign in again" verbatim as the conservative default. Reason-based,
+    /// never activation-based: an ACTIVE account with an expired token is
+    /// idle too.
     public var healthChip: ToolProbe.HealthChip {
         switch authState {
         case "ok": return .healthy
-        case "signin-required": return .signInAgain
+        case "signin-required":
+            return signinReason?.lowercased() == "expired" ? .idleSignIn : .signInAgain
         default: return .unknown
         }
     }

@@ -124,6 +124,18 @@ public enum DuplicateTokenMarker {
     /// ("state — caption").
     public static let accessibilityLabel =
         "Duplicate login warning — two profiles appear to hold the same login; redo /login for one"
+
+    /// Issue #152 (Tim, live deck): the warning "doesn't help me fix it…
+    /// I need something clickable". The explanation popover now carries a
+    /// "Re-log in" button; this hint says WHICH profile the button re-logs
+    /// and why either member of the duplicate pair works — the ambiguity Tim
+    /// hit ("which one do I fix?") answered in one short line. The button
+    /// only launches the provider's own login flow (never touches tokens or
+    /// running sessions).
+    public static func reloginHint(label: String, providerName: String) -> String {
+        "Re-log in opens \(providerName)'s own login for \(label). "
+            + "Re-logging either duplicate under its correct account clears both."
+    }
 }
 
 /// Compact per-provider notice for Settings → Accounts (issue #55 item 3):

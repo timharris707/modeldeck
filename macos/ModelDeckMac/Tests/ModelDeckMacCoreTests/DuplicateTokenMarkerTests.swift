@@ -60,6 +60,16 @@ struct DuplicateTokenFlagTests {
         #expect(DuplicateTokenMarker.accessibilityLabel.contains("redo /login for one"))
     }
 
+    @Test func reloginHintNamesTheProfileAndTheEitherMemberResolution() {
+        // Issue #152: the pinned hint behind the "Re-log in" action — it
+        // must name WHICH profile the button re-logs and that re-logging
+        // either member of the duplicate pair under its correct account
+        // resolves both. Placeholder labels only.
+        #expect(DuplicateTokenMarker.reloginHint(label: "Work", providerName: "Codex")
+            == "Re-log in opens Codex's own login for Work. "
+            + "Re-logging either duplicate under its correct account clears both.")
+    }
+
     // MARK: - Deck card VoiceOver label (CodeRabbit on PR #79): the card
     // Button's EXPLICIT accessibility label suppresses the child marker's
     // own label, so the row label must speak the duplicate-token state.

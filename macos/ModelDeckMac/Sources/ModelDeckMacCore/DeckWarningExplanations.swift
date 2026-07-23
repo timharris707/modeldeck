@@ -19,7 +19,9 @@ public enum DeckWarningTopic: Hashable, Sendable {
     case staleData
     /// The per-card Keychain recovery notice (issue #98).
     case keychainAccess
-    /// The per-card "Sign in needed" notice (issues #114/#118).
+    /// The per-card sign-in notice (issues #114/#118) — both #149 tones
+    /// ("Sign in needed" and the calm idle variant) share this one topic:
+    /// same affordance, same popover, same one-click action.
     case signInRequired
     /// The footer's slowed-refresh tortoise indicator (issue #90).
     case refreshCadence
@@ -61,11 +63,25 @@ public struct DeckWarningExplanation: Equatable, Sendable {
     /// The duplicate-login marker's explanation (issue #65): the marker
     /// caption as the lead sentence, then the accounts-banner [Why?] detail
     /// — both verbatim from their single sources.
-    public static func duplicateToken() -> DeckWarningExplanation {
-        DeckWarningExplanation(
-            title: "Duplicate login",
-            body: "\(DuplicateTokenMarker.caption).\n\n\(AccountsRoster.duplicateTokenDetail)"
-        )
+    ///
+    /// Issue #152: when the explanation carries the "Re-log in" action
+    /// (`reloginLabel` non-nil), one more line names the exact profile the
+    /// button re-logs and states that re-logging either member of the
+    /// duplicate pair under its correct account clears both — the ambiguity
+    /// Tim hit. Still single-source: the hint is
+    /// `DuplicateTokenMarker.reloginHint`, verbatim.
+    public static func duplicateToken(
+        reloginLabel: String? = nil,
+        provider: DeckProvider? = nil
+    ) -> DeckWarningExplanation {
+        var body = "\(DuplicateTokenMarker.caption).\n\n\(AccountsRoster.duplicateTokenDetail)"
+        if let reloginLabel {
+            body += "\n\n" + DuplicateTokenMarker.reloginHint(
+                label: reloginLabel,
+                providerName: provider?.displayName ?? "the provider"
+            )
+        }
+        return DeckWarningExplanation(title: "Duplicate login", body: body)
     }
 
     /// A stale card line's explanation (issue #89): the existing tooltip,
@@ -81,11 +97,13 @@ public struct DeckWarningExplanation: Equatable, Sendable {
         DeckWarningExplanation(title: recovery.text, body: recovery.tooltip)
     }
 
-    /// The "Sign in needed" notice's explanation (issues #114/#118): the
-    /// notice text as title, the existing recovery tooltip as body — the
-    /// same verbatim-reuse contract as every other builder here. The
-    /// explanation popover additionally carries the #118 "Sign in again…"
-    /// primary action, which is presentation (view-side), not copy.
+    /// The sign-in notice's explanation (issues #114/#118): the notice text
+    /// as title, the existing recovery tooltip as body — the same
+    /// verbatim-reuse contract as every other builder here. The explanation
+    /// popover additionally carries the #118 "Sign in again…" primary
+    /// action, which is presentation (view-side), not copy. Issue #149:
+    /// both tones flow through unchanged — the recovery already carries the
+    /// tone-honest title and body, so this builder needs no split.
     public static func signIn(_ recovery: DeckFreshness.SignInRecovery) -> DeckWarningExplanation {
         DeckWarningExplanation(title: recovery.text, body: recovery.tooltip)
     }

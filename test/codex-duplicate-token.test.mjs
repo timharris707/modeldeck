@@ -228,6 +228,11 @@ test('duplicate-token outranks the signin-required refresh error, matching the C
       ['Lending', 'duplicate-token'],
       ['Personal', 'ok'],
     ]);
+    // Issue #149: while duplicate-token outranks, the additive signinReason
+    // never rides along — it exists only beside signin-required.
+    let insight = (await data.service.accountsWithAuthState())
+      .find((account) => account.label === 'Insight');
+    assert.equal('signinReason' in insight, false);
     // And once the duplicate clears, the recorded error surfaces honestly.
     data.writeAuth('insight', 'acct-placeholder-relogged');
     await data.service.refreshCodex();
@@ -236,5 +241,10 @@ test('duplicate-token outranks the signin-required refresh error, matching the C
       ['Lending', 'ok'],
       ['Personal', 'ok'],
     ]);
+    // Issue #149: the Codex sign-in message has no expired prefix, so the
+    // reason stays the conservative "missing" (today's alarm treatment).
+    insight = (await data.service.accountsWithAuthState())
+      .find((account) => account.label === 'Insight');
+    assert.equal(insight.signinReason, 'missing');
   } finally { data.close(); }
 });

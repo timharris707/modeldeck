@@ -35,22 +35,29 @@ public struct ToolProbe: Codable, Equatable, Sendable {
 
     /// Health chip per the spec's Accounts pane: "Healthy" / "Sign in again"
     /// (plus an honest "Unknown" when the probe couldn't tell).
+    /// Issue #149 adds the calm `idleSignIn` variant for per-ACCOUNT chips
+    /// whose signin-required carries `signinReason: "expired"` — idle-decay,
+    /// not a sign-out. Same one-click sign-in path, calmer presentation.
     public enum HealthChip: Equatable, Sendable {
         case healthy
         case signInAgain
+        case idleSignIn
         case unknown
 
         public var text: String {
             switch self {
             case .healthy: return "Healthy"
             case .signInAgain: return "Sign in again"
+            case .idleSignIn: return "Idle — renews on next use"
             case .unknown: return "Unknown"
             }
         }
     }
 
     /// Maps the daemon's auth states (src/service.mjs: "ok" /
-    /// "signin-required" / "unknown") onto the chip.
+    /// "signin-required" / "unknown") onto the chip. The provider-level
+    /// probe carries no `signinReason`, so it never yields the #149 idle
+    /// chip — that split lives on `DeckAccount.healthChip`.
     public var healthChip: HealthChip {
         switch authState {
         case "ok": return .healthy

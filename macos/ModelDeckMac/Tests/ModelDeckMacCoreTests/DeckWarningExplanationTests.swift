@@ -185,6 +185,29 @@ struct WarningExplanationContentTests {
         #expect(explanation.body == "\(DuplicateTokenMarker.caption).\n\n\(AccountsRoster.duplicateTokenDetail)")
     }
 
+    @Test func duplicateTokenWithReloginLabelAppendsThePinnedHint() {
+        // Issue #152: when the explanation carries the "Re-log in" action,
+        // one more line names the profile the button re-logs — verbatim from
+        // DuplicateTokenMarker.reloginHint, never popover-local copy.
+        // Placeholder labels only.
+        let explanation = DeckWarningExplanation.duplicateToken(
+            reloginLabel: "Work", provider: .codex
+        )
+        #expect(explanation.title == "Duplicate login")
+        #expect(explanation.body ==
+            "\(DuplicateTokenMarker.caption).\n\n\(AccountsRoster.duplicateTokenDetail)"
+            + "\n\n\(DuplicateTokenMarker.reloginHint(label: "Work", providerName: "Codex"))")
+    }
+
+    @Test func duplicateTokenReloginHintWithoutAProviderStaysGeneric() {
+        // An unknown provider string must never invent a provider name.
+        let explanation = DeckWarningExplanation.duplicateToken(
+            reloginLabel: "Work", provider: nil
+        )
+        #expect(explanation.body.contains(
+            DuplicateTokenMarker.reloginHint(label: "Work", providerName: "the provider")))
+    }
+
     @Test func staleReusesTheTooltipVerbatim() {
         let staleness = DeckFreshness.CardStaleness(
             text: "Data from 16 hr ago",
@@ -212,6 +235,19 @@ struct WarningExplanationContentTests {
         let explanation = DeckWarningExplanation.signIn(recovery)
         #expect(explanation.title == recovery.text)
         #expect(explanation.title == "Sign in needed")
+        #expect(explanation.body == recovery.tooltip)
+    }
+
+    @Test func signInReusesTheIdleToneVerbatimToo() {
+        // Issue #149: the calm idle tone flows through the SAME builder —
+        // same affordance, same popover anatomy, tone-honest strings only.
+        let account = DeckAccount(
+            id: "a", provider: "claude", label: "Studio",
+            authState: "signin-required", signinReason: "expired"
+        )
+        let recovery = DeckFreshness.signInRecovery(for: account)!
+        let explanation = DeckWarningExplanation.signIn(recovery)
+        #expect(explanation.title == "Idle — renews on next use")
         #expect(explanation.body == recovery.tooltip)
     }
 
@@ -355,9 +391,16 @@ struct SignInAgainActionTests {
         return DeckPopoverModel(defaults: defaults)
     }
 
-    private func row(id: String, authState: String? = "signin-required") -> DeckAccountRow {
+    private func row(
+        id: String,
+        authState: String? = "signin-required",
+        signinReason: String? = nil
+    ) -> DeckAccountRow {
         DeckAccountRow(
-            account: DeckAccount(id: id, provider: "claude", label: "Client", authState: authState),
+            account: DeckAccount(
+                id: id, provider: "claude", label: "Client",
+                authState: authState, signinReason: signinReason
+            ),
             provider: .claude,
             windows: [],
             isActive: false
@@ -413,6 +456,31 @@ struct SignInAgainActionTests {
         #expect(DeckPopoverModel.signInAgainTarget(accountID: "acct-1", state: state) == account)
     }
 
+    @Test func requestFiresFromTheIdleNoticeToo() {
+        // Issue #149 (Tim directive): the calm idle tone must drive the
+        // EXACT same one-click flow — the split never weakens the recovery
+        // loop. Same handler, same account targeting, same pane routing.
+        let model = model()
+        var requested: [String] = []
+        model.onSignInAgain = { requested.append($0) }
+        model.settingsPane = .general
+        model.requestSignInAgain(for: row(id: "acct-3", signinReason: "expired"))
+        #expect(requested == ["acct-3"])
+        #expect(model.settingsPane == .accounts)
+    }
+
+    @Test func signInAgainTargetResolvesIdleAccountsToo() {
+        // Issue #149: the resolver keys on the same signInRecovery
+        // derivation, so an idle-decayed ("expired") account is a valid
+        // sign-in target exactly like a signed-out one.
+        let idle = DeckAccount(
+            id: "acct-1", provider: "claude", label: "Client",
+            authState: "signin-required", signinReason: "expired"
+        )
+        let state = DeckState(accounts: [idle], usage: [])
+        #expect(DeckPopoverModel.signInAgainTarget(accountID: "acct-1", state: state) == idle)
+    }
+
     @Test func signInAgainTargetNoOpsWhenTheAccountRecoveredMeanwhile() {
         // CodeRabbit on #119: a render-time click can dispatch after a
         // verified sign-in already landed in fresh state — the resolver must
@@ -443,5 +511,112 @@ struct SignInAgainActionTests {
             cadenceNoticeVisible: false
         )
         #expect(live.contains(DeckWarningID(topic: .signInRequired, elementID: "acct-1")))
+    }
+}
+
+// Issue #152 — the duplicate-login warning's "Re-log in" one-click path:
+// the exact #118 anatomy with the guard keyed on the duplicate flag. Tim,
+// live: "it doesn't help me fix it or resolve it… I need something
+// clickable to fix the issue, not just telling me there's an issue."
+// Placeholder identities only — never real account data.
+@Suite("Duplicate re-login from the deck (issue #152)")
+@MainActor
+struct DuplicateReloginActionTests {
+    private func model() -> DeckPopoverModel {
+        let defaults = UserDefaults(suiteName: "dup-relogin-tests-\(UUID().uuidString)")!
+        return DeckPopoverModel(defaults: defaults)
+    }
+
+    private func row(
+        id: String,
+        provider: String = "codex",
+        authState: String? = "duplicate-token"
+    ) -> DeckAccountRow {
+        DeckAccountRow(
+            account: DeckAccount(
+                id: id, provider: provider, label: "Work", authState: authState
+            ),
+            provider: DeckProvider.from(provider),
+            windows: [],
+            isActive: false
+        )
+    }
+
+    @Test func requestTargetsExactlyTheClickedAccount() {
+        let model = model()
+        var requested: [String] = []
+        model.onDuplicateRelogin = { requested.append($0) }
+        model.requestDuplicateRelogin(for: row(id: "codex-2"))
+        #expect(requested == ["codex-2"])
+    }
+
+    @Test func requestDismissesThePresentedExplanation() {
+        let model = model()
+        model.toggleWarning(DeckWarningID(topic: .duplicateToken, elementID: "codex-1"))
+        model.onDuplicateRelogin = { _ in }
+        model.requestDuplicateRelogin(for: row(id: "codex-1"))
+        #expect(model.presentedWarning == nil)
+    }
+
+    @Test func requestRoutesSettingsToTheAccountsPane() {
+        let model = model()
+        model.settingsPane = .general
+        model.requestDuplicateRelogin(for: row(id: "codex-1"))
+        #expect(model.settingsPane == .accounts)
+    }
+
+    @Test func requestNoOpsWhenTheFlagAlreadyCleared() {
+        // A corrective /login landed between render and click: launching
+        // another login for a healthy account would be noise. The dismissal
+        // still happens (the popover the button lived in closes).
+        let model = model()
+        model.toggleWarning(DeckWarningID(topic: .duplicateToken, elementID: "codex-1"))
+        var fired = false
+        model.onDuplicateRelogin = { _ in fired = true }
+        model.requestDuplicateRelogin(for: row(id: "codex-1", authState: "ok"))
+        #expect(!fired)
+        #expect(model.presentedWarning == nil)
+    }
+
+    @Test func requestWithoutAHandlerIsSafe() {
+        let model = model()
+        model.requestDuplicateRelogin(for: row(id: "codex-1")) // no crash
+        #expect(model.settingsPane == .accounts)
+    }
+
+    @Test func requestWorksForClaudeDuplicatesToo() {
+        // The mechanism is provider-generic, exactly like the #65/#108
+        // marker itself — one re-login path, both providers.
+        let model = model()
+        var requested: [String] = []
+        model.onDuplicateRelogin = { requested.append($0) }
+        model.requestDuplicateRelogin(for: row(id: "claude-1", provider: "claude"))
+        #expect(requested == ["claude-1"])
+    }
+
+    @Test func reloginTargetResolvesAgainstFreshState() {
+        let account = DeckAccount(
+            id: "codex-1", provider: "codex", label: "Work", authState: "duplicate-token"
+        )
+        let state = DeckState(accounts: [account], usage: [])
+        #expect(DeckPopoverModel.duplicateReloginTarget(accountID: "codex-1", state: state) == account)
+    }
+
+    @Test func reloginTargetNoOpsWhenTheFlagClearedMeanwhile() {
+        // Same never-diverge contract as signInAgainTarget: the resolver
+        // keys on the SAME hasDuplicateToken derivation the marker renders
+        // from, so a stale click never launches a login for a resolved pair.
+        let resolved = DeckAccount(id: "codex-1", provider: "codex", label: "Work", authState: "ok")
+        let state = DeckState(accounts: [resolved], usage: [])
+        #expect(DeckPopoverModel.duplicateReloginTarget(accountID: "codex-1", state: state) == nil)
+    }
+
+    @Test func reloginTargetNoOpsWhenTheAccountVanished() {
+        let state = DeckState(
+            accounts: [DeckAccount(id: "other", provider: "codex", label: "Second")],
+            usage: []
+        )
+        #expect(DeckPopoverModel.duplicateReloginTarget(accountID: "codex-1", state: state) == nil)
+        #expect(DeckPopoverModel.duplicateReloginTarget(accountID: "codex-1", state: nil) == nil)
     }
 }

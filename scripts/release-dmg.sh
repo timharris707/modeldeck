@@ -100,7 +100,12 @@ locate_sign_update() {
     echo "$MD_SPARKLE_SIGN_UPDATE"
     return
   fi
-  find "$PACKAGE_DIR/.build/artifacts" -type f -name sign_update 2>/dev/null | head -1
+  # `|| true`: in a pristine worktree .build/artifacts does not exist yet, so
+  # find exits nonzero; under pipefail that status escapes through the
+  # callers' command substitutions and set -e kills the script with NO
+  # message, before the intended loud "tool not found" fail. Empty output is
+  # the not-found signal — the callers check for it.
+  find "$PACKAGE_DIR/.build/artifacts" -type f -name sign_update 2>/dev/null | head -1 || true
 }
 
 # Generates <dir-of-dmg>/appcast.xml for a ModelDeck-<version>.dmg.
@@ -259,12 +264,24 @@ security find-identity -v -p codesigning | grep -Fq "$IDENTITY" \
 xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1 \
   || fail "notarytool profile '$NOTARY_PROFILE' missing or not accepted by Apple"
 
+# A pristine release worktree has no .build/artifacts until SwiftPM has
+# resolved packages, so the Sparkle tools below genuinely cannot exist yet
+# (the v0.3.2 release hit exactly this). Resolve first so the preflight
+# checks the real post-resolve state instead of failing on a fresh checkout.
+if [[ ! -d "$PACKAGE_DIR/.build/artifacts" ]]; then
+  echo "==> swift package resolve (SwiftPM artifacts not present yet)"
+  swift package resolve --package-path "$PACKAGE_DIR" \
+    || fail "swift package resolve failed — cannot locate the Sparkle tools for the preflight"
+fi
+
 # Issue #121: the Sparkle EdDSA PUBLIC key must be stamped into the app's
 # Info.plist (SUPublicEDKey) or shipped updates can never verify. Explicit
 # env wins; otherwise derive it from the Keychain via generate_keys -p.
+# `|| true` on the find pipeline for the same reason as locate_sign_update:
+# a missing artifacts dir must reach the loud fail below, not a silent exit.
 SPARKLE_PUBLIC_KEY="${MD_SPARKLE_PUBLIC_ED_KEY:-}"
 if [[ -z "$SPARKLE_PUBLIC_KEY" ]]; then
-  GENERATE_KEYS="$(find "$PACKAGE_DIR/.build/artifacts" -type f -name generate_keys 2>/dev/null | head -1)"
+  GENERATE_KEYS="$(find "$PACKAGE_DIR/.build/artifacts" -type f -name generate_keys 2>/dev/null | head -1 || true)"
   if [[ -n "$GENERATE_KEYS" && -x "$GENERATE_KEYS" ]]; then
     SPARKLE_PUBLIC_KEY="$("$GENERATE_KEYS" -p 2>/dev/null | tail -1 | tr -d '[:space:]')" || true
   fi
@@ -331,6 +348,22 @@ cp "$APP_ICON" "$APP/Contents/Resources/ModelDeck.icns"
 RESOURCE_BUNDLE="$(dirname "$BIN")/ModelDeckMac_ModelDeckMacCore.bundle"
 [[ -d "$RESOURCE_BUNDLE" ]] || fail "SwiftPM resource bundle not found at $RESOURCE_BUNDLE"
 cp -R "$RESOURCE_BUNDLE" "$APP/Contents/Resources/"
+PACKAGED_BUNDLE="$APP/Contents/Resources/ModelDeckMac_ModelDeckMacCore.bundle"
+# Issue #151 belt-and-braces: Package.swift's defaultLocalization makes
+# SwiftPM generate the bundle's Info.plist; if a toolchain change ever drops
+# it again, synthesize a minimal plist here rather than package a directory
+# Bundle(url:) rejects (the v0.3.3 SIGTRAP). The preflight below still
+# fails the release if neither path produced a printable plist.
+if [[ ! -f "$PACKAGED_BUNDLE/Info.plist" && ! -f "$PACKAGED_BUNDLE/Contents/Info.plist" ]]; then
+  echo "==> WARNING: SwiftPM emitted no Info.plist in the resource bundle; synthesizing a minimal one (issue #151)"
+  /usr/libexec/PlistBuddy \
+    -c "Add :CFBundleIdentifier string app.modeldeck.mac.ModelDeckMacCore.resources" \
+    -c "Add :CFBundleName string ModelDeckMac_ModelDeckMacCore" \
+    -c "Add :CFBundlePackageType string BNDL" \
+    -c "Add :CFBundleDevelopmentRegion string en" \
+    "$PACKAGED_BUNDLE/Info.plist" >/dev/null \
+    || fail "could not synthesize the resource bundle Info.plist"
+fi
 cp "$DAEMON_BINARY" "$APP/Contents/Resources/daemon/modeldeckd"
 chmod 755 "$APP/Contents/Resources/daemon/modeldeckd"
 # Issue #96: the manifest travels with the binary — the app compares its
@@ -375,6 +408,34 @@ if otool -l "$APP_MAIN_BIN" | grep -q "path $BUILD_RPATH "; then
 fi
 /usr/libexec/PlistBuddy -c "Set :SUPublicEDKey $SPARKLE_PUBLIC_KEY" "$APP/Contents/Info.plist" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $SPARKLE_PUBLIC_KEY" "$APP/Contents/Info.plist"
+
+# --------------------------------- resource-bundle preflight (issue #151)
+# v0.3.3 shipped ModelDeckMac_ModelDeckMacCore.bundle as loose PNGs with NO
+# Info.plist; macOS Bundle(url:) rejected the directory, the generated
+# Bundle.module accessor exhausted its candidates, and the app trapped
+# (SIGTRAP) on the first popover open — 100% repro in the field (public
+# report modeldeck#1). Refuse to sign a bundle that would trap: the plist
+# must EXIST (NB: `PlistBuddy -c Print` on a missing path happily CREATES
+# an empty file and exits 0, so existence is checked explicitly first) and
+# print, and every provider PNG that Bundle.module serves must be present.
+echo "==> resource bundle preflight (issue #151: Info.plist + provider icons)"
+BUNDLE_PLIST=""
+for candidate in "$PACKAGED_BUNDLE/Info.plist" "$PACKAGED_BUNDLE/Contents/Info.plist"; do
+  if [[ -f "$candidate" ]]; then BUNDLE_PLIST="$candidate"; break; fi
+done
+[[ -n "$BUNDLE_PLIST" ]] \
+  || fail "resource bundle has NO Info.plist (flat or Contents/ layout): $PACKAGED_BUNDLE
+Bundle.module would trap (SIGTRAP) on first popover open — the v0.3.3 field crash.
+Check defaultLocalization in macos/ModelDeckMac/Package.swift and the synthesis step above."
+/usr/libexec/PlistBuddy -c Print "$BUNDLE_PLIST" >/dev/null \
+  || fail "resource bundle Info.plist does not print via PlistBuddy: $BUNDLE_PLIST
+A malformed plist makes Bundle(url:) reject the bundle and Bundle.module trap (issue #151)."
+for png in provider-claude-32.png provider-claude-64.png provider-claude-128.png \
+           provider-codex-32.png provider-codex-64.png provider-codex-128.png; do
+  [[ -f "$PACKAGED_BUNDLE/$png" || -f "$PACKAGED_BUNDLE/Contents/Resources/$png" ]] \
+    || fail "resource bundle is missing provider icon $png (issue #103 artwork): $PACKAGED_BUNDLE"
+done
+echo "==> resource bundle preflight OK ($BUNDLE_PLIST prints; all 6 provider PNGs present)"
 
 # ------------------------------------------------------------- 3. sign
 # Sign nested code inside-out. The daemon build's ad-hoc signature is replaced
@@ -484,6 +545,17 @@ spctl -a -t open --context context:primary-signature -vv "$DMG"
 echo "==> generating Sparkle appcast"
 generate_appcast "$DMG" "$BUILD_NUMBER"
 
+# ------------------------------------- 9. stable-named asset (modeldeck.ai)
+# The website's no-JavaScript fallback download link is the PERMANENT URL
+#   https://github.com/timharris707/modeldeck/releases/latest/download/ModelDeck.dmg
+# which only resolves if EVERY release ships an asset with that exact name.
+# The copy is made from the stapled DMG so the bytes are identical; the
+# Sparkle appcast enclosure keeps pointing at the versioned asset.
+STABLE_DMG="$DIST_DIR/ModelDeck.dmg"
+cp "$DMG" "$STABLE_DMG"
+echo "==> stable-named asset written: $STABLE_DMG (same bytes as $DMG)"
+
 echo "==> done: $DMG"
-echo "    publish BOTH assets on the release:"
-echo "    gh release create v$VERSION \"$DMG\" \"$DIST_DIR/appcast.xml\""
+echo "    publish ALL THREE assets on the release (the stable-named"
+echo "    ModelDeck.dmg keeps the website's permanent download URL alive):"
+echo "    gh release create v$VERSION \"$DMG\" \"$DIST_DIR/appcast.xml\" \"$STABLE_DMG\""

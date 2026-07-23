@@ -142,6 +142,22 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
         remainingPercent.map { "\(Int($0.rounded()))% left" }
     }
 
+    /// Issue #145 (generalizing #143/#144): what the row's reset slot
+    /// actually renders — nil means the slot stays empty. The "no reset
+    /// data" placeholder is gone from EVERY row kind: when a window carries
+    /// no real reset (nil `resetsAt` on an anchored or recently-rolled
+    /// window — rate-limit and spend alike), absence reads better than
+    /// noise, and the hover tooltip keeps the fuller explanation
+    /// (`resetTooltip` explains the missing report). Preserved as
+    /// information, not placeholder: the #101 unanchored copy ("Resets
+    /// 7 days after first use") — keyed on the anchor, not the date,
+    /// because an unanchored window deliberately IGNORES its drifting
+    /// `resetsAt` — and any real reset timestamp, which renders as always.
+    public var displayedResetText: String? {
+        if case .unanchored = anchor { return resetText }
+        return resetsAt == nil ? nil : resetText
+    }
+
     /// Issue #139: what the expanded row's value slot shows — the
     /// payload-stated "$X.XX of $Y.YY" on spend rows that carry amounts,
     /// the locked "% left" everywhere else (including spend rows whose
@@ -208,6 +224,9 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     /// Issue #114: likewise suppressed while the sign-in recovery notice is
     /// up — one notice per card, and "Sign in needed" explains the aging
     /// data better than the age itself.
+    /// Issue #149 (Tim directive): the calm idle tone suppresses it the
+    /// same way — the split changes wording/tone/color on the ONE notice
+    /// line, never the card's footprint or notice count.
     public func staleness(now: Date, autoRefreshInterval: TimeInterval) -> DeckFreshness.CardStaleness? {
         guard keychainRecovery == nil, signInRecovery == nil else { return nil }
         return DeckFreshness.cardStaleness(
@@ -232,6 +251,10 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     /// of every non-active account under CLI ≥ 2.1.216). The card renders an
     /// actionable "Sign in needed" line instead of a bare stale age.
     /// Mutually exclusive with `keychainRecovery` (single-valued authState).
+    /// Issue #149: carries `tone` — `.idle` (reason "expired": calm
+    /// idle-decay copy, neutral styling) vs `.signedOut` (reason "missing"
+    /// or an old daemon: today's alarm verbatim). Same slot, same #118
+    /// one-click path either way.
     public var signInRecovery: DeckFreshness.SignInRecovery? {
         DeckFreshness.signInRecovery(for: account)
     }
@@ -303,9 +326,13 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     }
 
     /// Collapsed-line detail beside the % left, e.g. "Weekly · Fable · Wed 6:00 PM".
+    /// Issue #145 (generalizing #143): when the binding window suppresses
+    /// its reset slot (no real reset to show, any window kind), the summary
+    /// is the bare title — no vestigial "· no reset data".
     public var worstSummary: String? {
         guard let worst = worstWindow else { return nil }
-        return "\(worst.title) · \(worst.resetText)"
+        guard let reset = worst.displayedResetText else { return worst.title }
+        return "\(worst.title) · \(reset)"
     }
 
     /// VoiceOver label for the whole card button. The card's Button carries
@@ -903,6 +930,15 @@ public final class DeckPopoverModel: ObservableObject {
     /// machinery: this is pure navigation plumbing.
     public var onSignInAgain: ((String) -> Void)?
 
+    /// Issue #152: fired by `requestDuplicateRelogin(for:)` with the target
+    /// account's id — the duplicate-login warning's "Re-log in" action. The
+    /// app resolves the id against the FRESH daemon state (via
+    /// `duplicateReloginTarget`) and hands the account to the SAME
+    /// `AccountSignInModel.beginSignIn` path as #118's "Sign in again…" —
+    /// one re-login mechanism, two entry points. The flow only launches the
+    /// provider's own login for the user to complete; nothing automatic.
+    public var onDuplicateRelogin: ((String) -> Void)?
+
     // MARK: - Menu bar pin (account percentage picker)
 
     /// The daemon-confirmed `menuBarAccountId` mirrored here (set by the
@@ -973,6 +1009,37 @@ public final class DeckPopoverModel: ObservableObject {
     ) -> DeckAccount? {
         state?.accounts.first {
             $0.id == accountID && DeckFreshness.signInRecovery(for: $0) != nil
+        }
+    }
+
+    /// Issue #152: the duplicate-login warning's "Re-log in" action —
+    /// the exact anatomy of `requestSignInAgain` with the guard keyed on
+    /// the duplicate flag instead of the sign-in recovery. Dismisses the
+    /// explanation the button lives in, routes Settings to the Accounts
+    /// pane, and fires `onDuplicateRelogin`. No-op (beyond the dismissal)
+    /// when the flag has cleared — a fresh /login may have resolved the
+    /// pair between render and click.
+    public func requestDuplicateRelogin(for row: DeckAccountRow) {
+        presentedWarning = nil
+        guard row.account.hasDuplicateToken else { return }
+        settingsPane = .accounts
+        onDuplicateRelogin?(row.id)
+    }
+
+    /// Issue #152: resolves a requested duplicate re-login against the
+    /// freshest daemon state — the same never-launch-for-a-ghost contract
+    /// as `signInAgainTarget`. Nil when the account vanished, and nil when
+    /// it no longer carries the duplicate flag (a corrective /login landed
+    /// between the render-time click and this dispatch): the check uses the
+    /// SAME `hasDuplicateToken` derivation the marker renders from, so the
+    /// action and the warning can never diverge. Identifier comparison
+    /// only — the app never reads or stores token values.
+    nonisolated public static func duplicateReloginTarget(
+        accountID: String,
+        state: DeckState?
+    ) -> DeckAccount? {
+        state?.accounts.first {
+            $0.id == accountID && $0.hasDuplicateToken
         }
     }
 

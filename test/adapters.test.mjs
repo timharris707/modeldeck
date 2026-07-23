@@ -27,7 +27,7 @@ import {
   readClaudeProfileIdentity,
 } from '../src/adapters/claude.mjs';
 import { claudeCredentialServiceName, claudeCredentialsPresent } from '../src/adapters/claude-keychain.mjs';
-import { readClaudeCredentials, runProbeCli, KEYCHAIN_DENIED_ERROR } from '../src/adapters/claude-usage-probe.mjs';
+import { main as probeClaudeUsage, readClaudeCredentials, runProbeCli, KEYCHAIN_DENIED_ERROR } from '../src/adapters/claude-usage-probe.mjs';
 import { extractIdentity } from '../src/adapters/identity.mjs';
 import { createProviderProfileHelpers } from '../src/adapters/provider-profile.mjs';
 
@@ -475,6 +475,33 @@ test('probe CLI failure keeps the probe error prefix, never a daemon-start shape
   assert.equal(written.length, 1);
   assert.match(written[0], /^Claude usage probe failed: stored OAuth credentials have expired/);
   assert.doesNotMatch(written[0], /failed to start/i);
+});
+
+// Issue #149: the deck's idle-vs-signed-out split keys on the probe's TWO
+// distinct failure prefixes. These exact strings are load-bearing — the
+// daemon's SIGN_IN_EXPIRED_ERROR_PATTERN derives the additive `signinReason`
+// from them — so any wording drift must fail HERE, loudly, instead of
+// silently turning every idle account back into an alarming "Sign in needed".
+test('probe failure messages are pinned exactly: missing vs expired credentials (issue #149)', async () => {
+  const fetcher = async () => { throw new Error('fetcher must not run when credentials fail'); };
+  await assert.rejects(probeClaudeUsage({
+    env: { CLAUDE_CONFIG_DIR: '/profiles/selected' },
+    fetcher,
+    readFile: async () => JSON.stringify({ claudeAiOauth: {} }),
+  }), (error) => {
+    assert.equal(error.message, 'stored OAuth credentials are unavailable; sign in explicitly before refreshing');
+    return true;
+  });
+  await assert.rejects(probeClaudeUsage({
+    env: { CLAUDE_CONFIG_DIR: '/profiles/selected' },
+    fetcher,
+    readFile: async () => JSON.stringify({
+      claudeAiOauth: { accessToken: 'fixture-oauth-token', expiresAt: Date.now() - 60_000 },
+    }),
+  }), (error) => {
+    assert.equal(error.message, 'stored OAuth credentials have expired; sign in explicitly before refreshing');
+    return true;
+  });
 });
 
 test('probe CLI success writes nothing to stderr and exits 0 (issue #114)', async () => {

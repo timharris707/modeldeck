@@ -70,6 +70,16 @@ export const CLAUDE_RESOLVED_HOME_CREDENTIALS_MIN_VERSION = '2.1.216';
 // chip stayed "Healthy" while the card rendered fossils.
 export const SIGN_IN_REQUIRED_ERROR_PATTERN = /sign in explicitly before refreshing/i;
 
+// Issue #149: the Claude probe emits two DISTINCT failures that both end in
+// the suffix above — "stored OAuth credentials are unavailable; …" (genuine
+// sign-out) vs "stored OAuth credentials have expired; …" (idle-decay: the
+// credentials still exist and Claude Code renews them the next time the
+// account is used). This prefix tells the expired case apart so the account
+// payload can carry an ADDITIVE `signinReason: "missing" | "expired"`
+// alongside the unchanged authState — old apps ignore the extra field, old
+// daemons omit it (#65 honest-Unknown compat story). Never feeds authState.
+export const SIGN_IN_EXPIRED_ERROR_PATTERN = /stored oauth credentials have expired/i;
+
 // Issue #98: a refresh that failed because macOS refused the daemon's read of
 // an EXISTING Claude Keychain item (the dismissed first-run prompt). Matches
 // KEYCHAIN_DENIED_ERROR from src/adapters/claude-usage-probe.mjs as it
@@ -1155,14 +1165,37 @@ export class ModelDeckService {
     return 'unknown';
   }
 
+  // Issue #149: WHY an account is signin-required — "expired" (stored
+  // credentials present but idle-decayed; Claude Code renews them the next
+  // time the account is used) vs "missing" (the only genuine sign-out).
+  // Derived from the probe's distinct message prefixes; an unrecognized
+  // signin-required message stays "missing" so the alarming treatment is the
+  // conservative default. Null for every other authState — precedence
+  // (keychain-denied #98, duplicate-token #65/#108) is decided by
+  // accountAuthState and never revisited here.
+  signinReason(account, authState) {
+    if (authState !== 'signin-required') return null;
+    const lastError = account.id != null && this.accountRefreshErrors.get(account.id);
+    if (lastError && SIGN_IN_REQUIRED_ERROR_PATTERN.test(lastError.message)) {
+      return SIGN_IN_EXPIRED_ERROR_PATTERN.test(lastError.message) ? 'expired' : 'missing';
+    }
+    // Presence-probe path: the credential item / auth.json is simply absent.
+    return 'missing';
+  }
+
   async accountsWithAuthState(accounts = this.store.listAccounts()) {
     return Promise.all(accounts.map(async (account) => {
       // Issue #89: surface the per-account refresh failure refreshAll used
       // to drop, so the deck and Settings can render honest staleness.
       const lastRefreshError = this.accountRefreshErrors.get(account.id) || null;
+      const authState = await this.accountAuthState(account);
+      // Issue #149: additive reason field — present only alongside
+      // signin-required, so every other payload byte stays identical.
+      const signinReason = this.signinReason(account, authState);
       return {
         ...account,
-        authState: await this.accountAuthState(account),
+        authState,
+        ...(signinReason ? { signinReason } : {}),
         ...(lastRefreshError ? { lastRefreshError } : {}),
       };
     }));

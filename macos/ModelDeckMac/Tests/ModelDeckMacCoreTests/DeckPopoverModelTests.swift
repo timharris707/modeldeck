@@ -495,6 +495,64 @@ struct DeckBuilderTests {
         #expect(spend?.resetText == "no reset data")
     }
 
+    @Test func spendRowWithBudgetOmitsNoResetPlaceholder() {
+        // Issue #143 (live v0.3.3): the row rendered "$353.51 of $500.00"
+        // AND "no reset data" side by side. When the dollar budget renders,
+        // the placeholder is vestigial — the budget IS the row's data.
+        let amounts = SpendAmounts(usedMinor: 35351, limitMinor: 50000, currency: "USD", exponent: 2)
+        let row = DeckBuilder.rows(state: spendAmountsState(amounts: amounts), now: now)[0]
+        let spend = row.windows.first { $0.isSpend }
+        #expect(spend?.spendText != nil)
+        // The stored resetText is untouched; the DISPLAYED slot is empty.
+        #expect(spend?.resetText == "no reset data")
+        #expect(spend?.displayedResetText == nil)
+        // A spend-only account's collapsed summary drops the placeholder
+        // tail too — bare title, no "Spend · no reset data".
+        let spendOnly = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio", isDefault: true)],
+            usage: [
+                UsageSnapshot(
+                    accountId: "c1",
+                    scope: "spend",
+                    remainingPercent: 29,
+                    stale: false,
+                    detail: UsageSnapshotDetail(spend: amounts)
+                ),
+            ]
+        )
+        let summary = DeckBuilder.rows(state: spendOnly, now: now)[0].worstSummary
+        #expect(summary == "Spend")
+        // A real reset timestamp, should the payload ever carry one,
+        // renders normally — suppression is placeholder-only.
+        let withReset = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio", isDefault: true)],
+            usage: [
+                UsageSnapshot(
+                    accountId: "c1",
+                    scope: "spend",
+                    remainingPercent: 29,
+                    resetsAt: iso(30 * 60),
+                    stale: false,
+                    detail: UsageSnapshotDetail(spend: amounts)
+                ),
+            ]
+        )
+        let anchored = DeckBuilder.rows(state: withReset, now: now)[0].windows.first { $0.isSpend }
+        #expect(anchored?.displayedResetText == "Resets in 30 min")
+    }
+
+    @Test func percentOnlySpendRowAlsoDropsPlaceholder() {
+        // Issue #145 (supersedes #143's percent-only carve-out): the
+        // placeholder is gone from EVERY row kind — a percent-only spend
+        // row without a reset renders an empty slot too. The stored
+        // resetText string is untouched; only the displayed slot empties.
+        let row = DeckBuilder.rows(state: spendAmountsState(amounts: nil), now: now)[0]
+        let spend = row.windows.first { $0.isSpend }
+        #expect(spend?.spendText == nil)
+        #expect(spend?.resetText == "no reset data")
+        #expect(spend?.displayedResetText == nil)
+    }
+
     @Test func amountBearingSpendRowIsNeverMeaningless() {
         let amounts = SpendAmounts(usedMinor: 0, limitMinor: 50000, currency: "USD", exponent: 2)
         // Zero usage + no reset would hide an amount-free spend row (#28);
@@ -1315,5 +1373,128 @@ struct DeckMenuBarPinTests {
         model.onPinMenuBarAccount = { pushed.append($0) }
         model.menuBarPinnedSetting = "acct-9"
         #expect(pushed.isEmpty)
+    }
+}
+
+// Issue #145 (Tim directive, live v0.3.3 — generalizes #143/#144): the
+// "no reset data" placeholder is removed from ALL deck rows. A window with
+// no real reset renders an empty middle slot; the #101 unanchored copy,
+// rollover annotations, and provider-stated timestamps are preserved.
+@Suite("No reset placeholder on any row (issue #145)")
+struct NoResetPlaceholderTests {
+    @Test func unusedFiveHourAndModelWeeklyWithoutResetShowEmptySlot() {
+        // The live screenshot's shape: 100%-left windows the provider gave
+        // no resetsAt for (no active session) — the exact rows that showed
+        // "no reset data" and where the absence is self-explanatory.
+        let state = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio")],
+            usage: [
+                snapshot("c1", scope: "5h", remaining: 100, resetsIn: nil),
+                snapshot("c1", scope: "week:fable", remaining: 100, resetsIn: nil),
+            ]
+        )
+        let row = DeckBuilder.rows(state: state, now: now)[0]
+        for window in row.windows {
+            #expect(window.displayedResetText == nil, "\(window.scope) must render an empty slot")
+            // The stored fallback string survives internally; it just never
+            // reaches a row anymore.
+            #expect(window.resetText == "no reset data")
+        }
+        // Collapsed summary is the bare title — no "· no reset data" tail.
+        #expect(row.worstSummary == row.worstWindow?.title)
+        #expect(row.worstSummary?.contains("no reset data") == false)
+    }
+
+    @Test func partiallyUsedWindowWithoutResetShowsLabelAndPercentCleanly() {
+        // The issue's sanity case: partial usage, no reset data — label +
+        // percent render cleanly, no placeholder, tooltip explanation intact.
+        let state = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio")],
+            usage: [snapshot("c1", scope: "5h", remaining: 40, resetsIn: nil)]
+        )
+        let window = DeckBuilder.rows(state: state, now: now)[0].windows[0]
+        #expect(window.remainingText == "40% left")
+        #expect(window.displayedResetText == nil)
+        #expect(window.resetTooltip == "The provider didn't report a reset time for this window")
+    }
+
+    @Test func unanchoredWeeklyKeepsIssue101Copy() {
+        // PRESERVED (#101): an unanchored weekly — zero usage, resetsAt
+        // drifting at probe time + window length — keeps its honest copy.
+        // That line is information, not placeholder.
+        let state = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio")],
+            usage: [
+                UsageSnapshot(
+                    accountId: "c1",
+                    scope: "week",
+                    remainingPercent: 100,
+                    resetsAt: iso(7 * 86_400),
+                    observedAt: iso(0)
+                ),
+            ]
+        )
+        let window = DeckBuilder.rows(state: state, now: now)[0].windows[0]
+        #expect(window.anchor == .unanchored(windowDuration: 7 * 86_400))
+        #expect(window.displayedResetText == "Resets 7 days after first use")
+        #expect(window.resetTooltip.contains("Fresh window"))
+    }
+
+    @Test func unanchoredFiveHourKeepsIssue101Copy() {
+        let state = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio")],
+            usage: [
+                UsageSnapshot(
+                    accountId: "c1",
+                    scope: "5h",
+                    remainingPercent: 100,
+                    resetsAt: iso(5 * 3600),
+                    observedAt: iso(0)
+                ),
+            ]
+        )
+        let window = DeckBuilder.rows(state: state, now: now)[0].windows[0]
+        #expect(window.anchor == .unanchored(windowDuration: 5 * 3600))
+        #expect(window.displayedResetText == "Resets 5 hours after first use")
+    }
+
+    @Test func recentlyRolledWindowKeepsTimestampAndRolloverAnnotation() {
+        // PRESERVED (#101): a recently rolled window keeps BOTH its real
+        // reset timestamp and the rollover annotation.
+        let rolledAgo: TimeInterval = 30 * 60
+        let state = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio")],
+            usage: [
+                UsageSnapshot(
+                    accountId: "c1",
+                    scope: "week",
+                    remainingPercent: 100,
+                    resetsAt: iso(7 * 86_400 - rolledAgo),
+                    observedAt: iso(-2 * 3600)
+                ),
+            ]
+        )
+        let window = DeckBuilder.rows(state: state, now: now)[0].windows[0]
+        guard case .recentlyRolled = window.anchor else {
+            Issue.record("expected recentlyRolled, got \(window.anchor)")
+            return
+        }
+        #expect(window.displayedResetText?.hasPrefix("Resets ") == true)
+        #expect(window.rolloverText?.hasPrefix("Week reset at ") == true)
+    }
+
+    @Test func providerStatedTimestampsRenderAsAlways() {
+        let state = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio")],
+            usage: [
+                snapshot("c1", scope: "5h", remaining: 72, resetsIn: 57 * 60),
+                snapshot("c1", scope: "week", remaining: 63, resetsIn: 2 * 86_400),
+            ]
+        )
+        let row = DeckBuilder.rows(state: state, now: now)[0]
+        #expect(row.windows[0].displayedResetText == "Resets in 57 min")
+        #expect(row.windows[1].displayedResetText == row.windows[1].resetText)
+        // And the collapsed summary keeps its "title · reset" grammar.
+        #expect(row.worstSummary?.contains(" · ") == true)
     }
 }

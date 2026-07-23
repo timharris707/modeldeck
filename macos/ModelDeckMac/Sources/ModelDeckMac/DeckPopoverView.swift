@@ -519,6 +519,19 @@ struct DeckAccountRowView: View {
         SettingsWindowFronting.activateAndFront()
     }
 
+    /// Issue #152 — the duplicate-login warning's one-click path, the same
+    /// shape as `beginSignInAgain` with the model request keyed on the
+    /// duplicate flag: dismiss the explanation, route Settings to the
+    /// Accounts pane, fire the model's re-login request (which the app
+    /// resolves against fresh state and hands to the SAME
+    /// `AccountSignInModel.beginSignIn` flow), and front Settings so the
+    /// in-progress flow is visible.
+    private func beginDuplicateRelogin() {
+        deckModel.requestDuplicateRelogin(for: row)
+        openSettings()
+        SettingsWindowFronting.activateAndFront()
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Button(action: onToggle) {
@@ -547,6 +560,12 @@ struct DeckAccountRowView: View {
                         deckModel.toggleWarning(
                             DeckWarningID(topic: .duplicateToken, elementID: row.id)
                         )
+                    }
+                    // Issue #152: VoiceOver can skip the popover hop — the
+                    // named action runs the same one-click re-login path the
+                    // popover's "Re-log in…" button offers.
+                    Button("Re-log in this profile") {
+                        beginDuplicateRelogin()
                     }
                 }
             }
@@ -599,18 +618,33 @@ struct DeckAccountRowView: View {
             // explanation, whose primary "Sign in again…" button drops the
             // user into the roster's EXISTING #99-correct sign-in flow for
             // exactly this account (Settings → Accounts opens alongside).
+            // Issue #149 (Tim directive): the idle-decay tone renders in the
+            // SAME slot with the SAME click path — only glyph, color, and
+            // wording calm down (neutral secondary, never amber). Zero
+            // functionality lost in either tone.
             if let recovery = row.signInRecovery {
                 let warningID = DeckWarningID(topic: .signInRequired, elementID: row.id)
                 Button {
                     deckModel.toggleWarning(warningID)
                 } label: {
                     HStack(spacing: 4) {
-                        Image(systemName: "person.crop.circle.badge.exclamationmark")
+                        Image(systemName: recovery.tone == .idle
+                            ? "moon.zzz"
+                            : "person.crop.circle.badge.exclamationmark")
                             .font(.system(size: 9, weight: .semibold))
                         Text(recovery.text)
                             .font(.system(size: 10))
+                            // Orchestrator verify on PR #150 (Tim's
+                            // constraint 1): the notice may NEVER grow the
+                            // card — one line, both tones, truncation beats
+                            // growth if wording ever drifts. The full copy
+                            // stays reachable in the click-through
+                            // explanation and the tooltip.
+                            .lineLimit(1)
                     }
-                    .foregroundStyle(severityColor(.warning))
+                    .foregroundStyle(recovery.tone == .idle
+                        ? Color.secondary
+                        : severityColor(.warning))
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -723,10 +757,19 @@ struct DeckAccountRowView: View {
                     // Issue #113: clicking the marker opens the explanation
                     // (a tap gesture on the marker's own hit area — never a
                     // nested Button; see DuplicateTokenMarkerView).
+                    // Issue #152: the explanation names THIS profile and
+                    // carries the "Re-log in…" one-click action — the deck
+                    // row itself stays one line (the action lives inside
+                    // the popover, never on the collapsed row).
                     DuplicateTokenMarkerView(
                         isExplaining: deckModel.warningBinding(
                             DeckWarningID(topic: .duplicateToken, elementID: row.id)
-                        )
+                        ),
+                        explanation: .duplicateToken(
+                            reloginLabel: row.account.label,
+                            provider: row.provider
+                        ),
+                        onRelogin: { beginDuplicateRelogin() }
                     )
                 }
                 Spacer(minLength: 8)
@@ -780,17 +823,26 @@ struct DeckAccountRowView: View {
     /// truncates first); wrapping is allowed as the last resort — never an
     /// ellipsis that hides the reset time. Every reset text carries a hover
     /// tooltip with the full absolute timestamp as backstop.
+    /// Issue #145 (generalizing #143): ANY window without a real reset —
+    /// rate-limit or spend — suppresses the former "no reset data"
+    /// placeholder (`displayedResetText` is nil) and the slot renders
+    /// nothing at all. The #101 unanchored copy and real timestamps render
+    /// as always; the tooltip keeps the fuller explanation either way.
+    @ViewBuilder
     private func resetTextView(for window: DeckWindow) -> some View {
-        Text(window.resetText)
-            .font(DeckType.caption)
-            .foregroundStyle(.secondary)
-            .multilineTextAlignment(.trailing)
-            .fixedSize(horizontal: false, vertical: true)
-            .layoutPriority(1)
-            // Issue #101: unanchored windows explain the fresh-window state
-            // here instead of surfacing the placeholder timestamp; anchored
-            // windows keep the issue #67 absolute-timestamp backstop.
-            .help(window.resetTooltip)
+        if let reset = window.displayedResetText {
+            Text(reset)
+                .font(DeckType.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.trailing)
+                .fixedSize(horizontal: false, vertical: true)
+                .layoutPriority(1)
+                // Issue #101: unanchored windows explain the fresh-window
+                // state here instead of surfacing the placeholder timestamp;
+                // anchored windows keep the issue #67 absolute-timestamp
+                // backstop.
+                .help(window.resetTooltip)
+        }
     }
 
     /// "Studio · Max (20x)" — the plan tier inline beside the name, muted
@@ -896,8 +948,14 @@ struct WarningExplanationView: View {
 /// primary action: "Sign in again…", the one-click path into the roster's
 /// existing re-login flow for this exact account. Direction-A restraint: a
 /// single small prominent button, no competing affordances.
+/// Issue #152: the duplicate-login explanation reuses this exact anatomy
+/// with "Re-log in…" wording — the action parameters exist so the two
+/// surfaces share one view instead of growing parallel popovers.
 struct SignInExplanationView: View {
     let explanation: DeckWarningExplanation
+    var actionTitle: String = "Sign in again…"
+    var actionHelp: String = "Opens Settings → Accounts and starts this account's sign-in flow"
+    var actionAccessibilityLabel: String = "Sign in again for this account"
     let onSignInAgain: () -> Void
 
     var body: some View {
@@ -909,13 +967,13 @@ struct SignInExplanationView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Button(action: onSignInAgain) {
-                Text("Sign in again…")
+                Text(actionTitle)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
             .padding(.top, 4)
-            .help("Opens Settings → Accounts and starts this account's sign-in flow")
-            .accessibilityLabel("Sign in again for this account")
+            .help(actionHelp)
+            .accessibilityLabel(actionAccessibilityLabel)
         }
         .padding(12)
         .frame(width: 280, alignment: .leading)
@@ -1012,6 +1070,17 @@ struct DuplicateTokenMarkerView: View {
     /// Model-backed presentation when provided (deck popover); local state
     /// otherwise (Settings roster, where the marker is self-contained).
     var isExplaining: Binding<Bool>?
+    /// Issue #152: the explanation this marker's popover shows. Call sites
+    /// that can name the account pass `.duplicateToken(reloginLabel:provider:)`
+    /// so the popover says WHICH profile the action re-logs; the default
+    /// keeps the label-free #65/#113 copy.
+    var explanation: DeckWarningExplanation = .duplicateToken()
+    /// Issue #152 (Tim: "I need something clickable to fix the issue"):
+    /// when set, the explanation popover carries a "Re-log in…" primary
+    /// action — the same one-click anatomy as #118's sign-in path. The
+    /// action only launches the provider's own login flow for this profile;
+    /// nothing automatic, running sessions never touched.
+    var onRelogin: (() -> Void)?
     @State private var localExplaining = false
 
     private var explaining: Binding<Bool> { isExplaining ?? $localExplaining }
@@ -1041,7 +1110,18 @@ struct DuplicateTokenMarkerView: View {
             // suppresses this child element).
             .accessibilityAction { explaining.wrappedValue.toggle() }
             .popover(isPresented: explaining, arrowEdge: .bottom) {
-                WarningExplanationView(explanation: .duplicateToken())
+                if let onRelogin {
+                    SignInExplanationView(
+                        explanation: explanation,
+                        actionTitle: "Re-log in…",
+                        actionHelp: "Opens Settings → Accounts and launches "
+                            + "the provider's own login for this profile",
+                        actionAccessibilityLabel: "Re-log in this profile",
+                        onSignInAgain: onRelogin
+                    )
+                } else {
+                    WarningExplanationView(explanation: explanation)
+                }
             }
     }
 }

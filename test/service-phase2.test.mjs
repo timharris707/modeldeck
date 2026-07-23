@@ -968,6 +968,95 @@ test('expired stored OAuth flips the account auth chip to signin-required despit
   } finally { data.close(); }
 });
 
+// Issue #149 — the ADDITIVE `signinReason` beside authState: "expired" is
+// idle-decay (credentials present, Claude Code renews them on next use, the
+// deck renders the calm idle notice); "missing" is the only genuine sign-out
+// (today's alarm). Both probe messages are pinned VERBATIM here and in
+// adapters.test.mjs so probe wording drift fails loudly instead of silently
+// re-alarming every idle account. authState values themselves are unchanged.
+const MISSING_OAUTH_ERROR = 'Claude usage refresh failed: stored OAuth credentials are unavailable; sign in explicitly before refreshing';
+
+test('expired-credentials refresh failure carries signinReason "expired" (issue #149)', async () => {
+  const data = fixture({
+    claudeCredentialsPresent: async () => true,
+    fetchClaude: async ({ claudeConfigDir }) => {
+      if (claudeConfigDir === data.secondHome) throw new Error(EXPIRED_OAUTH_ERROR);
+      return [{ scope: 'weekly', usedPercent: 15, source: 'fixture' }];
+    },
+  });
+  try {
+    const first = data.store.saveAccount({ provider: 'claude', label: 'First', profileRef: data.firstHome, isDefault: true });
+    const second = data.store.saveAccount({ provider: 'claude', label: 'Second', profileRef: data.secondHome });
+    await data.service.refreshAll();
+
+    const state = await data.service.state();
+    const healthy = state.accounts.find((account) => account.id === first.id);
+    assert.equal(healthy.authState, 'ok');
+    // The reason field is present ONLY alongside signin-required — every
+    // other account's payload stays byte-identical to the pre-#149 shape.
+    assert.equal('signinReason' in healthy, false);
+    const expired = state.accounts.find((account) => account.id === second.id);
+    assert.equal(expired.authState, 'signin-required');
+    assert.equal(expired.signinReason, 'expired');
+  } finally { data.close(); }
+});
+
+test('missing-credentials refresh failure carries signinReason "missing" (issue #149)', async () => {
+  const data = fixture({
+    claudeCredentialsPresent: async () => true,
+    fetchClaude: async ({ claudeConfigDir }) => {
+      if (claudeConfigDir === data.secondHome) throw new Error(MISSING_OAUTH_ERROR);
+      return [{ scope: 'weekly', usedPercent: 15, source: 'fixture' }];
+    },
+  });
+  try {
+    data.store.saveAccount({ provider: 'claude', label: 'First', profileRef: data.firstHome, isDefault: true });
+    const second = data.store.saveAccount({ provider: 'claude', label: 'Second', profileRef: data.secondHome });
+    await data.service.refreshAll();
+
+    const account = (await data.service.state()).accounts.find((item) => item.id === second.id);
+    assert.equal(account.authState, 'signin-required');
+    assert.equal(account.signinReason, 'missing');
+  } finally { data.close(); }
+});
+
+test('presence-probe sign-in states carry signinReason "missing" — absent credentials are a genuine sign-out (issue #149)', async () => {
+  // No refresh ran, so there is no per-account refresh error to derive from:
+  // the reason comes from the presence path (Claude Keychain/file probe and
+  // the Codex auth.json check alike).
+  const data = fixture({ claudeCredentialsPresent: async () => false });
+  try {
+    const claude = data.store.saveAccount({ provider: 'claude', label: 'Claude', profileRef: data.firstHome, isDefault: true });
+    const codex = data.store.saveAccount({ provider: 'codex', label: 'Codex', profileRef: data.secondHome, isDefault: true });
+
+    const state = await data.service.state();
+    for (const id of [claude.id, codex.id]) {
+      const account = state.accounts.find((item) => item.id === id);
+      assert.equal(account.authState, 'signin-required');
+      assert.equal(account.signinReason, 'missing');
+    }
+  } finally { data.close(); }
+});
+
+test('keychain-denied precedence is untouched: no signinReason rides along (issues #98/#149)', async () => {
+  const data = fixture({
+    claudeCredentialsPresent: async () => true,
+    fetchClaude: async ({ claudeConfigDir }) => {
+      if (claudeConfigDir === data.secondHome) throw new Error(KEYCHAIN_DENIED_REFRESH_ERROR);
+      return [{ scope: 'weekly', usedPercent: 15, source: 'fixture' }];
+    },
+  });
+  try {
+    data.store.saveAccount({ provider: 'claude', label: 'First', profileRef: data.firstHome, isDefault: true });
+    const second = data.store.saveAccount({ provider: 'claude', label: 'Second', profileRef: data.secondHome });
+    await data.service.refreshAll();
+
+    const account = (await data.service.state()).accounts.find((item) => item.id === second.id);
+    assert.equal(account.authState, 'keychain-denied');
+    assert.equal('signinReason' in account, false);
+  } finally { data.close(); }
+});
+
 test('expired-OAuth transition invalidates the cached tool probe so the provider chip flips too', async () => {
   let expired = false;
   const data = fixture({

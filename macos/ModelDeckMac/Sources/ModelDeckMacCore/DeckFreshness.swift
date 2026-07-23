@@ -171,19 +171,48 @@ public enum DeckFreshness {
     /// visual family as the #98 Keychain notice: the actionable state, not
     /// the age, is the headline.
     public struct SignInRecovery: Equatable, Sendable {
+        /// Issue #149: how the notice presents. `.signedOut` is the amber
+        /// alarm ("Sign in needed" — the stored sign-in is genuinely gone);
+        /// `.idle` is the calm neutral idle-decay state ("Idle — renews on
+        /// next use": the sign-in exists and renews the next time the
+        /// account is used; its data is merely paused). Tim directive
+        /// (issue #149 comment): SAME footprint, SAME click → explanation →
+        /// one-click sign-in path in both tones — this is a
+        /// wording/tone/color split on one affordance, never a second
+        /// notice. The idle text is deliberately as terse as the alarm so
+        /// it stays single-line in the two-column card width; the full
+        /// renewal sentence lives in the tooltip/explanation body.
+        public enum Tone: Equatable, Sendable {
+            case signedOut
+            case idle
+        }
+
         public var text: String
         public var tooltip: String
         public var accessibilityLabel: String
+        public var tone: Tone
 
-        public init(text: String, tooltip: String, accessibilityLabel: String) {
+        public init(
+            text: String,
+            tooltip: String,
+            accessibilityLabel: String,
+            tone: Tone = .signedOut
+        ) {
             self.text = text
             self.tooltip = tooltip
             self.accessibilityLabel = accessibilityLabel
+            self.tone = tone
         }
     }
 
     /// Shared recovery coaching for the tooltip and VoiceOver label.
     static let signInRecoveryDetail = "This account's stored sign-in is missing or has expired, so ModelDeck can't refresh its usage. Sign in again from Settings → Accounts."
+
+    /// Issue #149: the calm idle-decay lead — the stored sign-in EXISTS but
+    /// expired while the account sat idle; the provider CLI renews it
+    /// automatically on next use, so the data is paused, not broken. The
+    /// same one-click sign-in path stays for "fresh data now".
+    static let idleSignInDetail = "This account's stored sign-in expired while idle, so its usage data is paused. Using the account again renews the sign-in automatically — or sign in now from Settings → Accounts to refresh right away."
 
     /// Claude-only context (issue #114 root cause): Claude Code ≥ 2.1.216
     /// renews only the ACTIVE account's stored sign-in, so every other
@@ -196,20 +225,40 @@ public enum DeckFreshness {
     /// account (issue #89's authState) — pure derivation, no clock. The
     /// keychain-denied notice never coexists with this one: `authState` is
     /// single-valued, and the row model gives #98's notice precedence.
+    ///
+    /// Issue #149: the notice splits by tone on `signinReason`. "expired"
+    /// (idle-decay) renders the calm neutral idle text; "missing" — or an
+    /// absent reason from an old daemon — keeps the pre-#149 "Sign in
+    /// needed" alarm VERBATIM. Both tones keep the full #114 structural
+    /// story for Claude and the last-refresh-error line; both occupy the
+    /// same single notice slot and drive the same #118 one-click path.
     public static func signInRecovery(for account: DeckAccount) -> SignInRecovery? {
-        guard account.healthChip == .signInAgain else { return nil }
-        var detail = signInRecoveryDetail
+        let tone: SignInRecovery.Tone
+        switch account.healthChip {
+        case .signInAgain: tone = .signedOut
+        case .idleSignIn: tone = .idle
+        default: return nil
+        }
+        var detail = tone == .idle ? idleSignInDetail : signInRecoveryDetail
         if account.provider == "claude" {
             detail += " \(signInRecoveryClaudeDetail)"
         }
         if let message = account.lastRefreshError?.message, !message.isEmpty {
             detail += " Last refresh failed: \(message)"
         }
-        let text = "Sign in needed"
+        // Orchestrator verify on PR #150: the notice must stay ONE line in
+        // the two-column card width (Tim's constraint 1 — same footprint),
+        // so the deck copy matches the Settings chip verbatim and the full
+        // "renews when this account is next used" sentence stays in the
+        // tooltip and explanation popover where it always was.
+        let text = tone == .idle
+            ? "Idle — renews on next use"
+            : "Sign in needed"
         return SignInRecovery(
             text: text,
             tooltip: detail,
-            accessibilityLabel: "\(text) — \(detail)"
+            accessibilityLabel: "\(text) — \(detail)",
+            tone: tone
         )
     }
 }

@@ -4,6 +4,48 @@ All notable changes to ModelDeck are documented here. Versioning follows the
 roadmap in `design/mac-app-roadmap.md`: `v0.1-web` tags the retired web MVP,
 and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 
+## 0.3.4 — 2026-07-23
+
+A hotfix release. 0.3.3 crashes on launch-click for users on newer macOS
+builds — if you're affected, the in-app updater can't rescue an app that
+won't open, so download the fresh DMG. Everyone else gets this through
+**Update Now** as usual.
+
+### Fixed
+- **0.3.3 crashed instantly on menu-bar click on newer macOS (issue #151,
+  first public field report — thanks @rickdubiel)**: the shipped SwiftPM
+  resource bundle contained the provider icons but no `Info.plist`, so
+  stricter macOS builds rejected the bundle and the app trapped the first
+  time the popover rendered a provider icon. The bundle now always carries
+  a generated `Info.plist`, and the release pipeline refuses to sign a
+  build whose resource bundle is malformed — this class of crash can't
+  ship again.
+
+### Added
+- **The duplicate-credential warning is now clickable (issue #152, Tim
+  request)**: when two profiles hold the same account (the warning badge
+  from issue #108), the deck warning popover and Settings → Accounts now
+  offer a **Re-log in…** button that opens the profile-scoped login flow
+  directly, with copy explaining that re-logging either duplicate under
+  its correct account clears both. Previously the app told you about the
+  problem but left you to fix it by hand.
+- **Idle sign-in decay reads calm, not alarming (issue #149)**: an
+  account whose OAuth token merely idled out now shows a quiet
+  "Idle — renews on next use" note instead of the amber "Sign in needed"
+  alarm, which is reserved for genuinely signed-out accounts. Both states
+  keep the one-click path into the re-login flow.
+
+### Changed
+- **"no reset data" placeholder retired everywhere (issues #143, #145)**:
+  deck rows simply omit reset copy when the provider states none —
+  absence reads better than noise. Real timestamps, "after first use"
+  copy, and rollover annotations are untouched.
+- Release pipeline hardening (issues #128, #147): the Sparkle preflight
+  fails loudly (and self-resolves packages) in pristine worktrees, and
+  the stable-named `ModelDeck.dmg` asset is produced by the release
+  script itself, so the website's permanent download URL is a script
+  guarantee rather than a manual step.
+
 ## 0.3.3 — 2026-07-23
 
 The first release delivered **through** Sparkle: if you're running 0.3.2,

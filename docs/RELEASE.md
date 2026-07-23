@@ -121,7 +121,10 @@ it. The script auto-derives the public key via `generate_keys -p` (override
 with `MD_SPARKLE_PUBLIC_ED_KEY`) and signs the DMG's appcast entry with
 Sparkle's `sign_update` (auto-located in the SwiftPM artifacts; override
 with `MD_SPARKLE_SIGN_UPDATE`). Both preflight checks fail loudly with these
-instructions when the key or tool is missing.
+instructions when the key or tool is missing. In a pristine release worktree
+the SwiftPM artifacts directory cannot exist yet, so the script runs
+`swift package resolve` itself before this preflight (the v0.3.2 release
+tripped over a silent exit here before that was added).
 
 `scripts/release-dmg.sh --appcast-only <dmg>` regenerates just the appcast
 for an existing DMG (also the test hook — `MD_SPARKLE_KEY_FILE` may inject
@@ -129,19 +132,27 @@ the fake fixture key for tests, never for real releases).
 
 ## Publishing
 
-Attach the DMG **and the appcast** to a GitHub Release for the version tag:
+Attach **all three** build outputs to a GitHub Release for the version tag:
 
 ```sh
 VERSION="$(cat VERSION)"
 gh release create -R timharris707/modeldeck "v$VERSION" \
-  "dist/ModelDeck-$VERSION.dmg" "dist/appcast.xml"
+  "dist/ModelDeck-$VERSION.dmg" "dist/appcast.xml" "dist/ModelDeck.dmg"
 ```
 
 The release must live on the **public mirror repo** (`-R
 timharris707/modeldeck`): that is where the app's update checker and the
-Sparkle `SUFeedURL` both point. Both assets are required: the DMG is what
-the appcast's enclosure URL points at, and `appcast.xml` is what installed
-apps poll via the stable `releases/latest/download/appcast.xml` URL.
+Sparkle `SUFeedURL` both point. All three assets are required:
+
+- `ModelDeck-<version>.dmg` — what the appcast's enclosure URL points at.
+- `appcast.xml` — what installed apps poll via the stable
+  `releases/latest/download/appcast.xml` URL.
+- `ModelDeck.dmg` — the stable-named copy (identical bytes, produced by
+  the script since v0.3.3). modeldeck.ai's no-JavaScript fallback download
+  link is the permanent URL
+  `releases/latest/download/ModelDeck.dmg`, which resolves only while
+  **every** release ships an asset with that exact name. Omitting it
+  silently breaks the website's fallback download for the release.
 
 ## Syncing the public mirror
 

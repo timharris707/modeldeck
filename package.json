@@ -1,6 +1,6 @@
 {
   "name": "modeldeck",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "private": true,
   "type": "module",
   "description": "Local project-aware AI account and usage control plane.",

@@ -6,6 +6,13 @@ import PackageDescription
 // assembled by Scripts/build_app.sh).
 let package = Package(
     name: "ModelDeckMac",
+    // Issue #151 (public report modeldeck#1): without defaultLocalization,
+    // SwiftPM emits the ModelDeckMac_ModelDeckMacCore.bundle as loose PNGs
+    // with NO Info.plist. macOS Bundle(url:) rejects a plist-less directory,
+    // so the shipped app's Bundle.module accessor exhausted its candidates
+    // and trapped (SIGTRAP) on first popover render in v0.3.3. Declaring a
+    // localization makes SwiftPM generate the bundle's Info.plist.
+    defaultLocalization: "en",
     platforms: [
         .macOS(.v14)
     ],

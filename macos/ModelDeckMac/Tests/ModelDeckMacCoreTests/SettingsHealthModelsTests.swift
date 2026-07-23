@@ -21,6 +21,38 @@ struct PerAccountHealthChipTests {
         #expect(DeckAccount(id: "b", provider: "codex", label: "Deck Two", authState: "future-value").healthChip == .unknown)
     }
 
+    @Test func signinReasonSplitsTheChipIntoIdleVsAlarm() {
+        // Issue #149: "expired" is idle-decay — calm chip, same click path;
+        // "missing" or an absent reason (old daemon) keeps the alarm chip.
+        #expect(DeckAccount(
+            id: "a", provider: "claude", label: "Deck One",
+            authState: "signin-required", signinReason: "expired"
+        ).healthChip == .idleSignIn)
+        #expect(DeckAccount(
+            id: "b", provider: "claude", label: "Deck Two",
+            authState: "signin-required", signinReason: "missing"
+        ).healthChip == .signInAgain)
+        #expect(DeckAccount(
+            id: "c", provider: "claude", label: "Deck Three",
+            authState: "signin-required"
+        ).healthChip == .signInAgain)
+        // An UNRECOGNIZED reason from a future daemon must fall back to the
+        // alarm chip too — calm is only ever an explicit "expired".
+        #expect(DeckAccount(
+            id: "d", provider: "claude", label: "Deck Four",
+            authState: "signin-required", signinReason: "revoked-future-value"
+        ).healthChip == .signInAgain)
+        // The chip copy is the at-a-glance distinction Tim asked for.
+        #expect(ToolProbe.HealthChip.idleSignIn.text == "Idle — renews on next use")
+        #expect(ToolProbe.HealthChip.signInAgain.text == "Sign in again")
+    }
+
+    @Test func providerLevelProbeNeverYieldsTheIdleChip() {
+        // The CLI tools probe carries no signinReason — the #149 split is
+        // per-account only, so the provider chip mapping is unchanged.
+        #expect(ToolProbe(installed: true, authState: "signin-required").healthChip == .signInAgain)
+    }
+
     @Test func decodesStateWithAndWithoutAuthState() throws {
         let json = #"""
         {"accounts":[

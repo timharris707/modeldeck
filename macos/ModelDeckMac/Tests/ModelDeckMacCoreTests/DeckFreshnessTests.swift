@@ -455,19 +455,23 @@ struct SignInRecoveryTests {
         authState: String?,
         provider: String = "claude",
         errorMessage: String? = expiredMessage,
-        observedSecondsAgo: TimeInterval? = nil
+        observedSecondsAgo: TimeInterval? = nil,
+        signinReason: String? = nil,
+        isDefault: Bool = false
     ) -> DeckAccountRow {
         DeckAccountRow(
             account: DeckAccount(
                 id: "acct-1", provider: provider, label: "Studio",
+                isDefault: isDefault,
                 authState: authState,
                 lastRefreshError: errorMessage.map {
                     AccountRefreshError(message: $0, at: "2026-07-22T04:10:00.000Z")
-                }
+                },
+                signinReason: signinReason
             ),
             provider: provider == "claude" ? .claude : .codex,
             windows: [],
-            isActive: false,
+            isActive: isDefault,
             newestObservedAt: observedSecondsAgo.map { now.addingTimeInterval(-$0) }
         )
     }
@@ -541,6 +545,143 @@ struct SignInRecoveryTests {
         // A daemon that omits authState maps to the Unknown chip — no
         // notice, exactly like #98's leniency rule.
         let account = DeckAccount(id: "a", provider: "claude", label: "Work")
+        #expect(DeckFreshness.signInRecovery(for: account) == nil)
+    }
+
+    // MARK: Idle-decay split (issue #149)
+
+    @Test func expiredReasonRendersTheCalmIdleNotice() {
+        let recovery = row(authState: "signin-required", signinReason: "expired").signInRecovery
+        #expect(recovery?.tone == .idle)
+        // Pinned EXACTLY (orchestrator verify on PR #150, Tim's constraint
+        // 1): this string matches the Settings chip and fits the two-column
+        // card on one line — the view adds lineLimit(1) as the structural
+        // guard, and this pin catches wording drift toward a longer copy.
+        // The full renewal sentence lives in the tooltip/explanation only.
+        #expect(recovery?.text == "Idle — renews on next use")
+        #expect(recovery?.text == ToolProbe.HealthChip.idleSignIn.text)
+        // The calm lead: paused data, automatic renewal on next use.
+        #expect(recovery?.tooltip.contains("renews the sign-in automatically") == true)
+        // The full #114 structural story stays in the explanation…
+        #expect(recovery?.tooltip.contains("only the active account's sign-in") == true)
+        // …and so does the #118 one-click path pointer.
+        #expect(recovery?.tooltip.contains("Settings → Accounts") == true)
+        #expect(recovery?.accessibilityLabel.contains("Idle — renews on next use") == true)
+    }
+
+    @Test func expiredReasonKeepsTheDaemonErrorLine() {
+        let recovery = row(authState: "signin-required", signinReason: "expired").signInRecovery
+        #expect(recovery?.tooltip.contains("Last refresh failed:") == true)
+        #expect(recovery?.tooltip.contains("stored OAuth credentials have expired") == true)
+    }
+
+    @Test func expiredReasonIsCaseInsensitive() {
+        #expect(row(authState: "signin-required", signinReason: "Expired").signInRecovery?.tone == .idle)
+    }
+
+    @Test func missingReasonKeepsTodaysAlarmVerbatim() {
+        let missing = row(authState: "signin-required", signinReason: "missing").signInRecovery
+        #expect(missing?.tone == .signedOut)
+        #expect(missing?.text == "Sign in needed")
+        // Byte-for-byte the pre-#149 rendering: identical to a payload that
+        // carries no reason at all.
+        #expect(missing == row(authState: "signin-required", signinReason: nil).signInRecovery)
+    }
+
+    @Test func absentReasonFromAnOldDaemonKeepsTodaysAlarmVerbatim() {
+        let recovery = row(authState: "signin-required", signinReason: nil).signInRecovery
+        #expect(recovery?.tone == .signedOut)
+        #expect(recovery?.text == "Sign in needed")
+        #expect(recovery?.tooltip.contains("missing or has expired") == true)
+    }
+
+    @Test func unrecognizedReasonStaysTheConservativeAlarm() {
+        let recovery = row(authState: "signin-required", signinReason: "future-reason").signInRecovery
+        #expect(recovery?.tone == .signedOut)
+        #expect(recovery?.text == "Sign in needed")
+    }
+
+    @Test func activeAccountWithExpiredTokenIsAlsoIdle() {
+        // The distinction is reason-based, never activation-based: Tim idle
+        // >8h everywhere means the ACTIVE account's token expires too, and
+        // it renews on next use exactly the same way.
+        let recovery = row(
+            authState: "signin-required", signinReason: "expired", isDefault: true
+        ).signInRecovery
+        #expect(recovery?.tone == .idle)
+    }
+
+    @Test func codexIdleOmitsTheClaudeDetail() {
+        let recovery = row(
+            authState: "signin-required", provider: "codex", signinReason: "expired"
+        ).signInRecovery
+        #expect(recovery?.tone == .idle)
+        #expect(recovery?.tooltip.contains("active account's sign-in") == false)
+    }
+
+    @Test func idleNoticeKeepsTheSameSingleNoticeFootprint() {
+        // Tim directive (issue #149 comment): the calm tone occupies the
+        // SAME slot as the alarm — one notice per card, so the bare stale
+        // line stays suppressed exactly as it is for the signed-out tone.
+        let idle = row(
+            authState: "signin-required",
+            observedSecondsAgo: 50_400,
+            signinReason: "expired"
+        )
+        #expect(idle.signInRecovery != nil)
+        #expect(idle.staleness(now: now, autoRefreshInterval: 1_800) == nil)
+        #expect(idle.keychainRecovery == nil)
+    }
+}
+
+// MARK: - signinReason decode (issue #149)
+
+@Suite("signinReason decode (issue #149)")
+struct SigninReasonDecodeTests {
+    private func decodeAccount(_ json: String) throws -> DeckAccount {
+        let wrapped = #"{"accounts": [\#(json)], "usage": []}"#
+        return try JSONDecoder().decode(DeckState.self, from: Data(wrapped.utf8)).accounts[0]
+    }
+
+    @Test func decodesTheReasonAndSplitsTheChip() throws {
+        let account = try decodeAccount(#"""
+        {"id": "a1", "provider": "claude", "label": "Work", "enabled": true, "isDefault": false,
+         "authState": "signin-required", "signinReason": "expired"}
+        """#)
+        #expect(account.signinReason == "expired")
+        #expect(account.healthChip == .idleSignIn)
+    }
+
+    @Test func missingReasonMapsToTheAlarmChip() throws {
+        let account = try decodeAccount(#"""
+        {"id": "a1", "provider": "claude", "label": "Work", "enabled": true, "isDefault": false,
+         "authState": "signin-required", "signinReason": "missing"}
+        """#)
+        #expect(account.signinReason == "missing")
+        #expect(account.healthChip == .signInAgain)
+    }
+
+    @Test func oldDaemonPayloadDecodesToExactlyTodaysState() throws {
+        // The compat story (#65 honest-Unknown precedent): no reason field
+        // means the pre-#149 rendering, bit for bit.
+        let account = try decodeAccount(#"""
+        {"id": "a1", "provider": "claude", "label": "Work", "enabled": true, "isDefault": false,
+         "authState": "signin-required"}
+        """#)
+        #expect(account.signinReason == nil)
+        #expect(account.healthChip == .signInAgain)
+        #expect(DeckFreshness.signInRecovery(for: account)?.text == "Sign in needed")
+        #expect(DeckFreshness.signInRecovery(for: account)?.tone == .signedOut)
+    }
+
+    @Test func reasonNeverAffectsOtherAuthStates() throws {
+        // A daemon bug pairing a reason with a healthy state must not
+        // invent an idle chip — the reason only refines signin-required.
+        let account = try decodeAccount(#"""
+        {"id": "a1", "provider": "claude", "label": "Work", "enabled": true, "isDefault": false,
+         "authState": "ok", "signinReason": "expired"}
+        """#)
+        #expect(account.healthChip == .healthy)
         #expect(DeckFreshness.signInRecovery(for: account) == nil)
     }
 }

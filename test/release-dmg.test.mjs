@@ -148,6 +148,83 @@ test('release signing uses a placeholder unless MD_SIGN_IDENTITY is set', () => 
   assert.match(script, /signing identity is still the placeholder; set MD_SIGN_IDENTITY/);
 });
 
+test('missing Sparkle artifacts dir fails loudly, not with a silent exit', (t) => {
+  // v0.3.2 regression: in a pristine worktree .build/artifacts does not
+  // exist, find exits nonzero, and under `set -euo pipefail` that status
+  // escaped the command substitution and killed the script BEFORE the
+  // intended fail() message. --appcast-only exercises locate_sign_update
+  // on exactly that path without needing credentials or a build.
+  const root = releaseRepository(t);
+  const dmg = path.join(root, 'dist', 'ModelDeck-0.0.0.dmg');
+  fs.writeFileSync(dmg, 'not a real dmg');
+  const result = spawnSync('bash', ['scripts/release-dmg.sh', '--appcast-only', dmg], {
+    cwd: root,
+    encoding: 'utf8',
+    env: { ...process.env, MD_SPARKLE_SIGN_UPDATE: '' },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Sparkle sign_update tool not found/);
+  assert.match(result.stderr, /Sparkle EdDSA key setup/);
+});
+
+test('Sparkle preflight find pipelines cannot die silently under pipefail', () => {
+  const script = fs.readFileSync(releaseScript, 'utf8');
+  // Every artifacts-dir find must neutralize its exit status so an absent
+  // directory reaches the loud fail() instead of tripping set -e.
+  const finds = script
+    .split('\n')
+    .filter((line) => /^[^#]*\bfind "\$PACKAGE_DIR\/\.build\/artifacts"/.test(line));
+  assert.ok(finds.length >= 2, 'expected the sign_update and generate_keys lookups');
+  for (const line of finds) {
+    assert.match(line, /\|\| true/, `find lookup can silently kill the script: ${line.trim()}`);
+  }
+  // A pristine worktree has no artifacts until SwiftPM resolves; the script
+  // must resolve before the Sparkle preflight rather than fail on it.
+  assert.match(script, /swift package resolve --package-path "\$PACKAGE_DIR"/);
+});
+
+test('resource bundle ships with an Info.plist and a loud preflight (#151)', () => {
+  // v0.3.3 field crash (public report modeldeck#1): the packaged
+  // ModelDeckMac_ModelDeckMacCore.bundle was loose PNGs with no Info.plist,
+  // Bundle(url:) rejected it, and Bundle.module trapped on first popover
+  // open. Three layers guard the regression:
+  // 1. Package.swift declares defaultLocalization so SwiftPM generates the
+  //    bundle's Info.plist in the first place.
+  const packageSwift = fs.readFileSync(
+    new URL('../macos/ModelDeckMac/Package.swift', import.meta.url),
+    'utf8'
+  );
+  assert.match(packageSwift, /defaultLocalization:\s*"en"/);
+
+  const script = fs.readFileSync(releaseScript, 'utf8');
+  // 2. Belt-and-braces: the script synthesizes a minimal plist if a future
+  //    toolchain stops emitting one (CFBundlePackageType=BNDL et al.).
+  assert.match(script, /synthesizing a minimal one \(issue #151\)/);
+  assert.match(script, /Add :CFBundlePackageType string BNDL/);
+  assert.match(script, /Add :CFBundleIdentifier string /);
+  assert.match(script, /Add :CFBundleName string /);
+  // 3. Loud preflight before signing: plist must EXIST (PlistBuddy Print
+  //    creates a missing file and exits 0, so a bare Print is not enough),
+  //    must print, and all six provider PNGs must be present.
+  assert.match(script, /resource bundle preflight/);
+  assert.match(script, /"\$PACKAGED_BUNDLE\/Info\.plist" "\$PACKAGED_BUNDLE\/Contents\/Info\.plist"/);
+  assert.match(script, /resource bundle has NO Info\.plist/);
+  assert.match(script, /PlistBuddy -c Print "\$BUNDLE_PLIST"/);
+  assert.match(script, /resource bundle Info\.plist does not print via PlistBuddy/);
+  for (const provider of ['claude', 'codex']) {
+    for (const px of [32, 64, 128]) {
+      assert.match(script, new RegExp(`provider-${provider}-${px}\\.png`));
+    }
+  }
+  assert.match(script, /missing provider icon/);
+  // The preflight must run BEFORE any codesign call so a bad bundle can
+  // never reach signing/notarization.
+  const preflightAt = script.indexOf('resource bundle preflight');
+  const firstSignAt = script.indexOf('codesign --force');
+  assert.ok(preflightAt > 0 && firstSignAt > 0 && preflightAt < firstSignAt,
+    'resource bundle preflight must precede the first codesign');
+});
+
 test('release assembly requires, stages, and signs the self-contained daemon (#91)', () => {
   const script = fs.readFileSync(releaseScript, 'utf8');
   assert.match(script, /DAEMON_BINARY="\$DIST_DIR\/daemon\/modeldeckd"/);
