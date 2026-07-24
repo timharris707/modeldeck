@@ -24,9 +24,6 @@ struct DeckPopoverView: View {
     /// once in the model's load(), never in this struct's initializer (an
     /// XPC round-trip per App-body evaluation — the #68 re-render tax).
     @ObservedObject var launchAtLoginModel: LaunchAtLoginModel
-    /// Presents the standard result dialog once a gear-menu check finishes.
-    @State private var updateDialog: AppUpdateModel.ResultDialog?
-    @Environment(\.openURL) private var openURL
     /// Issue #45: Settings opens via the environment action wrapped in
     /// activation + fronting (see SettingsWindowFronting) instead of a bare
     /// SettingsLink, which with the accessory activation policy opened the
@@ -116,11 +113,18 @@ struct DeckPopoverView: View {
                 Button("Check for App Updates…") {
                     Task {
                         await appUpdateModel.check()
-                        // Issue #45: same accessory-policy pitfall as the
-                        // Settings window — activate so the result dialog
-                        // presents in front of whatever app was frontmost.
-                        SettingsWindowFronting.activateForDialog()
-                        updateDialog = appUpdateModel.resultDialog
+                        // Issue #163: the result presents in the floating
+                        // update panel (activation handled inside), which
+                        // transitions IN PLACE to the progress surface on
+                        // Update Now and outlives this popover — a SwiftUI
+                        // .alert here closed on the click and left no
+                        // feedback at all (Tim's live 0.3.5 report).
+                        if let dialog = appUpdateModel.resultDialog {
+                            AppUpdateDialogPanel.present(
+                                dialog: dialog,
+                                installModel: appUpdateInstallModel
+                            )
+                        }
                     }
                 }
                 .disabled(appUpdateModel.isChecking)
@@ -131,30 +135,6 @@ struct DeckPopoverView: View {
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
-            .alert(
-                updateDialog?.title ?? "",
-                isPresented: Binding(
-                    get: { updateDialog != nil },
-                    set: { if !$0 { updateDialog = nil } }
-                ),
-                presenting: updateDialog
-            ) { dialog in
-                if dialog.offersInstall, let releaseURL = dialog.releaseURL {
-                    // Issue #121 (Tim directive 2026-07-22): Update Now is
-                    // the primary action; the release page demotes to a
-                    // secondary "Release Notes" link.
-                    Button("Update Now") { appUpdateInstallModel.updateNow() }
-                    Button("Release Notes") { openURL(releaseURL) }
-                    Button("Cancel", role: .cancel) {}
-                } else if let releaseURL = dialog.releaseURL {
-                    Button("View Release") { openURL(releaseURL) }
-                    Button("Cancel", role: .cancel) {}
-                } else {
-                    Button("OK", role: .cancel) {}
-                }
-            } message: { dialog in
-                Text(dialog.message)
-            }
         }
     }
 

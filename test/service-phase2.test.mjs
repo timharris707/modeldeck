@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../src/db.mjs';
 import { ModelDeckService } from '../src/service.mjs';
+import { codexDeadCredentialError } from '../src/adapters/codex.mjs';
 
 function fixture(options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-phase2-'));
@@ -1035,6 +1036,97 @@ test('presence-probe sign-in states carry signinReason "missing" — absent cred
       assert.equal(account.authState, 'signin-required');
       assert.equal(account.signinReason, 'missing');
     }
+  } finally { data.close(); }
+});
+
+// Issue #164 — the live forensics: a Codex probe failing `401
+// token_invalidated` (token family rotated after re-logging the #108
+// duplicate's other half) left authState "ok" — auth.json still exists, so
+// the presence check passed — and the deck showed only the passive #89
+// staleness chip. The classified probe rejection must flip the account to
+// signin-required/"missing" (amber "Sign in needed" + #118 one-click path),
+// while an UNRECOGNIZED 401 keeps exactly the old behavior.
+
+test('Codex token_invalidated probe failure flips authState to signin-required with reason "missing" (issue #164)', async () => {
+  const data = fixture({
+    fetchCodex: async ({ codexHome }) => {
+      if (path.basename(codexHome) === 'second') throw codexDeadCredentialError('token_invalidated');
+      return [{ scope: 'weekly', usedPercent: 12, source: 'fixture' }];
+    },
+  });
+  try {
+    // Both profiles still HOLD an auth.json — the dead token looks present
+    // locally, which is exactly how the account hid behind the stale chip.
+    for (const home of [data.firstHome, data.secondHome]) {
+      fs.writeFileSync(path.join(home, 'auth.json'), JSON.stringify({
+        tokens: { id_token: 'placeholder-token', account_id: `acct-placeholder-${path.basename(home)}` },
+      }), { mode: 0o600 });
+    }
+    const healthy = data.store.saveAccount({ provider: 'codex', label: 'Healthy', profileRef: data.firstHome, isDefault: true });
+    const dead = data.store.saveAccount({ provider: 'codex', label: 'Invalidated', profileRef: data.secondHome });
+    await data.service.refreshAll();
+
+    const state = await data.service.state();
+    assert.equal(state.accounts.find((account) => account.id === healthy.id).authState, 'ok');
+    const flipped = state.accounts.find((account) => account.id === dead.id);
+    assert.equal(flipped.authState, 'signin-required');
+    // Genuine sign-out: amber "Sign in needed", never the calm #149 idle tone.
+    assert.equal(flipped.signinReason, 'missing');
+    assert.match(flipped.lastRefreshError.message, /token_invalidated/);
+    assert.match(flipped.lastRefreshError.message, /sign in explicitly before refreshing/);
+  } finally { data.close(); }
+});
+
+test('unrecognized Codex 401 keeps authState "ok" with only the staleness error — no false alarm (issue #164)', async () => {
+  const transient = 'unexpected status 401 Unauthorized: {"error":{"message":"intermittent auth verification failure","type":"server_error"}}';
+  const data = fixture({
+    fetchCodex: async ({ codexHome }) => {
+      if (path.basename(codexHome) === 'second') throw new Error(transient);
+      return [{ scope: 'weekly', usedPercent: 12, source: 'fixture' }];
+    },
+  });
+  try {
+    for (const home of [data.firstHome, data.secondHome]) {
+      fs.writeFileSync(path.join(home, 'auth.json'), JSON.stringify({
+        tokens: { id_token: 'placeholder-token', account_id: `acct-placeholder-${path.basename(home)}` },
+      }), { mode: 0o600 });
+    }
+    data.store.saveAccount({ provider: 'codex', label: 'Healthy', profileRef: data.firstHome, isDefault: true });
+    const hiccup = data.store.saveAccount({ provider: 'codex', label: 'Hiccup', profileRef: data.secondHome });
+    await data.service.refreshAll();
+
+    const account = (await data.service.state()).accounts.find((item) => item.id === hiccup.id);
+    // Exactly today's behavior: honest staleness, no sign-in alarm.
+    assert.equal(account.authState, 'ok');
+    assert.equal('signinReason' in account, false);
+    assert.equal(account.lastRefreshError.message, transient);
+  } finally { data.close(); }
+});
+
+test('re-login after token_invalidated clears the alarm without waiting for the next tick (issues #118/#164)', async () => {
+  let invalidated = true;
+  const data = fixture({
+    fetchCodex: async () => {
+      if (invalidated) throw codexDeadCredentialError('token_invalidated');
+      return [{ scope: 'weekly', usedPercent: 12, source: 'fixture' }];
+    },
+  });
+  try {
+    fs.writeFileSync(path.join(data.firstHome, 'auth.json'), JSON.stringify({
+      tokens: { id_token: 'placeholder-token', account_id: 'acct-placeholder-relogged' },
+    }), { mode: 0o600 });
+    const account = data.store.saveAccount({ provider: 'codex', label: 'Invalidated', profileRef: data.firstHome, isDefault: true });
+    await data.service.refreshAll();
+    assert.equal((await data.service.state()).accounts[0].authState, 'signin-required');
+
+    // The #118 one-click path ends in a verify; an authenticated result
+    // supersedes the recorded failure immediately (#89 contract).
+    invalidated = false;
+    data.service.readCodexAuth = async () => ({ authenticated: true, identity: 'user@example.invalid', plan: { planType: null } });
+    await data.service.verifyAccount(account.id);
+    const recovered = (await data.service.state()).accounts[0];
+    assert.equal(recovered.authState, 'ok');
+    assert.equal(recovered.lastRefreshError, undefined);
   } finally { data.close(); }
 });
 

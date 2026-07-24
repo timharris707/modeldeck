@@ -632,6 +632,60 @@ struct SignInRecoveryTests {
         #expect(idle.staleness(now: now, autoRefreshInterval: 1_800) == nil)
         #expect(idle.keychainRecovery == nil)
     }
+
+    // MARK: Provider-invalidated token (issue #164)
+
+    /// The exact per-account error the daemon records after classifying the
+    /// live #164 forensics: a Codex probe failing `401 token_invalidated`
+    /// (token family rotated server-side after re-logging the #108
+    /// duplicate's other half). No credential material — an error message.
+    private static let tokenInvalidatedMessage =
+        "Codex invalidated this account's stored sign-in (token_invalidated); sign in explicitly before refreshing"
+
+    @Test func providerInvalidatedCodexTokenRendersTheAmberSignInNotice() {
+        // A genuine server-side sign-out: amber "Sign in needed" with the
+        // #118 one-click pointer — never the calm #149 idle tone, because
+        // nothing renews this token on next use.
+        let recovery = row(
+            authState: "signin-required",
+            provider: "codex",
+            errorMessage: Self.tokenInvalidatedMessage,
+            signinReason: "missing"
+        ).signInRecovery
+        #expect(recovery?.tone == .signedOut)
+        #expect(recovery?.text == "Sign in needed")
+        #expect(recovery?.tooltip.contains("Settings → Accounts") == true)
+        // The daemon's classified error rides along so the card says WHY.
+        #expect(recovery?.tooltip.contains("Last refresh failed:") == true)
+        #expect(recovery?.tooltip.contains("token_invalidated") == true)
+    }
+
+    @Test func invalidatedTokenNoticeReplacesThePassiveStaleChip() {
+        // The live #164 shape: "Data from 18 hr ago" with nothing clickable.
+        // Once the daemon flips authState, the actionable notice takes the
+        // one-notice slot and the bare stale line is suppressed (#89/#114).
+        let signin = row(
+            authState: "signin-required",
+            provider: "codex",
+            errorMessage: Self.tokenInvalidatedMessage,
+            observedSecondsAgo: 64_800,
+            signinReason: "missing"
+        )
+        #expect(signin.signInRecovery?.tone == .signedOut)
+        #expect(signin.staleness(now: now, autoRefreshInterval: 1_800) == nil)
+
+        // Regression guard on the other half of the #164 contract: an
+        // UNRECOGNIZED 401 leaves authState "ok" — the same row before the
+        // flip keeps today's passive staleness rendering, no false alarm.
+        let transient = row(
+            authState: "ok",
+            provider: "codex",
+            errorMessage: "unexpected status 401 Unauthorized",
+            observedSecondsAgo: 64_800
+        )
+        #expect(transient.signInRecovery == nil)
+        #expect(transient.staleness(now: now, autoRefreshInterval: 1_800) != nil)
+    }
 }
 
 // MARK: - signinReason decode (issue #149)

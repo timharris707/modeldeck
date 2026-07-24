@@ -4,6 +4,29 @@ All notable changes to ModelDeck are documented here. Versioning follows the
 roadmap in `design/mac-app-roadmap.md`: `v0.1-web` tags the retired web MVP,
 and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 
+## 0.3.6 — 2026-07-24
+
+### Fixed
+- **Clicking Update Now shows you what it's doing — and actually finishes
+  (issue #163, Tim report)**: clicking Update Now used to leave the
+  dialog unchanged while the install ran invisibly — and worse, the
+  install could stall forever, staged and silently waiting for a
+  menu-bar app quit that never comes. The dialog now transitions in
+  place to live progress (downloading with percentage, verifying,
+  installing, relaunching), failures come back actionable with the
+  error shown, and an explicit Update Now click drives the full
+  quit → install → relaunch to completion. Background automatic updates
+  still stage quietly, but now honestly report "installed — pending
+  relaunch" instead of a perpetual "Installing…".
+- **Dead sign-ins announce themselves (issue #164, Tim report)**: when a
+  provider invalidates an account's token server-side (for example
+  after resolving a duplicate-credential situation), the card used to
+  drift into "Data from N hr ago" with no way to act. Both providers'
+  probes now recognize unambiguous dead-credential responses and flip
+  the card to the amber "Sign in needed" with its one-click login.
+  Transient auth hiccups keep the quiet stale marker — no false alarms —
+  and conditions a fresh sign-in can't fix never show a sign-in button.
+
 ## 0.3.5 — 2026-07-23
 
 The real fix for the 0.3.3/0.3.4 menu-bar click crash. 0.3.4's repair

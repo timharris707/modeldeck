@@ -1077,22 +1077,27 @@ struct GeneralSettingsPane: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         case .updateAvailable(let release):
-            HStack(spacing: 8) {
-                Text("Version \(release.version) is available.")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                if appUpdateModel.canInstallUpdates {
-                    Button("Update Now") { appUpdateInstallModel.updateNow() }
-                        .controlSize(.small)
-                        .disabled(appUpdateInstallModel.isBusy)
-                        .help("Downloads, verifies, and installs the update, then relaunches ModelDeck.")
-                    Button("Release Notes") { openURL(release.url) }
-                        .controlSize(.small)
-                        .help("Opens the GitHub release page.")
-                } else {
-                    Button("View Release") { openURL(release.url) }
-                        .controlSize(.small)
-                        .help("Opens the GitHub release page — download and install from there.")
+            // Issue #163: the instant Update Now is clicked this actionable
+            // row is REPLACED by the progress surface (installStatusLine
+            // below) — a still-enabled-looking offer next to an invisible
+            // install is exactly Tim's "it's not working" report.
+            if !appUpdateInstallModel.isBusy {
+                HStack(spacing: 8) {
+                    Text("Version \(release.version) is available.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    if appUpdateModel.canInstallUpdates {
+                        Button("Update Now") { appUpdateInstallModel.updateNow() }
+                            .controlSize(.small)
+                            .help("Downloads, verifies, and installs the update, then relaunches ModelDeck.")
+                        Button("Release Notes") { openURL(release.url) }
+                            .controlSize(.small)
+                            .help("Opens the GitHub release page.")
+                    } else {
+                        Button("View Release") { openURL(release.url) }
+                            .controlSize(.small)
+                            .help("Opens the GitHub release page — download and install from there.")
+                    }
                 }
             }
         case .unavailable(let message):
@@ -1105,18 +1110,17 @@ struct GeneralSettingsPane: View {
 
     /// Issue #121: honest install progress/outcome under the row — the same
     /// shared state the deck popover renders, so the surfaces always agree.
+    /// Issue #163: while the install runs this is the full progress surface
+    /// (stage copy + bar + Cancel while Sparkle permits), not a caption.
     @ViewBuilder
     private var installStatusLine: some View {
-        if let status = AppUpdateInstallModel.statusText(for: appUpdateInstallModel.phase) {
-            HStack(spacing: 6) {
-                if appUpdateInstallModel.isBusy {
-                    ProgressView().controlSize(.small)
-                }
-                Text(status)
-                    .font(.caption)
-                    .foregroundStyle(installFailed ? .red : .secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+        if appUpdateInstallModel.isBusy {
+            AppUpdateInstallProgressView(installModel: appUpdateInstallModel)
+        } else if let status = AppUpdateInstallModel.statusText(for: appUpdateInstallModel.phase) {
+            Text(status)
+                .font(.caption)
+                .foregroundStyle(installFailed ? .red : .secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

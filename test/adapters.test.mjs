@@ -13,8 +13,13 @@ import {
   parseClaudeUsage,
   validateClaudeProfileHome,
 } from '../src/adapters/claude.mjs';
+import { EventEmitter } from 'node:events';
 import {
+  CODEX_DEAD_CREDENTIAL_CODES,
+  codexDeadCredentialCode,
+  codexDeadCredentialError,
   createCodexProfileHome,
+  fetchCodexRateLimits,
   parseCodexRateLimits,
   readCodexLoginStatus,
   readCodexPlan,
@@ -27,7 +32,7 @@ import {
   readClaudeProfileIdentity,
 } from '../src/adapters/claude.mjs';
 import { claudeCredentialServiceName, claudeCredentialsPresent } from '../src/adapters/claude-keychain.mjs';
-import { main as probeClaudeUsage, readClaudeCredentials, runProbeCli, KEYCHAIN_DENIED_ERROR } from '../src/adapters/claude-usage-probe.mjs';
+import { main as probeClaudeUsage, readClaudeCredentials, runProbeCli, KEYCHAIN_DENIED_ERROR, TOKEN_INVALIDATED_ERROR } from '../src/adapters/claude-usage-probe.mjs';
 import { extractIdentity } from '../src/adapters/identity.mjs';
 import { createProviderProfileHelpers } from '../src/adapters/provider-profile.mjs';
 
@@ -504,6 +509,60 @@ test('probe failure messages are pinned exactly: missing vs expired credentials 
   });
 });
 
+// Issue #164 (Claude-side audit): a token that passes both local gates
+// (present + unexpired) yet is refused by the provider with a structured
+// 401 authentication error is dead server-side — the Claude twin of the
+// Codex token_invalidated gap. Fixture tokens are placeholders.
+const liveClaudeCredentials = JSON.stringify({
+  claudeAiOauth: { accessToken: 'fixture-oauth-token', expiresAt: Date.now() + 3_600_000 },
+});
+
+test('provider-rejected 401 with a structured authentication error is a sign-out, pinned exactly (issue #164)', async () => {
+  await assert.rejects(probeClaudeUsage({
+    env: { CLAUDE_CONFIG_DIR: '/profiles/selected' },
+    readFile: async () => liveClaudeCredentials,
+    fetcher: async () => ({
+      ok: false,
+      status: 401,
+      text: async () => JSON.stringify({
+        type: 'error',
+        error: { type: 'authentication_error', message: 'OAuth token has been revoked.' },
+      }),
+    }),
+  }), (error) => {
+    assert.equal(error.message, TOKEN_INVALIDATED_ERROR);
+    // The #89 flip suffix without the #149 idle prefix: genuine sign-out,
+    // amber treatment, signinReason "missing".
+    assert.match(error.message, /sign in explicitly before refreshing/);
+    assert.doesNotMatch(error.message, /stored oauth credentials have expired/i);
+    return true;
+  });
+});
+
+test('unstructured or non-auth 401/403 bodies keep the generic transient shape (issue #164)', async () => {
+  const cases = [
+    // 401 with an unparseable body: could be a proxy hiccup, never a flip.
+    { status: 401, text: async () => '<html>gateway error</html>' },
+    // 401 whose structured type is not an authentication verdict.
+    { status: 401, text: async () => JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'bad request' } }) },
+    // 403 permission errors: a fresh sign-in cannot fix them.
+    { status: 403, text: async () => JSON.stringify({ type: 'error', error: { type: 'permission_error', message: 'not allowed' } }) },
+    // Server errors stay server errors.
+    { status: 500, text: async () => JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'internal' } }) },
+  ];
+  for (const response of cases) {
+    await assert.rejects(probeClaudeUsage({
+      env: { CLAUDE_CONFIG_DIR: '/profiles/selected' },
+      readFile: async () => liveClaudeCredentials,
+      fetcher: async () => ({ ok: false, ...response }),
+    }), (error) => {
+      assert.equal(error.message, `provider returned HTTP ${response.status}`);
+      assert.doesNotMatch(error.message, /sign in explicitly before refreshing/);
+      return true;
+    });
+  }
+});
+
 test('probe CLI success writes nothing to stderr and exits 0 (issue #114)', async () => {
   const written = [];
   const code = await runProbeCli({
@@ -798,6 +857,124 @@ test('preserves an upstream weekly-only Codex response without inventing a 5-hou
   });
   assert.deepEqual(snapshots.map((row) => [row.scope, row.usedPercent]), [['weekly', 64]]);
   assert.equal(snapshots[0].resetsAt, '2026-07-25T03:29:39.000Z');
+});
+
+// ---------------------------------------------------------------------------
+// Issue #164 — Codex probe dead-credential classification. The live daemon
+// forensics: a probe failing `401 token_invalidated` left authState "ok"
+// behind a passive stale-data chip. Classification is on the STRUCTURED
+// `code` field only; prose can never flip. No fixture below contains a real
+// token — the 401 body is the provider's error message shape.
+
+// The exact 401 body from the #164 forensics (an error message, no
+// credential material).
+const TOKEN_INVALIDATED_401_BODY = JSON.stringify({
+  error: {
+    message: 'Your authentication token has been invalidated. Please try signing in again.',
+    type: 'invalid_request_error',
+    code: 'token_invalidated',
+  },
+});
+
+// Minimal in-process stand-in for the codex app-server: replies to each
+// JSON-RPC request line with respond(request), over the same newline-framed
+// stdout the adapter parses.
+function fakeAppServerSpawn(respond) {
+  const child = new EventEmitter();
+  child.killed = false;
+  child.kill = () => { child.killed = true; };
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.stdin = {
+    write(line) {
+      const request = JSON.parse(line);
+      const reply = respond(request);
+      if (reply) queueMicrotask(() => child.stdout.emit('data', `${JSON.stringify(reply)}\n`));
+    },
+  };
+  return () => child;
+}
+
+test('Codex probe 401 token_invalidated rejects with the pinned sign-in message (issue #164)', async () => {
+  await assert.rejects(fetchCodexRateLimits({
+    codexHome: '/profiles/codex-fixture',
+    spawnImpl: fakeAppServerSpawn((request) => {
+      if (request.id === 1) return { id: 1, result: {} };
+      if (request.id === 2) {
+        return { id: 2, error: { code: -32603, message: `unexpected status 401 Unauthorized: ${TOKEN_INVALIDATED_401_BODY}` } };
+      }
+      return null;
+    }),
+  }), (error) => {
+    // The #89 suffix flips authState to signin-required in the service…
+    assert.match(error.message, /sign in explicitly before refreshing/);
+    // …the structured code rides along for humans reading /api/state…
+    assert.match(error.message, /token_invalidated/);
+    // …and the #149 idle-decay prefix is absent, so signinReason stays
+    // "missing" — the amber "Sign in needed", never the calm moon.
+    assert.doesNotMatch(error.message, /stored oauth credentials have expired/i);
+    return true;
+  });
+});
+
+test('unrecognized Codex probe 401 keeps the raw provider message — no false alarm (issue #164)', async () => {
+  const transientMessage = 'unexpected status 401 Unauthorized: {"error":{"message":"intermittent auth verification failure","type":"server_error"}}';
+  await assert.rejects(fetchCodexRateLimits({
+    codexHome: '/profiles/codex-fixture',
+    spawnImpl: fakeAppServerSpawn((request) => {
+      if (request.id === 1) return { id: 1, result: {} };
+      if (request.id === 2) return { id: 2, error: { code: -32603, message: transientMessage } };
+      return null;
+    }),
+  }), (error) => {
+    // Exactly today's behavior: the raw message becomes lastRefreshError,
+    // authState never flips (the sign-in phrase is absent by construction).
+    assert.equal(error.message, transientMessage);
+    assert.doesNotMatch(error.message, /sign in explicitly before refreshing/);
+    return true;
+  });
+});
+
+test('dead-credential classification at the initialize step uses the same pinned shape (issue #164)', async () => {
+  await assert.rejects(fetchCodexRateLimits({
+    codexHome: '/profiles/codex-fixture',
+    spawnImpl: fakeAppServerSpawn((request) => (request.id === 1
+      ? { id: 1, error: { code: -32603, message: `unexpected status 401 Unauthorized: ${TOKEN_INVALIDATED_401_BODY}` } }
+      : null)),
+  }), /sign in explicitly before refreshing/);
+});
+
+test('codexDeadCredentialCode matches structured codes only, never prose (issue #164)', () => {
+  // Structured code embedded in the app-server message string.
+  assert.equal(codexDeadCredentialCode({ code: -32603, message: `unexpected status 401 Unauthorized: ${TOKEN_INVALIDATED_401_BODY}` }), 'token_invalidated');
+  // Structured code passed through JSON-RPC error.data.
+  assert.equal(codexDeadCredentialCode({ message: 'request failed', data: { code: 'token_revoked' } }), 'token_revoked');
+  assert.equal(codexDeadCredentialCode({ message: 'refresh failed: {"error":{"code":"invalid_grant"}}' }), 'invalid_grant');
+  // A prose MENTION of a dead code (no parseable JSON `code` field) never flips.
+  assert.equal(codexDeadCredentialCode({ message: 'server said token_invalidated in plain prose' }), null);
+  // Numeric JSON-RPC transport codes are not credential verdicts.
+  assert.equal(codexDeadCredentialCode({ code: -32603, message: 'internal error' }), null);
+  // Unrecognized structured codes keep today's behavior.
+  assert.equal(codexDeadCredentialCode({ message: 'unexpected status 403 Forbidden: {"error":{"code":"account_deactivated"}}' }), null);
+  assert.equal(codexDeadCredentialCode({ message: 'unexpected status 401 Unauthorized: {"error":{"message":"no code field"}}' }), null);
+  assert.equal(codexDeadCredentialCode(null), null);
+  assert.equal(codexDeadCredentialCode(new Error('plain failure')), null);
+});
+
+test('Codex dead-credential message honors the #89/#149 pinned-string contracts (issue #164)', () => {
+  assert.deepEqual([...CODEX_DEAD_CREDENTIAL_CODES], ['token_invalidated', 'token_revoked', 'invalid_grant']);
+  for (const code of CODEX_DEAD_CREDENTIAL_CODES) {
+    const { message } = codexDeadCredentialError(code);
+    assert.match(message, /sign in explicitly before refreshing/);
+    assert.match(message, new RegExp(code));
+    assert.doesNotMatch(message, /stored oauth credentials have expired/i);
+    assert.doesNotMatch(message, /keychain blocked/i);
+  }
+  // The #164 case verbatim, pinned like the #149 probe strings.
+  assert.equal(
+    codexDeadCredentialError('token_invalidated').message,
+    "Codex invalidated this account's stored sign-in (token_invalidated); sign in explicitly before refreshing",
+  );
 });
 
 test('reads the ChatGPT plan type from the Codex id_token payload', async (t) => {

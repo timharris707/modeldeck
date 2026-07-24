@@ -68,6 +68,12 @@ export const CLAUDE_RESOLVED_HOME_CREDENTIALS_MIN_VERSION = '2.1.216';
 // fresh provider login, no matter what the presence probe says. Expired OAuth
 // still LOOKS present to the Keychain/file probe, which is exactly how the
 // chip stayed "Healthy" while the card rendered fossils.
+// Issue #164 rides the same channel: both probes classify a provider-side
+// dead-credential rejection (Codex app-server structured `code` in
+// CODEX_DEAD_CREDENTIAL_CODES, Claude 401 `authentication_error`) into a
+// message carrying this exact suffix, so authState flips to signin-required
+// with signinReason "missing" — the amber "Sign in needed" + one-click
+// path (#114/#118), never the calm #149 idle notice.
 export const SIGN_IN_REQUIRED_ERROR_PATTERN = /sign in explicitly before refreshing/i;
 
 // Issue #149: the Claude probe emits two DISTINCT failures that both end in

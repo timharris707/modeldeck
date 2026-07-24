@@ -80,46 +80,16 @@ final class MenuBarContextMenuController: NSObject {
     }
 
     /// Same flow as the gear menu's item: run the shared AppUpdateModel and
-    /// present the standard result dialog (as an NSAlert here — no SwiftUI
-    /// presentation context exists for a status-item context menu).
+    /// present the shared update panel. Issue #163: the NSAlert this used
+    /// to show closed on Update Now and left zero feedback while Sparkle
+    /// worked; the panel transitions in place to the progress surface and
+    /// stays up through download → verify → install → relaunch (or lands on
+    /// the error, actionable).
     @objc private func checkForAppUpdates() {
         Task { @MainActor [appUpdateModel, installModel] in
             await appUpdateModel.check()
-            SettingsWindowFronting.activateForDialog()
-            Self.presentResultAlert(appUpdateModel.resultDialog, installModel: installModel)
-        }
-    }
-
-    private static func presentResultAlert(
-        _ dialog: AppUpdateModel.ResultDialog?,
-        installModel: AppUpdateInstallModel
-    ) {
-        guard let dialog else { return }
-        let alert = NSAlert()
-        alert.messageText = dialog.title
-        alert.informativeText = dialog.message
-        if dialog.offersInstall, let releaseURL = dialog.releaseURL {
-            // Issue #121: Update Now primary, release page secondary.
-            alert.addButton(withTitle: "Update Now")
-            alert.addButton(withTitle: "Release Notes")
-            alert.addButton(withTitle: "Cancel")
-            switch alert.runModal() {
-            case .alertFirstButtonReturn:
-                installModel.updateNow()
-            case .alertSecondButtonReturn:
-                NSWorkspace.shared.open(releaseURL)
-            default:
-                break
-            }
-        } else if let releaseURL = dialog.releaseURL {
-            alert.addButton(withTitle: "View Release")
-            alert.addButton(withTitle: "Cancel")
-            if alert.runModal() == .alertFirstButtonReturn {
-                NSWorkspace.shared.open(releaseURL)
-            }
-        } else {
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
+            guard let dialog = appUpdateModel.resultDialog else { return }
+            AppUpdateDialogPanel.present(dialog: dialog, installModel: installModel)
         }
     }
 

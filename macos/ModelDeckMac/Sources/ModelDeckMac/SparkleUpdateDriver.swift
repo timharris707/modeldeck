@@ -60,8 +60,15 @@ final class SparkleUpdateDriver: NSObject, AppUpdateInstalling {
     // MARK: AppUpdateInstalling
 
     func beginInstall() {
-        guard updater.canCheckForUpdates else { return }
+        guard updater.canCheckForUpdates else {
+            // Issue #163: a silent return here left the model stuck on
+            // "Checking…" forever (updateNow() already reported .checking).
+            // Say why the click can't act instead of eating it.
+            userDriver.reportBlockedStart()
+            return
+        }
         userDriver.mode = .userInitiated
+        userDriver.beginUserInitiatedSession()
         updater.checkForUpdates()
     }
 
@@ -98,13 +105,66 @@ final class OneClickUserDriver: NSObject {
     private var expectedDownloadLength: UInt64 = 0
     private var receivedDownloadLength: UInt64 = 0
     private var foundVersion: String = ""
+    /// Issue #163: set when the user's Cancel invoked Sparkle's cancellation
+    /// block — the follow-up updater "error" (if Sparkle raises one) is the
+    /// cancellation echo, never a failure to surface.
+    private var userDidCancel = false
+    /// Issue #163: the force-quit fallback runs at most once per session.
+    private var relaunchTerminationScheduled = false
 
     init(installModel: AppUpdateInstallModel) {
         self.installModel = installModel
     }
 
+    /// Fresh user-initiated session: reset the per-session flags.
+    func beginUserInitiatedSession() {
+        userDidCancel = false
+        relaunchTerminationScheduled = false
+    }
+
+    /// Issue #163: `SPUUpdater.canCheckForUpdates` said no (a session is
+    /// already running or the updater hasn't started) — land the click on an
+    /// actionable, honest state instead of a stuck "Checking…".
+    func reportBlockedStart() {
+        report(.failed(message:
+            "An update is already in progress. Give it a moment, then try again."))
+    }
+
     private func report(_ phase: AppUpdateInstallPhase) {
         installModel?.report(phase)
+    }
+
+    /// Offers Sparkle's cancellation block to the shared model (Cancel in
+    /// the dialog). User-initiated sessions only — background sessions have
+    /// no visible flow to cancel.
+    private func offerCancellation(_ cancellation: @escaping () -> Void) {
+        guard mode == .userInitiated else { return }
+        installModel?.setCancelHandler { [weak self] in
+            self?.userDidCancel = true
+            cancellation()
+        }
+    }
+
+    /// Issue #163 root-cause fix: Sparkle's Autoupdate agent sends ONE quit
+    /// Apple event and then KVO-waits for this process to die — in Tim's
+    /// live 0.3.4→0.3.5 update that event never took effect, and the staged
+    /// installer slept indefinitely ("Installing — ModelDeck will
+    /// relaunch." forever). On an explicit Update Now the app finishes the
+    /// job itself: give Sparkle's event a beat, re-send it via the
+    /// sanctioned retry handler, then terminate in-process. The agent
+    /// observes the termination, swaps the bundle, and relaunches the new
+    /// version — the completion #121 promised.
+    private func forceTerminationSoon(retry: @escaping () -> Void) {
+        guard !relaunchTerminationScheduled else { return }
+        relaunchTerminationScheduled = true
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard case .relaunching = installModel?.phase else { return }
+            retry() // Sparkle re-sends the quit Apple event
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard case .relaunching = installModel?.phase else { return }
+            NSApp.terminate(nil)
+        }
     }
 }
 
@@ -123,8 +183,12 @@ extension OneClickUserDriver: SPUUserDriver {
     }
 
     nonisolated func showUserInitiatedUpdateCheck(cancellation: @escaping () -> Void) {
+        nonisolated(unsafe) let cancellation = cancellation
         MainActor.assumeIsolated {
             report(.checking)
+            // Issue #163: Sparkle permits cancelling until the check
+            // completes — surface it as the dialog's Cancel.
+            offerCancellation(cancellation)
         }
     }
 
@@ -144,6 +208,9 @@ extension OneClickUserDriver: SPUUserDriver {
             foundVersion = appcastItem.displayVersionString
             switch mode {
             case .userInitiated:
+                // The check's cancellation block is spent — the download
+                // stage offers its own (showDownloadInitiated).
+                installModel?.setCancelHandler(nil)
                 // One-click: the user already said "Update Now".
                 report(.downloading(fraction: nil))
                 reply(.install)
@@ -186,7 +253,12 @@ extension OneClickUserDriver: SPUUserDriver {
     nonisolated func showUpdaterError(_ error: any Error, acknowledgement: @escaping () -> Void) {
         nonisolated(unsafe) let acknowledgement = acknowledgement
         MainActor.assumeIsolated {
-            if mode == .userInitiated {
+            if userDidCancel {
+                // Issue #163: the "error" is Sparkle acknowledging the
+                // user's own Cancel — actionable idle, never a red failure.
+                userDidCancel = false
+                installModel?.clearTransientProgress()
+            } else if mode == .userInitiated {
                 report(.failed(message:
                     "Update failed — \(error.localizedDescription) Nothing was changed; you can retry or use the release page."))
             } else {
@@ -200,10 +272,16 @@ extension OneClickUserDriver: SPUUserDriver {
     }
 
     nonisolated func showDownloadInitiated(cancellation: @escaping () -> Void) {
+        nonisolated(unsafe) let cancellation = cancellation
         MainActor.assumeIsolated {
             expectedDownloadLength = 0
             receivedDownloadLength = 0
-            if mode == .userInitiated { report(.downloading(fraction: nil)) }
+            if mode == .userInitiated {
+                report(.downloading(fraction: nil))
+                // Issue #163: valid until extraction starts; the model
+                // drops it automatically on the .extracting report.
+                offerCancellation(cancellation)
+            }
         }
     }
 
@@ -242,11 +320,14 @@ extension OneClickUserDriver: SPUUserDriver {
     nonisolated func showReady(toInstallAndRelaunch reply: @escaping (SPUUserUpdateChoice) -> Void) {
         nonisolated(unsafe) let reply = reply
         MainActor.assumeIsolated {
-            switch mode {
-            case .userInitiated:
+            switch AppUpdateRelaunchPolicy.onReadyToInstall(mode: policyMode) {
+            case .installAndRelaunchNow:
+                // Issue #163: the explicit click drives the install to
+                // COMPLETION — .install here, and the showInstallingUpdate
+                // callback below guarantees the quit actually happens.
                 report(.installing)
                 reply(.install)
-            case .background:
+            case .stageForNextLaunch:
                 // Staged; installs on the next quit/relaunch — never yank
                 // the app out from under the user.
                 report(.installedPendingRelaunch(version: foundVersion))
@@ -259,8 +340,29 @@ extension OneClickUserDriver: SPUUserDriver {
         withApplicationTerminated applicationTerminated: Bool,
         retryTerminatingApplication: @escaping () -> Void
     ) {
+        nonisolated(unsafe) let retryTerminatingApplication = retryTerminatingApplication
         MainActor.assumeIsolated {
-            report(.installing)
+            switch AppUpdateRelaunchPolicy.onInstalling(
+                mode: policyMode, applicationTerminated: applicationTerminated
+            ) {
+            case .relaunchingNow(let forceTerminationIfNeeded):
+                report(.relaunching)
+                if forceTerminationIfNeeded {
+                    forceTerminationSoon(retry: retryTerminatingApplication)
+                }
+            case .stagedUntilNextLaunch:
+                // Issue #163: a background-staged install waiting on the
+                // next quit must never read as "Installing…" — that copy
+                // describes a stall (and in Tim's live run, it WAS one).
+                report(.installedPendingRelaunch(version: foundVersion))
+            }
+        }
+    }
+
+    private var policyMode: AppUpdateRelaunchPolicy.SessionMode {
+        switch mode {
+        case .userInitiated: return .userInitiated
+        case .background: return .background
         }
     }
 
@@ -276,7 +378,9 @@ extension OneClickUserDriver: SPUUserDriver {
     nonisolated func dismissUpdateInstallation() {
         MainActor.assumeIsolated {
             // Terminal cleanup — keep terminal states (failed / pending
-            // relaunch) visible; clear only transient progress.
+            // relaunch) visible; clear only transient progress (which also
+            // withdraws any still-offered cancellation, issue #163).
+            userDidCancel = false
             installModel?.clearTransientProgress()
         }
     }

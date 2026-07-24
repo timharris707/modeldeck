@@ -59,6 +59,69 @@ export function parseCodexRateLimits(result) {
   return snapshots.filter((snapshot, index, all) => all.findIndex((item) => item.scope === snapshot.scope) === index);
 }
 
+// ---------------------------------------------------------------------------
+// Issue #164: provider error codes that unambiguously mean the stored
+// credential is DEAD — the provider itself refused it and only a fresh
+// sign-in can revive the account. Matching is on the STRUCTURED `code`
+// field of the provider's error body, never on prose, so message wording
+// drift can only ever fail toward today's behavior (stale chip), never
+// toward a false "Sign in needed" alarm.
+//
+//   token_invalidated  — the live #164 forensics: the token family was
+//                        rotated server-side (re-logging the #108
+//                        duplicate's other half), invalidating this copy.
+//   token_revoked      — an explicit server-side revocation of the token.
+//   invalid_grant      — RFC 6749 §5.2: the refresh token is invalid,
+//                        expired, or revoked at the token endpoint; the
+//                        standard OAuth code for "re-authenticate".
+//
+// Deliberately NOT in this set (they keep the stale chip + lastRefreshError):
+//   - any 401/403 without a recognized structured code (transient auth
+//     hiccups, proxies, clock skew) — no false alarms;
+//   - account_deactivated / plan or permission errors — a new sign-in
+//     cannot fix them, so a "Sign in needed" CTA would be dishonest;
+//   - rate-limit and server errors — not credential states at all.
+export const CODEX_DEAD_CREDENTIAL_CODES = Object.freeze(['token_invalidated', 'token_revoked', 'invalid_grant']);
+
+// Pinned suffix contract (#89/#149): the daemon's
+// SIGN_IN_REQUIRED_ERROR_PATTERN keys on "sign in explicitly before
+// refreshing", and the message must NEVER contain the #149 idle-decay
+// prefix "stored OAuth credentials have expired" — this is a genuine
+// server-side sign-out, so signinReason stays "missing" and the deck
+// renders the amber "Sign in needed" + one-click path, not the calm moon.
+export function codexDeadCredentialError(code) {
+  return new Error(`Codex invalidated this account's stored sign-in (${code}); sign in explicitly before refreshing`);
+}
+
+function structuredErrorCode(value) {
+  if (!value || typeof value !== 'object') return null;
+  for (const candidate of [value.code, value.error?.code, value.detail?.code]) {
+    // String-only on purpose: JSON-RPC numeric codes (-32603 …) are
+    // transport plumbing, never a credential verdict.
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+  }
+  return null;
+}
+
+/// Extracts a recognized dead-credential code from a Codex app-server
+/// JSON-RPC error: from `error.data` when the server passes the provider
+/// body through structurally, or from the JSON object the server embeds in
+/// its `error.message` string. A message that merely MENTIONS a code in
+/// prose (no parseable JSON body with a `code` field) never matches.
+export function codexDeadCredentialCode(rpcError) {
+  if (!rpcError || typeof rpcError !== 'object') return null;
+  let code = structuredErrorCode(rpcError) || structuredErrorCode(rpcError.data);
+  if (!code && typeof rpcError.message === 'string') {
+    const start = rpcError.message.indexOf('{');
+    const end = rpcError.message.lastIndexOf('}');
+    if (start !== -1 && end > start) {
+      try { code = structuredErrorCode(JSON.parse(rpcError.message.slice(start, end + 1))); }
+      catch { /* prose-only message: no structured verdict, no flip */ }
+    }
+  }
+  return code && CODEX_DEAD_CREDENTIAL_CODES.includes(code) ? code : null;
+}
+
 export function fetchCodexRateLimits({ binary = 'codex', codexHome, timeoutMs = 20_000, spawnImpl = spawn } = {}) {
   if (!codexHome) return Promise.reject(new Error('CODEX_HOME is required'));
   return new Promise((resolve, reject) => {
@@ -95,13 +158,29 @@ export function fetchCodexRateLimits({ binary = 'codex', codexHome, timeoutMs = 
         let message;
         try { message = JSON.parse(line); } catch { continue; }
         if (message.id === 1) {
-          if (message.error) return finish(reject, new Error(message.error.message || 'Codex app-server initialization failed'));
+          if (message.error) {
+            // Issue #164: a dead credential can surface at either request;
+            // classify structurally before falling back to the raw message.
+            const deadCode = codexDeadCredentialCode(message.error);
+            return finish(reject, deadCode
+              ? codexDeadCredentialError(deadCode)
+              : new Error(message.error.message || 'Codex app-server initialization failed'));
+          }
           child.stdin.write(`${JSON.stringify({ method: 'initialized' })}\n`);
           child.stdin.write(`${JSON.stringify({ id: 2, method: 'account/rateLimits/read', params: null })}\n`);
         }
         if (message.id === 2) {
-          if (message.error) finish(reject, new Error(message.error.message || 'Codex rate-limit request failed'));
-          else finish(resolve, parseCodexRateLimits(message.result));
+          if (message.error) {
+            // Issue #164: `401 token_invalidated` (and its siblings) left
+            // authState "ok" behind a stale-data chip — reject with the
+            // pinned sign-in message so the service-layer pattern (#89)
+            // flips the account to signin-required. Unrecognized errors
+            // keep exactly the previous shape: staleness, no false alarm.
+            const deadCode = codexDeadCredentialCode(message.error);
+            finish(reject, deadCode
+              ? codexDeadCredentialError(deadCode)
+              : new Error(message.error.message || 'Codex rate-limit request failed'));
+          } else finish(resolve, parseCodexRateLimits(message.result));
         }
       }
     });

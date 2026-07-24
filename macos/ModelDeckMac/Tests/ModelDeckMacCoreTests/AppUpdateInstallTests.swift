@@ -128,7 +128,7 @@ struct AppUpdateInstallModelTests {
         let model = AppUpdateInstallModel(defaults: freshDefaults())
         for phase: AppUpdateInstallPhase in [
             .checking, .downloading(fraction: nil), .downloading(fraction: 0.4),
-            .extracting(fraction: 0.9), .installing,
+            .extracting(fraction: 0.9), .installing, .relaunching,
         ] {
             model.report(phase)
             #expect(model.isBusy, "\(phase) should read busy")
@@ -148,9 +148,162 @@ struct AppUpdateInstallModelTests {
         #expect(AppUpdateInstallModel.statusText(for: .downloading(fraction: 0.42)) == "Downloading update… 42%")
         #expect(AppUpdateInstallModel.statusText(for: .extracting(fraction: 0.5)) == "Preparing update… 50%")
         #expect(AppUpdateInstallModel.statusText(for: .installing) == "Installing — ModelDeck will relaunch.")
+        #expect(AppUpdateInstallModel.statusText(for: .relaunching) == "Relaunching ModelDeck…")
         #expect(AppUpdateInstallModel.statusText(for: .installedPendingRelaunch(version: "0.4.0"))
             == "v0.4.0 is downloaded and installs the next time ModelDeck relaunches.")
         #expect(AppUpdateInstallModel.statusText(for: .failed(message: "Update failed — boom")) == "Update failed — boom")
+    }
+}
+
+@Suite("Update-flow progress + relaunch policy (issue #163)")
+@MainActor
+struct AppUpdateProgressDialogTests {
+    // MARK: Full explicit-click transition (idle → … → relaunching)
+
+    @Test func explicitUpdateWalksEveryStageToRelaunching() {
+        let model = AppUpdateInstallModel(defaults: freshDefaults())
+        let driver = StubInstallDriver()
+        model.attach(driver: driver)
+        model.updateNow()
+        #expect(model.phase == .checking)
+        for phase: AppUpdateInstallPhase in [
+            .downloading(fraction: nil), .downloading(fraction: 0.4),
+            .extracting(fraction: nil), .extracting(fraction: 0.9),
+            .installing, .relaunching,
+        ] {
+            model.report(phase)
+            #expect(model.phase == phase)
+            #expect(model.isBusy, "\(phase) must keep the dialog in its progress surface")
+        }
+    }
+
+    @Test func failureLandsOnActionableStateWithTheError() {
+        let model = AppUpdateInstallModel(defaults: freshDefaults())
+        let driver = StubInstallDriver()
+        model.attach(driver: driver)
+        model.updateNow()
+        model.report(.downloading(fraction: 0.7))
+        model.report(.failed(message: "Update failed — download interrupted."))
+        #expect(!model.isBusy) // dialog is actionable again
+        guard case .failed(let message) = model.phase else {
+            Issue.record("expected .failed, got \(model.phase)"); return
+        }
+        #expect(message.contains("download interrupted"))
+        // Try Again works from the failure state.
+        model.updateNow()
+        #expect(model.phase == .checking)
+        #expect(driver.beginInstallCount == 2)
+    }
+
+    // MARK: clearTransientProgress interactions (#121 rules preserved)
+
+    @Test func clearTransientProgressPreservesRelaunching() {
+        // Sparkle's dismissUpdateInstallation can fire while the app waits
+        // to terminate for the installer — clearing .relaunching would lie
+        // ("idle" while the swap is imminent) and disarm the driver's
+        // force-termination fallback, resurrecting the #163 stall.
+        let model = AppUpdateInstallModel(defaults: freshDefaults())
+        model.report(.relaunching)
+        model.clearTransientProgress()
+        #expect(model.phase == .relaunching)
+        // A driver-reported failure still moves the model off it.
+        model.report(.failed(message: "x"))
+        guard case .failed = model.phase else {
+            Issue.record("failure must override relaunching"); return
+        }
+    }
+
+    // MARK: Cancel — only while Sparkle permits (checking/downloading)
+
+    @Test func cancelIsOfferedOnlyWhileSparklePermits() {
+        let model = AppUpdateInstallModel(defaults: freshDefaults())
+        #expect(!model.canCancel)
+        model.report(.checking)
+        model.setCancelHandler {}
+        #expect(model.canCancel)
+        // Stays valid through the download stage…
+        model.report(.downloading(fraction: 0.2))
+        #expect(model.canCancel)
+        // …and drops the moment extraction (verification) starts.
+        model.report(.extracting(fraction: nil))
+        #expect(!model.canCancel)
+        // Re-offered handlers die with every later stage too.
+        for phase: AppUpdateInstallPhase in [
+            .installing, .relaunching, .installedPendingRelaunch(version: "0.4.0"),
+            .failed(message: "x"), .idle,
+        ] {
+            model.setCancelHandler {}
+            model.report(phase)
+            #expect(!model.canCancel, "\(phase) must withdraw Cancel")
+        }
+    }
+
+    @Test func cancelUpdateFiresOnceAndReturnsToActionableIdle() {
+        let model = AppUpdateInstallModel(defaults: freshDefaults())
+        let driver = StubInstallDriver()
+        model.attach(driver: driver)
+        model.updateNow()
+        var cancelCalls = 0
+        model.setCancelHandler { cancelCalls += 1 }
+        model.cancelUpdate()
+        #expect(cancelCalls == 1)
+        #expect(model.phase == .idle) // actionable again, immediately
+        #expect(!model.canCancel)
+        model.cancelUpdate() // no handler left → no-op
+        #expect(cancelCalls == 1)
+        // And Update Now works again after a cancel.
+        model.updateNow()
+        #expect(driver.beginInstallCount == 2)
+    }
+
+    @Test func clearTransientProgressWithdrawsAnOfferedCancel() {
+        let model = AppUpdateInstallModel(defaults: freshDefaults())
+        model.report(.downloading(fraction: 0.5))
+        var cancelCalls = 0
+        model.setCancelHandler { cancelCalls += 1 }
+        model.clearTransientProgress()
+        #expect(model.phase == .idle)
+        #expect(!model.canCancel)
+        model.cancelUpdate()
+        #expect(cancelCalls == 0) // the stale Sparkle block is never invoked
+    }
+
+    // MARK: Progress fraction for the dialog's bar
+
+    @Test func progressFractionOnlyForDownloadAndExtract() {
+        #expect(AppUpdateInstallModel.progressFraction(for: .downloading(fraction: 0.42)) == 0.42)
+        #expect(AppUpdateInstallModel.progressFraction(for: .extracting(fraction: 0.9)) == 0.9)
+        #expect(AppUpdateInstallModel.progressFraction(for: .downloading(fraction: nil)) == nil)
+        for phase: AppUpdateInstallPhase in [
+            .idle, .checking, .installing, .relaunching,
+            .installedPendingRelaunch(version: "0.4.0"), .failed(message: "x"),
+        ] {
+            #expect(AppUpdateInstallModel.progressFraction(for: phase) == nil)
+        }
+    }
+
+    // MARK: Relaunch policy — the stalled-install root cause (#163)
+
+    @Test func explicitClickInstallsAndRelaunchesNow() {
+        // Tim's live 0.3.4→0.3.5 forensics: Update Now must never take the
+        // stage-and-wait path — the explicit click drives the install to
+        // completion, force-terminating if Sparkle's quit event is ignored.
+        #expect(AppUpdateRelaunchPolicy.onReadyToInstall(mode: .userInitiated)
+            == .installAndRelaunchNow)
+        #expect(AppUpdateRelaunchPolicy.onInstalling(mode: .userInitiated, applicationTerminated: false)
+            == .relaunchingNow(forceTerminationIfNeeded: true))
+        // Already terminating: no extra force needed, but still relaunching.
+        #expect(AppUpdateRelaunchPolicy.onInstalling(mode: .userInitiated, applicationTerminated: true)
+            == .relaunchingNow(forceTerminationIfNeeded: false))
+    }
+
+    @Test func backgroundUpdatesStayStagedAndNeverYankTheApp() {
+        #expect(AppUpdateRelaunchPolicy.onReadyToInstall(mode: .background)
+            == .stageForNextLaunch)
+        #expect(AppUpdateRelaunchPolicy.onInstalling(mode: .background, applicationTerminated: false)
+            == .stagedUntilNextLaunch)
+        #expect(AppUpdateRelaunchPolicy.onInstalling(mode: .background, applicationTerminated: true)
+            == .stagedUntilNextLaunch)
     }
 }
 

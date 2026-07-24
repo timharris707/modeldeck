@@ -19,6 +19,22 @@ const SIGN_IN_ERROR = 'stored OAuth credentials are unavailable; sign in explici
 // refreshing" phrase so it can never trip the signin-required chip.
 export const KEYCHAIN_DENIED_ERROR = "macOS Keychain blocked ModelDeck's background service from reading this account's stored sign-in (a dismissed permission prompt does this); click Refresh and choose Always Allow when macOS asks again";
 
+// Issue #164 (Claude-side audit of the Codex `token_invalidated` gap): the
+// stored token passed BOTH local gates — it exists and its expiresAt is in
+// the future (both failures above throw before any network call) — yet the
+// provider still refused it with a STRUCTURED 401 authentication error.
+// That token is dead server-side (revoked, or invalidated by token
+// rotation, e.g. re-logging a #108 duplicate's other half); only a fresh
+// sign-in revives it. Classified on the response body's structured
+// `error.type`, never prose. Carries the #89 "sign in explicitly before
+// refreshing" suffix so the service pattern flips authState, and
+// deliberately NOT the #149 "stored OAuth credentials have expired" prefix:
+// this is a genuine sign-out (signinReason "missing", amber "Sign in
+// needed" + one-click path), not calm idle-decay. A 401 whose body is
+// missing, unparseable, or of any other type keeps the generic
+// `provider returned HTTP 401` shape — staleness chip, no false alarm.
+export const TOKEN_INVALIDATED_ERROR = 'stored OAuth credentials were invalidated by the provider; sign in explicitly before refreshing';
+
 function finiteNumber(value) {
   const parsed = typeof value === 'string' && value.trim() ? Number(value) : value;
   return typeof parsed === 'number' && Number.isFinite(parsed) ? parsed : null;
@@ -106,7 +122,15 @@ export async function main({ env = process.env, fetcher = globalThis.fetch, ...c
     },
     signal: AbortSignal.timeout(15_000),
   });
-  if (!response.ok) throw new Error(`provider returned HTTP ${response.status}`);
+  if (!response.ok) {
+    if (response.status === 401) {
+      let body = null;
+      try { body = JSON.parse(await response.text()); }
+      catch { /* unstructured 401 body: keep the generic transient shape */ }
+      if (body?.error?.type === 'authentication_error') throw new Error(TOKEN_INVALIDATED_ERROR);
+    }
+    throw new Error(`provider returned HTTP ${response.status}`);
+  }
   const text = await response.text();
   JSON.parse(text);
   process.stdout.write(text);

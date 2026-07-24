@@ -503,6 +503,27 @@ struct SignInAgainActionTests {
         #expect(DeckPopoverModel.signInAgainTarget(accountID: "acct-1", state: nil) == nil)
     }
 
+    @Test func providerInvalidatedCodexAccountIsAOneClickTarget() {
+        // Issue #164: the daemon's `401 token_invalidated` classification
+        // flips a Codex account to signin-required/"missing" — that row must
+        // land in the SAME #118 one-click machinery as every other sign-out:
+        // handler fired, Accounts pane routed, resolver accepts the target.
+        let model = model()
+        var requested: [String] = []
+        model.onSignInAgain = { requested.append($0) }
+        model.settingsPane = .general
+        let account = DeckAccount(
+            id: "acct-codex", provider: "codex", label: "Client",
+            authState: "signin-required", signinReason: "missing"
+        )
+        let codexRow = DeckAccountRow(account: account, provider: .codex, windows: [], isActive: false)
+        model.requestSignInAgain(for: codexRow)
+        #expect(requested == ["acct-codex"])
+        #expect(model.settingsPane == .accounts)
+        let state = DeckState(accounts: [account], usage: [])
+        #expect(DeckPopoverModel.signInAgainTarget(accountID: "acct-codex", state: state) == account)
+    }
+
     @Test func signInNoticeIsALiveWarningAffordance() {
         // The #115 reconcile knows the notice: present while signin-required.
         let live = DeckPopoverModel.liveWarningIDs(

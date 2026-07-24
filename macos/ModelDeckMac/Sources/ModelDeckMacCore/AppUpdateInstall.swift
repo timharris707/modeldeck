@@ -22,10 +22,72 @@ public enum AppUpdateInstallPhase: Equatable, Sendable {
     /// Download verified (EdDSA + Apple code signature); installer running.
     /// The app is about to terminate and relaunch.
     case installing
+    /// Issue #163: the installer is waiting for THIS process to quit so it
+    /// can swap the bundle and relaunch. On an explicit Update Now this is
+    /// moments long (the driver terminates the app itself if Sparkle's quit
+    /// event doesn't land) — never a silent stage-and-wait.
+    case relaunching
     /// A background (automatic) install is staged; it applies on the next
     /// relaunch — nothing yanks the app out from under the user mid-session.
     case installedPendingRelaunch(version: String)
     case failed(message: String)
+}
+
+/// Issue #163 — the decision table the Sparkle driver applies when the
+/// installer reaches its terminal callbacks. Pure and core-owned so tests
+/// pin the split Tim's live 0.3.4→0.3.5 forensics exposed: an EXPLICIT
+/// Update Now must drive quit → install → relaunch to completion, while
+/// background (automatic) updates stay staged until the app next quits.
+public enum AppUpdateRelaunchPolicy {
+    public enum SessionMode: Equatable, Sendable {
+        /// The user pressed Update Now.
+        case userInitiated
+        /// The daily scheduled check.
+        case background
+    }
+
+    /// Response to Sparkle's "ready to install and relaunch" ask.
+    public enum ReadyResponse: Equatable, Sendable {
+        /// Install immediately and relaunch — the one-click promise (#121).
+        case installAndRelaunchNow
+        /// Keep the staged update; it applies on the next natural quit.
+        case stageForNextLaunch
+    }
+
+    /// Response to Sparkle's "installing, app not necessarily terminated"
+    /// callback (the stall point in issue #163's forensics: Autoupdate
+    /// KVO-waits on app termination after sending a quit Apple event).
+    public enum InstallingResponse: Equatable, Sendable {
+        /// Show "relaunching"; when `forceTerminationIfNeeded` the driver
+        /// must actively quit the app if Sparkle's own quit event doesn't
+        /// take effect — waiting forever is the bug, not a state.
+        case relaunchingNow(forceTerminationIfNeeded: Bool)
+        /// Background staging: stay running, report the honest
+        /// pending-relaunch story (never "Installing…" — that reads as
+        /// stalled because it IS stalled until the next quit).
+        case stagedUntilNextLaunch
+    }
+
+    public static func onReadyToInstall(mode: SessionMode) -> ReadyResponse {
+        switch mode {
+        case .userInitiated: return .installAndRelaunchNow
+        case .background: return .stageForNextLaunch
+        }
+    }
+
+    public static func onInstalling(
+        mode: SessionMode, applicationTerminated: Bool
+    ) -> InstallingResponse {
+        switch mode {
+        case .userInitiated:
+            // Explicit click: completion is the contract. If the app is
+            // still alive, the driver terminates it (retry signal first,
+            // then a direct in-process terminate).
+            return .relaunchingNow(forceTerminationIfNeeded: !applicationTerminated)
+        case .background:
+            return .stagedUntilNextLaunch
+        }
+    }
 }
 
 /// Seam the app target's Sparkle driver implements. All methods are fire-and
@@ -54,6 +116,11 @@ public final class AppUpdateInstallModel: ObservableObject {
 
     @Published public private(set) var phase: AppUpdateInstallPhase = .idle
     @Published public private(set) var isAutoInstallEnabled: Bool
+    /// Issue #163: true exactly while Sparkle permits cancelling the
+    /// in-flight session (checking + downloading; never once extraction
+    /// starts). The dialog's Cancel button renders from this.
+    @Published public private(set) var canCancel: Bool = false
+    private var cancelHandler: (() -> Void)?
 
     private let defaults: UserDefaults
     /// Nil in builds without a Sparkle-configured bundle (dev builds, and
@@ -109,14 +176,45 @@ public final class AppUpdateInstallModel: ObservableObject {
         driver.checkInBackground()
     }
 
-    /// Driver callback funnel — every Sparkle state lands here.
+    /// Driver callback funnel — every Sparkle state lands here. Any phase
+    /// past the cancellable window (checking/downloading) drops the cancel
+    /// handler: Sparkle's cancellation blocks are only valid before
+    /// extraction starts (issue #163).
     public func report(_ phase: AppUpdateInstallPhase) {
         self.phase = phase
+        switch phase {
+        case .checking, .downloading:
+            break // an offered cancellation stays valid through these
+        case .idle, .extracting, .installing, .relaunching,
+             .installedPendingRelaunch, .failed:
+            dropCancelHandler()
+        }
+    }
+
+    /// Issue #163: the Sparkle driver offers (and withdraws) the session's
+    /// cancellation block here. Nil withdraws.
+    public func setCancelHandler(_ handler: (() -> Void)?) {
+        cancelHandler = handler
+        canCancel = handler != nil
+    }
+
+    /// The dialog's Cancel button. Returns the flow to an actionable idle
+    /// immediately; the handler tells Sparkle to abort its session.
+    public func cancelUpdate() {
+        guard let cancelHandler else { return }
+        dropCancelHandler()
+        phase = .idle
+        cancelHandler()
+    }
+
+    private func dropCancelHandler() {
+        cancelHandler = nil
+        if canCancel { canCancel = false }
     }
 
     public var isBusy: Bool {
         switch phase {
-        case .checking, .downloading, .extracting, .installing: return true
+        case .checking, .downloading, .extracting, .installing, .relaunching: return true
         case .idle, .installedPendingRelaunch, .failed: return false
         }
     }
@@ -124,8 +222,14 @@ public final class AppUpdateInstallModel: ObservableObject {
     /// Clears transient progress back to idle while PRESERVING terminal
     /// states — a staged pending-relaunch or a surfaced failure must stay
     /// visible through background-check errors and dialog dismissals alike.
+    /// `.relaunching` is preserved too (issue #163): after an explicit
+    /// Update Now it is terminal for THIS process — the app is about to
+    /// quit for the installer, and clearing it would both lie to the user
+    /// and disarm the driver's force-termination fallback. Only a driver
+    /// report (e.g. `.failed`) moves the model off it.
     public func clearTransientProgress() {
-        if isBusy { phase = .idle }
+        if isBusy, phase != .relaunching { phase = .idle }
+        dropCancelHandler()
     }
 
     /// Honest one-line status for the Settings row / dialog body. Nil when
@@ -144,10 +248,25 @@ public final class AppUpdateInstallModel: ObservableObject {
             return "Preparing update… \(Int((fraction * 100).rounded()))%"
         case .installing:
             return "Installing — ModelDeck will relaunch."
+        case .relaunching:
+            return "Relaunching ModelDeck…"
         case .installedPendingRelaunch(let version):
             return "v\(version) is downloaded and installs the next time ModelDeck relaunches."
         case .failed(let message):
             return message
+        }
+    }
+
+    /// Determinate progress for the dialog's bar, when Sparkle reports one
+    /// (download with a known content length; extraction). Nil = show an
+    /// indeterminate bar/spinner for that phase.
+    nonisolated public static func progressFraction(for phase: AppUpdateInstallPhase) -> Double? {
+        switch phase {
+        case .downloading(let fraction), .extracting(let fraction):
+            return fraction
+        case .idle, .checking, .installing, .relaunching,
+             .installedPendingRelaunch, .failed:
+            return nil
         }
     }
 }
