@@ -103,6 +103,117 @@ test('override path agrees end-to-end: daemon write path and generated block sou
   assert.deepEqual(output.split('\n'), [realProfile, realProfile]);
 });
 
+// Issue #161: the Codex block freezes CODEX_HOME per terminal by resolving
+// the ~/.codex active-profile symlink once at shell startup, mirroring the
+// Claude pinning so a `codex login` can never land in a profile that was
+// activated after the terminal opened.
+test('installs a Codex block that resolves the symlink once and respects an explicit CODEX_HOME', (t) => {
+  const home = fixtureHome(t);
+  runInstaller(home);
+  const content = fs.readFileSync(path.join(home, '.zshenv'), 'utf8');
+  assert.ok(content.includes('# >>> ModelDeck Codex identity switching >>>'));
+  assert.ok(content.includes('# <<< ModelDeck Codex identity switching <<<'));
+  // Precedence guard: an already-exported CODEX_HOME (per-profile launch
+  // commands, issue #106) must never be overwritten.
+  assert.ok(content.includes('if [ -z "${CODEX_HOME:-}" ]; then'));
+  assert.ok(content.includes('readlink ~/.codex'));
+
+  // Idempotent: a second run adds nothing.
+  runInstaller(home);
+  assert.equal(fs.readFileSync(path.join(home, '.zshenv'), 'utf8'), content);
+  assert.equal(content.match(/>>> ModelDeck Codex identity switching >>>/g).length, 1);
+});
+
+test('sourcing the Codex block exports the symlink target frozen at shell open', (t) => {
+  const home = fixtureHome(t);
+  runInstaller(home);
+  const profile = path.join(home, '.codex-profiles', 'work');
+  fs.mkdirSync(profile, { recursive: true });
+  fs.symlinkSync(profile, path.join(home, '.codex'));
+  const output = execFileSync('/bin/sh', ['-c', '. "$HOME/.zshenv"; printf "%s" "${CODEX_HOME:-}"'], {
+    env: { HOME: home, PATH: process.env.PATH },
+  }).toString();
+  assert.equal(output, profile);
+});
+
+test('a RELATIVE symlink target is anchored at $HOME before export (PR #162 review)', (t) => {
+  const home = fixtureHome(t);
+  runInstaller(home);
+  const profile = path.join(home, '.codex-profiles', 'work');
+  fs.mkdirSync(profile, { recursive: true });
+  // Symlink created with a relative target, as a hand-made `ln -s` might be.
+  fs.symlinkSync(path.join('.codex-profiles', 'work'), path.join(home, '.codex'));
+  const output = execFileSync('/bin/sh', ['-c', '. "$HOME/.zshenv"; printf "%s" "${CODEX_HOME:-}"'], {
+    env: { HOME: home, PATH: process.env.PATH },
+  }).toString();
+  assert.equal(output, profile);
+});
+
+test('no ~/.codex symlink means no CODEX_HOME export (stock behavior)', (t) => {
+  const home = fixtureHome(t);
+  runInstaller(home);
+  // Nothing at ~/.codex at all.
+  const missing = execFileSync('/bin/sh', ['-c', '. "$HOME/.zshenv"; printf "%s" "${CODEX_HOME:-unset}"'], {
+    env: { HOME: home, PATH: process.env.PATH },
+  }).toString();
+  assert.equal(missing, 'unset');
+  // A real (unmanaged) directory at ~/.codex is not a symlink either.
+  fs.mkdirSync(path.join(home, '.codex'));
+  const realDir = execFileSync('/bin/sh', ['-c', '. "$HOME/.zshenv"; printf "%s" "${CODEX_HOME:-unset}"'], {
+    env: { HOME: home, PATH: process.env.PATH },
+  }).toString();
+  assert.equal(realDir, 'unset');
+});
+
+test('an already-exported CODEX_HOME wins over the symlink (issue #106 launch commands)', (t) => {
+  const home = fixtureHome(t);
+  runInstaller(home);
+  const active = path.join(home, '.codex-profiles', 'active');
+  const explicit = path.join(home, '.codex-profiles', 'explicit');
+  fs.mkdirSync(active, { recursive: true });
+  fs.mkdirSync(explicit, { recursive: true });
+  fs.symlinkSync(active, path.join(home, '.codex'));
+  const output = execFileSync('/bin/sh', ['-c', '. "$HOME/.zshenv"; printf "%s" "$CODEX_HOME"'], {
+    env: { HOME: home, PATH: process.env.PATH, CODEX_HOME: explicit },
+  }).toString();
+  assert.equal(output, explicit);
+});
+
+test('adds the Codex block to a pre-#161 install without duplicating the Claude block', (t) => {
+  const home = fixtureHome(t);
+  const zshenv = path.join(home, '.zshenv');
+  // A ~/.zshenv exactly as the pre-#161 installer left it: Claude block
+  // present (with the claude-env.sh marker), no Codex block.
+  fs.writeFileSync(zshenv, [
+    'export EDITOR=vi',
+    '',
+    '# >>> ModelDeck Claude identity switching >>>',
+    '_modeldeck_claude_env="${MODELDECK_CLAUDE_SHELL_ENV_FILE:-$HOME/Library/Application Support/ModelDeck/claude-env.sh}"',
+    'if [ -f "$_modeldeck_claude_env" ]; then',
+    '  . "$_modeldeck_claude_env"',
+    'else',
+    '  export CLAUDE_SECURESTORAGE_CONFIG_DIR="$(readlink ~/.claude 2>/dev/null || true)"',
+    'fi',
+    'unset _modeldeck_claude_env',
+    '# <<< ModelDeck Claude identity switching <<<',
+    '',
+  ].join('\n'));
+  runInstaller(home);
+  const upgraded = fs.readFileSync(zshenv, 'utf8');
+  assert.equal(upgraded.match(/>>> ModelDeck Claude identity switching >>>/g).length, 1);
+  assert.equal(upgraded.match(/>>> ModelDeck Codex identity switching >>>/g).length, 1);
+  assert.ok(upgraded.includes('export EDITOR=vi'));
+});
+
+test('--remove strips the Codex block too', (t) => {
+  const home = fixtureHome(t);
+  runInstaller(home);
+  runInstaller(home, ['--remove']);
+  const removed = fs.readFileSync(path.join(home, '.zshenv'), 'utf8');
+  assert.ok(!removed.includes('ModelDeck'));
+  assert.ok(!removed.includes('CODEX_HOME'));
+});
+
 test('upgrades a legacy readlink-only block in place and --remove restores the file', (t) => {
   const home = fixtureHome(t);
   const zshenv = path.join(home, '.zshenv');

@@ -171,6 +171,49 @@ different; `identity-unverified` means either identity is unknown, the CLI is
 older than the verified scoping floor, or environment setup degraded.
 `mismatched`, `unlinked`, and `blocked` retain their physical-link meanings.
 
+## Codex shell pinning (issue #161)
+
+Codex has the same crossed-terminal hole Claude had before #66: `~/.codex`
+is a symlink to the active profile under `~/.codex-profiles/`, and `codex`
+resolves it at invocation time. A `codex login` typed in any terminal
+therefore lands in whichever profile is active at that instant — overwriting
+that profile's `auth.json` and destroying that account's only refresh token
+(the genesis of the #108 duplicate-credential incident).
+
+`scripts/install-shell-env.sh` now also writes a marked Codex block into
+`~/.zshenv` that resolves the `~/.codex` symlink **once, at terminal open**,
+and exports the concrete profile path as `CODEX_HOME`. Every Codex
+invocation in that terminal — login, status, sessions — is frozen to the
+profile that was active when the terminal opened, no matter how many
+activations happen later. `scripts/install-shell-env.sh --remove` strips
+this block along with the Claude one.
+
+Guards, in order:
+
+- An already-exported `CODEX_HOME` is never overwritten. ModelDeck's
+  per-profile login and launch commands (issue #106) set
+  `CODEX_HOME=<profileRef>` explicitly on the command line, and that always
+  wins — both because a command-line assignment overrides the shell's
+  environment for that process, and because the block only exports when
+  `CODEX_HOME` is empty.
+- No symlink at `~/.codex` (nothing there, or a real unmanaged directory)
+  → no export → stock Codex behavior. The block never invents a scope.
+
+Ceremony gotchas (the Codex mirror of the Claude rules above):
+
+- **A terminal's scope freezes at open.** Activating a different account in
+  ModelDeck does not retarget terminals that are already open.
+- **Open terminals AFTER activating.** To sign in or work as profile B:
+  activate B first, then open the terminal, then run `codex login`.
+- **A login in a stale terminal goes to the stale profile.** Not the one
+  ModelDeck currently shows as active. If you must reuse an old terminal,
+  either prefix explicitly (`CODEX_HOME="$HOME/.codex-profiles/<name>"
+  codex login`, the #106 form) or check `printf '%s\n' "$CODEX_HOME"`
+  first.
+- Sessions and shells that were already open before the block was installed
+  (or that bypass `~/.zshenv`) still resolve the symlink live and remain
+  exposed to the pre-#161 behavior.
+
 `CLAUDE_SECURESTORAGE_CONFIG_DIR` is an undocumented Claude Code interface,
 and the pinning behaviors above (no-realpath config resolution, per-append
 symlink re-resolution, subprocess env forwarding) are undocumented internals
