@@ -214,6 +214,190 @@ struct FooterStatusTests {
     }
 }
 
+// MARK: - Explained staleness footer (issue #168)
+
+// Tim's decision (issue #168, 2026-07-24): the footer's amber alarm fires
+// ONLY for unexplained staleness. When every stale enabled account's age is
+// explained by its card state (idle-decay #149, signed-out #114/#164,
+// Keychain-blocked #98), the footer renders a neutral one-line summary —
+// "Oldest data 1 day ago" surviving Refresh on an idle deck read as a
+// contradiction, not information.
+@Suite("Explained staleness footer (issue #168)")
+@MainActor
+struct ExplainedStalenessFooterTests {
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    private func model() -> MenuBarStatusModel {
+        let fixed = now
+        return MenuBarStatusModel(evaluator: StubEvaluator(results: []), clock: { fixed })
+    }
+
+    private func iso(secondsAgo: TimeInterval) -> String {
+        ISO8601DateFormatter().string(from: now.addingTimeInterval(-secondsAgo))
+    }
+
+    private func snapshot(
+        _ accountId: String, secondsAgo: TimeInterval, stale: Bool = false
+    ) -> UsageSnapshot {
+        UsageSnapshot(
+            accountId: accountId, scope: "5h", remainingPercent: 50,
+            observedAt: iso(secondsAgo: secondsAgo), stale: stale
+        )
+    }
+
+    private func live(_ id: String, label: String) -> DeckAccount {
+        DeckAccount(id: id, provider: "claude", label: label)
+    }
+
+    private func idle(_ id: String, label: String) -> DeckAccount {
+        DeckAccount(
+            id: id, provider: "claude", label: label,
+            authState: "signin-required", signinReason: "expired"
+        )
+    }
+
+    private func signedOut(_ id: String, label: String) -> DeckAccount {
+        DeckAccount(
+            id: id, provider: "codex", label: label,
+            authState: "signin-required", signinReason: "missing"
+        )
+    }
+
+    @Test func allIdleExplainedRendersTheNeutralSummary() {
+        // Tim's live 0.3.6 shape: three idle-expired Claude accounts a day
+        // old, one live account refreshing fine — neutral, never amber.
+        let model = model()
+        model.apply(deckState: DeckState(
+            accounts: [
+                live("l", label: "Studio"),
+                idle("i1", label: "Client"),
+                idle("i2", label: "Personal"),
+                idle("i3", label: "Side"),
+            ],
+            usage: [
+                snapshot("l", secondsAgo: 60),
+                snapshot("i1", secondsAgo: 90_000),
+                snapshot("i2", secondsAgo: 91_000),
+                snapshot("i3", secondsAgo: 92_000),
+            ]
+        ))
+        let status = model.footerStatus(now: now)
+        // Pinned EXACTLY (house rule): the neutral all-explained line.
+        #expect(status?.text == "Live accounts current · 3 idle")
+        #expect(status?.isStale == false)
+        #expect(status?.tooltip == MenuBarStatusModel.FooterStatus.explainedTooltip)
+    }
+
+    @Test func signedOutAccountsCountAsExplainedToo() {
+        let model = model()
+        model.apply(deckState: DeckState(
+            accounts: [
+                live("l", label: "Studio"),
+                idle("i1", label: "Client"),
+                signedOut("s1", label: "Personal"),
+            ],
+            usage: [
+                snapshot("l", secondsAgo: 60),
+                snapshot("i1", secondsAgo: 90_000),
+                snapshot("s1", secondsAgo: 57_600),
+            ]
+        ))
+        let status = model.footerStatus(now: now)
+        #expect(status?.text == "Live accounts current · 1 idle · 1 signed out")
+        #expect(status?.isStale == false)
+    }
+
+    @Test func deckWithNoLiveAccountsOmitsTheLeadSegment() {
+        let model = model()
+        model.apply(deckState: DeckState(
+            accounts: [idle("i1", label: "Client"), idle("i2", label: "Personal")],
+            usage: [snapshot("i1", secondsAgo: 90_000), snapshot("i2", secondsAgo: 91_000)]
+        ))
+        #expect(model.footerStatus(now: now)?.text == "2 idle")
+    }
+
+    @Test func keychainDeniedCountsAsExplained() {
+        // The #98 notice is a card-level state that accounts for the age —
+        // by Tim's rule ("old WITHOUT a card-level state that accounts for
+        // it") it never ambers the footer.
+        let model = model()
+        var denied = DeckAccount(id: "k", provider: "claude", label: "Client")
+        denied.authState = "keychain-denied"
+        model.apply(deckState: DeckState(
+            accounts: [live("l", label: "Studio"), denied],
+            usage: [snapshot("l", secondsAgo: 60), snapshot("k", secondsAgo: 57_600)]
+        ))
+        let status = model.footerStatus(now: now)
+        #expect(status?.text == "Live accounts current · 1 needs Keychain access")
+        #expect(status?.isStale == false)
+    }
+
+    @Test func oneUnexplainedStaleAccountKeepsTheAmberLine() {
+        // Mixed case: the idle accounts stay explained, but one enabled
+        // account is silently old (authState "ok", no notice) — the #89
+        // alarm keeps firing, keyed on the oldest observation as always.
+        let model = model()
+        model.apply(deckState: DeckState(
+            accounts: [
+                live("l", label: "Studio"),
+                idle("i1", label: "Client"),
+                live("u", label: "Personal"), // silently stale — unexplained
+            ],
+            usage: [
+                snapshot("l", secondsAgo: 60),
+                snapshot("i1", secondsAgo: 90_000),
+                snapshot("u", secondsAgo: 7_200),
+            ]
+        ))
+        let status = model.footerStatus(now: now)
+        #expect(status?.text == "Oldest data 1 day ago")
+        #expect(status?.isStale == true)
+        #expect(status?.tooltip == MenuBarStatusModel.FooterStatus.staleTooltip)
+    }
+
+    @Test func refreshCompletingWithIdleAccountsStaysNeutral() {
+        // Tim's exact complaint: hit Refresh, live account updates, idle
+        // accounts can't — the footer must NOT regress to amber. The idle
+        // rows even carry the daemon's per-row stale flag: a flag on an
+        // EXPLAINED account is still explained.
+        let model = model()
+        model.apply(deckState: DeckState(
+            accounts: [live("l", label: "Studio"), idle("i1", label: "Client")],
+            usage: [
+                snapshot("l", secondsAgo: 5), // just refreshed
+                snapshot("i1", secondsAgo: 90_000, stale: true),
+            ]
+        ))
+        let status = model.footerStatus(now: now)
+        #expect(status?.text == "Live accounts current · 1 idle")
+        #expect(status?.isStale == false)
+    }
+
+    @Test func fullyFreshDeckKeepsTheOldestDataLine() {
+        // Nothing stale → the classic age readout, neutral, fresh tooltip.
+        let model = model()
+        model.apply(deckState: DeckState(
+            accounts: [live("l", label: "Studio"), idle("i1", label: "Client")],
+            usage: [snapshot("l", secondsAgo: 60), snapshot("i1", secondsAgo: 90)]
+        ))
+        let status = model.footerStatus(now: now)
+        #expect(status?.text == "Oldest data 1 min ago")
+        #expect(status?.isStale == false)
+        #expect(status?.tooltip == MenuBarStatusModel.FooterStatus.freshTooltip)
+    }
+
+    @Test func pinnedTooltipStrings() {
+        #expect(MenuBarStatusModel.FooterStatus.freshTooltip
+            == "Age of the oldest account's newest provider-reported usage")
+        #expect(MenuBarStatusModel.FooterStatus.staleTooltip
+            == "Usage data is older than expected — Refresh forces a fresh provider poll.")
+        // Deliberate pin update (PR #169 review): the tooltip must not
+        // misdescribe Keychain-blocked accounts as idle or signed out.
+        #expect(MenuBarStatusModel.FooterStatus.explainedTooltip
+            == "Idle, signed-out, or Keychain-blocked accounts pause their usage data; live accounts are up to date. Click for details.")
+    }
+}
+
 // MARK: - Per-card staleness (issue #89)
 
 @Suite("Card staleness (issue #89)")

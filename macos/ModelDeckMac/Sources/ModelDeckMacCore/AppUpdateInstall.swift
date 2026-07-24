@@ -90,6 +90,43 @@ public enum AppUpdateRelaunchPolicy {
     }
 }
 
+/// Issue #170 — outcome routing for a Sparkle session that ends WITHOUT an
+/// update to install. Pure and core-owned (like AppUpdateRelaunchPolicy) so
+/// tests pin the split: an EXPLICIT user-initiated session always lands on a
+/// visible phase, a BACKGROUND session stays silent. The driver applies the
+/// returned phase verbatim; nil means "report nothing".
+public enum AppUpdateCheckOutcomePolicy {
+    /// Explicit Update Now, but Sparkle's appcast re-check disagrees with
+    /// the GitHub check that offered the button (rare) — say so, never spin.
+    public static let feedNoNewerVersionMessage =
+        "The update feed has no newer version yet. Try again later."
+    /// Explicit click while `SPUUpdater.canCheckForUpdates` says no (a
+    /// session is already running) — issue #165's fix for the silent no-op;
+    /// pinned here so the presentation can never quietly drift away.
+    public static let blockedStartMessage =
+        "An update is already in progress. Give it a moment, then try again."
+
+    /// Where Sparkle's no-update-found user-driver callback
+    /// (`showUpdateNotFoundWithError`) lands, by session origin.
+    public static func onUpdateNotFound(
+        mode: AppUpdateRelaunchPolicy.SessionMode
+    ) -> AppUpdateInstallPhase? {
+        switch mode {
+        case .userInitiated:
+            return .failed(message: feedNoNewerVersionMessage)
+        case .background:
+            // Background checks that find nothing stay silent exactly as
+            // always — no phase change, no dialog, tomorrow retries.
+            return nil
+        }
+    }
+
+    /// Phase for a blocked explicit start (`canCheckForUpdates == false`).
+    public static func onBlockedExplicitStart() -> AppUpdateInstallPhase {
+        .failed(message: blockedStartMessage)
+    }
+}
+
 /// Seam the app target's Sparkle driver implements. All methods are fire-and
 /// -forget from the model's perspective; outcomes come back via
 /// `AppUpdateInstallModel.report(_:)`.

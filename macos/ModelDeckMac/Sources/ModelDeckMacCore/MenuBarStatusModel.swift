@@ -340,12 +340,25 @@ public final class MenuBarStatusModel: ObservableObject {
     /// What the popover footer renders: the freshness line plus whether it
     /// should carry the muted warning tint.
     public struct FooterStatus: Equatable, Sendable {
+        /// Tooltip for the healthy age line — nothing stale.
+        public static let freshTooltip =
+            "Age of the oldest account's newest provider-reported usage"
+        /// Tooltip for the amber line — unexplained staleness (issue #168:
+        /// the alarm's ONLY remaining trigger).
+        public static let staleTooltip =
+            "Usage data is older than expected — Refresh forces a fresh provider poll."
+        /// Tooltip for the neutral explained-staleness summary (issue #168).
+        public static let explainedTooltip =
+            "Idle, signed-out, or Keychain-blocked accounts pause their usage data; live accounts are up to date. Click for details."
+
         public var text: String
         public var isStale: Bool
+        public var tooltip: String
 
-        public init(text: String, isStale: Bool) {
+        public init(text: String, isStale: Bool, tooltip: String = FooterStatus.freshTooltip) {
             self.text = text
             self.isStale = isStale
+            self.tooltip = tooltip
         }
     }
 
@@ -354,27 +367,48 @@ public final class MenuBarStatusModel: ObservableObject {
     /// complaint). Issue #89 rebased it per account: the line reads "Oldest
     /// data N min ago", keyed on the account whose newest snapshot is
     /// OLDEST, so one silently failing account can no longer hide behind its
-    /// siblings' fresh data. Stale when that age exceeds ~2x the
-    /// auto-refresh interval or the daemon flags any row stale. Falls back
+    /// siblings' fresh data. Staleness triggers past ~2x the auto-refresh
+    /// interval or on the daemon's per-row stale flag. Falls back
     /// to the app-side "Updated…" text when no snapshot carries observedAt
     /// (older daemons); nil before the first load.
+    /// Issue #168 (Tim's decision): the amber alarm fires ONLY for
+    /// unexplained staleness. When every stale enabled account's age is
+    /// explained by its card state (idle-decay #149, signed-out #114/#164,
+    /// Keychain-blocked #98), the footer renders a neutral summary instead
+    /// ("Live accounts current · 3 idle") — an idle deck surviving Refresh
+    /// is expected behavior, not a contradiction.
     public func footerStatus(now: Date? = nil) -> FooterStatus? {
         let now = now ?? clock()
-        let rowStale = deckState.map(DeckFreshness.anyRowStale(in:)) ?? false
-        if let state = deckState, let observedAt = DeckFreshness.oldestAccountObservation(in: state) {
+        guard let state = deckState else {
+            guard let text = updatedAgoText(now: now) else { return nil }
+            return FooterStatus(text: text, isStale: false)
+        }
+        // Issue #90: EFFECTIVE cadence — a daemon deliberately slowed by
+        // the active-session cap is not "stale".
+        let breakdown = DeckFreshness.footerBreakdown(
+            state: state, now: now, autoRefreshInterval: stalenessInterval
+        )
+        if breakdown.allExplained {
+            return FooterStatus(
+                text: DeckFreshness.explainedFooterText(breakdown),
+                isStale: false,
+                tooltip: FooterStatus.explainedTooltip
+            )
+        }
+        if let observedAt = DeckFreshness.oldestAccountObservation(in: state) {
+            let stale = breakdown.hasUnexplained
             return FooterStatus(
                 text: DeckFreshness.text(observedAt: observedAt, now: now),
-                isStale: rowStale || DeckFreshness.isStale(
-                    observedAt: observedAt,
-                    now: now,
-                    // Issue #90: EFFECTIVE cadence — a daemon deliberately
-                    // slowed by the active-session cap is not "stale".
-                    autoRefreshInterval: stalenessInterval
-                )
+                isStale: stale,
+                tooltip: stale ? FooterStatus.staleTooltip : FooterStatus.freshTooltip
             )
         }
         guard let text = updatedAgoText(now: now) else { return nil }
-        return FooterStatus(text: text, isStale: rowStale)
+        return FooterStatus(
+            text: text,
+            isStale: breakdown.hasUnexplained,
+            tooltip: breakdown.hasUnexplained ? FooterStatus.staleTooltip : FooterStatus.freshTooltip
+        )
     }
 
     /// Issue #113 addendum: what clicking the footer's oldest-data line

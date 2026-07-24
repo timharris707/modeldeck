@@ -136,6 +136,10 @@ test('daemon build selects and validates MD_NODE_BINARY when running Node lacks 
 });
 
 test('daemon CJS bundle inlines its version and has no import.meta warnings', (t) => {
+  if (!fs.existsSync(esbuild)) {
+    t.skip('esbuild devDependency is not installed; run `npm install` to enable this test');
+    return;
+  }
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-daemon-bundle-'));
   t.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
   const bundle = path.join(temporary, 'modeldeckd.cjs');
@@ -146,7 +150,8 @@ test('daemon CJS bundle inlines its version and has no import.meta warnings', (t
     '--define:import.meta.url="file:///__modeldeck_sea_bundle__.mjs"',
     `--outfile=${bundle}`,
   ], { encoding: 'utf8' });
-  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.error, undefined, `esbuild failed to spawn: ${result.error}`);
+  assert.equal(result.status, 0, result.stderr || `esbuild exited with status ${result.status}`);
   assert.doesNotMatch(result.stderr, /import\.meta.*not available/i);
   const content = fs.readFileSync(bundle, 'utf8');
   assert.match(content, /VERSION = true \? "9\.8\.7"/);
@@ -171,6 +176,35 @@ test('daemon manifest records artifact, Node version, commit, and SHA-256', (t) 
     MDGitCommit: '0123456789abcdef0123456789abcdef01234567',
     sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
   });
+});
+
+test('daemon manifest CLI writes the manifest when invoked via a symlinked path', (t) => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-daemon-symlink-'));
+  t.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
+  const binaryPath = path.join(temporary, 'modeldeckd');
+  fs.writeFileSync(binaryPath, 'fixture modeldeckd binary');
+
+  const realScript = fileURLToPath(new URL('../scripts/write-daemon-manifest.mjs', import.meta.url));
+  const symlinkedScript = path.join(temporary, 'write-daemon-manifest.mjs');
+  fs.symlinkSync(realScript, symlinkedScript);
+
+  const manifestPath = path.join(temporary, 'manifest.json');
+  const result = spawnSync(
+    process.execPath,
+    [symlinkedScript, binaryPath, manifestPath, 'v24.99.0', 'deadbeef'],
+    { encoding: 'utf8' },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(fs.existsSync(manifestPath), 'manifest must be written when argv[1] is a symlink to the script');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  assert.equal(manifest.artifact, 'modeldeckd');
+  assert.equal(manifest.nodeVersion, 'v24.99.0');
+  assert.equal(manifest.MDGitCommit, 'deadbeef');
+});
+
+test('daemon build fails loudly when publish_artifacts leaves no manifest', () => {
+  const script = fs.readFileSync(buildScript, 'utf8');
+  assert.match(script, /daemon manifest was not written/);
 });
 
 test('daemon build uses documented SEA injection and an EPERM-only smoke skip', () => {

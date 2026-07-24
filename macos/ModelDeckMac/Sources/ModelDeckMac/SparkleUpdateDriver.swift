@@ -126,8 +126,9 @@ final class OneClickUserDriver: NSObject {
     /// already running or the updater hasn't started) — land the click on an
     /// actionable, honest state instead of a stuck "Checking…".
     func reportBlockedStart() {
-        report(.failed(message:
-            "An update is already in progress. Give it a moment, then try again."))
+        // Phase + copy pinned in core (issue #170 verified #165's fix
+        // actually presents): AppUpdateCheckOutcomePolicy owns the message.
+        report(AppUpdateCheckOutcomePolicy.onBlockedExplicitStart())
     }
 
     private func report(_ phase: AppUpdateInstallPhase) {
@@ -241,10 +242,13 @@ extension OneClickUserDriver: SPUUserDriver {
     nonisolated func showUpdateNotFoundWithError(_ error: any Error, acknowledgement: @escaping () -> Void) {
         nonisolated(unsafe) let acknowledgement = acknowledgement
         MainActor.assumeIsolated {
-            // Feed disagrees with the GitHub check that offered the button —
-            // rare, but say so instead of spinning.
-            if mode == .userInitiated {
-                report(.failed(message: "The update feed has no newer version yet. Try again later."))
+            // Issue #170: the no-update-found callback routes through the
+            // core policy by session origin — explicit sessions present the
+            // feed-disagreement message (the GitHub check offered the button,
+            // Sparkle's re-check disagrees; rare), background sessions stay
+            // silent exactly as always.
+            if let phase = AppUpdateCheckOutcomePolicy.onUpdateNotFound(mode: policyMode) {
+                report(phase)
             }
             acknowledgement()
         }

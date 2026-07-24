@@ -157,6 +157,33 @@ public final class AppUpdateModel: ObservableObject {
             : .upToDate(latest: release.version)
     }
 
+    /// Issue #170 — the explicit "Check for App Updates" entry point. An
+    /// explicit user-initiated check must ALWAYS end in a presentable
+    /// outcome: `check()` silently no-ops when a check is already in flight
+    /// (the daily auto-check racing the click), which left `resultDialog`
+    /// nil and the click with zero feedback. This waits the in-flight check
+    /// out instead and returns the finished phase's dialog — never nil, so
+    /// every explicit-check surface has something to present.
+    ///
+    /// Background scheduled checks keep calling `check()` directly and stay
+    /// exactly as silent as before — this path is for user clicks only.
+    public func explicitCheck() async -> ResultDialog {
+        if !isChecking {
+            await check()
+        }
+        // Another caller owns the in-flight check; its outcome serves this
+        // click too. Poll cheaply — checks finish in network time.
+        while isChecking {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        // A finished check never rests on .idle/.checking, so this fallback
+        // is defensive only — but "no feedback" is the bug, so never nil.
+        return resultDialog ?? ResultDialog(
+            title: "Couldn't check for updates",
+            message: "The update check didn't finish. Try again in a moment."
+        )
+    }
+
     // MARK: Result dialog (issue #33 final placement decision)
 
     /// What the gear-menu "Check for App Updates…" flow presents once a

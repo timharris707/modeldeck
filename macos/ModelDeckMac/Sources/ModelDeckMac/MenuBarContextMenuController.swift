@@ -87,8 +87,10 @@ final class MenuBarContextMenuController: NSObject {
     /// the error, actionable).
     @objc private func checkForAppUpdates() {
         Task { @MainActor [appUpdateModel, installModel] in
-            await appUpdateModel.check()
-            guard let dialog = appUpdateModel.resultDialog else { return }
+            // Issue #170: explicitCheck() never returns nil — every explicit
+            // check presents its outcome (the old `guard let resultDialog`
+            // silently dropped the click when a check was already in flight).
+            let dialog = await appUpdateModel.explicitCheck()
             AppUpdateDialogPanel.present(dialog: dialog, installModel: installModel)
         }
     }

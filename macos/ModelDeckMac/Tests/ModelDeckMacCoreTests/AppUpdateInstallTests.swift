@@ -305,6 +305,126 @@ struct AppUpdateProgressDialogTests {
         #expect(AppUpdateRelaunchPolicy.onInstalling(mode: .background, applicationTerminated: true)
             == .stagedUntilNextLaunch)
     }
+
+    // MARK: Explicit check always ends visible (issue #170)
+
+    private let releaseURL =
+        URL(string: "https://github.com/timharris707/modeldeck/releases/tag/v0.3.6")!
+
+    @Test func explicitCheckUpToDatePresentsTheConfirmation() async {
+        // The 0.3.6 regression: an explicit check that found nothing newer
+        // vanished with zero feedback. explicitCheck() returns a NON-optional
+        // dialog — the pre-#163 confirmation, version named, pinned.
+        let checker = StubReleaseChecker()
+        checker.result = .success(AppReleaseInfo(version: "0.3.6", url: releaseURL))
+        let model = AppUpdateModel(checker: checker, currentVersion: "0.3.6")
+        let dialog = await model.explicitCheck()
+        #expect(dialog.title == "You're up to date")
+        #expect(dialog.message == "ModelDeck v0.3.6 is the latest release.")
+        #expect(dialog.releaseURL == nil) // plain OK confirmation
+        #expect(!dialog.offersInstall)
+        #expect(checker.callCount == 1)
+    }
+
+    @Test func explicitCheckFailurePresentsAnActionableError() async {
+        let checker = StubReleaseChecker()
+        checker.result = .failure(URLError(.notConnectedToInternet))
+        let model = AppUpdateModel(checker: checker, currentVersion: "0.3.6")
+        let dialog = await model.explicitCheck()
+        #expect(dialog.title == "Couldn't check for updates")
+        #expect(dialog.message == "Update check unavailable — couldn't reach the releases feed.")
+    }
+
+    @Test func explicitCheckWaitsOutAnInFlightCheckInsteadOfDroppingTheClick() async {
+        // check() no-ops while a check is already in flight (the daily
+        // auto-check racing the click) — the old call sites then found a nil
+        // resultDialog and silently dropped the click. explicitCheck() waits
+        // the in-flight check out and presents ITS outcome.
+        let checker = GatedReleaseChecker()
+        let model = AppUpdateModel(checker: checker, currentVersion: "0.3.6")
+        let inFlight = Task { await model.check() } // e.g. the auto-checker's
+        while !model.isChecking { await Task.yield() }
+        let click = Task { await model.explicitCheck() }
+        checker.release(AppReleaseInfo(version: "0.3.6", url: releaseURL))
+        await inFlight.value
+        let dialog = await click.value
+        #expect(dialog.title == "You're up to date")
+        #expect(dialog.message == "ModelDeck v0.3.6 is the latest release.")
+        #expect(checker.callCount == 1) // the click reused the in-flight check
+    }
+
+    // MARK: No-update-found routing by origin (issue #170)
+
+    @Test func explicitNoUpdateFoundPresentsThePinnedFeedMessage() {
+        // Sparkle's showUpdateNotFoundWithError during an explicit session
+        // (Update Now offered by the GitHub check, appcast disagrees) must
+        // land visibly, never spin or vanish.
+        let outcome = AppUpdateCheckOutcomePolicy.onUpdateNotFound(mode: .userInitiated)
+        #expect(outcome == .failed(
+            message: "The update feed has no newer version yet. Try again later."))
+    }
+
+    @Test func backgroundNoUpdateFoundStaysCompletelySilent() {
+        // Background scheduled checks that find nothing report NO phase —
+        // no dialog, no state change, exactly as before #170.
+        #expect(AppUpdateCheckOutcomePolicy.onUpdateNotFound(mode: .background) == nil)
+        // Applying "nothing" leaves every last honest state untouched,
+        // including a staged pending-relaunch (the #121/#165 terminal rule).
+        let model = AppUpdateInstallModel(defaults: freshDefaults())
+        model.report(.installedPendingRelaunch(version: "0.4.0"))
+        if let phase = AppUpdateCheckOutcomePolicy.onUpdateNotFound(mode: .background) {
+            model.report(phase)
+        }
+        #expect(model.phase == .installedPendingRelaunch(version: "0.4.0"))
+    }
+
+    @Test func blockedExplicitStartPresentsThePinnedMessage() {
+        // Issue #165's canCheckForUpdates fix, verified end-state: the
+        // blocked click lands on an actionable failed phase, copy pinned.
+        let outcome = AppUpdateCheckOutcomePolicy.onBlockedExplicitStart()
+        #expect(outcome == .failed(
+            message: "An update is already in progress. Give it a moment, then try again."))
+        let model = AppUpdateInstallModel(defaults: freshDefaults())
+        let driver = StubInstallDriver()
+        model.attach(driver: driver)
+        model.updateNow() // .checking — the stuck state #165 fixed
+        model.report(outcome)
+        #expect(!model.isBusy) // actionable again (Try Again renders)
+    }
+}
+
+/// Release checker whose answer is gated on an explicit `release(_:)` —
+/// lets a test hold a check in flight while a second caller races it.
+private final class GatedReleaseChecker: AppReleaseChecking, @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [CheckedContinuation<AppReleaseInfo?, Error>] = []
+    private var released: AppReleaseInfo??
+    private(set) var callCount = 0
+
+    func latestRelease() async throws -> AppReleaseInfo? {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            callCount += 1
+            // Once released, answer immediately — a late caller must never
+            // wait on a gate that has already opened (test-hang guard).
+            if let released {
+                lock.unlock()
+                continuation.resume(returning: released)
+                return
+            }
+            continuations.append(continuation)
+            lock.unlock()
+        }
+    }
+
+    func release(_ info: AppReleaseInfo?) {
+        lock.lock()
+        released = .some(info)
+        let pending = continuations
+        continuations = []
+        lock.unlock()
+        pending.forEach { $0.resume(returning: info) }
+    }
 }
 
 @Suite("Update-found dialog with install capability (issue #121)")

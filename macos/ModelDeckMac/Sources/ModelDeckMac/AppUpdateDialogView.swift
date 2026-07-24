@@ -183,6 +183,14 @@ enum AppUpdateDialogPanel {
         panel.title = "ModelDeck Update"
         panel.titlebarAppearsTransparent = true
         panel.isReleasedWhenClosed = false
+        // Issue #170 (0.3.6 regression): NSPanel defaults hidesOnDeactivate
+        // to YES, and ModelDeck is an accessory app whose activation is
+        // transient — the deck popover closing (or any click elsewhere)
+        // deactivates the app, which silently hid this panel the instant it
+        // appeared. Tim, live: "it's just disappearing without giving me any
+        // feedback whatsoever." An explicit check's outcome stays on screen
+        // until the user dismisses it, exactly like the pre-#163 NSAlert.
+        panel.hidesOnDeactivate = false
         panel.level = .floating
         // Accessory-activation pitfall (#45): activate so the panel comes
         // up in front of whatever app was frontmost.

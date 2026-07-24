@@ -4,6 +4,32 @@ All notable changes to ModelDeck are documented here. Versioning follows the
 roadmap in `design/mac-app-roadmap.md`: `v0.1-web` tags the retired web MVP,
 and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 
+## 0.3.7 — 2026-07-24
+
+### Fixed
+- **"Check for Updates" always answers you (issue #170, Tim report)**: on
+  0.3.6 an explicit check that found nothing vanished without a word —
+  the confirmation panel was hiding itself the instant the app
+  deactivated, and a check racing the daily background check could
+  silently drop. An explicit check now always ends in a visible result:
+  the update offer, "You're up to date — ModelDeck v(latest) is the
+  latest release.", or an actionable error. Background checks stay
+  silent as they should.
+- **The data-age footer no longer contradicts your deck (issue #168, Tim
+  decision)**: idle and signed-out accounts pause their usage data by
+  design, and the footer used to count them into an amber "Oldest data
+  N ago" that survived Refresh. The amber alarm now fires only for
+  unexplained staleness — a silent fetch failure. When everything stale
+  is explained, the footer shows a calm summary ("Live accounts current
+  · 3 idle"), and clicking it lists each paused account with its age
+  and reason.
+
+### Changed
+- Release/test tooling hardening: the daemon-manifest writer works under
+  symlinked checkouts and the build fails loudly if the manifest is
+  missing (the 0.3.4 near-miss), and the daemon-bundle test skips with a
+  named reason when its tooling is absent.
+
 ## 0.3.6 — 2026-07-24
 
 ### Fixed

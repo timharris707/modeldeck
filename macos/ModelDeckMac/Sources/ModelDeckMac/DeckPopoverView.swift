@@ -112,19 +112,22 @@ struct DeckPopoverView: View {
                 // Never a CLI-update control — those live in Settings.
                 Button("Check for App Updates…") {
                     Task {
-                        await appUpdateModel.check()
                         // Issue #163: the result presents in the floating
                         // update panel (activation handled inside), which
                         // transitions IN PLACE to the progress surface on
                         // Update Now and outlives this popover — a SwiftUI
                         // .alert here closed on the click and left no
                         // feedback at all (Tim's live 0.3.5 report).
-                        if let dialog = appUpdateModel.resultDialog {
-                            AppUpdateDialogPanel.present(
-                                dialog: dialog,
-                                installModel: appUpdateInstallModel
-                            )
-                        }
+                        // Issue #170: explicitCheck() never returns nil —
+                        // an explicit check ALWAYS presents its outcome
+                        // (up to date / update available / couldn't check);
+                        // the old `if let resultDialog` silently dropped
+                        // the click when a check was already in flight.
+                        let dialog = await appUpdateModel.explicitCheck()
+                        AppUpdateDialogPanel.present(
+                            dialog: dialog,
+                            installModel: appUpdateInstallModel
+                        )
                     }
                 }
                 .disabled(appUpdateModel.isChecking)
@@ -285,15 +288,23 @@ struct DeckPopoverView: View {
                             ? "Refreshing…"
                             : (status?.text ?? "Not updated yet"))
                             .font(.caption)
+                            // Issue #168 (review): the explained summary
+                            // grows with account counts — the footer's
+                            // one-line footprint is a Tim contract.
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                             .foregroundStyle(status?.isStale == true && !statusModel.isRefreshing
                                 ? AnyShapeStyle(severityColor(.warning))
                                 : AnyShapeStyle(.secondary))
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .help(status?.isStale == true
-                        ? "Usage data is older than expected — Refresh forces a fresh provider poll."
-                        : "Age of the oldest account's newest provider-reported usage")
+                    // Issue #168: the tooltip rides on the model's
+                    // FooterStatus so the neutral explained-staleness
+                    // summary ("Live accounts current · 3 idle") explains
+                    // itself instead of claiming to be an age readout.
+                    .help(status?.tooltip
+                        ?? MenuBarStatusModel.FooterStatus.freshTooltip)
                     .popover(
                         isPresented: deckModel.warningBinding(DeckWarningID(topic: .footerFreshness)),
                         arrowEdge: .bottom

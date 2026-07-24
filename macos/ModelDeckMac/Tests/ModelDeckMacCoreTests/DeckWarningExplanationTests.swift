@@ -376,6 +376,74 @@ struct FooterFreshnessExplanationTests {
         #expect(explanation(for: nil).body.contains("No account data has arrived yet."))
         #expect(explanation(for: DeckState()).body.contains("No account data has arrived yet."))
     }
+
+    // MARK: Issue #168 — per-account reasons in the breakdown
+
+    @Test func explainedBreakdownListsReasonsUnderPausedHeader() {
+        // All staleness explained: calm lead, "Paused:" header, and every
+        // account carries its reason in the card notices' vocabulary.
+        let state = DeckState(
+            accounts: [
+                DeckAccount(id: "l", provider: "claude", label: "Studio"),
+                DeckAccount(
+                    id: "i", provider: "claude", label: "Client",
+                    authState: "signin-required", signinReason: "expired"
+                ),
+                DeckAccount(
+                    id: "s", provider: "codex", label: "Personal",
+                    authState: "signin-required", signinReason: "missing"
+                ),
+            ],
+            usage: [
+                snapshot("l", secondsAgo: 60),
+                snapshot("i", secondsAgo: 90_000),
+                snapshot("s", secondsAgo: 57_600),
+            ]
+        )
+        let explanation = explanation(for: state)
+        #expect(explanation.body.contains("Live accounts are refreshing normally."))
+        #expect(explanation.body.contains("Paused:"))
+        #expect(explanation.body.contains("• Client — data from 1 day ago · idle, renews on next use"))
+        #expect(explanation.body.contains("• Personal — data from 16 hr ago · sign in needed"))
+        #expect(!explanation.body.contains("Waiting on"))
+        #expect(!explanation.body.contains("OLDEST"))
+    }
+
+    @Test func mixedBreakdownNamesTheUnexplainedOffender() {
+        // The payoff Tim asked for: amber stays, and the breakdown shows
+        // WHICH account is unexplained (its refresh error) next to the
+        // explained idle sibling.
+        let state = DeckState(
+            accounts: [
+                DeckAccount(
+                    id: "i", provider: "claude", label: "Client",
+                    authState: "signin-required", signinReason: "expired"
+                ),
+                DeckAccount(
+                    id: "u", provider: "codex", label: "Personal",
+                    lastRefreshError: AccountRefreshError(message: "token expired", at: nil)
+                ),
+            ],
+            usage: [
+                snapshot("i", secondsAgo: 90_000),
+                snapshot("u", secondsAgo: 7_200),
+            ]
+        )
+        let explanation = explanation(for: state)
+        #expect(explanation.body.contains("OLDEST"))
+        #expect(explanation.body.contains("Waiting on:"))
+        #expect(explanation.body.contains("• Client — data from 1 day ago · idle, renews on next use"))
+        #expect(explanation.body.contains("• Personal — data from 2 hr ago · last refresh failed: token expired"))
+    }
+
+    @Test func unexplainedWithoutAnErrorSaysNoNewerData() {
+        let state = DeckState(
+            accounts: [DeckAccount(id: "u", provider: "claude", label: "Client")],
+            usage: [snapshot("u", secondsAgo: 57_600)]
+        )
+        #expect(explanation(for: state).body
+            .contains("• Client — data from 16 hr ago · no newer data from the provider"))
+    }
 }
 
 // Issue #118 — the deck's "Sign in needed" notice offers a one-click path

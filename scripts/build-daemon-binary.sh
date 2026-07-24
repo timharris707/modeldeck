@@ -225,6 +225,8 @@ publish_artifacts() {
   chmod 755 "$OUTPUT_BINARY"
   "$RUNNING_NODE_BINARY" "$REPO_ROOT/scripts/write-daemon-manifest.mjs" \
     "$OUTPUT_BINARY" "$OUTPUT_MANIFEST" "$NODE_VERSION" "$GIT_COMMIT"
+  [[ -s "$OUTPUT_MANIFEST" ]] \
+    || fail "daemon manifest was not written: $OUTPUT_MANIFEST"
 }
 
 echo "==> smoke-checking GET /api/health"

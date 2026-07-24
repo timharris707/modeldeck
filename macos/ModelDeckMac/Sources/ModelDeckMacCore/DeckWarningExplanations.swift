@@ -122,60 +122,81 @@ extension DeckFreshness {
     /// footer line now explains the oldest-account basis and names the
     /// stale account(s) with their ages, derived from the SAME per-card
     /// staleness math the cards use (single source of truth).
+    /// Issue #168: the breakdown carries each stale account's REASON (from
+    /// the same card-state derivations the cards render), so an amber footer
+    /// names the unexplained offender and a neutral footer explains what is
+    /// paused and why.
     public static func footerFreshnessExplanation(
         state: DeckState?,
         now: Date,
         autoRefreshInterval: TimeInterval
     ) -> DeckWarningExplanation {
         let title = "Data freshness"
-        let lead = "This is the age of the OLDEST account's newest "
+        let agedLead = "This is the age of the OLDEST account's newest "
             + "provider-reported data — one lagging account sets this number "
             + "even while the others refresh."
         guard let state, !state.accounts.isEmpty else {
             return DeckWarningExplanation(
                 title: title,
-                body: "\(lead)\n\nNo account data has arrived yet."
+                body: "\(agedLead)\n\nNo account data has arrived yet."
             )
         }
-        // Per-account newest observation — the same basis as
-        // `oldestAccountObservation` (issue #89), kept per account so each
-        // laggard can be named with its own age.
-        var newestByAccount: [String: Date] = [:]
-        for snapshot in state.usage {
-            guard let date = DeckDateParsing.date(from: snapshot.observedAt) else { continue }
-            newestByAccount[snapshot.accountId] = max(newestByAccount[snapshot.accountId] ?? .distantPast, date)
-        }
-        // Disabled accounts don't refresh by design and are excluded from
-        // the footer basis, so they are excluded here too. Note: no
-        // keychain-notice suppression — the footer's job is to name every
-        // account whose age drags the number, whatever the reason.
-        let laggards = state.accounts
-            .filter(\.enabled)
-            .compactMap { account -> (label: String, observedAt: Date, staleness: CardStaleness)? in
-                guard let observedAt = newestByAccount[account.id],
-                      let staleness = cardStaleness(
-                          newestObservedAt: observedAt,
-                          lastRefreshError: account.lastRefreshError,
-                          now: now,
-                          autoRefreshInterval: autoRefreshInterval
-                      )
-                else { return nil }
-                return (account.label, observedAt, staleness)
-            }
-            .sorted { $0.observedAt < $1.observedAt } // oldest first
-        guard !laggards.isEmpty else {
+        // Issue #168: one shared classification with the footer line itself
+        // — disabled accounts excluded (footer basis, #89), reasons from the
+        // card-state derivations (#98/#114/#149). No keychain-notice
+        // suppression: the footer's job is to name every account whose age
+        // drags the number, whatever the reason.
+        let breakdown = footerBreakdown(
+            state: state, now: now, autoRefreshInterval: autoRefreshInterval
+        )
+        guard !breakdown.stale.isEmpty else {
             return DeckWarningExplanation(
                 title: title,
-                body: "\(lead)\n\nAll accounts are currently fresh."
+                body: "\(agedLead)\n\nAll accounts are currently fresh."
             )
         }
-        let lines = laggards.map { laggard in
-            // "Data from 16 hr ago" → "• Client — data from 16 hr ago"
-            "• \(laggard.label) — \(laggard.staleness.text.prefix(1).lowercased() + laggard.staleness.text.dropFirst())"
+        // Neutral state gets a calm lead (nothing here is lagging — it is
+        // paused by design); any unexplained staleness keeps the #113 lead
+        // that explains the amber oldest-data number.
+        // Review (PR #169): a Keychain-blocked account is neither idle nor
+        // signed out — when one is present the lead must say so.
+        let hasKeychainBlocked = breakdown.stale.contains { $0.reason == .keychainAccess }
+        let explainedLead = hasKeychainBlocked
+            ? "Live accounts are refreshing normally. Idle or signed-out "
+                + "accounts pause their usage data until they're next used "
+                + "or signed in; accounts waiting on Keychain access resume "
+                + "once it's granted."
+            : "Live accounts are refreshing normally. Idle or signed-out "
+                + "accounts pause their usage data until they're next used "
+                + "or signed in."
+        let lead = breakdown.allExplained ? explainedLead : agedLead
+        let header = breakdown.allExplained ? "Paused:" : "Waiting on:"
+        let lines = breakdown.stale.map { entry in
+            let age = entry.observedAt.map { "data from \(ageText(observedAt: $0, now: now))" }
+                ?? "data age unknown"
+            return "• \(entry.label) — \(age) · \(reasonText(entry.reason))"
         }
         return DeckWarningExplanation(
             title: title,
-            body: "\(lead)\n\nWaiting on:\n\(lines.joined(separator: "\n"))"
+            body: "\(lead)\n\n\(header)\n\(lines.joined(separator: "\n"))"
         )
+    }
+
+    /// The breakdown's per-account reason phrase (issue #168) — short,
+    /// jargon-free, matching the card notices' vocabulary.
+    static func reasonText(_ reason: StaleAccountEntry.Reason) -> String {
+        switch reason {
+        case .idle:
+            return "idle, renews on next use"
+        case .signedOut:
+            return "sign in needed"
+        case .keychainAccess:
+            return "needs Keychain access"
+        case .unexplained(let errorMessage):
+            if let errorMessage, !errorMessage.isEmpty {
+                return "last refresh failed: \(errorMessage)"
+            }
+            return "no newer data from the provider"
+        }
     }
 }

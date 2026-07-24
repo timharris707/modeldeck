@@ -125,6 +125,155 @@ public enum DeckFreshness {
         )
     }
 
+    // MARK: - Explained staleness (issue #168)
+
+    /// One stale enabled account as the footer sees it: its label, the age
+    /// basis (nil when the daemon flagged rows stale without a parseable
+    /// observation), and WHY the data is old.
+    public struct StaleAccountEntry: Equatable, Sendable {
+        /// Why an account's data is old. Tim's decision (issue #168):
+        /// staleness EXPLAINED by a card-level state (idle-decay #149,
+        /// signed-out #114/#164, Keychain-blocked #98 — every state whose
+        /// card notice already accounts for the age) is not an alarm; the
+        /// footer's amber fires only for `.unexplained` — the #89 original
+        /// mission, silent fetch failures.
+        public enum Reason: Equatable, Sendable {
+            case idle
+            case signedOut
+            case keychainAccess
+            case unexplained(errorMessage: String?)
+
+            public var isExplained: Bool {
+                if case .unexplained = self { return false }
+                return true
+            }
+        }
+
+        public var label: String
+        public var observedAt: Date?
+        public var reason: Reason
+
+        public init(label: String, observedAt: Date?, reason: Reason) {
+            self.label = label
+            self.observedAt = observedAt
+            self.reason = reason
+        }
+    }
+
+    /// The footer's per-account staleness picture (issue #168): every stale
+    /// enabled account with its reason (oldest first), plus whether any
+    /// enabled account is currently fresh (drives the "Live accounts
+    /// current" lead segment).
+    public struct FooterBreakdown: Equatable, Sendable {
+        public var stale: [StaleAccountEntry]
+        public var hasCurrentAccounts: Bool
+
+        public init(stale: [StaleAccountEntry], hasCurrentAccounts: Bool) {
+            self.stale = stale
+            self.hasCurrentAccounts = hasCurrentAccounts
+        }
+
+        /// True when staleness exists and every bit of it is explained —
+        /// the neutral-footer condition.
+        public var allExplained: Bool {
+            !stale.isEmpty && stale.allSatisfy(\.reason.isExplained)
+        }
+
+        /// True when at least one stale account has no explaining card
+        /// state — the ONLY condition that ambers the footer.
+        public var hasUnexplained: Bool {
+            stale.contains { !$0.reason.isExplained }
+        }
+    }
+
+    /// Classifies every enabled account the footer basis covers (issue
+    /// #168). Same basis as `oldestAccountObservation`: per-account newest
+    /// observation, disabled accounts excluded, usage rows without a listed
+    /// account kept (honest default — they classify as unexplained). An
+    /// account is stale when its age exceeds the threshold OR the daemon
+    /// flagged any of its rows stale; the reason comes from the SAME
+    /// card-state derivations the cards render from (#98/#114/#149), so the
+    /// footer and the cards can never disagree about an account's story.
+    public static func footerBreakdown(
+        state: DeckState,
+        now: Date,
+        autoRefreshInterval: TimeInterval
+    ) -> FooterBreakdown {
+        let disabled = Set(state.accounts.filter { !$0.enabled }.map(\.id))
+        var newestByAccount: [String: Date] = [:]
+        var flagged: Set<String> = []
+        for snapshot in state.usage where !disabled.contains(snapshot.accountId) {
+            if snapshot.stale { flagged.insert(snapshot.accountId) }
+            guard let date = DeckDateParsing.date(from: snapshot.observedAt) else { continue }
+            newestByAccount[snapshot.accountId] = max(newestByAccount[snapshot.accountId] ?? .distantPast, date)
+        }
+        var accountsByID: [String: DeckAccount] = [:]
+        for account in state.accounts where account.enabled {
+            accountsByID[account.id] = accountsByID[account.id] ?? account
+        }
+        var ids = state.accounts.filter(\.enabled).map(\.id)
+        for id in newestByAccount.keys.sorted() where !ids.contains(id) { ids.append(id) }
+        for id in flagged.sorted() where !ids.contains(id) { ids.append(id) }
+
+        var stale: [StaleAccountEntry] = []
+        var hasCurrent = false
+        for id in ids {
+            let account = accountsByID[id]
+            let observedAt = newestByAccount[id]
+            let ageStale = observedAt.map {
+                isStale(observedAt: $0, now: now, autoRefreshInterval: autoRefreshInterval)
+            } ?? false
+            guard ageStale || flagged.contains(id) else {
+                if observedAt != nil { hasCurrent = true }
+                continue
+            }
+            let reason: StaleAccountEntry.Reason
+            if let account {
+                if keychainRecovery(for: account) != nil {
+                    reason = .keychainAccess
+                } else if let recovery = signInRecovery(for: account) {
+                    reason = recovery.tone == .idle ? .idle : .signedOut
+                } else {
+                    reason = .unexplained(errorMessage: account.lastRefreshError?.message)
+                }
+            } else {
+                reason = .unexplained(errorMessage: nil)
+            }
+            stale.append(StaleAccountEntry(
+                label: account?.label ?? id,
+                observedAt: observedAt,
+                reason: reason
+            ))
+        }
+        stale.sort { ($0.observedAt ?? .distantFuture) < ($1.observedAt ?? .distantFuture) }
+        return FooterBreakdown(stale: stale, hasCurrentAccounts: hasCurrent)
+    }
+
+    /// The neutral footer line for the all-explained state (issue #168,
+    /// Tim's example copy): "Live accounts current · 3 idle". Segments in
+    /// fixed order, joined with " · ": the live lead (only when a fresh
+    /// enabled account exists), then idle, signed-out, and Keychain counts
+    /// (only when non-zero).
+    public static func explainedFooterText(_ breakdown: FooterBreakdown) -> String {
+        var idle = 0, signedOut = 0, keychain = 0
+        for entry in breakdown.stale {
+            switch entry.reason {
+            case .idle: idle += 1
+            case .signedOut: signedOut += 1
+            case .keychainAccess: keychain += 1
+            case .unexplained: break
+            }
+        }
+        var parts: [String] = []
+        if breakdown.hasCurrentAccounts { parts.append("Live accounts current") }
+        if idle > 0 { parts.append("\(idle) idle") }
+        if signedOut > 0 { parts.append("\(signedOut) signed out") }
+        if keychain > 0 {
+            parts.append(keychain == 1 ? "1 needs Keychain access" : "\(keychain) need Keychain access")
+        }
+        return parts.joined(separator: " · ")
+    }
+
     // MARK: - Keychain access recovery (issue #98)
 
     /// What a keychain-denied card renders instead of the bare stale line: a
