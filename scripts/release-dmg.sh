@@ -437,6 +437,53 @@ for png in provider-claude-32.png provider-claude-64.png provider-claude-128.png
 done
 echo "==> resource bundle preflight OK ($BUNDLE_PLIST prints; all 6 provider PNGs present)"
 
+# ----------------------------- in-app icon-resolution gate (issue #158)
+# v0.3.4 shipped a well-formed bundle to Contents/Resources — a location the
+# plain-`swift build` Bundle.module accessor NEVER reads (it checks the app
+# root, then a hardcoded builder .build path). Every install was resolving
+# provider icons through the baked builder path, so the app crashed on any
+# machine where that path was absent. CoreResourceBundle.swift now resolves
+# Bundle.main.resourceURL/<name> FIRST; this gate proves the packaged app
+# satisfies that contract using ONLY paths inside the .app:
+#   1. the staged location is exactly Contents/Resources/<bundle name>, the
+#      resolver's first candidate;
+#   2. Bundle(url:) on that in-app path — the resolver's own call — loads
+#      and serves every provider PNG, with no build directory involved.
+echo "==> icon-resolution gate (issue #158: resolution must not leave the .app)"
+EXPECTED_BUNDLE_PATH="$APP/Contents/Resources/ModelDeckMac_ModelDeckMacCore.bundle"
+[[ "$PACKAGED_BUNDLE" == "$EXPECTED_BUNDLE_PATH" ]] \
+  || fail "resource bundle staged at $PACKAGED_BUNDLE
+but CoreResourceBundle resolves Contents/Resources/ModelDeckMac_ModelDeckMacCore.bundle first (issue #158).
+If the bundle name or staging location changed, update CoreResourceBundle.swift, its tests, and this gate together."
+grep -Eq 'static let bundleFileName = "ModelDeckMac_ModelDeckMacCore\.bundle"' \
+  "$REPO_ROOT/macos/ModelDeckMac/Sources/ModelDeckMacCore/CoreResourceBundle.swift" \
+  || fail "CoreResourceBundle.swift no longer names ModelDeckMac_ModelDeckMacCore.bundle — resolver and packaging drifted (issue #158)"
+swift - "$PACKAGED_BUNDLE" <<'SWIFT_GATE' \
+  || fail "packaged bundle failed in-app resolution (Bundle(url:) + provider PNG lookup) at $PACKAGED_BUNDLE (issue #158)"
+import AppKit
+import Foundation
+let path = CommandLine.arguments[1]
+precondition(!path.isEmpty)
+guard let bundle = Bundle(url: URL(fileURLWithPath: path, isDirectory: true)) else {
+    FileHandle.standardError.write(Data("gate: Bundle(url:) rejected \(path)\n".utf8))
+    exit(1)
+}
+for base in ["provider-claude", "provider-codex"] {
+    for pixels in [32, 64, 128] {
+        guard let url = bundle.url(forResource: "\(base)-\(pixels)", withExtension: "png") else {
+            FileHandle.standardError.write(Data("gate: \(base)-\(pixels).png not served by \(path)\n".utf8))
+            exit(1)
+        }
+        guard let data = try? Data(contentsOf: url), !data.isEmpty,
+              let image = NSImage(data: data), image.isValid else {
+            FileHandle.standardError.write(Data("gate: \(base)-\(pixels).png exists but does not decode as an image\n".utf8))
+            exit(1)
+        }
+    }
+}
+SWIFT_GATE
+echo "==> icon-resolution gate OK (bundle loads and serves all icons from inside the .app)"
+
 # ------------------------------------------------------------- 3. sign
 # Sign nested code inside-out. The daemon build's ad-hoc signature is replaced
 # here with the same Developer ID identity used for the outer app.

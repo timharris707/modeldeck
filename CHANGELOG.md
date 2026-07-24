@@ -4,6 +4,25 @@ All notable changes to ModelDeck are documented here. Versioning follows the
 roadmap in `design/mac-app-roadmap.md`: `v0.1-web` tags the retired web MVP,
 and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 
+## 0.3.5 — 2026-07-23
+
+The real fix for the 0.3.3/0.3.4 menu-bar click crash. 0.3.4's repair
+addressed a genuine packaging defect but not the actual cause — if 0.3.3
+or 0.3.4 crashes when you click the menu-bar icon, download the fresh
+DMG (an app that can't open can't self-update). Working installs update
+via **Update Now** as usual.
+
+### Fixed
+- **The provider-icon crash, actually fixed this time (issue #158,
+  escalating #151 / public report #1)**: the app resolved its icon
+  resources through a build-machine path baked into the binary at
+  compile time — invisible in testing (the path exists on the build
+  machine) and fatal anywhere else. Icons now load through an explicit
+  resolver that only depends on paths inside the installed app, falls
+  back to plain glyphs rather than crashing if resources are ever
+  missing, and the release pipeline now runs the shipped app's own
+  resolution path — decoding every icon — before anything is signed.
+
 ## 0.3.4 — 2026-07-23
 
 A hotfix release. 0.3.3 crashes on launch-click for users on newer macOS

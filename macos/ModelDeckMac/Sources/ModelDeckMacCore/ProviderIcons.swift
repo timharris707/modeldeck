@@ -37,12 +37,18 @@ public enum ProviderIcons {
     private static let codexImage = loadImage(for: .codex)
 
     private static func loadImage(for provider: DeckProvider) -> NSImage? {
+        // Issue #158: NEVER Bundle.module here — its plain-`swift build`
+        // accessor only checks the app root and a baked builder path, and
+        // traps when both miss (the v0.3.3/v0.3.4 field crash). The
+        // explicit resolver checks Contents/Resources first and degrades
+        // to nil (callers keep their fallback glyphs) instead of trapping.
+        guard let bundle = CoreResourceBundle.bundle else { return nil }
         let base = resourceBaseName(for: provider)
         // Shared point size; drawing scales it anyway. 16 keeps 1 pt = 2-8 px.
         let pointSize = NSSize(width: 16, height: 16)
         let image = NSImage(size: pointSize)
         for pixels in pixelSizes {
-            guard let url = Bundle.module.url(forResource: "\(base)-\(pixels)", withExtension: "png"),
+            guard let url = bundle.url(forResource: "\(base)-\(pixels)", withExtension: "png"),
                   let data = try? Data(contentsOf: url),
                   let rep = NSBitmapImageRep(data: data) else {
                 return nil
