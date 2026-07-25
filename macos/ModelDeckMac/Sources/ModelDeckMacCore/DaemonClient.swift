@@ -247,6 +247,22 @@ public struct DaemonClient: Sendable {
         throw DaemonClientError.httpStatus(http.statusCode)
     }
 
+    // MARK: - Statusline capture opt-in (issue #174)
+
+    /// `POST /api/accounts/:id/statusline/{install|uninstall}` — writes or
+    /// reverts ModelDeck's statusline tee in the profile's OWN settings.json
+    /// (the daemon chains any existing user statusline on install and
+    /// restores the original — byte-for-byte where feasible — on uninstall).
+    public func setClaudeStatuslineCapture(accountID: String, enabled: Bool) async throws -> ClaudeStatuslineOptIn {
+        struct Envelope: Decodable { var statusline: ClaudeStatuslineOptIn }
+        let request = try await authorizedRequest(
+            method: "POST",
+            pathComponents: ["api", "accounts", accountID, "statusline", enabled ? "install" : "uninstall"]
+        )
+        let envelope: Envelope = try await send(request)
+        return envelope.statusline
+    }
+
     // MARK: - Account editing (issue #7)
 
     /// `POST /api/accounts` — upsert. With an existing account's `id` and

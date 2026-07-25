@@ -54,6 +54,11 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
     /// sign-out). Optional by design: an old daemon omits it and the account
     /// renders exactly the pre-#149 alarming treatment.
     public var signinReason: String?
+    /// Issue #174: whether ModelDeck's opt-in statusline capture tee is
+    /// installed in this Claude profile's settings.json. Optional by design:
+    /// an old daemon (or a Codex account) omits it and Settings simply shows
+    /// no statusline control.
+    public var claudeStatusline: ClaudeStatuslineOptIn?
 
     public init(
         id: String,
@@ -68,7 +73,8 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         metadata: DeckAccountMetadata? = nil,
         authState: String? = nil,
         lastRefreshError: AccountRefreshError? = nil,
-        signinReason: String? = nil
+        signinReason: String? = nil,
+        claudeStatusline: ClaudeStatuslineOptIn? = nil
     ) {
         self.id = id
         self.provider = provider
@@ -83,6 +89,7 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         self.authState = authState
         self.lastRefreshError = lastRefreshError
         self.signinReason = signinReason
+        self.claudeStatusline = claudeStatusline
     }
 
     /// Per-account health chip (issue #32): each roster row reads its OWN
@@ -192,6 +199,21 @@ public struct AccountRefreshError: Codable, Equatable, Sendable {
 /// `codexPlan`/`plan` are decoded tolerantly ahead of issue #26 landing on
 /// the daemon side: whichever key the backend ships (mirroring the Claude
 /// field or a generic one), the tier renders with no further UI change.
+/// Issue #174: the daemon's per-account statusline-capture opt-in state
+/// (`claudeStatusline: {installed}` on `GET /api/state` accounts, and the
+/// `statusline` body of the install/uninstall endpoints). `chained` is
+/// reported by install only: whether a pre-existing user statusLine command
+/// is being chained (its output passes through untouched).
+public struct ClaudeStatuslineOptIn: Codable, Equatable, Sendable {
+    public var installed: Bool
+    public var chained: Bool?
+
+    public init(installed: Bool, chained: Bool? = nil) {
+        self.installed = installed
+        self.chained = chained
+    }
+}
+
 public struct DeckAccountMetadata: Codable, Equatable, Sendable {
     public var claudePlan: ProviderPlanInfo?
     public var codexPlan: ProviderPlanInfo?

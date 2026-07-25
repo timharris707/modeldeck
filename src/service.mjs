@@ -4,6 +4,8 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { isSea } from 'node:sea';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import {
   activateClaudeProfile,
@@ -17,6 +19,12 @@ import {
   validateClaudeProfileHome,
 } from './adapters/claude.mjs';
 import { claudeCredentialsPresent } from './adapters/claude-keychain.mjs';
+import {
+  buildStatuslineCommand,
+  chainCommandFromStatuslineCommand,
+  isModelDeckStatuslineCommand,
+  statuslineSnapshotsFromCapture,
+} from './adapters/claude-statusline.mjs';
 import {
   createCodexProfileHome,
   fetchCodexRateLimits,
@@ -229,6 +237,20 @@ export class ModelDeckService {
     // Application Support directory) so test fixtures stay inside their roots.
     this.claudeShellEnvFile = options.claudeShellEnvFile
       || path.join(path.dirname(this.claudeProfilesDir), 'claude-env.sh');
+    // Issue #174: per-profile statusline capture files live under ModelDeck's
+    // own data dir (default: sibling of the profiles directory, matching
+    // CLAUDE_STATUSLINE_DIR in src/paths.mjs) — never inside a provider
+    // directory. The statusline command embeds the daemon's own executable:
+    // the SEA binary re-enters through the argv marker; source mode runs the
+    // adapter script with the same Node.
+    this.claudeStatuslineDir = options.claudeStatuslineDir
+      || path.join(path.dirname(this.claudeProfilesDir), 'statusline');
+    this.statuslineExecPath = options.statuslineExecPath || process.execPath;
+    this.statuslineSea = options.statuslineSea ?? isSea();
+    this.statuslineScriptPath = options.statuslineScriptPath
+      || (this.statuslineSea ? null : fileURLToPath(new URL('./adapters/claude-statusline.mjs', import.meta.url)));
+    this.statuslineWatcher = null;
+    this.statuslineIngestTimer = null;
     this.codexPath = options.codexPath || 'codex';
     this.codexActiveLink = options.codexActiveLink || path.join(os.homedir(), '.codex');
     this.codexProfilesDir = options.codexProfilesDir || path.join(os.homedir(), '.codex-profiles');
@@ -307,6 +329,11 @@ export class ModelDeckService {
     this.autoRefreshStarted = true;
     // Local, credential-free startup migration for pre-#62 Claude rows.
     void this.backfillClaudeIdentities();
+    // Issue #174: pick up statusline captures written while the daemon was
+    // down, then watch for new ones — server-truth windows should not wait
+    // for the next scheduled provider refresh.
+    void this.ingestClaudeStatuslineCaptures().catch(() => {});
+    this.startClaudeStatuslineWatcher();
     const generation = ++this.autoRefreshGeneration;
     const settings = this.store.getSettings();
     if (settings.autoRefreshEnabled) {
@@ -322,6 +349,258 @@ export class ModelDeckService {
     this.autoRefreshTimer = null;
     this.pausedForActiveSessions = false;
     this.activeProviderSessionPresent = false;
+    if (this.statuslineIngestTimer != null) this.clearTimeout(this.statuslineIngestTimer);
+    this.statuslineIngestTimer = null;
+    if (this.statuslineWatcher) {
+      try { this.statuslineWatcher.close(); } catch { /* already closed */ }
+      this.statuslineWatcher = null;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Issue #174 — statusline rate-limits capture ingest.
+
+  claudeStatuslineCaptureFile(accountId) {
+    return path.join(this.claudeStatuslineDir, `${accountId}.json`);
+  }
+
+  claudeStatuslineBackupFile(accountId) {
+    return path.join(this.claudeStatuslineDir, 'backups', `${accountId}.settings-backup.json`);
+  }
+
+  /// Watch the capture directory so a statusline render lands on the deck
+  /// within about a second, not at the next scheduled refresh. Best-effort:
+  /// a watch failure degrades to refresh-tick ingest, never to a crash.
+  startClaudeStatuslineWatcher() {
+    if (this.statuslineWatcher) return;
+    try {
+      fs.mkdirSync(this.claudeStatuslineDir, { recursive: true, mode: 0o700 });
+      this.statuslineWatcher = fs.watch(this.claudeStatuslineDir, () => {
+        if (this.statuslineIngestTimer != null) return;
+        this.statuslineIngestTimer = this.setTimeout(() => {
+          this.statuslineIngestTimer = null;
+          void this.ingestClaudeStatuslineCaptures().catch((error) => {
+            console.error(`[modeldeck] statusline ingest failed: ${error?.message || error}`);
+          });
+        }, 1_000);
+      });
+      this.statuslineWatcher.on?.('error', () => {});
+      // The watcher must never keep the daemon process alive on its own.
+      this.statuslineWatcher.unref?.();
+    } catch (error) {
+      console.error(`[modeldeck] statusline watcher unavailable: ${error?.message || error}`);
+    }
+  }
+
+  /// Read every enabled Claude account's capture file and record the windows
+  /// as usage snapshots with `source: 'claude-statusline'`.
+  ///
+  /// Precedence contract (issue #174): newest observedAt wins. A capture row
+  /// is recorded only when its observedAt is strictly newer than the newest
+  /// stored row for that (account, scope) — so a fresher probe result is
+  /// never shadowed, and re-reading the same capture is idempotent. Probe
+  /// rows are stamped at insert time, so a later probe always outranks an
+  /// older capture on its own.
+  ///
+  /// Fingerprint safety (#65/#108 — the spike's HARD RULE): this path writes
+  /// through recordUsage with its own provenance label but NEVER touches
+  /// claudeWeeklyFingerprints or the duplicate-token sets. Those update
+  /// exclusively from probe results inside refreshClaude, so statusline data
+  /// can never poison weeklyResetFingerprint duplicate detection.
+  async ingestClaudeStatuslineCaptures() {
+    const accounts = this.store.listAccounts()
+      .filter((account) => account.provider === 'claude' && account.enabled);
+    const ingested = [];
+    for (const account of accounts) {
+      let capture;
+      try {
+        capture = JSON.parse(await fs.promises.readFile(this.claudeStatuslineCaptureFile(account.id), 'utf8'));
+      } catch {
+        continue; // absent or malformed capture: normal, never an error state
+      }
+      for (const snapshot of statuslineSnapshotsFromCapture(capture)) {
+        const latest = this.store.latestUsageRow(account.id, snapshot.scope);
+        const latestMs = latest?.observedAt ? Date.parse(latest.observedAt) : null;
+        if (latestMs != null && !(Date.parse(snapshot.observedAt) > latestMs)) continue;
+        this.store.recordUsage(account.id, snapshot);
+        ingested.push({ accountId: account.id, scope: snapshot.scope, observedAt: snapshot.observedAt });
+      }
+    }
+    return ingested;
+  }
+
+  /// Whether a profile's settings.json currently carries ModelDeck's
+  /// statusline tee. Local file read only; any miss reads as false.
+  async claudeStatuslineInstalled(profileRef) {
+    if (!profileRef) return false;
+    try {
+      const parsed = JSON.parse(await fs.promises.readFile(path.join(profileRef, 'settings.json'), 'utf8'));
+      return isModelDeckStatuslineCommand(parsed?.statusLine?.command);
+    } catch {
+      return false;
+    }
+  }
+
+  /// Opt-in install (issue #174): write ModelDeck's statusline tee into the
+  /// profile's OWN settings.json — profile-scoped path only (#66: never the
+  /// active ~/.claude symlink), non-destructive (an existing user statusLine
+  /// is chained, its output passing through untouched), reversible (the
+  /// pre-install settings.json bytes are backed up before any change), and
+  /// idempotent (re-install refreshes paths without stacking tees or
+  /// clobbering the original backup).
+  async installClaudeStatusline(accountId) {
+    const account = this.store.getAccount(accountId);
+    if (!account) throw new Error('account not found');
+    if (account.provider !== 'claude') {
+      const error = new Error('statusline capture is only supported for claude accounts');
+      error.statusCode = 400;
+      throw error;
+    }
+    const profileRef = managedClaudeProfile(account.profileRef, this.claudeProfilesDir);
+    const settingsPath = path.join(profileRef, 'settings.json');
+    let raw = null;
+    try { raw = await fs.promises.readFile(settingsPath, 'utf8'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    let parsed = {};
+    if (raw != null) {
+      try { parsed = JSON.parse(raw); }
+      catch { throw new Error('Claude profile settings.json is not valid JSON; fix it before enabling statusline capture'); }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('Claude profile settings.json must contain a JSON object');
+      }
+    }
+    const existingStatusLine = parsed.statusLine;
+    const existingCommand = typeof existingStatusLine?.command === 'string' ? existingStatusLine.command : null;
+    const alreadyOurs = isModelDeckStatuslineCommand(existingCommand);
+    // Re-install keeps the ORIGINAL user command from the previous install's
+    // tee — chaining our own tee would stack wrappers forever.
+    const chainCommand = alreadyOurs
+      ? chainCommandFromStatuslineCommand(existingCommand)
+      : existingCommand;
+    const padding = existingStatusLine?.padding;
+    const command = buildStatuslineCommand({
+      execPath: this.statuslineExecPath,
+      scriptPath: this.statuslineScriptPath,
+      captureFile: this.claudeStatuslineCaptureFile(account.id),
+      chainCommand,
+      sea: this.statuslineSea,
+    });
+    const nextSettings = {
+      ...parsed,
+      statusLine: {
+        type: 'command',
+        command,
+        ...(typeof padding === 'number' ? { padding } : {}),
+      },
+    };
+    const written = `${JSON.stringify(nextSettings, null, 2)}\n`;
+    const backupFile = this.claudeStatuslineBackupFile(account.id);
+    let backup = null;
+    if (alreadyOurs) {
+      try { backup = JSON.parse(await fs.promises.readFile(backupFile, 'utf8')); }
+      catch { backup = null; }
+    }
+    // The pre-install truth is captured ONCE — a re-install must never
+    // replace the original bytes with an already-teed document.
+    if (!backup) {
+      backup = {
+        accountId: account.id,
+        settingsPath,
+        existed: raw != null,
+        content: alreadyOurs ? null : raw,
+        originalStatusLine: alreadyOurs
+          ? (chainCommand ? { type: 'command', command: chainCommand } : null)
+          : (existingStatusLine ?? null),
+        installedAt: new Date(this.now()).toISOString(),
+      };
+    }
+    backup.writtenContent = written;
+    await fs.promises.mkdir(path.dirname(backupFile), { recursive: true, mode: 0o700 });
+    await fs.promises.writeFile(backupFile, `${JSON.stringify(backup, null, 2)}\n`, { mode: 0o600 });
+    await this.writeClaudeProfileSettings(settingsPath, written);
+    await fs.promises.mkdir(this.claudeStatuslineDir, { recursive: true, mode: 0o700 });
+    this.startClaudeStatuslineWatcher();
+    return { installed: true, chained: Boolean(chainCommand) };
+  }
+
+  /// Opt-out (issue #174): restore the profile's settings.json — byte for
+  /// byte when the file is exactly what install wrote (unlink when it did
+  /// not exist before), surgically (only the statusLine key reverts) when
+  /// the user edited other settings since, and hands-off entirely when the
+  /// user already replaced our tee themselves. The capture file and backup
+  /// are removed either way; stored snapshots stay (history is history).
+  async uninstallClaudeStatusline(accountId) {
+    const account = this.store.getAccount(accountId);
+    if (!account) throw new Error('account not found');
+    if (account.provider !== 'claude') {
+      const error = new Error('statusline capture is only supported for claude accounts');
+      error.statusCode = 400;
+      throw error;
+    }
+    const profileRef = managedClaudeProfile(account.profileRef, this.claudeProfilesDir);
+    const settingsPath = path.join(profileRef, 'settings.json');
+    const backupFile = this.claudeStatuslineBackupFile(account.id);
+    let backup = null;
+    try { backup = JSON.parse(await fs.promises.readFile(backupFile, 'utf8')); }
+    catch { backup = null; }
+    let raw = null;
+    try { raw = await fs.promises.readFile(settingsPath, 'utf8'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    let parsed = null;
+    if (raw != null) {
+      try { parsed = JSON.parse(raw); } catch { parsed = null; }
+    }
+    const command = parsed?.statusLine?.command;
+    if (raw != null && parsed && isModelDeckStatuslineCommand(command)) {
+      if (backup?.writtenContent === raw && backup.content !== undefined) {
+        // Untouched since install: byte-for-byte restore.
+        if (backup.existed && typeof backup.content === 'string') {
+          await this.writeClaudeProfileSettings(settingsPath, backup.content);
+        } else if (!backup.existed) {
+          await fs.promises.unlink(settingsPath).catch(() => {});
+        } else {
+          // existed but original bytes unknown (backup from a re-install
+          // without the original): fall through to the surgical path.
+          await this.surgicallyRestoreStatusline(settingsPath, parsed, backup, command);
+        }
+      } else {
+        await this.surgicallyRestoreStatusline(settingsPath, parsed, backup, command);
+      }
+    }
+    // Not ours (or settings.json is gone/unreadable): leave the user's
+    // config alone — never guess.
+    await fs.promises.unlink(this.claudeStatuslineCaptureFile(account.id)).catch(() => {});
+    await fs.promises.unlink(backupFile).catch(() => {});
+    return { installed: false };
+  }
+
+  /// Surgical uninstall path: the rest of the document is the user's — only
+  /// statusLine reverts, to the backed-up original (or the chain embedded in
+  /// our own tee command when no backup survived), else the key is removed.
+  async surgicallyRestoreStatusline(settingsPath, parsed, backup, command) {
+    const next = { ...parsed };
+    const chained = chainCommandFromStatuslineCommand(command);
+    const original = backup?.originalStatusLine
+      ?? (chained ? { type: 'command', command: chained } : null);
+    if (original) next.statusLine = original;
+    else delete next.statusLine;
+    await this.writeClaudeProfileSettings(settingsPath, `${JSON.stringify(next, null, 2)}\n`);
+  }
+
+  /// Atomic settings.json write preserving the file's existing mode (0600
+  /// for a fresh file) — a statusline render sourcing settings mid-write
+  /// must never see a torn document.
+  async writeClaudeProfileSettings(settingsPath, content) {
+    let mode = 0o600;
+    try { mode = (await fs.promises.stat(settingsPath)).mode & 0o777; } catch { /* fresh file */ }
+    const temporary = `${settingsPath}.modeldeck-${process.pid}-${crypto.randomUUID()}`;
+    try {
+      await fs.promises.writeFile(temporary, content, { mode });
+      await fs.promises.rename(temporary, settingsPath);
+    } catch (error) {
+      await fs.promises.unlink(temporary).catch(() => {});
+      throw error;
+    }
   }
 
   rescheduleAutoRefresh(settings = this.store.getSettings()) {
@@ -484,6 +763,10 @@ export class ModelDeckService {
   }
 
   async refreshClaude() {
+    // Issue #174: fold in any statusline captures first. Probe rows are
+    // stamped at insert time below, so this ordering can never let an older
+    // capture shadow the fresh probe result.
+    await this.ingestClaudeStatuslineCaptures().catch(() => {});
     const accounts = this.store.listAccounts().filter((account) => account.provider === 'claude' && account.enabled);
     const refreshedSnapshots = new Map();
     const results = await Promise.all(accounts.map(async (account) => {
@@ -1198,11 +1481,18 @@ export class ModelDeckService {
       // Issue #149: additive reason field — present only alongside
       // signin-required, so every other payload byte stays identical.
       const signinReason = this.signinReason(account, authState);
+      // Issue #174: additive statusline opt-in state for Claude accounts —
+      // truth read from the profile's own settings.json, so a tee removed
+      // out-of-band renders honestly as not installed.
+      const claudeStatusline = account.provider === 'claude'
+        ? { installed: await this.claudeStatuslineInstalled(account.profileRef) }
+        : null;
       return {
         ...account,
         authState,
         ...(signinReason ? { signinReason } : {}),
         ...(lastRefreshError ? { lastRefreshError } : {}),
+        ...(claudeStatusline ? { claudeStatusline } : {}),
       };
     }));
   }

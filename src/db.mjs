@@ -176,6 +176,11 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS usage_account_observed
         ON usage_snapshots(account_id, observed_at DESC);
+      -- PR #177 review: statusline ingest raises the insert rate, and the
+      -- latest-per-(account, scope) readers must stay index-served rather
+      -- than scanning the whole history on every /api/state poll.
+      CREATE INDEX IF NOT EXISTS usage_account_scope_observed
+        ON usage_snapshots(account_id, scope, observed_at DESC, id DESC);
 
       CREATE TABLE IF NOT EXISTS launch_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -364,13 +369,36 @@ export class Store {
     );
   }
 
+  /// Issue #174: the newest stored row for one (account, scope) — the
+  /// statusline ingest's record-if-newer guard reads this before inserting.
+  /// Same ordering contract as latestUsage: newest observed_at wins, insert
+  /// order (id) breaks ties.
+  latestUsageRow(accountId, scope) {
+    return usageRow(this.db.prepare(`
+      SELECT * FROM usage_snapshots
+      WHERE account_id = ? AND scope = ?
+      ORDER BY observed_at DESC, id DESC LIMIT 1
+    `).get(accountId, scope));
+  }
+
+  // Issue #174: "latest" means newest OBSERVATION, not newest insert. With a
+  // single snapshot source those coincide (probe rows are stamped at insert
+  // time), but statusline captures carry their own observedAt — a refresh
+  // pass that lands after a fresher capture was ingested must not shadow it
+  // just by inserting later. Ties (identical observed_at) keep the previous
+  // max-id behavior.
   latestUsage() {
+    // Correlated-subquery form so the usage_account_scope_observed covering
+    // index serves each (account, scope)'s newest row directly — the
+    // window-function form full-scanned the table (PR #177 review). Same
+    // contract: newest observed_at wins, id breaks ties.
     const rows = this.db.prepare(`
       SELECT u.* FROM usage_snapshots u
-      JOIN (
-        SELECT account_id, scope, MAX(id) AS max_id
-        FROM usage_snapshots GROUP BY account_id, scope
-      ) latest ON latest.max_id = u.id
+      WHERE u.id = (
+        SELECT u2.id FROM usage_snapshots u2
+        WHERE u2.account_id = u.account_id AND u2.scope = u.scope
+        ORDER BY u2.observed_at DESC, u2.id DESC LIMIT 1
+      )
       ORDER BY u.account_id, u.scope
     `).all();
     return rows.map(usageRow);

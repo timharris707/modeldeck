@@ -219,7 +219,13 @@ struct AccountsSettingsPane: View {
             onRelaunchSignIn: { signInModel.relaunch(accountID: account.id) },
             onCancelSignIn: { signInModel.cancel(accountID: account.id) },
             onEdit: { editingAccount = account },
-            onRemove: { removalCandidate = account }
+            onRemove: { removalCandidate = account },
+            // Issue #174: present only when the daemon reported the opt-in
+            // state (Claude accounts on a statusline-capable daemon).
+            statuslineInstalled: account.claudeStatusline?.installed,
+            onSetStatusline: { enabled in
+                Task { await accountsModel.setStatuslineCapture(account: account, enabled: enabled) }
+            }
         )
     }
 
@@ -427,6 +433,11 @@ struct AccountRosterRow: View {
     var onCancelSignIn: (() -> Void)?
     let onEdit: () -> Void
     let onRemove: () -> Void
+    /// Issue #174: the daemon-reported statusline capture opt-in state for
+    /// Claude accounts. Nil (Codex accounts, old daemons) renders no control.
+    var statuslineInstalled: Bool?
+    /// Enables (true) or disables (false) statusline capture for this profile.
+    var onSetStatusline: ((Bool) -> Void)?
 
     @State private var isHovered = false
 
@@ -580,6 +591,24 @@ struct AccountRosterRow: View {
     private var editRemoveActions: some View {
         Button("Edit…", action: onEdit)
             .disabled(isBusy || !canEdit)
+        // Issue #174: opt-in statusline capture for Claude profiles. The
+        // toggle reflects the daemon's read of the profile's own
+        // settings.json; an existing user statusline is chained, its output
+        // untouched, and disabling restores the original config.
+        if let statuslineInstalled, let onSetStatusline {
+            Divider()
+            Toggle(
+                "Capture usage from Claude Code statusline",
+                isOn: Binding(
+                    get: { statuslineInstalled },
+                    set: { onSetStatusline($0) }
+                )
+            )
+            .disabled(isBusy)
+            .help(statuslineInstalled
+                ? "ModelDeck updates this account's usage from Claude Code's statusline data whenever the profile is in use. Turning this off restores the profile's previous statusline configuration."
+                : "Adds a small statusline step to this profile that records Claude's own rate-limit numbers whenever the account is in use — no credentials, no extra API calls. Any statusline you already use keeps working unchanged.")
+        }
         Button("Remove…", role: .destructive, action: onRemove)
             .disabled(isBusy)
     }

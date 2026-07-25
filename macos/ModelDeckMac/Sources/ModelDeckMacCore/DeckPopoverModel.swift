@@ -69,6 +69,40 @@ public enum DeckSortOrder: String, Equatable, Sendable, CaseIterable {
         case .provider: return "square.grid.2x2"
         }
     }
+
+    /// Issue #178: human words for what a direction means IN THIS MODE —
+    /// tooltip and accessibility value for the active segment's direction
+    /// indicator. Pinned by tests: VoiceOver users hear exactly these.
+    public func directionDescription(_ direction: DeckSortDirection) -> String {
+        switch (self, direction) {
+        case (.nextReset, .ascending): return "soonest reset first"
+        case (.nextReset, .descending): return "latest reset first"
+        case (.lowestRemaining, .ascending): return "lowest remaining first"
+        case (.lowestRemaining, .descending): return "most remaining first"
+        case (.provider, .ascending): return "soonest reset first within each provider"
+        case (.provider, .descending): return "latest reset first within each provider"
+        }
+    }
+}
+
+/// Issue #178 (Tim): direction of the active sort mode. Every mode's default
+/// is `.ascending` — byte-identical to the pre-#178 order (next reset:
+/// soonest first; lowest remaining: the worry-sort lowest-%-first; provider:
+/// grouped, soonest reset first within a group). Clicking the ALREADY-active
+/// segment flips the direction for THAT mode only; Tim's "most appealing
+/// account on top" is % sort descending — one extra click, never the default.
+///
+/// Direction is display-order only (menu-bar %, notifications, and
+/// /api/capacity never consult it) and popover-local like the Provider mode:
+/// the daemon settings schema carries no direction field, so it persists via
+/// UserDefaults per mode and never syncs.
+public enum DeckSortDirection: String, Equatable, Sendable, CaseIterable {
+    case ascending
+    case descending
+
+    public var flipped: DeckSortDirection {
+        self == .ascending ? .descending : .ascending
+    }
 }
 
 /// Health of a usage window on the locked "% left" thresholds:
@@ -112,6 +146,13 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
     /// Claude Code's own extra-usage presentation — while the meter keeps
     /// showing the utilization fraction.
     public var spendText: String?
+    /// Issue #175: non-nil when this window's stored `resetsAt` has
+    /// provably passed since the snapshot was observed (idle rollforward).
+    /// The notice replaces the reset slot's text and SUPPRESSES the stored
+    /// percent/meter — a % from a window that has since closed must not
+    /// render as if current, and a fresh % is never fabricated. Pure
+    /// render-time derivation; the stored snapshot fields are untouched.
+    public var idleRollforward: IdleRollforward.Notice?
 
     public var id: String { scope }
 
@@ -120,6 +161,10 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
     /// explain the fresh-window state instead of surfacing the placeholder
     /// timestamp the copy just declined to show.
     public var resetTooltip: String {
+        // Issue #175: the rollforward tooltip explains the closed window —
+        // the stored absolute timestamp would present a past instant as if
+        // it were still the upcoming reset.
+        if let idleRollforward { return idleRollforward.tooltip }
         if case .unanchored(let duration) = anchor {
             return WindowPresentation.unanchoredTooltip(windowDuration: duration)
         }
@@ -132,14 +177,22 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
     public var isSpend: Bool { UsageScope.isSpend(scope) }
 
     /// Bars fill with **usage** while the number reads **% left** (mockup §02).
+    /// Issue #175: an idle-rolled window's meter reads empty — the stored
+    /// fill describes a window that has since closed.
     public var usedFraction: Double {
+        guard idleRollforward == nil else { return 0 }
         guard let remaining = remainingPercent else { return 0 }
         return min(max((100 - remaining) / 100, 0), 1)
     }
 
     /// "72% left" — the locked number convention, both providers.
+    /// Issue #175: nil once the window has provably closed since its
+    /// observation — the stale % must not render as if current, and a
+    /// derived % is NEVER fabricated (limits are per-account; our idleness
+    /// signal is per-machine-profile).
     public var remainingText: String? {
-        remainingPercent.map { "\(Int($0.rounded()))% left" }
+        guard idleRollforward == nil else { return nil }
+        return remainingPercent.map { "\(Int($0.rounded()))% left" }
     }
 
     /// Issue #145 (generalizing #143/#144): what the row's reset slot
@@ -154,6 +207,10 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
     /// because an unanchored window deliberately IGNORES its drifting
     /// `resetsAt` — and any real reset timestamp, which renders as always.
     public var displayedResetText: String? {
+        // Issue #175: the rollforward fact replaces the reset text — the
+        // stored `resetsAt` is in the past, so "resetting now" (or a past
+        // timestamp) would be dishonest. One line, same slot (#145).
+        if let idleRollforward { return idleRollforward.text }
         if case .unanchored = anchor { return resetText }
         return resetsAt == nil ? nil : resetText
     }
@@ -176,7 +233,8 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
         stale: Bool,
         anchor: WindowAnchor = .anchored,
         rolloverText: String? = nil,
-        spendText: String? = nil
+        spendText: String? = nil,
+        idleRollforward: IdleRollforward.Notice? = nil
     ) {
         self.scope = scope
         self.title = title
@@ -188,6 +246,7 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
         self.anchor = anchor
         self.rolloverText = rolloverText
         self.spendText = spendText
+        self.idleRollforward = idleRollforward
     }
 }
 
@@ -433,19 +492,34 @@ public enum DeckBuilder {
     }
 
     /// Rows sorted by the given order. Ties break by label so the order is stable.
-    public static func sorted(_ rows: [DeckAccountRow], by order: DeckSortOrder) -> [DeckAccountRow] {
+    ///
+    /// Issue #178: `direction` inverts the mode's PRIMARY key only.
+    /// Invariants in both directions:
+    /// - rows with no data for the key sort LAST either way (a card with
+    ///   nothing to show never floats to the top because the arrow flipped);
+    /// - the #53-era label tie-break stays ascending either way, so rows
+    ///   tied on the key keep one stable relative order in both directions;
+    /// - Provider mode keeps its grouping fixed (Claude, Codex, unknown —
+    ///   mirroring the two-column left→right order) and flips only the
+    ///   within-group reset order.
+    /// The `.ascending` default keeps every pre-#178 call site byte-identical.
+    public static func sorted(
+        _ rows: [DeckAccountRow],
+        by order: DeckSortOrder,
+        direction: DeckSortDirection = .ascending
+    ) -> [DeckAccountRow] {
         rows.sorted { lhs, rhs in
             switch order {
             case .nextReset:
                 // Issue #43: keyed on the displayed (binding) window's
                 // reset, never a hidden window's.
-                let l = lhs.displayedReset ?? .distantFuture
-                let r = rhs.displayedReset ?? .distantFuture
-                if l != r { return l < r }
+                if let outcome = compare(lhs.displayedReset, rhs.displayedReset, direction: direction) {
+                    return outcome
+                }
             case .lowestRemaining:
-                let l = lhs.lowestRemaining ?? .infinity
-                let r = rhs.lowestRemaining ?? .infinity
-                if l != r { return l < r }
+                if let outcome = compare(lhs.lowestRemaining, rhs.lowestRemaining, direction: direction) {
+                    return outcome
+                }
             case .provider:
                 // Issue #30: group by provider even in single-column mode;
                 // within a provider group keep the Reset order (displayed
@@ -454,11 +528,32 @@ public enum DeckBuilder {
                 let lp = providerRank(lhs.provider)
                 let rp = providerRank(rhs.provider)
                 if lp != rp { return lp < rp }
-                let l = lhs.displayedReset ?? .distantFuture
-                let r = rhs.displayedReset ?? .distantFuture
-                if l != r { return l < r }
+                if let outcome = compare(lhs.displayedReset, rhs.displayedReset, direction: direction) {
+                    return outcome
+                }
             }
             return lhs.account.label.localizedCaseInsensitiveCompare(rhs.account.label) == .orderedAscending
+        }
+    }
+
+    /// Direction-aware key comparison: nil returns "no ordering decision"
+    /// (fall through to the label tie-break) for equal keys; rows missing
+    /// the key sink to the bottom in BOTH directions.
+    static func compare<Key: Comparable>(
+        _ lhs: Key?,
+        _ rhs: Key?,
+        direction: DeckSortDirection
+    ) -> Bool? {
+        switch (lhs, rhs) {
+        case let (l?, r?):
+            if l == r { return nil }
+            return direction == .ascending ? l < r : l > r
+        case (nil, nil):
+            return nil
+        case (nil, .some):
+            return false // no-data row sinks
+        case (.some, nil):
+            return true
         }
     }
 
@@ -478,6 +573,7 @@ public enum DeckBuilder {
     public static func columns(
         state: DeckState,
         sortOrder: DeckSortOrder,
+        direction: DeckSortDirection = .ascending,
         thresholds: UsageThresholds = .default,
         now: Date = Date()
     ) -> [DeckColumn] {
@@ -485,7 +581,7 @@ public enum DeckBuilder {
         return [DeckProvider.claude, .codex].map { provider in
             DeckColumn(
                 provider: provider,
-                rows: sorted(allRows.filter { $0.provider == provider }, by: sortOrder)
+                rows: sorted(allRows.filter { $0.provider == provider }, by: sortOrder, direction: direction)
             )
         }
     }
@@ -494,10 +590,11 @@ public enum DeckBuilder {
     public static func interleavedRows(
         state: DeckState,
         sortOrder: DeckSortOrder,
+        direction: DeckSortDirection = .ascending,
         thresholds: UsageThresholds = .default,
         now: Date = Date()
     ) -> [DeckAccountRow] {
-        sorted(rows(state: state, thresholds: thresholds, now: now), by: sortOrder)
+        sorted(rows(state: state, thresholds: thresholds, now: now), by: sortOrder, direction: direction)
     }
 
     // MARK: - Windows
@@ -505,17 +602,30 @@ public enum DeckBuilder {
     static func window(from snapshot: UsageSnapshot, thresholds: UsageThresholds, now: Date) -> DeckWindow {
         let remaining = snapshot.remainingPercent ?? snapshot.usedPercent.map { 100 - $0 }
         let resetDate = DeckDateParsing.date(from: snapshot.resetsAt)
+        let observedDate = DeckDateParsing.date(from: snapshot.observedAt)
+        let duration = WindowPresentation.windowDuration(
+            scope: snapshot.scope,
+            detailMinutes: snapshot.detail?.windowDurationMins
+        )
         // Issue #101: classify the window (anchored / unanchored /
         // recently rolled) so correct-but-confusing states get honest copy.
         // Spend rows are excluded — they carry no rate-limit window.
         let anchor: WindowAnchor = UsageScope.isSpend(snapshot.scope) ? .anchored : WindowPresentation.anchor(
             remainingPercent: remaining,
             resetsAt: resetDate,
-            observedAt: DeckDateParsing.date(from: snapshot.observedAt),
-            windowDuration: WindowPresentation.windowDuration(
-                scope: snapshot.scope,
-                detailMinutes: snapshot.detail?.windowDurationMins
-            ),
+            observedAt: observedDate,
+            windowDuration: duration,
+            now: now
+        )
+        // Issue #175: idle rollforward — render-time derivation ONLY. The
+        // snapshot's stored fields pass through untouched; only the row's
+        // COPY changes once the window has provably closed.
+        let rollforward = IdleRollforward.notice(
+            scope: snapshot.scope,
+            anchor: anchor,
+            resetsAt: resetDate,
+            observedAt: observedDate,
+            windowDuration: duration,
             now: now
         )
         let text: String
@@ -541,7 +651,15 @@ public enum DeckBuilder {
             remainingPercent: remaining,
             resetsAt: resetDate,
             resetText: text,
-            severity: UsageSeverity.severity(remainingPercent: remaining, thresholds: thresholds),
+            // Issue #175: a rolled-idle window's severity is .unknown for
+            // DISPLAY (muted dash, no red/gold from a closed window's %);
+            // the stored percent itself is untouched and still drives
+            // ordering — and every non-presentation consumer (menu-bar %,
+            // /api/capacity, notifications) reads the snapshots directly,
+            // never this field.
+            severity: rollforward != nil
+                ? .unknown
+                : UsageSeverity.severity(remainingPercent: remaining, thresholds: thresholds),
             stale: snapshot.stale,
             anchor: anchor,
             rolloverText: rollover,
@@ -549,7 +667,8 @@ public enum DeckBuilder {
             // payload-stated amounts + currency.
             spendText: UsageScope.isSpend(snapshot.scope)
                 ? spendAmountText(snapshot.detail?.spend)
-                : nil
+                : nil,
+            idleRollforward: rollforward
         )
     }
 
@@ -797,6 +916,42 @@ public final class DeckPopoverModel: ObservableObject {
             defaults.set(sortOrder.rawValue, forKey: Self.sortDefaultsKey)
             guard !isAdoptingConfirmedSettings, oldValue != sortOrder else { return }
             onSelectionChange?(layout, sortOrder)
+        }
+    }
+
+    /// Issue #178: per-mode sort direction. Defaults `.ascending` for every
+    /// mode (pre-#178 behavior byte-identical); persisted per mode via
+    /// UserDefaults exactly like the sort choice itself, popover-local like
+    /// the Provider mode (the daemon settings schema has no direction field,
+    /// so this never syncs and never fires `onSelectionChange`).
+    @Published public private(set) var sortDirections: [DeckSortOrder: DeckSortDirection]
+
+    static func sortDirectionDefaultsKey(for order: DeckSortOrder) -> String {
+        "modeldeck.popover.sortDirection.\(order.rawValue)"
+    }
+
+    /// The persisted direction for a mode; `.ascending` until toggled.
+    public func sortDirection(for order: DeckSortOrder) -> DeckSortDirection {
+        sortDirections[order] ?? .ascending
+    }
+
+    /// The active mode's direction — what the deck currently renders with.
+    public var sortDirection: DeckSortDirection {
+        sortDirection(for: sortOrder)
+    }
+
+    /// Issue #178 segment-click handler: first click on an INACTIVE segment
+    /// activates that mode with its remembered (or default) direction —
+    /// unchanged pre-#178 behavior; a click on the ALREADY-active segment
+    /// flips that mode's direction only. Other modes' directions are
+    /// untouched either way.
+    public func selectSort(_ order: DeckSortOrder) {
+        if order == sortOrder {
+            let flipped = sortDirection(for: order).flipped
+            sortDirections[order] = flipped
+            defaults.set(flipped.rawValue, forKey: Self.sortDirectionDefaultsKey(for: order))
+        } else {
+            sortOrder = order
         }
     }
 
@@ -1104,6 +1259,15 @@ public final class DeckPopoverModel: ObservableObject {
             .flatMap(DeckLayout.init(rawValue:)) ?? .twoColumn
         self.sortOrder = defaults.string(forKey: Self.sortDefaultsKey)
             .flatMap(DeckSortOrder.init(rawValue:)) ?? .nextReset
+        // Issue #178: absent keys read `.ascending` — every mode's default
+        // direction is today's order until the user flips it.
+        self.sortDirections = Dictionary(
+            uniqueKeysWithValues: DeckSortOrder.allCases.compactMap { order in
+                defaults.string(forKey: Self.sortDirectionDefaultsKey(for: order))
+                    .flatMap(DeckSortDirection.init(rawValue:))
+                    .map { (order, $0) }
+            }
+        )
         // Absent key reads false — the issue #73 default-off requirement.
         self.showAccountEmails = defaults.bool(forKey: Self.showEmailsDefaultsKey)
     }
@@ -1122,14 +1286,14 @@ public final class DeckPopoverModel: ObservableObject {
 
     /// Two-column mode content.
     public func columns(for state: DeckState, now: Date = Date()) -> [DeckColumn] {
-        DeckBuilder.columns(state: state, sortOrder: sortOrder, thresholds: thresholds, now: now)
+        DeckBuilder.columns(state: state, sortOrder: sortOrder, direction: sortDirection, thresholds: thresholds, now: now)
             .map { DeckColumn(provider: $0.provider, rows: applyingActivation($0.rows)) }
     }
 
     /// Single-column mode content (both providers interleaved by sort).
     public func interleavedRows(for state: DeckState, now: Date = Date()) -> [DeckAccountRow] {
         applyingActivation(
-            DeckBuilder.interleavedRows(state: state, sortOrder: sortOrder, thresholds: thresholds, now: now)
+            DeckBuilder.interleavedRows(state: state, sortOrder: sortOrder, direction: sortDirection, thresholds: thresholds, now: now)
         )
     }
 

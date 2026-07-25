@@ -311,6 +311,100 @@ struct DeckBuilderTests {
         #expect(DeckSortOrder.allCases.contains(.provider))
     }
 
+    // MARK: - Issue #178: sort direction
+
+    // Defaults-unchanged regression: omitting `direction` is byte-identical
+    // to passing `.ascending` in every mode and both layouts.
+    @Test func omittedDirectionIsAscendingEverywhere() {
+        let state = fixtureState()
+        for order in DeckSortOrder.allCases {
+            let implicit = DeckBuilder.columns(state: state, sortOrder: order, now: now)
+            let explicit = DeckBuilder.columns(state: state, sortOrder: order, direction: .ascending, now: now)
+            #expect(implicit.map { $0.rows.map(\.id) } == explicit.map { $0.rows.map(\.id) })
+            let implicitRows = DeckBuilder.interleavedRows(state: state, sortOrder: order, now: now)
+            let explicitRows = DeckBuilder.interleavedRows(state: state, sortOrder: order, direction: .ascending, now: now)
+            #expect(implicitRows.map(\.id) == explicitRows.map(\.id))
+        }
+    }
+
+    @Test func lowestRemainingDescendingPutsMostAvailableFirst() {
+        let columns = DeckBuilder.columns(state: fixtureState(), sortOrder: .lowestRemaining, direction: .descending, now: now)
+        #expect(columns[0].rows.map(\.id) == ["c3", "c1", "c2"]) // 88, 32, 8
+        #expect(columns[1].rows.map(\.id) == ["x1", "x2"]) // 99, 22
+        let rows = DeckBuilder.interleavedRows(state: fixtureState(), sortOrder: .lowestRemaining, direction: .descending, now: now)
+        #expect(rows.map(\.id) == ["x1", "c3", "c1", "x2", "c2"]) // 99, 88, 32, 22, 8
+    }
+
+    @Test func nextResetDescendingPutsLatestResetFirst() {
+        let columns = DeckBuilder.columns(state: fixtureState(), sortOrder: .nextReset, direction: .descending, now: now)
+        #expect(columns[0].rows.map(\.id) == ["c3", "c2", "c1"]) // 4 d, 3 d, 2 d
+        #expect(columns[1].rows.map(\.id) == ["x1", "x2"]) // 6 d, 5 d
+    }
+
+    // Provider grouping is a layout decision, fixed in BOTH directions
+    // (Claude, Codex, unknown — mirroring the two-column order); direction
+    // flips only the within-group reset order.
+    @Test func providerDescendingKeepsGroupingAndFlipsWithinGroups() {
+        var state = fixtureState()
+        state.accounts.append(account("g1", provider: "gemini", label: "Other"))
+        let rows = DeckBuilder.interleavedRows(state: state, sortOrder: .provider, direction: .descending, now: now)
+        #expect(rows.map(\.id) == ["c3", "c2", "c1", "x1", "x2", "g1"])
+    }
+
+    // #53-era tie-break stability in both directions: rows tied on the key
+    // keep the SAME label-ascending relative order whichever way the
+    // primary key points.
+    @Test func tieBreakStaysLabelAscendingInBothDirections() {
+        let state = DeckState(
+            accounts: [
+                account("b", provider: "claude", label: "Studio"),
+                account("a", provider: "claude", label: "Client"),
+            ],
+            usage: [
+                snapshot("b", scope: "week", remaining: 40, resetsIn: 86_400),
+                snapshot("a", scope: "week", remaining: 40, resetsIn: 86_400),
+            ]
+        )
+        for order in DeckSortOrder.allCases {
+            for direction in DeckSortDirection.allCases {
+                let columns = DeckBuilder.columns(state: state, sortOrder: order, direction: direction, now: now)
+                #expect(columns[0].rows.map(\.id) == ["a", "b"], "\(order) \(direction): Client before Studio")
+            }
+        }
+    }
+
+    // A row with no data never floats to the top because the arrow flipped:
+    // no-key rows sink in BOTH directions.
+    @Test func accountsWithoutUsageSortLastInBothDirections() {
+        var state = fixtureState()
+        state.accounts.append(account("c4", provider: "claude", label: "Aardvark"))
+        for order in [DeckSortOrder.nextReset, .lowestRemaining] {
+            for direction in DeckSortDirection.allCases {
+                let columns = DeckBuilder.columns(state: state, sortOrder: order, direction: direction, now: now)
+                #expect(columns[0].rows.last?.id == "c4", "\(order) \(direction): no-data row sinks")
+            }
+        }
+    }
+
+    @Test func directionFlipIsAnInvolution() {
+        #expect(DeckSortDirection.ascending.flipped == .descending)
+        #expect(DeckSortDirection.descending.flipped == .ascending)
+        for direction in DeckSortDirection.allCases {
+            #expect(direction.flipped.flipped == direction)
+        }
+    }
+
+    // Issue #178: pinned accessibility/tooltip vocabulary for the direction
+    // indicator — VoiceOver users hear exactly these per-mode words.
+    @Test func directionDescriptionsArePinned() {
+        #expect(DeckSortOrder.nextReset.directionDescription(.ascending) == "soonest reset first")
+        #expect(DeckSortOrder.nextReset.directionDescription(.descending) == "latest reset first")
+        #expect(DeckSortOrder.lowestRemaining.directionDescription(.ascending) == "lowest remaining first")
+        #expect(DeckSortOrder.lowestRemaining.directionDescription(.descending) == "most remaining first")
+        #expect(DeckSortOrder.provider.directionDescription(.ascending) == "soonest reset first within each provider")
+        #expect(DeckSortOrder.provider.directionDescription(.descending) == "latest reset first within each provider")
+    }
+
     // Issue #30 item 10: the popover's compact sort control renders icon
     // segments; every order carries a distinct symbol and keeps its
     // display name for tooltips/accessibility.
@@ -806,6 +900,87 @@ struct DeckPopoverModelTests {
         let state = fixtureState()
         #expect(model.columns(for: state, now: now)[0].rows.first?.id == "c2")
         #expect(model.interleavedRows(for: state, now: now).first?.id == "c2")
+    }
+
+    // MARK: - Issue #178: sort direction toggle
+
+    // Defaults byte-identical: a fresh model is ascending in every mode.
+    @Test func sortDirectionDefaultsAscendingForEveryMode() {
+        let model = DeckPopoverModel(defaults: freshDefaults())
+        for order in DeckSortOrder.allCases {
+            #expect(model.sortDirection(for: order) == .ascending)
+        }
+        #expect(model.sortDirection == .ascending)
+    }
+
+    // First click on an inactive segment activates WITHOUT flipping —
+    // today's behavior verbatim; the second click flips.
+    @Test func selectingInactiveModeActivatesWithoutFlipping() {
+        let model = DeckPopoverModel(defaults: freshDefaults())
+        model.selectSort(.lowestRemaining)
+        #expect(model.sortOrder == .lowestRemaining)
+        #expect(model.sortDirection == .ascending, "% sort's first-click default stays lowest-remaining-first")
+        model.selectSort(.lowestRemaining)
+        #expect(model.sortOrder == .lowestRemaining)
+        #expect(model.sortDirection == .descending, "second click flips")
+        model.selectSort(.lowestRemaining)
+        #expect(model.sortDirection == .ascending, "third click flips back")
+    }
+
+    // Direction is PER MODE: flipping % never touches Reset or Provider.
+    @Test func directionTogglesPerModeIndependently() {
+        let model = DeckPopoverModel(defaults: freshDefaults())
+        model.selectSort(.lowestRemaining)
+        model.selectSort(.lowestRemaining) // flip %
+        #expect(model.sortDirection(for: .lowestRemaining) == .descending)
+        #expect(model.sortDirection(for: .nextReset) == .ascending)
+        #expect(model.sortDirection(for: .provider) == .ascending)
+        // Switching away and back remembers the flipped direction.
+        model.selectSort(.nextReset)
+        #expect(model.sortDirection == .ascending)
+        model.selectSort(.lowestRemaining)
+        #expect(model.sortDirection == .descending, "mode remembers its own direction")
+    }
+
+    // Persistence round-trip: per-mode directions survive a relaunch via
+    // the same UserDefaults mechanism the sort choice uses.
+    @Test func sortDirectionPersistsPerModeAcrossInstances() {
+        let defaults = freshDefaults()
+        let model = DeckPopoverModel(defaults: defaults)
+        model.selectSort(.lowestRemaining)
+        model.selectSort(.lowestRemaining) // % -> descending
+        model.selectSort(.nextReset)
+        model.selectSort(.nextReset) // reset -> descending
+        model.selectSort(.nextReset) // reset -> back to ascending
+        let second = DeckPopoverModel(defaults: defaults)
+        #expect(second.sortOrder == .nextReset)
+        #expect(second.sortDirection(for: .lowestRemaining) == .descending)
+        #expect(second.sortDirection(for: .nextReset) == .ascending)
+        #expect(second.sortDirection(for: .provider) == .ascending)
+    }
+
+    // Tim's ask end-to-end: % descending puts the most available account on
+    // top in both layouts.
+    @Test func percentDescendingPutsMostAvailableOnTop() {
+        let model = DeckPopoverModel(defaults: freshDefaults())
+        model.selectSort(.lowestRemaining)
+        model.selectSort(.lowestRemaining)
+        let state = fixtureState()
+        #expect(model.columns(for: state, now: now)[0].rows.map(\.id) == ["c3", "c1", "c2"])
+        #expect(model.interleavedRows(for: state, now: now).first?.id == "x1", "99% Codex row leads interleaved")
+    }
+
+    // The direction toggle never fires onSelectionChange — the daemon
+    // settings schema carries no direction field (popover-local, like the
+    // Provider mode), so there is nothing to sync and nothing to echo.
+    @Test func directionToggleNeverFiresSelectionChange() {
+        let model = DeckPopoverModel(defaults: freshDefaults())
+        var fired: [DeckSortOrder] = []
+        model.onSelectionChange = { _, sort in fired.append(sort) }
+        model.selectSort(.lowestRemaining) // mode change: fires
+        model.selectSort(.lowestRemaining) // direction flip: must not fire
+        model.selectSort(.lowestRemaining) // direction flip: must not fire
+        #expect(fired == [.lowestRemaining])
     }
 }
 

@@ -4,6 +4,34 @@ All notable changes to ModelDeck are documented here. Versioning follows the
 roadmap in `design/mac-app-roadmap.md`: `v0.1-web` tags the retired web MVP,
 and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 
+## 0.3.8 — 2026-07-25
+
+The idle-accounts release: your deck now stays truthful about every
+account, whether you're using it or not — with no credentials involved.
+
+### Added
+- **Capture usage from Claude Code itself (issue #174)**: an opt-in
+  per-profile toggle (Settings → Accounts) installs a tiny statusline
+  hook that receives the rate-limit numbers Claude Code already shows
+  you — five-hour and weekly percentages with reset times — and feeds
+  them to the deck at every real use of that account. Server-truth
+  freshness with zero credentials and zero extra API calls. Your
+  existing statusline, if you have one, passes through untouched, and
+  the toggle uninstalls cleanly.
+- **Sort both ways (issue #178, Tim request)**: clicking the active
+  sort segment flips ascending/descending, with a small chevron showing
+  the direction — so "which account has the most left" can finally sit
+  at the top. Every default stays exactly as before; the flip is one
+  extra click, remembered per sort mode.
+
+### Fixed
+- **Idle cards stop showing yesterday's window as if it were current
+  (issue #175)**: when a window's reset time passes while an account
+  sits idle, the card now says "5-hour window reset since last use" (or
+  the weekly equivalent) with a muted meter, instead of rendering a
+  stale percentage. No number is ever fabricated — fresh figures arrive
+  on next use, exactly as the copy says.
+
 ## 0.3.7 — 2026-07-24
 
 ### Fixed

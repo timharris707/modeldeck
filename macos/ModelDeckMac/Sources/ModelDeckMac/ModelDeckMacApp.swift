@@ -59,7 +59,7 @@ struct ModelDeckMacApp: App {
         // Phase 6 (issue #7): daemon-owned settings, Settings window models,
         // and threshold-crossing notifications.
         let settingsSync = SettingsSyncModel(sync: client)
-        let accountsModel = AccountsSettingsModel(editor: client, stateProvider: client)
+        let accountsModel = AccountsSettingsModel(editor: client, stateProvider: client, statusline: client)
         let toolsModel = ToolsStatusModel(prober: client)
         // Phase 7 (issue #8): the 3-step add-account flow. The daemon creates
         // the isolated profile home; the provider's own login runs in

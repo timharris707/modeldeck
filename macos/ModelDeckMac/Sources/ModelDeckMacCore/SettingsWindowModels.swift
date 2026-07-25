@@ -16,6 +16,15 @@ public protocol AccountEditing: Sendable {
 
 extension DaemonClient: AccountEditing {}
 
+/// Seam for the per-profile statusline capture opt-in (issue #174);
+/// `DaemonClient` conforms.
+public protocol StatuslineConfiguring: Sendable {
+    /// `POST /api/accounts/:id/statusline/{install|uninstall}`.
+    func setClaudeStatuslineCapture(accountID: String, enabled: Bool) async throws -> ClaudeStatuslineOptIn
+}
+
+extension DaemonClient: StatuslineConfiguring {}
+
 /// Accounts pane logic: edit (label / purpose / color) and remove-behind-
 /// confirm. After a successful mutation it re-reads `GET /api/state` and
 /// hands the fresh state to `onStateChanged` so the popover/menu bar update
@@ -31,10 +40,18 @@ public final class AccountsSettingsModel: ObservableObject {
 
     private let editor: any AccountEditing
     private let stateProvider: any DeckStateProviding
+    /// Issue #174: optional so existing call sites (and old tests) build
+    /// unchanged; without it the statusline toggle simply does nothing.
+    private let statusline: (any StatuslineConfiguring)?
 
-    public init(editor: any AccountEditing, stateProvider: any DeckStateProviding) {
+    public init(
+        editor: any AccountEditing,
+        stateProvider: any DeckStateProviding,
+        statusline: (any StatuslineConfiguring)? = nil
+    ) {
         self.editor = editor
         self.stateProvider = stateProvider
+        self.statusline = statusline
     }
 
     /// Whether an account can be edited at all: the daemon must have
@@ -57,6 +74,22 @@ public final class AccountsSettingsModel: ObservableObject {
         }
         return await perform(accountID: account.id) {
             _ = try await self.editor.saveAccount(edit)
+        }
+    }
+
+    /// Issue #174: enable/disable the per-profile statusline capture tee.
+    /// Claude accounts only — the view offers the control solely where the
+    /// daemon reported a `claudeStatusline` state. Returns true on success;
+    /// the fresh daemon state (with the flipped `claudeStatusline.installed`)
+    /// flows through `onStateChanged` like every other roster mutation.
+    @discardableResult
+    public func setStatuslineCapture(account: DeckAccount, enabled: Bool) async -> Bool {
+        guard let statusline else {
+            lastError = "Statusline capture isn't available in this build."
+            return false
+        }
+        return await perform(accountID: account.id) {
+            _ = try await statusline.setClaudeStatuslineCapture(accountID: account.id, enabled: enabled)
         }
     }
 

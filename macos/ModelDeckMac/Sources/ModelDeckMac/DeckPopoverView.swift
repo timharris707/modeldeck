@@ -61,6 +61,8 @@ struct DeckPopoverView: View {
     /// shrinks to compact icon segments (clock = next reset, percent =
     /// lowest remaining, grid = by provider; tooltips + accessibility labels
     /// carry the names) and sits beside the settings gear, top-right.
+    /// Issue #178: clicking the active segment flips that mode's direction
+    /// (see `sortControl`).
     /// Update chrome stays out of the header — the version is a muted footer
     /// detail and update checks live in Settings (issue #33).
     private var header: some View {
@@ -76,20 +78,7 @@ struct DeckPopoverView: View {
 
             Spacer()
 
-            Picker("Sort", selection: $deckModel.sortOrder) {
-                ForEach(DeckSortOrder.allCases, id: \.self) { order in
-                    Label(order.displayName, systemImage: order.iconName)
-                        .labelStyle(.iconOnly)
-                        .help(order.displayName)
-                        .accessibilityLabel(order.displayName)
-                        .tag(order)
-                }
-            }
-            .pickerStyle(.segmented)
-            .controlSize(.small) // issue #30: smaller sort control
-            .labelsHidden()
-            .fixedSize()
-            .help("Sort accounts: next reset, lowest remaining, or grouped by provider")
+            sortControl
 
             Menu {
                 Button("Settings…") {
@@ -139,6 +128,68 @@ struct DeckPopoverView: View {
             .menuStyle(.borderlessButton)
             .fixedSize()
         }
+    }
+
+    /// Issue #178 (Tim): the compact icon-segment sort control, hand-rolled
+    /// because a segmented `Picker` cannot report a click on the segment
+    /// that is already selected — and that click is now the direction
+    /// toggle. Same visual language as the #30 control (small icon
+    /// segments, tooltips + accessibility labels carry the names); the
+    /// active segment additionally shows a tiny chevron (up = ascending,
+    /// down = descending) — subtle, no header growth. First click on an
+    /// inactive segment activates it with its remembered direction
+    /// (unchanged behavior); a second click flips.
+    private var sortControl: some View {
+        HStack(spacing: 1) {
+            ForEach(DeckSortOrder.allCases, id: \.self) { order in
+                sortSegment(order)
+            }
+        }
+        .padding(1)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color(nsColor: .quaternarySystemFill))
+        )
+        .fixedSize()
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Sort")
+        .help("Sort accounts: next reset, lowest remaining, or grouped by provider. Click the active mode again to flip its direction.")
+    }
+
+    private func sortSegment(_ order: DeckSortOrder) -> some View {
+        let isActive = deckModel.sortOrder == order
+        let direction = deckModel.sortDirection(for: order)
+        return Button {
+            deckModel.selectSort(order)
+        } label: {
+            HStack(spacing: 2) {
+                Image(systemName: order.iconName)
+                    .font(.system(size: 10, weight: .medium))
+                if isActive {
+                    Image(systemName: direction == .ascending ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 6, weight: .bold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(height: 16)
+            .padding(.horizontal, isActive ? 5 : 6)
+            .contentShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(isActive ? Color(nsColor: .controlBackgroundColor) : .clear)
+                    .shadow(color: .black.opacity(isActive ? 0.15 : 0), radius: 0.75, y: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .help(isActive
+            ? "\(order.displayName) — \(order.directionDescription(direction)). Click again to flip."
+            : order.displayName)
+        .accessibilityLabel(order.displayName)
+        .accessibilityValue(isActive ? order.directionDescription(direction) : "")
+        .accessibilityHint(isActive
+            ? "Reverses the sort direction"
+            : "Sorts accounts by \(order.displayName.lowercased())")
+        .accessibilityAddTraits(isActive ? .isSelected : [])
     }
 
     /// Issue #121: once "Update Now" starts (the dialog closes on press),

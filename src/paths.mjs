@@ -25,6 +25,13 @@ export const CLAUDE_ACTIVE_LINK = path.resolve(
 export const CLAUDE_SHELL_ENV_FILE = path.resolve(
   process.env.MODELDECK_CLAUDE_SHELL_ENV_FILE || path.join(DATA_DIR, 'claude-env.sh'),
 );
+// Issue #174: per-profile statusline capture files (opt-in tee). Written by
+// the statusline script running inside the user's Claude Code session, read
+// by the daemon's ingest — always inside ModelDeck's own data dir, never a
+// provider directory.
+export const CLAUDE_STATUSLINE_DIR = path.resolve(
+  process.env.MODELDECK_CLAUDE_STATUSLINE_DIR || path.join(DATA_DIR, 'statusline'),
+);
 export const CODEX_PATH = process.env.MODELDECK_CODEX_PATH || 'codex';
 // Owner-only per-account CODEX_HOME directories created by the add-account
 // flow (docs/ACCOUNT_ONBOARDING.md "Codex onboarding").

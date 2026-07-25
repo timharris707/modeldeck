@@ -6,9 +6,10 @@ import { Store } from './db.mjs';
 import { ModelDeckService } from './service.mjs';
 import { resolveMutationToken } from './token.mjs';
 import { runProbeCli as runClaudeUsageProbe } from './adapters/claude-usage-probe.mjs';
+import { runStatuslineCli as runClaudeStatusline, STATUSLINE_SEA_COMMAND } from './adapters/claude-statusline.mjs';
 import {
   HOST, PORT, DB_PATH, PROJECTS_ROOT, CLAUDE_PATH, CLAUDE_PROFILES_DIR, CLAUDE_ACTIVE_LINK,
-  CLAUDE_SHELL_ENV_FILE, CODEX_PATH, CODEX_ACTIVE_LINK, CODEX_PROFILES_DIR,
+  CLAUDE_SHELL_ENV_FILE, CLAUDE_STATUSLINE_DIR, CODEX_PATH, CODEX_ACTIVE_LINK, CODEX_PROFILES_DIR,
 } from './paths.mjs';
 
 // esbuild replaces the build-only identifier with a string literal for SEA;
@@ -67,6 +68,7 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
     claudeProfilesDir: CLAUDE_PROFILES_DIR,
     claudeActiveLink: CLAUDE_ACTIVE_LINK,
     claudeShellEnvFile: CLAUDE_SHELL_ENV_FILE,
+    claudeStatuslineDir: CLAUDE_STATUSLINE_DIR,
     codexPath: CODEX_PATH,
     codexActiveLink: CODEX_ACTIVE_LINK,
     codexProfilesDir: CODEX_PROFILES_DIR,
@@ -162,6 +164,18 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
         if (!account) return json(res, 404, { error: 'account not found' });
         return json(res, 200, await ownedService.verifyAccount(account.id));
       }
+      // Issue #174: per-profile statusline capture opt-in. Both writes stay
+      // inside the profile's OWN settings.json (never the active-profile
+      // symlink) and are token-gated like every mutation.
+      const statuslineMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/statusline\/(install|uninstall)$/);
+      if (req.method === 'POST' && statuslineMatch) {
+        const account = ownedStore.getAccount(decodeURIComponent(statuslineMatch[1]));
+        if (!account) return json(res, 404, { error: 'account not found' });
+        const statusline = statuslineMatch[2] === 'install'
+          ? await ownedService.installClaudeStatusline(account.id)
+          : await ownedService.uninstallClaudeStatusline(account.id);
+        return json(res, 200, { statusline });
+      }
       const resetIdentityMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/reset-identity$/);
       if (req.method === 'POST' && resetIdentityMatch) {
         const account = ownedStore.getAccount(decodeURIComponent(resetIdentityMatch[1]));
@@ -241,6 +255,13 @@ async function main() {
     // daemon crash in every recorded per-account refresh error.
     const code = await runClaudeUsageProbe();
     if (code !== 0) process.exitCode = code;
+    return;
+  }
+  if (isSea() && process.argv.includes(STATUSLINE_SEA_COMMAND)) {
+    // Issue #174: the SEA daemon binary doubles as the statusline tee. The
+    // tee never fails (a statusline error would degrade the user's own
+    // statusline), so no exit-code plumbing here.
+    await runClaudeStatusline();
     return;
   }
 
