@@ -575,7 +575,7 @@ export async function readClaudeAuthStatus({
       plan: { subscriptionType: extractClaudeSubscriptionType(result?.stdout ?? ''), rateLimitTier },
     };
   } catch (error) {
-    if (error.code === 'ENOENT') throw new Error('Claude CLI is not installed');
+    if (error.code === 'ENOENT') throw new Error('Claude Code is not installed — install it (npm install -g @anthropic-ai/claude-code), then try again');
     return {
       authenticated: credentialsPresent,
       identity: extractIdentity(`${error?.stdout ?? ''}\n${error?.stderr ?? ''}`),

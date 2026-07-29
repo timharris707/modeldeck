@@ -43,20 +43,30 @@ export function createProviderProfileHelpers({
     return name;
   }
 
+  // The directory name is an internal identifier derived from the label —
+  // the account's display label lives in the store, not on disk. A leftover
+  // directory (an interrupted earlier add, an account deleted from the
+  // roster, a reinstall) must never dead-end account creation, so a taken
+  // name falls through to the next free suffixed one. Each mkdir stays
+  // exclusive: two accounts can never share a profile home.
+  const MAX_PROFILE_NAME_ATTEMPTS = 50;
+
   async function createProfileHome({ profilesDir, profileName } = {}) {
     if (!profilesDir) throw new Error(profilesDirRequiredError);
     const name = safeProfileName(profileName);
     await fs.promises.mkdir(profilesDir, { recursive: true, mode: 0o700 });
     await fs.promises.chmod(profilesDir, 0o700);
     const root = await fs.promises.realpath(profilesDir);
-    const profileRef = path.join(root, name);
-    try {
-      await fs.promises.mkdir(profileRef, { mode: 0o700 });
-    } catch (error) {
-      if (error.code === 'EEXIST') throw new Error(`${destinationExistsLabel}: ${profileRef}`);
-      throw error;
+    for (let attempt = 1; attempt <= MAX_PROFILE_NAME_ATTEMPTS; attempt += 1) {
+      const profileRef = path.join(root, attempt === 1 ? name : `${name}-${attempt}`);
+      try {
+        await fs.promises.mkdir(profileRef, { mode: 0o700 });
+        return profileRef;
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+      }
     }
-    return profileRef;
+    throw new Error(`${destinationExistsLabel}: ${path.join(root, name)}`);
   }
 
   async function assertOwnerOnlyDirectory(directory, label = profileHomeLabel, stat = fs.promises.lstat) {

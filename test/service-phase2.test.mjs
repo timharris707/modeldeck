@@ -655,8 +655,15 @@ test('missing Claude profile reports a clear activation error and leaves the def
   } finally { data.close(); }
 });
 
+// Account creation preflights the provider CLI (the add flow's next step
+// cannot work without it), so fixtures pin `--version` to a fixed answer.
+const cliInstalledExec = async (_binary, args) => {
+  if (args?.[0] === '--version') return { stdout: '9.9.9' };
+  return { stdout: '' };
+};
+
 test('creates managed Claude accounts and imports only an explicitly approved legacy home', async () => {
-  const data = fixture();
+  const data = fixture({ exec: cliInstalledExec });
   try {
     const created = await data.service.createClaudeAccount({
       label: 'New Profile',
@@ -682,6 +689,63 @@ test('creates managed Claude accounts and imports only an explicitly approved le
     assert.equal(imported.profileRef, path.join(fs.realpathSync(path.join(data.root, 'profiles')), 'imported-profile'));
     assert.equal(imported.metadata.migratedFromClaudeSwap, true);
     assert.equal(fs.readFileSync(path.join(approved, '.credentials.json'), 'utf8'), '{"fixture":true}');
+  } finally { data.close(); }
+});
+
+// First-run stuck states (field report, 2026-07-28): a fresh Mac with no
+// provider CLI let step 1 create the profile home + account, then step 2
+// died in Terminal with "command not found" — and every retry hit "profile
+// destination already exists" with no way forward.
+test('account creation refuses up front, with install guidance, when the provider CLI is missing', async (t) => {
+  const missingCliExec = async () => {
+    const error = new Error('spawn ENOENT');
+    error.code = 'ENOENT';
+    throw error;
+  };
+
+  await t.test('claude', async () => {
+    const data = fixture({ exec: missingCliExec });
+    try {
+      await assert.rejects(
+        data.service.createClaudeAccount({ label: 'Fresh Mac' }),
+        /Claude Code is not installed on this Mac.*npm install -g @anthropic-ai\/claude-code/,
+      );
+      // Nothing partial left behind: no account, no profile home to collide
+      // with a retry after the CLI gets installed.
+      assert.equal(data.store.listAccounts().length, 0);
+      assert.equal(fs.existsSync(path.join(data.root, 'profiles', 'fresh-mac')), false);
+    } finally { data.close(); }
+  });
+
+  await t.test('codex', async () => {
+    const data = fixture({ exec: missingCliExec, codexProfilesDir: path.join(os.tmpdir(), 'unused-codex-profiles') });
+    try {
+      await assert.rejects(
+        data.service.createCodexAccount({ label: 'Fresh Mac' }),
+        /Codex CLI is not installed on this Mac.*npm install -g @openai\/codex/,
+      );
+      assert.equal(data.store.listAccounts().length, 0);
+    } finally { data.close(); }
+  });
+
+  await t.test('a flaky version read never blocks creation (fail open)', async () => {
+    const data = fixture({
+      exec: async () => ({ stdout: 'no semver here' }),
+    });
+    try {
+      const created = await data.service.createClaudeAccount({ label: 'Flaky Read' });
+      assert.ok(fs.existsSync(created.profileRef));
+    } finally { data.close(); }
+  });
+});
+
+test('a leftover profile directory falls through to a suffixed home instead of dead-ending the retry', async () => {
+  const data = fixture({ exec: cliInstalledExec });
+  try {
+    fs.mkdirSync(path.join(data.root, 'profiles', 'exist12'), { mode: 0o700 });
+    const created = await data.service.createClaudeAccount({ label: 'Exist12' });
+    assert.equal(path.basename(created.profileRef), 'exist12-2');
+    assert.equal(fs.statSync(created.profileRef).mode & 0o777, 0o700);
   } finally { data.close(); }
 });
 

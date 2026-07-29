@@ -900,8 +900,30 @@ export class ModelDeckService {
     }
   }
 
+  // First-run trap seen in the field: with no provider CLI installed, step 1
+  // used to succeed (profile home + account created), then step 2 exploded in
+  // Terminal with "command not found" — leaving partial state and a user with
+  // no path forward. Creation now refuses up front with the install command.
+  // Only a definitive missing binary (ENOENT) blocks; any other version-read
+  // failure fails open so a flaky read can never lock out account creation.
+  async requireProviderCli(provider) {
+    const spec = provider === 'claude'
+      ? { binary: this.claudePath, label: 'Claude Code', packageName: '@anthropic-ai/claude-code' }
+      : { binary: this.codexPath, label: 'the Codex CLI', packageName: '@openai/codex' };
+    try {
+      await this.installedToolVersion(spec.binary);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') return;
+      throw new Error(
+        `${spec.label} is not installed on this Mac. Install it first `
+        + `(npm install -g ${spec.packageName}), then add this account.`,
+      );
+    }
+  }
+
   async createClaudeAccount({ label, identity, purpose = '', color, isDefault = false } = {}) {
     if (!label?.trim()) throw new Error('account label is required');
+    await this.requireProviderCli('claude');
     const profileRef = await this.createClaudeProfile({ profilesDir: this.claudeProfilesDir, profileName: label });
     let account;
     try {
@@ -920,6 +942,7 @@ export class ModelDeckService {
   // owner-only CODEX_HOME. Login stays with the provider (step 2).
   async createCodexAccount({ label, identity, purpose = '', color, isDefault = false } = {}) {
     if (!label?.trim()) throw new Error('account label is required');
+    await this.requireProviderCli('codex');
     const profileRef = await this.createCodexProfile({ profilesDir: this.codexProfilesDir, profileName: label });
     let account;
     try {

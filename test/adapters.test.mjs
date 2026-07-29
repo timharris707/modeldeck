@@ -748,9 +748,13 @@ test('creates owner-only Claude profile homes below the ModelDeck profiles direc
   await assert.rejects(validateClaudeProfileHome({ profileRef: outside, profilesDir }), {
     message: `Claude profile home must be inside ModelDeck's profiles directory: ${fs.realpathSync(profilesDir)}`,
   });
-  await assert.rejects(createClaudeProfileHome({ profilesDir, profileName: 'Work Profile' }), {
-    message: `Claude profile destination already exists: ${profileRef}`,
-  });
+  // A taken name (leftover from an interrupted earlier add) falls through to
+  // the next free suffix instead of dead-ending the add-account flow.
+  const second = await createClaudeProfileHome({ profilesDir, profileName: 'Work Profile' });
+  assert.equal(second, path.join(fs.realpathSync(profilesDir), 'work-profile-2'));
+  assert.equal(fs.statSync(second).mode & 0o777, 0o700);
+  const third = await createClaudeProfileHome({ profilesDir, profileName: 'Work Profile' });
+  assert.equal(path.basename(third), 'work-profile-3');
 });
 
 test('imports only explicitly selected cswap profile homes into owner-only native homes', async (t) => {
@@ -1028,11 +1032,19 @@ test('creates owner-only Codex profile homes and refuses duplicates', async (t) 
   assert.equal(path.basename(profileRef), 'work-codex');
   assert.equal(fs.statSync(profileRef).mode & 0o777, 0o700);
   assert.equal(fs.statSync(profilesDir).mode & 0o777, 0o700);
-  await assert.rejects(createCodexProfileHome({ profilesDir, profileName: 'Work Codex' }), {
-    message: `Codex profile destination already exists: ${profileRef}`,
-  });
+  const second = await createCodexProfileHome({ profilesDir, profileName: 'Work Codex' });
+  assert.equal(path.basename(second), 'work-codex-2');
+  assert.equal(fs.statSync(second).mode & 0o777, 0o700);
   await assert.rejects(createCodexProfileHome({ profilesDir, profileName: '..' }), {
     message: 'profile name is invalid',
+  });
+  // The suffix search is bounded: once every candidate is taken the original
+  // refusal (with the base path) still surfaces instead of an infinite loop.
+  for (let attempt = 3; attempt <= 50; attempt += 1) {
+    fs.mkdirSync(path.join(profilesDir, `work-codex-${attempt}`), { mode: 0o700 });
+  }
+  await assert.rejects(createCodexProfileHome({ profilesDir, profileName: 'Work Codex' }), {
+    message: `Codex profile destination already exists: ${profileRef}`,
   });
 });
 

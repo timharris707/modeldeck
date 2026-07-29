@@ -4,6 +4,23 @@ All notable changes to ModelDeck are documented here. Versioning follows the
 roadmap in `design/mac-app-roadmap.md`: `v0.1-web` tags the retired web MVP,
 and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 
+## 0.3.9 — 2026-07-28
+
+The first-run rescue release: a fresh Mac without the provider CLIs can
+no longer get stuck adding its first account.
+
+### Fixed
+- **First-run add-account no longer dead-ends on a fresh Mac**: adding an
+  account on a machine without the provider's CLI used to create the
+  profile home, then explode in Terminal with "command not found" — and
+  every retry hit "profile destination already exists" with no way
+  forward. Account creation now checks the CLI up front and refuses with
+  the exact install command (`npm install -g @anthropic-ai/claude-code` /
+  `npm install -g @openai/codex`) before anything is created, a leftover
+  profile directory falls through to the next free suffixed name instead
+  of blocking the retry, and the sign-in verify errors carry the same
+  install guidance.
+
 ## 0.3.8 — 2026-07-25
 
 The idle-accounts release: your deck now stays truthful about every

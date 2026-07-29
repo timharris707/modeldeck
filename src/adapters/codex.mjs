@@ -288,7 +288,7 @@ export async function readCodexLoginStatus({
     });
     return { authenticated: true, identity: extractIdentity(`${result?.stdout ?? ''}\n${result?.stderr ?? ''}`), plan };
   } catch (error) {
-    if (error.code === 'ENOENT') throw new Error('Codex CLI is not installed');
+    if (error.code === 'ENOENT') throw new Error('Codex CLI is not installed — install it (npm install -g @openai/codex), then try again');
     return { authenticated: false, identity: null, plan, detail: error?.stderr?.trim() || error?.message || null };
   }
 }
