@@ -4,6 +4,36 @@ All notable changes to ModelDeck are documented here. Versioning follows the
 roadmap in `design/mac-app-roadmap.md`: `v0.1-web` tags the retired web MVP,
 and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 
+## 0.3.10 — 2026-07-29
+
+The self-healing release: stale data now explains itself with the fix
+attached, and the background helper repairs itself when an update or a
+move breaks it.
+
+### Fixed
+- **Stale badges now offer the fix (issue #185, Tim report)**: clicking a
+  card's amber "Data from N hr ago" used to open a raw technical error
+  you had to decode yourself. The explanation now leads with a
+  plain-English reason and a **Refresh now** button that polls the
+  providers immediately (same as the footer Refresh). And the failure
+  behind the report — the background helper losing its program file, so
+  every Claude refresh silently died while the deck kept rendering — is
+  now detected and repaired automatically: the helper reports the
+  condition, the app reinstalls the service from the installed bundle,
+  and the deck refreshes with no clicks needed.
+- **Statusline capture survives helper moves (PR #190, follow-up to
+  #185)**: the opt-in statusline hook (0.3.8) embeds the helper's
+  location in each profile's statusline command, so a moved or replaced
+  helper silently stopped captures. The daemon now repoints installed
+  hooks at startup.
+
+### Changed
+- **Auto-refresh keeps running during active sessions (issue #187, Tim
+  decision)**: "Pause while a session is active" now defaults to OFF —
+  an active session is exactly when usage burns fastest and you most
+  want live numbers. Installs that already saved settings keep their
+  choice; the toggle is still in Settings → General.
+
 ## 0.3.9 — 2026-07-28
 
 The first-run rescue release: a fresh Mac without the provider CLIs can
