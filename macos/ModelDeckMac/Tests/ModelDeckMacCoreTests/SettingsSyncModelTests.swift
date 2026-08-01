@@ -129,7 +129,9 @@ struct SettingsSyncModelTests {
         await model.setAutoRefreshEnabled(false)
         await model.setNotificationThreshold(percent: 15)
         await model.setDefaultSort(.nextReset)
-        await model.setPauseWhileActive(true)
+        // Issue #187: echo the confirmed document's own value so this stays
+        // a true echo whatever the shipped default is (now OFF).
+        await model.setPauseWhileActive(model.settings.pauseWhileActive)
 
         #expect(sync.pushedPatches.isEmpty)
     }

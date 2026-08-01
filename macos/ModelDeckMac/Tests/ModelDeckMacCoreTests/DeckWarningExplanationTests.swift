@@ -709,3 +709,103 @@ struct DuplicateReloginActionTests {
         #expect(DeckPopoverModel.duplicateReloginTarget(accountID: "codex-1", state: nil) == nil)
     }
 }
+
+// Issue #185 — the stale badge's explanation offers the FIX, not just the
+// diagnosis: a "Refresh now" primary action wired to the same forced
+// provider poll as the footer Refresh button (#72), plus the daemon's
+// missing-binary self-report the app's auto-repair keys on.
+@Suite("Stale badge refresh action (issue #185)")
+@MainActor
+struct StaleRefreshActionTests {
+    private func model() -> DeckPopoverModel {
+        let defaults = UserDefaults(suiteName: "stale-refresh-tests-\(UUID().uuidString)")!
+        return DeckPopoverModel(defaults: defaults)
+    }
+
+    @Test func requestFiresTheForcedRefreshCallback() {
+        let model = model()
+        var fired = 0
+        model.onStaleRefresh = { fired += 1 }
+        model.requestStaleRefresh()
+        #expect(fired == 1)
+    }
+
+    @Test func requestDismissesThePresentedExplanation() {
+        let model = model()
+        model.toggleWarning(DeckWarningID(topic: .staleData, elementID: "acct-1"))
+        model.onStaleRefresh = {}
+        model.requestStaleRefresh()
+        #expect(model.presentedWarning == nil)
+    }
+
+    @Test func requestWithoutAHandlerIsSafe() {
+        let model = model()
+        model.toggleWarning(DeckWarningID(topic: .staleData, elementID: "acct-1"))
+        model.requestStaleRefresh() // no crash without a handler
+        #expect(model.presentedWarning == nil)
+    }
+
+    @Test func daemonRuntimeDecodesAndDrivesTheMissingBinaryDerivation() throws {
+        let json = """
+        {"accounts": [], "usage": [],
+         "daemon": {"execPath": "/gone/modeldeckd", "binaryPresent": false, "sea": true}}
+        """
+        let state = try JSONDecoder().decode(DeckState.self, from: Data(json.utf8))
+        #expect(state.daemon == DeckDaemonRuntime(
+            execPath: "/gone/modeldeckd", binaryPresent: false, sea: true
+        ))
+        #expect(state.daemonBinaryMissing)
+    }
+
+    @Test func oldDaemonsAndHealthyDaemonsNeverTriggerARepair() throws {
+        // Absent block (pre-#185 daemon): no repair signal.
+        let absent = try JSONDecoder().decode(
+            DeckState.self,
+            from: Data(#"{"accounts": [], "usage": []}"#.utf8)
+        )
+        #expect(absent.daemon == nil)
+        #expect(!absent.daemonBinaryMissing)
+        // Healthy self-report: no repair signal.
+        let healthy = try JSONDecoder().decode(
+            DeckState.self,
+            from: Data(#"{"accounts": [], "usage": [], "daemon": {"execPath": "/ok", "binaryPresent": true, "sea": true}}"#.utf8)
+        )
+        #expect(!healthy.daemonBinaryMissing)
+        // An unexpectedly shaped block reads as absent, never as missing —
+        // the tolerant-decode contract every optional state slice follows.
+        let malformed = try JSONDecoder().decode(
+            DeckState.self,
+            from: Data(#"{"accounts": [], "usage": [], "daemon": "nonsense"}"#.utf8)
+        )
+        #expect(malformed.daemon == nil)
+        #expect(!malformed.daemonBinaryMissing)
+    }
+
+    @Test func classifiedAccountErrorsSignalTheRepairForOldDaemons() {
+        // CodeRabbit (PR #186): a pre-#185 daemon can't self-report, but its
+        // per-account raw ENOENT names the daemon binary — that signal must
+        // drive the same automatic repair, so the card copy's "reinstalls it
+        // automatically" holds for old daemons too.
+        let broken = DeckAccount(
+            id: "a", provider: "claude", label: "Client",
+            lastRefreshError: AccountRefreshError(
+                message: "Claude usage refresh failed: spawn /gone/daemon/modeldeckd ENOENT"
+            )
+        )
+        #expect(DeckState(accounts: [broken], usage: []).daemonHelperMissingSignaled)
+        // An ordinary failure — including a missing provider CLI — never
+        // triggers a daemon repair.
+        let ordinary = DeckAccount(
+            id: "b", provider: "codex", label: "Client",
+            lastRefreshError: AccountRefreshError(message: "spawn codex ENOENT")
+        )
+        #expect(!DeckState(accounts: [ordinary], usage: []).daemonHelperMissingSignaled)
+        // The explicit self-report signals on its own, error or not.
+        let selfReported = DeckState(
+            accounts: [],
+            usage: [],
+            daemon: DeckDaemonRuntime(execPath: "/gone", binaryPresent: false, sea: true)
+        )
+        #expect(selfReported.daemonHelperMissingSignaled)
+    }
+}

@@ -4,6 +4,29 @@ All notable changes to ModelDeck are documented here. Versioning follows the
 roadmap in `design/mac-app-roadmap.md`: `v0.1-web` tags the retired web MVP,
 and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 
+## 0.3.11 — 2026-07-31
+
+The hands-off release: idle accounts now keep themselves fresh, so the
+deck stays accurate without terminal visits or re-logins.
+
+### Added
+- **Idle Claude accounts renew themselves (issue #176)**: when an idle
+  account's sign-in expires, ModelDeck now quietly renews it using the
+  Claude CLI's own renewal mechanism and resumes live updates — no
+  sign-in, no terminal. It only runs while no Claude session is active,
+  tries a free check first before falling back to one tiny Claude
+  request (which can start a fresh 5-hour window), backs off between
+  attempts, and stops at a daily limit per account. A **Renew now**
+  button on idle cards does the same on demand, and Settings → General
+  gains a switch to turn the automatic renewal off. Accounts whose
+  profile routes authentication elsewhere are left alone and say so
+  honestly instead of failing.
+
+### Fixed
+- **Signed-out accounts read as a to-do, not a mystery (issue #193)**:
+  the Accounts row for an account awaiting sign-in now states the
+  status plainly and carries a **Re-log in** action.
+
 ## 0.3.10 — 2026-07-29
 
 The self-healing release: stale data now explains itself with the fix

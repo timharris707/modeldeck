@@ -128,6 +128,21 @@ export function isModelDeckStatuslineCommand(command) {
   return command.includes(STATUSLINE_SEA_COMMAND) || command.includes('claude-statusline.mjs');
 }
 
+/// The executable path embedded in a ModelDeck tee command (its first
+/// shell word), or null for anything that is not our tee. The startup
+/// reconcile (issue #189, same bug class as #185) compares this against the
+/// live daemon's executable to catch tees still pointing at a deleted or
+/// moved binary.
+export function execPathFromStatuslineCommand(command) {
+  if (!isModelDeckStatuslineCommand(command)) return null;
+  const match = command.match(/^((?:'[^']*'|\\')+)(?:\s|$)/);
+  if (!match) return null;
+  return match[1]
+    .replaceAll(`'\\''`, '\u0000')
+    .replaceAll("'", '')
+    .replaceAll('\u0000', "'");
+}
+
 /// The user's original chained command out of a ModelDeck tee command, or
 /// null when the tee has no chain.
 export function chainCommandFromStatuslineCommand(command) {

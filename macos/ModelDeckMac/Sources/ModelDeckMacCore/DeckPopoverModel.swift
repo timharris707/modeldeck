@@ -1094,6 +1094,24 @@ public final class DeckPopoverModel: ObservableObject {
     /// provider's own login for the user to complete; nothing automatic.
     public var onDuplicateRelogin: ((String) -> Void)?
 
+    /// Issue #185: fired by `requestStaleRefresh()` — the stale badge
+    /// explanation's "Refresh now" button. The app wires it to the SAME
+    /// forced provider poll the footer Refresh button runs
+    /// (`MenuBarStatusModel.refreshFromProviders`, issue #72), so the badge
+    /// finally offers the fix instead of only naming the symptom.
+    public var onStaleRefresh: (() -> Void)?
+
+    /// Issue #185: the stale badge's one-click path — dismiss the
+    /// explanation the button lives in, then fire the app's forced-refresh
+    /// callback. Deliberately no staleness re-check beyond the dismissal:
+    /// refreshing a card that just healed is harmless (the footer button
+    /// offers the same poll at all times), and a guard would need the
+    /// clock + interval this model doesn't hold.
+    public func requestStaleRefresh() {
+        presentedWarning = nil
+        onStaleRefresh?()
+    }
+
     // MARK: - Menu bar pin (account percentage picker)
 
     /// The daemon-confirmed `menuBarAccountId` mirrored here (set by the

@@ -9,6 +9,10 @@ import ModelDeckMacCore
 struct DeckPopoverView: View {
     @ObservedObject var statusModel: MenuBarStatusModel
     @ObservedObject var deckModel: DeckPopoverModel
+    /// Issue #176: "Renew now" state for expired-idle Claude cards — the
+    /// popover observes the shared model (same instance as Settings →
+    /// Accounts) and hands each card plain presentation values.
+    @ObservedObject var renewModel: AccountRenewModel
     /// Issue #33 final placement: the gear menu carries the PRIMARY
     /// "Check for App Updates…" affordance, wired to the same shared model
     /// as the Settings mirror — one check state, two entry points.
@@ -267,7 +271,11 @@ struct DeckPopoverView: View {
                             deckModel: deckModel,
                             menuBarSourceAccountID: sourceID,
                             menuBarSourceTooltip: sourceTooltip,
-                            staleness: { statusModel.cardStaleness(for: $0) }
+                            staleness: { statusModel.cardStaleness(for: $0) },
+                            renewPresentation: { renewModel.presentation(for: $0.account) },
+                            onRenewNow: { row in
+                                Task { await renewModel.renew(account: row.account) }
+                            }
                         )
                         .frame(maxWidth: .infinity, alignment: .topLeading)
                     }
@@ -283,7 +291,11 @@ struct DeckPopoverView: View {
                             isMenuBarSource: row.id == sourceID,
                             menuBarSourceTooltip: sourceTooltip,
                             isExpanded: deckModel.isExpanded(row.id),
-                            staleness: statusModel.cardStaleness(for: row)
+                            staleness: statusModel.cardStaleness(for: row),
+                            renew: renewModel.presentation(for: row.account),
+                            onRenewNow: {
+                                Task { await renewModel.renew(account: row.account) }
+                            }
                         ) {
                             withAnimation(.easeOut(duration: 0.15)) {
                                 deckModel.toggleExpansion(of: row.id)
@@ -444,6 +456,11 @@ struct DeckColumnView: View {
     /// the column stays free of the status model (interval + clock live
     /// there). Defaults to no markers for previews/tests.
     var staleness: (DeckAccountRow) -> DeckFreshness.CardStaleness? = { _ in nil }
+    /// Issue #176: per-row renew state + action, supplied by the popover so
+    /// the column stays free of the renew model (same seam shape as
+    /// `staleness`). Defaults render nothing for previews/tests.
+    var renewPresentation: (DeckAccountRow) -> AccountRenewPresentation? = { _ in nil }
+    var onRenewNow: (DeckAccountRow) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -474,7 +491,9 @@ struct DeckColumnView: View {
                         isMenuBarSource: row.id == menuBarSourceAccountID,
                         menuBarSourceTooltip: menuBarSourceTooltip,
                         isExpanded: deckModel.isExpanded(row.id),
-                        staleness: staleness(row)
+                        staleness: staleness(row),
+                        renew: renewPresentation(row),
+                        onRenewNow: { onRenewNow(row) }
                     ) {
                         withAnimation(.easeOut(duration: 0.15)) {
                             deckModel.toggleExpansion(of: row.id)
@@ -543,6 +562,12 @@ struct DeckAccountRowView: View {
     /// ~2x the effective refresh interval — the card then carries a visible
     /// warning-tinted age line so fossil data can never pass as fresh.
     var staleness: DeckFreshness.CardStaleness? = nil
+    /// Issue #176: this account's renew rendering state (nil = no renew
+    /// affordance: healthy, signed out, Codex, or a pre-#176 daemon), and
+    /// the action that runs the daemon's guarded renew op. Plain values so
+    /// the card stays free of the renew model (the popover observes it).
+    var renew: AccountRenewPresentation? = nil
+    var onRenewNow: (() -> Void)? = nil
     let onToggle: () -> Void
     /// Issue #118: the "Sign in again…" action opens the Settings window
     /// (Accounts pane, via the model's routed selection) — the environment
@@ -664,7 +689,22 @@ struct DeckAccountRowView: View {
             // SAME slot with the SAME click path — only glyph, color, and
             // wording calm down (neutral secondary, never amber). Zero
             // functionality lost in either tone.
-            if let recovery = row.signInRecovery {
+            if row.signInRecovery != nil, renew?.isRenewing == true {
+                // Issue #176: while the daemon runs this account's renewal
+                // the notice slot itself carries the progress — the SAME
+                // single-line footprint (Tim's constraint on PR #150: the
+                // notice may never grow the card), calm secondary tone.
+                HStack(spacing: 4) {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text("Renewing sign-in…")
+                        .font(.system(size: 10))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(Color.secondary)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Renewing sign-in for \(row.account.label)")
+            } else if let recovery = row.signInRecovery {
                 let warningID = DeckWarningID(topic: .signInRequired, elementID: row.id)
                 Button {
                     deckModel.toggleWarning(warningID)
@@ -698,8 +738,40 @@ struct DeckAccountRowView: View {
                 .accessibilityAction(named: "Sign in again") {
                     beginSignInAgain()
                 }
+                // Issue #176: VoiceOver can renew without the popover hop
+                // too — same action the explanation's button runs, INCLUDING
+                // the dismissal (CodeRabbit, PR #196): the notice swaps to
+                // the progress line mid-renewal, and a presented-warning slot
+                // left set on a vanished anchor re-presents the popover the
+                // moment the notice returns.
+                .accessibilityActions {
+                    if renew?.action == .renewNow, let onRenewNow {
+                        Button("Renew sign-in now") {
+                            deckModel.setWarningPresented(warningID, false)
+                            onRenewNow()
+                        }
+                    }
+                }
                 .popover(isPresented: deckModel.warningBinding(warningID), arrowEdge: .bottom) {
-                    SignInExplanationView(explanation: .signIn(recovery)) {
+                    // Issue #176: the idle explanation carries the renew
+                    // story — the "Renew now" secondary action (with the
+                    // honest tiny-invocation / 5-hour-window disclosure in
+                    // the body and tooltip) when the daemon says it can, or
+                    // the calm authOverride sentence in the body when it
+                    // honestly can't. The #118 sign-in path stays primary.
+                    SignInExplanationView(
+                        explanation: .signIn(recovery, renew: renew),
+                        secondaryTitle: renew?.action == .renewNow ? "Renew now" : nil,
+                        secondaryHelp: "Renews this account's sign-in in the background. "
+                            + AccountRenew.disclosure,
+                        secondaryAccessibilityLabel: "Renew sign-in for \(row.account.label)",
+                        onSecondary: renew?.action == .renewNow && onRenewNow != nil
+                            ? {
+                                deckModel.setWarningPresented(warningID, false)
+                                onRenewNow?()
+                            }
+                            : nil
+                    ) {
                         beginSignInAgain()
                     }
                 }
@@ -711,6 +783,11 @@ struct DeckAccountRowView: View {
             // account's last refresh error (when the daemon reported one).
             // Issue #113: clickable for the same reason — the age + last
             // refresh error must be reachable, not tooltip-theoretical.
+            // Issue #185 (Tim, live): the explanation must offer the FIX,
+            // not just the diagnosis — same anatomy as the #118 sign-in
+            // popover, with "Refresh now" running the footer button's
+            // forced provider poll (#72). The body copy is cause-classified
+            // (helper-missing renders coaching, never a dead spawn path).
             if let staleness {
                 let warningID = DeckWarningID(topic: .staleData, elementID: row.id)
                 Button {
@@ -729,8 +806,20 @@ struct DeckAccountRowView: View {
                 .help(staleness.tooltip)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(staleness.accessibilityLabel)
+                // VoiceOver can skip the popover hop: the named action runs
+                // the same one-click refresh the popover's button offers.
+                .accessibilityAction(named: "Refresh now") {
+                    deckModel.requestStaleRefresh()
+                }
                 .popover(isPresented: deckModel.warningBinding(warningID), arrowEdge: .bottom) {
-                    WarningExplanationView(explanation: .stale(staleness))
+                    SignInExplanationView(
+                        explanation: .stale(staleness),
+                        actionTitle: "Refresh now",
+                        actionHelp: "Ask the daemon to poll the providers for fresh usage now",
+                        actionAccessibilityLabel: "Refresh usage data now"
+                    ) {
+                        deckModel.requestStaleRefresh()
+                    }
                 }
             }
         }
@@ -998,6 +1087,14 @@ struct SignInExplanationView: View {
     var actionTitle: String = "Sign in again…"
     var actionHelp: String = "Opens Settings → Accounts and starts this account's sign-in flow"
     var actionAccessibilityLabel: String = "Sign in again for this account"
+    /// Issue #176: optional second action beside the primary — the idle
+    /// notice's "Renew now" renders here (the #152 lesson: row actions live
+    /// inside the explanation popover, never on the collapsed row). Nil
+    /// keeps every existing call site pixel-identical.
+    var secondaryTitle: String?
+    var secondaryHelp: String = ""
+    var secondaryAccessibilityLabel: String = ""
+    var onSecondary: (() -> Void)?
     let onSignInAgain: () -> Void
 
     var body: some View {
@@ -1008,14 +1105,24 @@ struct SignInExplanationView: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Button(action: onSignInAgain) {
-                Text(actionTitle)
+            HStack(spacing: 8) {
+                Button(action: onSignInAgain) {
+                    Text(actionTitle)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .help(actionHelp)
+                .accessibilityLabel(actionAccessibilityLabel)
+                if let secondaryTitle, let onSecondary {
+                    Button(action: onSecondary) {
+                        Text(secondaryTitle)
+                    }
+                    .controlSize(.small)
+                    .help(secondaryHelp)
+                    .accessibilityLabel(secondaryAccessibilityLabel)
+                }
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
             .padding(.top, 4)
-            .help(actionHelp)
-            .accessibilityLabel(actionAccessibilityLabel)
         }
         .padding(12)
         .frame(width: 280, alignment: .leading)

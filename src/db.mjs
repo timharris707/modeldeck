@@ -24,6 +24,11 @@ function now() {
 
 export const DEFAULT_SETTINGS = Object.freeze({
   autoRefreshEnabled: true,
+  // Issue #176: expired Claude OAuth credentials may be renewed through the
+  // provider CLI after the normal scheduled refresh identifies them. This is
+  // independently switchable from usage refreshes so the background
+  // invocation can be stopped without making the deck stale.
+  autoRenewEnabled: true,
   autoRefreshIntervalSeconds: 300,
   // Issue #90 change-event provenance: flips to true — permanently — the
   // first time a settings write CHANGES autoRefreshIntervalSeconds (or the
@@ -32,7 +37,12 @@ export const DEFAULT_SETTINGS = Object.freeze({
   // event can't false-positive. While false, the active-session refresh cap
   // may slow the default cadence; once true, the user's interval always wins.
   autoRefreshIntervalCustomized: false,
-  pauseWhileActive: true,
+  // Issue #187 (Tim directive 2026-07-29): OFF by default — an active
+  // session is exactly when usage burns fastest and users most want the
+  // deck live (first outside tester hit this within days). The pause and
+  // the #90 active-session cap are opt-in via the Settings toggle; a
+  // stored value from an older install is preserved as-is.
+  pauseWhileActive: false,
   layout: 'two-column',
   defaultSort: 'next-reset',
   notificationThresholdPercent: 25,
@@ -48,7 +58,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
 
 function validateSetting(key, value) {
   if (!Object.hasOwn(DEFAULT_SETTINGS, key)) throw new Error(`unknown setting: ${key}`);
-  if (['autoRefreshEnabled', 'autoRefreshIntervalCustomized', 'pauseWhileActive'].includes(key) && typeof value !== 'boolean') {
+  if (['autoRefreshEnabled', 'autoRenewEnabled', 'autoRefreshIntervalCustomized', 'pauseWhileActive'].includes(key) && typeof value !== 'boolean') {
     throw new Error(`${key} must be a boolean`);
   }
   if (key === 'autoRefreshIntervalSeconds' && (!Number.isInteger(value) || value < 60 || value > 3600)) {

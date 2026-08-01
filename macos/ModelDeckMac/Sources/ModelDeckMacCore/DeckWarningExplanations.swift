@@ -104,8 +104,29 @@ public struct DeckWarningExplanation: Equatable, Sendable {
     /// action, which is presentation (view-side), not copy. Issue #149:
     /// both tones flow through unchanged — the recovery already carries the
     /// tone-honest title and body, so this builder needs no split.
-    public static func signIn(_ recovery: DeckFreshness.SignInRecovery) -> DeckWarningExplanation {
-        DeckWarningExplanation(title: recovery.text, body: recovery.tooltip)
+    /// Issue #176: `renew` (nil for old daemons / Codex / non-idle tones)
+    /// appends the renew-specific lines — the honest cost disclosure when
+    /// the "Renew now" action is offered, the calm authOverride explanation
+    /// when it can't be, and the last attempt's decided outcome. All strings
+    /// come from `AccountRenew`/the daemon verbatim, keeping the
+    /// no-diverging-copy contract.
+    public static func signIn(
+        _ recovery: DeckFreshness.SignInRecovery,
+        renew: AccountRenewPresentation? = nil
+    ) -> DeckWarningExplanation {
+        var body = recovery.tooltip
+        if let renew {
+            switch renew.action {
+            case .renewNow:
+                body += "\n\n\(AccountRenew.disclosure)"
+            case .authOverridden:
+                body += "\n\n\(AccountRenew.authOverrideExplanation)"
+            }
+            if let outcome = renew.outcomeText ?? renew.errorText {
+                body += "\n\nLast renewal attempt: \(outcome)"
+            }
+        }
+        return DeckWarningExplanation(title: recovery.text, body: body)
     }
 
     /// The slowed-refresh indicator's explanation (issue #90): the notice's
@@ -194,6 +215,12 @@ extension DeckFreshness {
             return "needs Keychain access"
         case .unexplained(let errorMessage):
             if let errorMessage, !errorMessage.isEmpty {
+                // Issue #185: the helper-missing class renders its short
+                // coaching here too — the footer breakdown must never leak
+                // the dead spawn path the card copy already suppresses.
+                if refreshErrorIndicatesMissingHelper(errorMessage) {
+                    return "background helper missing — ModelDeck reinstalls it automatically"
+                }
                 return "last refresh failed: \(errorMessage)"
             }
             return "no newer data from the provider"

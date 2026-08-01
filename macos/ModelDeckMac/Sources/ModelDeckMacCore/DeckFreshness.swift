@@ -85,23 +85,70 @@ public enum DeckFreshness {
     /// VoiceOver label carrying both. Nil (no marker) while the card's data
     /// is inside the staleness threshold — honest-states: stale data must
     /// LOOK stale, fresh data must not cry wolf.
+    /// Issue #185: also carries WHY (`cause`), so the click-through
+    /// explanation can lead with the right coaching instead of a raw error.
     public struct CardStaleness: Equatable, Sendable {
+        /// Issue #185: why this card's data is old. `.helperMissing` is the
+        /// daemon-binary-vanished state (launched from a since-deleted
+        /// bundle): the raw "spawn /private/var/… ENOENT" Tim hit live is
+        /// exactly what the classification exists to replace.
+        public enum Cause: Equatable, Sendable {
+            /// No refresh error on record — the provider simply hasn't
+            /// reported newer numbers.
+            case noNewData
+            /// The account's last refresh failed for an ordinary reason;
+            /// the daemon's message rides along verbatim.
+            case refreshFailed
+            /// The daemon's own executable is gone (issue #185) — the app
+            /// repairs this automatically; the copy says so.
+            case helperMissing
+        }
+
         public var text: String
         public var tooltip: String
         public var accessibilityLabel: String
+        public var cause: Cause
 
-        public init(text: String, tooltip: String, accessibilityLabel: String) {
+        public init(
+            text: String,
+            tooltip: String,
+            accessibilityLabel: String,
+            cause: Cause = .noNewData
+        ) {
             self.text = text
             self.tooltip = tooltip
             self.accessibilityLabel = accessibilityLabel
+            self.cause = cause
         }
+    }
+
+    /// Issue #185: the friendly replacement for the helper-missing refresh
+    /// error — no dead spawn paths, and it says what happens next (the app
+    /// reinstalls the service automatically; #185's repair path).
+    public static let helperMissingReason = "ModelDeck's background helper lost its program file (this can happen after an app update or move). ModelDeck reinstalls it automatically — refresh to pull fresh data, and if this notice persists, quit and reopen ModelDeck."
+
+    /// Issue #185: whether a per-account refresh error means the daemon's
+    /// own binary is gone. Matches the daemon's HELPER_MISSING phrase
+    /// (src/adapters/claude.mjs) AND the raw pre-#185 shape ("spawn
+    /// /private/var/…/modeldeckd ENOENT") so cards against an old daemon
+    /// get the friendly copy too. The legacy fallback requires the daemon
+    /// binary's own name (CodeRabbit, PR #186): a provider CLI missing from
+    /// PATH also spawns into ENOENT ("spawn codex ENOENT") and must stay an
+    /// ordinary refresh failure, never the helper coaching.
+    public static func refreshErrorIndicatesMissingHelper(_ message: String) -> Bool {
+        let lowered = message.lowercased()
+        if lowered.contains("background helper is missing") { return true }
+        return lowered.contains("spawn") && lowered.contains("enoent")
+            && lowered.contains("modeldeckd")
     }
 
     /// Card-level staleness for one account: its newest snapshot older than
     /// ~2x the effective refresh interval earns the marker. No observation
     /// at all means there is nothing to present as stale (the card already
     /// shows no meters). The daemon's `lastRefreshError` message, when
-    /// present, rides along in the tooltip so the marker explains WHY.
+    /// present, rides along in the tooltip so the marker explains WHY —
+    /// except the helper-missing class (issue #185), which renders the
+    /// friendly coaching instead of a dead spawn path.
     public static func cardStaleness(
         newestObservedAt: Date?,
         lastRefreshError: AccountRefreshError?,
@@ -112,16 +159,25 @@ public enum DeckFreshness {
               isStale(observedAt: newestObservedAt, now: now, autoRefreshInterval: autoRefreshInterval)
         else { return nil }
         let text = "Data from \(ageText(observedAt: newestObservedAt, now: now))"
+        let cause: CardStaleness.Cause
         let reason: String
         if let message = lastRefreshError?.message, !message.isEmpty {
-            reason = "Last refresh failed: \(message)"
+            if refreshErrorIndicatesMissingHelper(message) {
+                cause = .helperMissing
+                reason = helperMissingReason
+            } else {
+                cause = .refreshFailed
+                reason = "Last refresh failed: \(message)"
+            }
         } else {
+            cause = .noNewData
             reason = "No newer data has arrived from the provider."
         }
         return CardStaleness(
             text: text,
             tooltip: "\(text) — \(reason)",
-            accessibilityLabel: "Stale data — \(text.lowercased()). \(reason)"
+            accessibilityLabel: "Stale data — \(text.lowercased()). \(reason)",
+            cause: cause
         )
     }
 

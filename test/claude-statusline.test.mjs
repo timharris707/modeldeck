@@ -7,6 +7,7 @@ import { Readable } from 'node:stream';
 import {
   buildStatuslineCommand,
   chainCommandFromStatuslineCommand,
+  execPathFromStatuslineCommand,
   isModelDeckStatuslineCommand,
   parseStatuslineRateLimits,
   runStatuslineCli,
@@ -157,6 +158,7 @@ test('command builder and detector round-trip in both launch modes', () => {
   });
   assert.ok(isModelDeckStatuslineCommand(source));
   assert.equal(chainCommandFromStatuslineCommand(source), 'echo "hi there"');
+  assert.equal(execPathFromStatuslineCommand(source), '/usr/local/bin/node');
   const sea = buildStatuslineCommand({
     execPath: '/Applications/ModelDeck.app/Contents/MacOS/modeldeckd',
     captureFile: '/data/statusline/acct.json',
@@ -166,12 +168,23 @@ test('command builder and detector round-trip in both launch modes', () => {
   assert.ok(isModelDeckStatuslineCommand(sea));
   assert.equal(chainCommandFromStatuslineCommand(sea), null);
   assert.equal(isModelDeckStatuslineCommand('~/.claude/statusline.sh'), false);
+  assert.equal(execPathFromStatuslineCommand(sea), '/Applications/ModelDeck.app/Contents/MacOS/modeldeckd');
+  // Quotes and spaces in the bundle path survive the round-trip (issue #189).
+  const awkward = buildStatuslineCommand({
+    execPath: "/Volumes/Tim's Mac/Model Deck.app/modeldeckd",
+    captureFile: '/data/statusline/acct.json',
+    sea: true,
+  });
+  assert.equal(execPathFromStatuslineCommand(awkward), "/Volumes/Tim's Mac/Model Deck.app/modeldeckd");
+  // Not our tee → never a path.
+  assert.equal(execPathFromStatuslineCommand('~/.claude/statusline.sh'), null);
+  assert.equal(execPathFromStatuslineCommand(null), null);
 });
 
 // ---------------------------------------------------------------------------
 // Daemon ingest + Settings install/uninstall fixture
 
-function makeFixture({ fetchClaude } = {}) {
+function makeFixture({ fetchClaude, serviceOptions } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-statusline-svc-'));
   const profilesDir = path.join(root, 'claude-profiles');
   const profileA = path.join(profilesDir, 'work');
@@ -183,7 +196,10 @@ function makeFixture({ fetchClaude } = {}) {
   const accountA = store.saveAccount({ provider: 'claude', label: 'Work', profileRef: profileA, isDefault: true });
   const accountB = store.saveAccount({ provider: 'claude', label: 'Personal', profileRef: profileB });
   const statuslineDir = path.join(root, 'statusline');
-  const service = new ModelDeckService(store, {
+  // The #189 reconcile tests simulate a daemon RESTART from a different
+  // location: makeService builds another service over the same store and
+  // dirs, differing only in the overridden statusline paths.
+  const makeService = (overrides = {}) => new ModelDeckService(store, {
     claudeProfilesDir: profilesDir,
     claudeStatuslineDir: statuslineDir,
     claudeActiveLink: path.join(root, 'active', '.claude'),
@@ -200,12 +216,14 @@ function makeFixture({ fetchClaude } = {}) {
     statuslineExecPath: '/usr/local/bin/node',
     statuslineScriptPath: '/opt/modeldeck/claude-statusline.mjs',
     statuslineSea: false,
+    ...overrides,
   });
+  const service = makeService(serviceOptions);
   const writeCapture = (account, payload) => {
     fs.mkdirSync(statuslineDir, { recursive: true, mode: 0o700 });
     fs.writeFileSync(service.claudeStatuslineCaptureFile(account.id), `${JSON.stringify(payload)}\n`);
   };
-  return { root, store, service, accountA, accountB, profileA, profileB, statuslineDir, writeCapture };
+  return { root, store, service, makeService, accountA, accountB, profileA, profileB, statuslineDir, writeCapture };
 }
 
 const CAPTURE = (observedAt, fiveHour = 20, weekly = 55) => ({
@@ -449,6 +467,90 @@ test('statusline install/uninstall endpoints are token-gated and round-trip', as
   } finally {
     await app.close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Issue #189 — startup reconcile of tees pointing at a dead/moved daemon
+// (same bug class as #185's deleted release-worktree binary).
+
+test('reconcile repoints a tee whose executable is gone, preserving chain and original backup', async () => {
+  const { makeService, service, accountA, profileA } = makeFixture({
+    // The install-time daemon ran from a location that has been deleted
+    // (#185: a temp release worktree).
+    serviceOptions: { statuslineExecPath: '/tmp/deleted-release-worktree/dist/node' },
+  });
+  const settingsPath = path.join(profileA, 'settings.json');
+  const original = '{\n  "statusLine": {\n    "type": "command",\n    "command": "echo mine"\n  }\n}\n';
+  fs.writeFileSync(settingsPath, original);
+  await service.installClaudeStatusline(accountA.id);
+
+  // The daemon restarts from its repaired install path (#185 recovery).
+  const restarted = makeService({ statuslineExecPath: '/usr/local/bin/node-current' });
+  const repaired = await restarted.reconcileClaudeStatuslineInstalls();
+  assert.deepEqual(repaired, [accountA.id]);
+
+  const command = JSON.parse(fs.readFileSync(settingsPath, 'utf8')).statusLine.command;
+  assert.equal(execPathFromStatuslineCommand(command), '/usr/local/bin/node-current');
+  assert.equal(chainCommandFromStatuslineCommand(command), 'echo mine'); // user chain survives
+  // The ORIGINAL pre-install backup survived the rewrite: uninstall still
+  // restores the user's own statusLine, not a stale tee.
+  await restarted.uninstallClaudeStatusline(accountA.id);
+  assert.deepEqual(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).statusLine,
+    { type: 'command', command: 'echo mine' });
+});
+
+test('reconcile in SEA mode repoints on any exec path mismatch, even when the old binary still exists', async () => {
+  const { root, makeService, accountA, profileA } = makeFixture();
+  const oldBinary = path.join(root, 'old-bundle-modeldeckd');
+  fs.writeFileSync(oldBinary, '#!/bin/sh\n'); // still on disk — a moved, not deleted, bundle
+  const installer = makeService({ statuslineExecPath: oldBinary, statuslineSea: true, statuslineScriptPath: null });
+  await installer.installClaudeStatusline(accountA.id);
+
+  const restarted = makeService({
+    statuslineExecPath: path.join(root, 'new-bundle-modeldeckd'),
+    statuslineSea: true,
+    statuslineScriptPath: null,
+  });
+  assert.deepEqual(await restarted.reconcileClaudeStatuslineInstalls(), [accountA.id]);
+  const command = JSON.parse(fs.readFileSync(path.join(profileA, 'settings.json'), 'utf8')).statusLine.command;
+  assert.equal(execPathFromStatuslineCommand(command), path.join(root, 'new-bundle-modeldeckd'));
+  assert.ok(command.includes(STATUSLINE_SEA_COMMAND));
+});
+
+test('reconcile leaves healthy tees, foreign statusLines, and tee-less profiles untouched', async () => {
+  const { makeService, service, accountA, profileA, profileB } = makeFixture();
+  // accountA: our tee, exec path matches the running daemon (fixture default
+  // path does not exist on disk — same-path must short-circuit regardless).
+  await service.installClaudeStatusline(accountA.id);
+  const installedBytes = fs.readFileSync(path.join(profileA, 'settings.json'), 'utf8');
+  // accountB: the user's own statusLine, never ours.
+  const foreign = '{\n  "statusLine": {\n    "type": "command",\n    "command": "~/bin/my-statusline.sh"\n  }\n}\n';
+  fs.writeFileSync(path.join(profileB, 'settings.json'), foreign);
+
+  assert.deepEqual(await service.reconcileClaudeStatuslineInstalls(), []);
+  assert.equal(fs.readFileSync(path.join(profileA, 'settings.json'), 'utf8'), installedBytes);
+  assert.equal(fs.readFileSync(path.join(profileB, 'settings.json'), 'utf8'), foreign);
+
+  // Non-SEA with a DIFFERENT but still-existing interpreter (e.g. node moved
+  // homes but the old one still runs): the tee works, so leave it alone.
+  const teed = JSON.parse(installedBytes).statusLine.command;
+  fs.writeFileSync(path.join(profileA, 'settings.json'),
+    JSON.stringify({ statusLine: { type: 'command', command: teed.replace("'/usr/local/bin/node'", `'${process.execPath}'`) } }));
+  const other = makeService({ statuslineExecPath: '/somewhere/else/node' });
+  assert.deepEqual(await other.reconcileClaudeStatuslineInstalls(), []);
+  assert.equal(execPathFromStatuslineCommand(
+    JSON.parse(fs.readFileSync(path.join(profileA, 'settings.json'), 'utf8')).statusLine.command,
+  ), process.execPath);
+});
+
+test('reconcile skips missing or malformed settings.json without touching them', async () => {
+  const { service, profileA, profileB } = makeFixture({
+    serviceOptions: { statuslineExecPath: '/definitely/gone/node' },
+  });
+  fs.writeFileSync(path.join(profileB, 'settings.json'), 'not valid json');
+  assert.deepEqual(await service.reconcileClaudeStatuslineInstalls(), []);
+  assert.equal(fs.existsSync(path.join(profileA, 'settings.json')), false); // never creates one
+  assert.equal(fs.readFileSync(path.join(profileB, 'settings.json'), 'utf8'), 'not valid json');
 });
 
 test('the statusline command pins the daemon executable and per-account capture file', async () => {

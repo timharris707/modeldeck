@@ -338,6 +338,74 @@ final class DaemonSetupModelTests: XCTestCase {
         XCTAssertFalse(model.didReregisterForUpdate)
     }
 
+    // Missing-binary repair (issue #185)
+
+    /// The exact incident: same commit (no drift), port answering (launch
+    /// says .running/.quiet) — but the daemon's own executable is gone.
+    private func makeQuietRunningModel() async -> DaemonSetupModel {
+        registrar.statusValue = .enabled
+        marker.registeredCommit = "new"
+        probe = FakeProbe([true])
+        let model = makeModel()
+        await model.evaluateOnLaunch()
+        XCTAssertEqual(model.phase, .quiet)
+        return model
+    }
+
+    func testMissingBinaryRepairReregistersFromThisBundle() async {
+        let model = await makeQuietRunningModel()
+        let repaired = await model.repairMissingDaemonBinary()
+        XCTAssertTrue(repaired)
+        XCTAssertEqual(registrar.unregisterCalls, 1)
+        XCTAssertEqual(registrar.registerCalls, 1)
+        XCTAssertEqual(marker.registeredCommit, "new")
+        XCTAssertTrue(model.didReregisterForUpdate, "the subtle service-updated note applies")
+        XCTAssertEqual(model.phase, .quiet)
+    }
+
+    func testMissingBinaryRepairRunsOncePerSession() async {
+        let model = await makeQuietRunningModel()
+        let first = await model.repairMissingDaemonBinary()
+        XCTAssertTrue(first)
+        // A daemon that keeps reporting a missing binary (repair didn't
+        // take) must never loop unregister/register against launchd.
+        let second = await model.repairMissingDaemonBinary()
+        XCTAssertFalse(second)
+        XCTAssertEqual(registrar.unregisterCalls, 1)
+        XCTAssertEqual(registrar.registerCalls, 1)
+    }
+
+    func testMissingBinaryRepairStandsDownInDevBuilds() async {
+        probe = FakeProbe([true])
+        let model = makeModel(bundledCommit: nil)
+        await model.evaluateOnLaunch() // .quiet via bundledServiceUnavailable
+        XCTAssertEqual(model.phase, .quiet)
+        let repaired = await model.repairMissingDaemonBinary()
+        XCTAssertFalse(repaired)
+        XCTAssertEqual(registrar.unregisterCalls, 0)
+        XCTAssertEqual(registrar.registerCalls, 0)
+    }
+
+    func testMissingBinaryRepairNeverRacesAnActiveSetupFlow() async {
+        // First run: consent card up — a repair must not grab the registrar
+        // out from under the visible flow.
+        let model = makeModel()
+        await model.evaluateOnLaunch()
+        XCTAssertEqual(model.phase, .consentNeeded)
+        let repaired = await model.repairMissingDaemonBinary()
+        XCTAssertFalse(repaired)
+        XCTAssertEqual(registrar.unregisterCalls, 0)
+        XCTAssertEqual(registrar.registerCalls, 0)
+    }
+
+    func testMissingBinaryRepairLandingInRequiresApprovalReportsNotRepaired() async {
+        let model = await makeQuietRunningModel()
+        registrar.statusAfterRegister = .requiresApproval
+        let repaired = await model.repairMissingDaemonBinary()
+        XCTAssertFalse(repaired)
+        XCTAssertEqual(model.phase, .awaitingApproval, "the user gate surfaces; no silent success claim")
+    }
+
     func testDriftReregisterLandingInRequiresApprovalRoutesToApprovalNotStartingUp() async {
         // The unregister/register round-trip can revoke Login Items
         // approval; the model must send the user to System Settings instead

@@ -137,6 +137,10 @@ $SPARKLE_ONE_TIME_HELP"
     --out "$out" \
     || fail "appcast generation failed.
 $SPARKLE_ONE_TIME_HELP"
+  # The generator's entry detection failed SILENTLY on v0.3.9 and v0.3.10
+  # (symlinked mktemp worktree; see generate-appcast.mjs) — node exited 0
+  # without writing anything. Never report a file that isn't there.
+  [[ -s "$out" ]] || fail "appcast generation exited 0 but $out is missing or empty — entry-detection regression in generate-appcast.mjs?"
   echo "==> appcast written: $out"
 }
 

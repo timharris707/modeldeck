@@ -305,6 +305,15 @@ export async function validateClaudeProfileHome({ profileRef, profilesDir } = {}
   return claudeProfile.validateProfileHome({ profileRef, profilesDir });
 }
 
+// Issue #185: the SEA probe re-execs the daemon's own binary. When that
+// spawn fails ENOENT, the daemon's executable itself is gone (launched from
+// a since-deleted bundle — e.g. a temp release worktree) and the raw
+// "spawn /private/var/…/modeldeckd ENOENT" leaks a dead path the user can't
+// act on. This phrase replaces it; the Mac app pattern-matches it for the
+// friendly card copy, and the /api/state `daemon.binaryPresent` self-report
+// (src/service.mjs) drives the automatic re-register repair.
+export const HELPER_MISSING_ERROR = "Claude usage refresh failed: ModelDeck's background helper is missing on disk — ModelDeck reinstalls it automatically (or quit and reopen ModelDeck)";
+
 export async function fetchClaudeUsage({
   claudeConfigDir,
   profilesDir,
@@ -312,6 +321,7 @@ export async function fetchClaudeUsage({
   run = execFileAsync,
   lstat = fs.promises.lstat,
   platform = process.platform,
+  sea = isSea(),
 } = {}) {
   if (!claudeConfigDir) throw new Error('CLAUDE_CONFIG_DIR is required');
   if (profilesDir) await validateClaudeProfileHome({ profileRef: claudeConfigDir, profilesDir });
@@ -337,13 +347,18 @@ export async function fetchClaudeUsage({
   try {
     const env = claudeProfileEnv(claudeConfigDir);
     env.MODELDECK_CLAUDE_UA_VERSION = (await resolveClaudeCodeVersion()) ?? CLAUDE_CODE_UA_FALLBACK_VERSION;
-    const probeArgs = isSea() ? ['modeldeck-internal-claude-usage-probe'] : [usageProbePath];
+    const probeArgs = sea ? ['modeldeck-internal-claude-usage-probe'] : [usageProbePath];
     result = await run(process.execPath, probeArgs, {
       env,
       timeout: timeoutMs,
       maxBuffer: 2_000_000,
     });
   } catch (error) {
+    // Issue #185: in SEA mode the spawned executable IS this daemon —
+    // ENOENT means our own binary vanished, not an account problem.
+    if (sea && error?.code === 'ENOENT') {
+      throw new Error(HELPER_MISSING_ERROR);
+    }
     throw new Error(`Claude usage refresh failed: ${errorMessage(error)}`);
   }
   return parseClaudeUsage(result?.stdout ?? result);

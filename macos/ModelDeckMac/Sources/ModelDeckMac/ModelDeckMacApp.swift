@@ -10,6 +10,9 @@ struct ModelDeckMacApp: App {
     @StateObject private var toolsModel: ToolsStatusModel
     @StateObject private var addAccountModel: AddAccountModel
     @StateObject private var signInModel: AccountSignInModel
+    /// Issue #176: "Renew now" for expired-idle Claude accounts — one shared
+    /// state behind the deck cards and the Settings roster rows.
+    @StateObject private var renewModel: AccountRenewModel
     @StateObject private var toolUpdateModel: ToolUpdateModel
     @StateObject private var appUpdateModel: AppUpdateModel
     @StateObject private var appUpdateAutoChecker: AppUpdateAutoChecker
@@ -82,6 +85,11 @@ struct ModelDeckMacApp: App {
             stateProvider: client,
             activator: client
         )
+        // Issue #176: the daemon owns the guarded renew op end to end
+        // (process guard → activation flip → trivial invocation → restore →
+        // verify); the model only asks, shows progress, and relays the
+        // decided outcome calmly.
+        let renewModel = AccountRenewModel(renewer: client, stateProvider: client)
         let toolUpdateModel = ToolUpdateModel(updater: client)
         // Issue #33: the app's own update check against the PUBLIC repo's
         // GitHub releases feed. Strictly separate from CLI updates; no
@@ -174,7 +182,7 @@ struct ModelDeckMacApp: App {
             }
         }
         // Every fresh daemon state feeds the notification transition check.
-        statusModel.onStateUpdate = { [weak notifications, weak statusModel, weak deckModel] worst, state in
+        statusModel.onStateUpdate = { [weak notifications, weak statusModel, weak deckModel, weak daemonSetupModel] worst, state in
             Task { @MainActor [weak notifications] in
                 await notifications?.evaluate(worst: worst, state: state)
             }
@@ -191,6 +199,25 @@ struct ModelDeckMacApp: App {
                     cadenceNoticeVisible: statusModel.refreshCadenceNotice != nil
                 )
             }
+            // Issue #185: a daemon running from a since-deleted bundle keeps
+            // answering /api/state while every Claude usage refresh dies on
+            // spawn ENOENT (its own binary is gone) — the launch evaluation
+            // can't see it because the port answers and the MDGitCommit
+            // matches. When the daemon admits it — via the runtime
+            // self-report OR a classified per-account error (pre-#185
+            // daemons can't self-report; CodeRabbit, PR #186) — re-register
+            // the service from THIS bundle and force a provider poll so the
+            // deck heals with zero user action. One attempt per session
+            // (model-side guard); a failed repair falls back to the visible
+            // setup phases and the stale badges' honest coaching.
+            if let state, state.daemonHelperMissingSignaled {
+                Task { @MainActor [weak statusModel, weak daemonSetupModel] in
+                    guard let daemonSetupModel else { return }
+                    if await daemonSetupModel.repairMissingDaemonBinary() {
+                        await statusModel?.refreshFromProviders()
+                    }
+                }
+            }
         }
         // Account edits/removals verified against a fresh /api/state land in
         // the status model immediately.
@@ -206,6 +233,12 @@ struct ModelDeckMacApp: App {
         // /api/state with per-account authState) and the General pane's
         // cached CLI probe. Cached reads only — no forced provider probes.
         signInModel.onStateChanged = { [weak statusModel] state in
+            statusModel?.apply(deckState: state)
+        }
+        // Issue #176: every finished renew attempt lands its fresh state in
+        // the deck immediately — a renewed account simply turns healthy
+        // (chip + notice clear themselves), which IS the success feedback.
+        renewModel.onStateChanged = { [weak statusModel] state in
             statusModel?.apply(deckState: state)
         }
         // Issue #118: the deck's sign-in-needed notice offers a one-click
@@ -239,6 +272,14 @@ struct ModelDeckMacApp: App {
                 await signInModel?.beginSignIn(account: account)
             }
         }
+        // Issue #185: the stale badge's "Refresh now" runs the SAME forced
+        // provider poll as the footer Refresh button (#72) — the badge's
+        // explanation finally offers the fix, not just the diagnosis.
+        deckModel.onStaleRefresh = { [weak statusModel] in
+            Task { @MainActor [weak statusModel] in
+                await statusModel?.refreshFromProviders()
+            }
+        }
         signInModel.onSignedIn = { [weak toolsModel] in
             Task { @MainActor [weak toolsModel] in
                 await toolsModel?.load(refresh: false)
@@ -259,6 +300,7 @@ struct ModelDeckMacApp: App {
         _toolsModel = StateObject(wrappedValue: toolsModel)
         _addAccountModel = StateObject(wrappedValue: addAccountModel)
         _signInModel = StateObject(wrappedValue: signInModel)
+        _renewModel = StateObject(wrappedValue: renewModel)
         _toolUpdateModel = StateObject(wrappedValue: toolUpdateModel)
         _appUpdateModel = StateObject(wrappedValue: appUpdateModel)
         _appUpdateAutoChecker = StateObject(wrappedValue: appUpdateAutoChecker)
@@ -300,6 +342,7 @@ struct ModelDeckMacApp: App {
             DeckPopoverView(
                 statusModel: statusModel,
                 deckModel: deckModel,
+                renewModel: renewModel,
                 appUpdateModel: appUpdateModel,
                 appUpdateInstallModel: appUpdateInstallModel,
                 setupModel: daemonSetupModel,
@@ -353,6 +396,7 @@ struct ModelDeckMacApp: App {
                 addAccountModel: addAccountModel,
                 deckModel: deckModel,
                 signInModel: signInModel,
+                renewModel: renewModel,
                 updateModel: toolUpdateModel,
                 appUpdateModel: appUpdateModel,
                 appUpdateAutoChecker: appUpdateAutoChecker,

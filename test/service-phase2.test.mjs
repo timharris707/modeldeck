@@ -1290,3 +1290,40 @@ test('codex refresh failures propagate per account as well', async () => {
     assert.equal(codex.authState, 'ok');
   } finally { data.close(); }
 });
+
+test('state self-reports the daemon runtime and admits a missing executable (issue #185)', async () => {
+  // A daemon launched from a since-deleted bundle keeps answering
+  // /api/state while every SEA self-spawn fails ENOENT — the app can only
+  // repair what the daemon admits, so the state payload carries the truth.
+  const gone = fixture({
+    daemonExecPath: '/deleted-worktree/modeldeckd',
+    daemonExecPathExists: () => false,
+    daemonSea: true,
+  });
+  try {
+    assert.deepEqual((await gone.service.state()).daemon, {
+      execPath: '/deleted-worktree/modeldeckd',
+      binaryPresent: false,
+      sea: true,
+    });
+  } finally { gone.close(); }
+
+  // Defaults: the live process executable, which exists.
+  const healthy = fixture();
+  try {
+    assert.deepEqual((await healthy.service.state()).daemon, {
+      execPath: process.execPath,
+      binaryPresent: true,
+      sea: false,
+    });
+  } finally { healthy.close(); }
+
+  // A throwing existence probe reads as missing, never as healthy.
+  const throwing = fixture({
+    daemonExecPath: '/unreadable/modeldeckd',
+    daemonExecPathExists: () => { throw new Error('probe blew up'); },
+  });
+  try {
+    assert.equal((await throwing.service.state()).daemon.binaryPresent, false);
+  } finally { throwing.close(); }
+});

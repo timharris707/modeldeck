@@ -263,6 +263,27 @@ public struct DaemonClient: Sendable {
         return envelope.statusline
     }
 
+    // MARK: - Idle-account renewal (issue #176)
+
+    /// `POST /api/accounts/:id/renew` — asks the daemon to run its guarded
+    /// renewal op for an expired-idle Claude account (process guard →
+    /// activation flip → one trivial CLI invocation → activation restored →
+    /// verification). Every DECIDED outcome — including calm refusals like
+    /// "busy" — answers 200 with the outcome body; 409 means a renewal is
+    /// already in flight and surfaces as the standard daemon error.
+    public func renewAccount(id: String) async throws -> AccountRenewal {
+        struct Envelope: Decodable { var renew: AccountRenewal }
+        var request = try await authorizedRequest(
+            method: "POST",
+            pathComponents: ["api", "accounts", id, "renew"]
+        )
+        // Activation flip + a CLI invocation (the daemon's own hard timeout
+        // is ~60 s) + the verification probe — give the round trip room.
+        request.timeoutInterval = 120
+        let envelope: Envelope = try await send(request)
+        return envelope.renew
+    }
+
     // MARK: - Account editing (issue #7)
 
     /// `POST /api/accounts` — upsert. With an existing account's `id` and

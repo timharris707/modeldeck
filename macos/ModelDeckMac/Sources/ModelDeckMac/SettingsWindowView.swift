@@ -16,6 +16,9 @@ struct SettingsWindowView: View {
     @ObservedObject var deckModel: DeckPopoverModel
     /// Issue #32: per-account "Sign in again" flow and the CLI update pill.
     @ObservedObject var signInModel: AccountSignInModel
+    /// Issue #176: per-account "Renew now" flow for expired-idle Claude
+    /// accounts (same shared instance the deck popover observes).
+    @ObservedObject var renewModel: AccountRenewModel
     @ObservedObject var updateModel: ToolUpdateModel
     /// Issue #33: the app's own update check — a strictly separate surface
     /// from CLI updates (never a shared control or wording).
@@ -40,7 +43,8 @@ struct SettingsWindowView: View {
                 accountsModel: accountsModel,
                 addAccountModel: addAccountModel,
                 deckModel: deckModel,
-                signInModel: signInModel
+                signInModel: signInModel,
+                renewModel: renewModel
             )
             .tabItem { Label("Accounts", systemImage: "person.2") }
             .tag(SettingsPane.accounts)
@@ -85,6 +89,8 @@ struct AccountsSettingsPane: View {
     @ObservedObject var addAccountModel: AddAccountModel
     @ObservedObject var deckModel: DeckPopoverModel
     @ObservedObject var signInModel: AccountSignInModel
+    /// Issue #176: "Renew now" for expired-idle Claude rows.
+    @ObservedObject var renewModel: AccountRenewModel
 
     @State private var editingAccount: DeckAccount?
     @State private var removalCandidate: DeckAccount?
@@ -218,6 +224,11 @@ struct AccountsSettingsPane: View {
             onVerifySignIn: { Task { await signInModel.confirmSignedIn(account: account) } },
             onRelaunchSignIn: { signInModel.relaunch(accountID: account.id) },
             onCancelSignIn: { signInModel.cancel(accountID: account.id) },
+            // Issue #176: present only when the daemon reported the renew
+            // capability on an expired-idle Claude row; nil renders nothing.
+            renew: renewModel.presentation(for: account),
+            onRenewNow: { Task { await renewModel.renew(account: account) } },
+            onDismissRenewOutcome: { renewModel.dismissOutcome(accountID: account.id) },
             onEdit: { editingAccount = account },
             onRemove: { removalCandidate = account },
             // Issue #174: present only when the daemon reported the opt-in
@@ -431,6 +442,12 @@ struct AccountRosterRow: View {
     var onVerifySignIn: (() -> Void)?
     var onRelaunchSignIn: (() -> Void)?
     var onCancelSignIn: (() -> Void)?
+    /// Issue #176: this row's renew state — non-nil only for an expired-idle
+    /// Claude account whose daemon reported the `renew` capability (a
+    /// pre-#176 daemon or a Codex account renders nothing new).
+    var renew: AccountRenewPresentation?
+    var onRenewNow: (() -> Void)?
+    var onDismissRenewOutcome: (() -> Void)?
     let onEdit: () -> Void
     let onRemove: () -> Void
     /// Issue #174: the daemon-reported statusline capture opt-in state for
@@ -628,15 +645,15 @@ struct AccountRosterRow: View {
             }
         case .awaitingSignIn:
             HStack(spacing: 5) {
-                Text("Finish login in Terminal")
+                Text("Waiting for login in Terminal…")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("Verify") { onVerifySignIn?() }
                     .controlSize(.small)
                     .help("Check with the provider that this profile is now signed in")
-                Button("Relaunch") { onRelaunchSignIn?() }
+                Button("Re-log in") { onRelaunchSignIn?() }
                     .controlSize(.small)
-                    .help("Open Terminal with the provider's login command again")
+                    .help("Open Terminal with the provider's login command again — use this if no Terminal window appeared or you closed it")
                 Button {
                     onCancelSignIn?()
                 } label: {
@@ -664,6 +681,10 @@ struct AccountRosterRow: View {
                             ? "This account's sign-in renews when it is next used; its usage data is paused until then"
                             : "This account needs a fresh sign-in"))
                 }
+                // Issue #176: the renew affordance rides beside the idle
+                // chip (nil presentation — old daemon, Codex, signed-out
+                // alarm — renders nothing at all).
+                renewControls
             } else if account.hasDuplicateToken, let onSignIn {
                 // Issue #152 (Tim: "I need something clickable to fix the
                 // issue"): a duplicate-flagged row keeps its honest Unknown
@@ -680,6 +701,64 @@ struct AccountRosterRow: View {
                         providerName: DeckProvider.from(account.provider)?.displayName ?? "the provider"
                     ))
                     .accessibilityLabel("Re-log in \(account.label)")
+            }
+        }
+    }
+
+    /// Issue #176: the expired-idle row's renew surface, in the same
+    /// trailing slot family as the sign-in flow above. Running → calm
+    /// progress; finished → the daemon's decided outcome verbatim (calm
+    /// secondary, dismissible — a renewed account flips its chip healthy via
+    /// the fresh state, which is the real success feedback); otherwise the
+    /// small "Renew now" action, or the honest authOverride caption instead
+    /// of the button (never an error tone — that profile is configured to
+    /// authenticate elsewhere).
+    @ViewBuilder
+    private var renewControls: some View {
+        if let renew {
+            if renew.isRenewing {
+                HStack(spacing: 5) {
+                    ProgressView().controlSize(.small)
+                    Text("Renewing…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Renewing sign-in for \(account.label)")
+            } else if let outcome = renew.outcomeText ?? renew.errorText {
+                HStack(spacing: 5) {
+                    Text(outcome)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .help(outcome)
+                    if let onDismissRenewOutcome {
+                        Button(action: onDismissRenewOutcome) {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 8))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("Dismiss renewal result for \(account.label)")
+                    }
+                }
+            } else {
+                switch renew.action {
+                case .renewNow:
+                    if let onRenewNow {
+                        Button("Renew now", action: onRenewNow)
+                            .controlSize(.small)
+                            .help("Renews this account's sign-in in the background — no Terminal, no browser. "
+                                + AccountRenew.disclosure)
+                            .accessibilityLabel("Renew sign-in for \(account.label)")
+                    }
+                case .authOverridden:
+                    Text(AccountRenew.authOverrideShort)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .help(AccountRenew.authOverrideExplanation)
+                        .accessibilityLabel(AccountRenew.authOverrideExplanation)
+                }
             }
         }
     }
@@ -882,6 +961,25 @@ struct GeneralSettingsPane: View {
                         .help("Make the current interval your explicit choice — active sessions will no longer slow it.")
                     }
                 }
+                // Issue #176 (Tim decision 2026-07-31): scheduled renewal of
+                // expired-idle Claude accounts — zero user effort, honest
+                // disclosure of the tiny invocation and its possible
+                // 5-hour-window side effect. The daemon owns the schedule
+                // and every guard; this is only the switch.
+                Toggle("Keep idle Claude accounts fresh automatically", isOn: binding(
+                    get: { $0.autoRenewEnabled },
+                    set: { model, value in await model.setAutoRenewEnabled(value) }
+                ))
+                .help("When an idle Claude account's stored sign-in expires, ModelDeck renews it in the background — no Terminal, no browser. "
+                    + AccountRenew.disclosure)
+                // State-honest caption (CodeRabbit, PR #196; the Menu bar /
+                // ModelDeck section precedent): describe what is actually
+                // running, never the behavior a disabled toggle would have.
+                Text(settingsSync.settings.autoRenewEnabled
+                    ? "When an idle account's sign-in expires, ModelDeck renews it automatically. \(AccountRenew.disclosure)"
+                    : "Automatic renewal is off — an idle account's expired sign-in stays paused until you renew it or use the account.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Popover") {

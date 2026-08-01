@@ -59,6 +59,12 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
     /// an old daemon (or a Codex account) omits it and Settings simply shows
     /// no statusline control.
     public var claudeStatusline: ClaudeStatuslineOptIn?
+    /// Issue #176: the daemon's renewal capability report for this Claude
+    /// account (`renew: {available, authOverride, lastAttempt}`). Optional by
+    /// design — the #174 claudeStatusline precedent: an old daemon (or a
+    /// Codex account) omits the object entirely and no renew affordance
+    /// renders anywhere.
+    public var renew: AccountRenewCapability?
 
     public init(
         id: String,
@@ -74,7 +80,8 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         authState: String? = nil,
         lastRefreshError: AccountRefreshError? = nil,
         signinReason: String? = nil,
-        claudeStatusline: ClaudeStatuslineOptIn? = nil
+        claudeStatusline: ClaudeStatuslineOptIn? = nil,
+        renew: AccountRenewCapability? = nil
     ) {
         self.id = id
         self.provider = provider
@@ -90,6 +97,7 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         self.lastRefreshError = lastRefreshError
         self.signinReason = signinReason
         self.claudeStatusline = claudeStatusline
+        self.renew = renew
     }
 
     /// Per-account health chip (issue #32): each roster row reads its OWN
@@ -211,6 +219,82 @@ public struct ClaudeStatuslineOptIn: Codable, Equatable, Sendable {
     public init(installed: Bool, chained: Bool? = nil) {
         self.installed = installed
         self.chained = chained
+    }
+}
+
+/// Issue #176: the daemon's per-account renewal capability from
+/// `GET /api/state` (`renew: {available, authOverride, lastAttempt}`).
+/// `available` — the guarded renew op can run for this profile;
+/// `authOverride` — the profile routes authentication elsewhere (e.g. an
+/// apiKeyHelper/env override), so ModelDeck's renewal honestly can't apply.
+/// Decoding is deliberately shape-tolerant (the `activation`/`scheduler`
+/// policy): an unexpected shape reads as the inert empty capability rather
+/// than failing the whole account decode.
+public struct AccountRenewCapability: Codable, Equatable, Sendable {
+    public var available: Bool
+    public var authOverride: Bool
+    public var lastAttempt: AccountRenewAttempt?
+
+    public init(
+        available: Bool = false,
+        authOverride: Bool = false,
+        lastAttempt: AccountRenewAttempt? = nil
+    ) {
+        self.available = available
+        self.authOverride = authOverride
+        self.lastAttempt = lastAttempt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case available, authOverride, lastAttempt
+    }
+
+    public init(from decoder: Decoder) throws {
+        guard let container = try? decoder.container(keyedBy: CodingKeys.self) else {
+            self.init()
+            return
+        }
+        self.init(
+            available: (try? container.decodeIfPresent(Bool.self, forKey: .available)) ?? false,
+            authOverride: (try? container.decodeIfPresent(Bool.self, forKey: .authOverride)) ?? false,
+            lastAttempt: (try? container.decodeIfPresent(AccountRenewAttempt.self, forKey: .lastAttempt)) ?? nil
+        )
+    }
+}
+
+/// Issue #176: the daemon's record of this account's last renewal attempt
+/// (`{at, outcome, mechanism}`). All optional — the fields are informational
+/// and the daemon may omit any of them.
+public struct AccountRenewAttempt: Codable, Equatable, Sendable {
+    public var at: String?
+    public var outcome: String?
+    public var mechanism: String?
+
+    public init(at: String? = nil, outcome: String? = nil, mechanism: String? = nil) {
+        self.at = at
+        self.outcome = outcome
+        self.mechanism = mechanism
+    }
+}
+
+/// Issue #176: the decided body of `POST /api/accounts/:id/renew`
+/// (`{"renew": {outcome, mechanism, at, detail}}`, HTTP 200 for every
+/// decided outcome — including refusals like "busy"; 409 only while another
+/// renewal is already in flight). `detail` is the daemon's own human
+/// sentence and is preferred verbatim wherever it exists.
+public struct AccountRenewal: Codable, Equatable, Sendable {
+    /// "renewed" | "busy" | "signin-required" | "auth-overridden" | "failed".
+    public var outcome: String
+    /// "auth-status" | "invoke" | nil — which lazy-renewal trigger ran.
+    public var mechanism: String?
+    public var at: String?
+    public var detail: String?
+
+    public init(outcome: String, mechanism: String? = nil, at: String? = nil, detail: String? = nil) {
+        self.outcome = outcome
+        self.mechanism = mechanism
+        self.at = at
+        self.detail = detail
     }
 }
 
@@ -493,6 +577,25 @@ public struct DeckScheduler: Codable, Equatable, Sendable {
     }
 }
 
+/// `GET /api/state` `daemon` — the daemon's runtime self-report (issue
+/// #185). A daemon launched from a since-deleted bundle (e.g. a temp
+/// release worktree) keeps answering HTTP while every SEA self-spawn — the
+/// Claude usage probe — fails ENOENT; `binaryPresent: false` is the app's
+/// cue to re-register the service from its own bundle. Every field is
+/// optional so older daemons (which omit the block) decode cleanly and
+/// never trigger a repair.
+public struct DeckDaemonRuntime: Codable, Equatable, Sendable {
+    public var execPath: String?
+    public var binaryPresent: Bool?
+    public var sea: Bool?
+
+    public init(execPath: String? = nil, binaryPresent: Bool? = nil, sea: Bool? = nil) {
+        self.execPath = execPath
+        self.binaryPresent = binaryPresent
+        self.sea = sea
+    }
+}
+
 /// `GET /api/state` — only the slices Phase 3 needs. The daemon also returns
 /// `projects` and `launches`; they are ignored here and picked up in Phase 4+.
 public struct DeckState: Codable, Equatable, Sendable {
@@ -508,21 +611,27 @@ public struct DeckState: Codable, Equatable, Sendable {
     /// from the configured one. Same tolerant-decode contract as
     /// `activation` — absent or unexpectedly shaped reads as nil.
     public var scheduler: DeckScheduler?
+    /// Issue #185: the daemon's runtime self-report. Same tolerant-decode
+    /// contract as `activation` — absent or unexpectedly shaped reads as
+    /// nil (and a nil block never triggers the missing-binary repair).
+    public var daemon: DeckDaemonRuntime?
 
     public init(
         accounts: [DeckAccount] = [],
         usage: [UsageSnapshot] = [],
         activation: DeckActivation? = nil,
-        scheduler: DeckScheduler? = nil
+        scheduler: DeckScheduler? = nil,
+        daemon: DeckDaemonRuntime? = nil
     ) {
         self.accounts = accounts
         self.usage = usage
         self.activation = activation
         self.scheduler = scheduler
+        self.daemon = daemon
     }
 
     private enum CodingKeys: String, CodingKey {
-        case accounts, usage, activation, scheduler
+        case accounts, usage, activation, scheduler, daemon
     }
 
     public init(from decoder: Decoder) throws {
@@ -531,6 +640,28 @@ public struct DeckState: Codable, Equatable, Sendable {
         self.usage = try container.decodeIfPresent([UsageSnapshot].self, forKey: .usage) ?? []
         self.activation = try? container.decodeIfPresent(DeckActivation.self, forKey: .activation)
         self.scheduler = try? container.decodeIfPresent(DeckScheduler.self, forKey: .scheduler)
+        self.daemon = try? container.decodeIfPresent(DeckDaemonRuntime.self, forKey: .daemon)
+    }
+
+    /// Issue #185: true exactly when the daemon ADMITTED its executable no
+    /// longer exists. Strict `== false` on purpose — older daemons (nil
+    /// block) and healthy daemons must both read as "no repair needed".
+    public var daemonBinaryMissing: Bool {
+        daemon?.binaryPresent == false
+    }
+
+    /// Issue #185 (CodeRabbit, PR #186): whether ANY signal says the
+    /// daemon's own binary is gone — the explicit self-report above, or a
+    /// per-account refresh error carrying the helper-missing class. The
+    /// message path covers pre-#185 daemons that can't self-report, so the
+    /// automatic repair (and the card copy's "reinstalls it automatically")
+    /// holds for them too.
+    public var daemonHelperMissingSignaled: Bool {
+        if daemonBinaryMissing { return true }
+        return accounts.contains { account in
+            guard let message = account.lastRefreshError?.message else { return false }
+            return DeckFreshness.refreshErrorIndicatesMissingHelper(message)
+        }
     }
 }
 

@@ -440,6 +440,54 @@ struct CardStalenessTests {
             .staleness(now: now, autoRefreshInterval: 300)
         #expect(staleness?.tooltip == "Data from 1 hr ago — Last refresh failed: \(message)")
         #expect(staleness?.accessibilityLabel.contains(message) == true)
+        // Issue #185: an ordinary failure classifies as refreshFailed.
+        #expect(staleness?.cause == .refreshFailed)
+    }
+
+    // Issue #185: cause classification — the click-through explanation
+    // leads with the right coaching, never a dead spawn path.
+
+    @Test func agedDataWithoutAnErrorClassifiesAsNoNewData() {
+        let staleness = row(observedSecondsAgo: 57_600)
+            .staleness(now: now, autoRefreshInterval: 300)
+        #expect(staleness?.cause == .noNewData)
+    }
+
+    @Test func helperMissingPhraseRendersTheFriendlyCoaching() {
+        // The daemon-side HELPER_MISSING_ERROR phrase (src/adapters/claude.mjs).
+        let message = "Claude usage refresh failed: ModelDeck's background helper "
+            + "is missing on disk — ModelDeck reinstalls it automatically "
+            + "(or quit and reopen ModelDeck)"
+        let staleness = row(observedSecondsAgo: 64_800, errorMessage: message)
+            .staleness(now: now, autoRefreshInterval: 300)
+        #expect(staleness?.cause == .helperMissing)
+        #expect(staleness?.tooltip == "Data from 18 hr ago — \(DeckFreshness.helperMissingReason)")
+    }
+
+    @Test func rawSpawnEnoentFromAnOldDaemonClassifiesAsHelperMissingToo() {
+        // The exact pre-#185 shape Tim hit live: the raw spawn failure with
+        // the deleted staging path. The friendly copy must replace it — the
+        // dead path never reaches the tooltip or VoiceOver.
+        let message = "Claude usage refresh failed: spawn /private/var/folders/60/"
+            + "tmp.p0KHz83Ugl/modeldeck-release/dist/ModelDeck.app/Contents/"
+            + "Resources/daemon/modeldeckd ENOENT"
+        let staleness = row(observedSecondsAgo: 64_800, errorMessage: message)
+            .staleness(now: now, autoRefreshInterval: 300)
+        #expect(staleness?.cause == .helperMissing)
+        #expect(staleness?.tooltip.contains("/private/var") == false)
+        #expect(staleness?.accessibilityLabel.contains("ENOENT") == false)
+        #expect(staleness?.tooltip.contains("reinstalls it automatically") == true)
+    }
+
+    @Test func aMissingProviderCliIsNeverMistakenForTheHelper() {
+        // CodeRabbit (PR #186): a provider CLI absent from PATH also spawns
+        // into ENOENT — that's an ordinary refresh failure, and the raw
+        // message (which names the actual problem) must survive.
+        let message = "Codex rate limits failed: spawn codex ENOENT"
+        let staleness = row(observedSecondsAgo: 3_600, errorMessage: message)
+            .staleness(now: now, autoRefreshInterval: 300)
+        #expect(staleness?.cause == .refreshFailed)
+        #expect(staleness?.tooltip == "Data from 1 hr ago — Last refresh failed: \(message)")
     }
 
     @Test func thresholdUsesTheEffectiveInterval() {

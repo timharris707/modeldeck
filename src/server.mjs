@@ -182,6 +182,12 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
         if (!account) return json(res, 404, { error: 'account not found' });
         return json(res, 200, { account: ownedService.resetClaudeIdentity(account.id) });
       }
+      const renewMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/renew$/);
+      if (req.method === 'POST' && renewMatch) {
+        const id = decodeURIComponent(renewMatch[1]);
+        if (!ownedStore.getAccount(id)) return json(res, 404, { error: 'account not found' });
+        return json(res, 200, { renew: await ownedService.renewClaudeAccount(id) });
+      }
       const activateMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/activate$/);
       if (req.method === 'POST' && activateMatch) {
         const id = decodeURIComponent(activateMatch[1]);

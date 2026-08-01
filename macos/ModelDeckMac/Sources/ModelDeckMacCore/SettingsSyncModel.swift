@@ -99,6 +99,12 @@ public final class SettingsSyncModel: ObservableObject {
             { $0.menuBarAccountId != nil },
             { $0.menuBarAccountId = nil }
         ),
+        // Issue #176: pre-renew daemons don't know the auto-renew key.
+        (
+            "autoRenewEnabled",
+            { $0.autoRenewEnabled != nil },
+            { $0.autoRenewEnabled = nil }
+        ),
     ]
 
     private func push(_ patch: DaemonSettingsPatch) async {
@@ -180,6 +186,13 @@ public final class SettingsSyncModel: ObservableObject {
     public func setNotificationThreshold(percent: Int) async {
         guard percent != settings.notificationThresholdPercent else { return }
         await update(DaemonSettingsPatch(notificationThresholdPercent: percent))
+    }
+
+    /// Issue #176: the daemon's scheduled renewal of expired-idle Claude
+    /// accounts ("Keep idle Claude accounts fresh automatically").
+    public func setAutoRenewEnabled(_ enabled: Bool) async {
+        guard enabled != settings.autoRenewEnabled else { return }
+        await update(DaemonSettingsPatch(autoRenewEnabled: enabled))
     }
 
     /// Menu bar percent source: an account id pins the menu bar percentage

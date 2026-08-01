@@ -138,6 +138,38 @@ test('rejects missing mutation token, cross-origin mutations, and hostile Host h
   assert.equal(await requestWithHost(fixture, 'attacker.example'), 403);
 });
 
+test('Claude renewal endpoint returns decided outcomes, 404 unknown, and 409 concurrent', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  const at = '2026-07-31T12:00:00.000Z';
+
+  for (const outcome of ['renewed', 'busy', 'signin-required', 'auth-overridden', 'rate-limited', 'failed']) {
+    const renew = {
+      outcome,
+      mechanism: outcome === 'renewed' ? 'auth-status' : null,
+      at,
+      detail: `fixture ${outcome}`,
+    };
+    fixture.service.renewClaudeAccount = async () => renew;
+    const result = await request(fixture, `/api/accounts/${claude.id}/renew`, { method: 'POST' });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body, { renew });
+  }
+
+  let result = await request(fixture, '/api/accounts/missing/renew', { method: 'POST' });
+  assert.equal(result.response.status, 404);
+  assert.deepEqual(result.body, { error: 'account not found' });
+
+  fixture.service.renewClaudeAccount = async () => {
+    const error = new Error('a Claude account renewal is already in progress');
+    error.statusCode = 409;
+    throw error;
+  };
+  result = await request(fixture, `/api/accounts/${claude.id}/renew`, { method: 'POST' });
+  assert.equal(result.response.status, 409);
+});
+
 test('Claude identity reset clears provenance and can re-seed; other providers and unauthenticated calls are rejected', async (t) => {
   const fixture = await startFixture();
   t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
@@ -367,9 +399,12 @@ test('settings API validates partial updates and drives worst-capacity threshold
   let result = await request(fixture, '/api/settings');
   assert.deepEqual(result.body, {
     autoRefreshEnabled: true,
+    autoRenewEnabled: true,
     autoRefreshIntervalSeconds: 300,
     autoRefreshIntervalCustomized: false,
-    pauseWhileActive: true,
+    // Issue #187: pause-while-active is opt-in — live updates during an
+    // active session are the default experience.
+    pauseWhileActive: false,
     layout: 'two-column',
     defaultSort: 'next-reset',
     notificationThresholdPercent: 25,
@@ -379,7 +414,14 @@ test('settings API validates partial updates and drives worst-capacity threshold
   result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ layout: 'single-column', notificationThresholdPercent: 30 }) });
   assert.equal(result.body.layout, 'single-column');
   assert.equal(result.body.autoRefreshEnabled, true);
+  assert.equal(result.body.autoRenewEnabled, true);
   assert.equal(reschedules.length, 1);
+
+  result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ autoRenewEnabled: false }) });
+  assert.equal(result.body.autoRenewEnabled, false);
+  result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ autoRenewEnabled: 'yes' }) });
+  assert.equal(result.response.status, 400);
+  assert.match(result.body.error, /autoRenewEnabled/);
   assert.equal(reschedules[0].notificationThresholdPercent, 30);
 
   result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ autoRefreshIntervalSeconds: 30 }) });
@@ -388,7 +430,7 @@ test('settings API validates partial updates and drives worst-capacity threshold
   result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ surprise: true }) });
   assert.equal(result.response.status, 400);
   assert.match(result.body.error, /unknown setting: surprise/);
-  assert.equal(reschedules.length, 1);
+  assert.equal(reschedules.length, 2);
 
   // Menu bar pinned account: any short string round-trips ('' = lowest
   // across accounts); non-strings are rejected.

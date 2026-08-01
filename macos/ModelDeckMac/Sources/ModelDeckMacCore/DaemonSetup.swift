@@ -307,6 +307,40 @@ public final class DaemonSetupModel: ObservableObject {
         await evaluateOnLaunch()
     }
 
+    // MARK: Missing-binary repair (issue #185)
+
+    /// Guards the repair to ONE attempt per app session: a repair that
+    /// can't take (registration error, revoked Login Items approval) must
+    /// degrade to the visible setup phases, never loop unregister/register
+    /// against launchd.
+    private var didAttemptMissingBinaryRepair = false
+
+    /// Issue #185: the reachable daemon ADMITTED its own executable no
+    /// longer exists (`/api/state` → `daemon.binaryPresent: false`) — the
+    /// state a staged/temp bundle leaves behind when its directory is
+    /// deleted: the process survives and keeps answering HTTP, but every
+    /// SEA self-spawn (the Claude usage probe) fails ENOENT, so usage
+    /// quietly fossilizes. The launch evaluation can't catch it — the port
+    /// answers and the MDGitCommit matches (same release!).
+    ///
+    /// Repair = the SAME unregister/register cycle as the drift path, run
+    /// from THIS bundle, so launchd relaunches the daemon from a binary
+    /// that exists. Only meaningful while the setup surface is otherwise
+    /// quiet (a consent/install/approval flow in progress owns the
+    /// registrar). Returns true when the repaired daemon is reachable
+    /// again — the caller then forces a provider poll so the deck heals
+    /// without any user action.
+    @discardableResult
+    public func repairMissingDaemonBinary() async -> Bool {
+        guard !didAttemptMissingBinaryRepair,
+              phase == .quiet,
+              let bundledCommit = deps.bundledCommit, !bundledCommit.isEmpty
+        else { return false }
+        didAttemptMissingBinaryRepair = true
+        await reregister(bundledCommit: bundledCommit)
+        return phase == .quiet
+    }
+
     // MARK: Legacy takeover (explicit Settings action only)
 
     /// Adopt the bundled service: boot out + delete the legacy LaunchAgent,

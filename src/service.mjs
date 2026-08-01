@@ -22,6 +22,7 @@ import { claudeCredentialsPresent } from './adapters/claude-keychain.mjs';
 import {
   buildStatuslineCommand,
   chainCommandFromStatuslineCommand,
+  execPathFromStatuslineCommand,
   isModelDeckStatuslineCommand,
   statuslineSnapshotsFromCapture,
 } from './adapters/claude-statusline.mjs';
@@ -49,6 +50,17 @@ const execFileAsync = promisify(execFile);
 // /api/state says so (scheduler.effectiveRefreshReason) so the deck can be
 // honest about it instead of silently starving.
 const ACTIVE_SESSION_REFRESH_CAP_MS = 30 * 60_000;
+
+const CLAUDE_RENEWAL_TIMEOUT_MS = 60_000;
+const CLAUDE_RENEWAL_BACKOFF_MS = 30 * 60_000;
+const CLAUDE_RENEWAL_DAY_MS = 24 * 60 * 60_000;
+const CLAUDE_RENEWAL_DAILY_LIMIT = 6;
+const CLAUDE_RENEWAL_MODEL = 'claude-haiku-4-5-20251001';
+const CLAUDE_AUTH_OVERRIDE_KEYS = [
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_BASE_URL',
+];
 
 // Issue #90 provenance: "customized" is the persisted change-event flag
 // (db.mjs saveSettings flips it — permanently — when a write CHANGES the
@@ -191,6 +203,13 @@ class ToolUpdateConflictError extends Error {
   }
 }
 
+class ClaudeRenewalConflictError extends Error {
+  constructor() {
+    super('a Claude account renewal is already in progress');
+    this.statusCode = 409;
+  }
+}
+
 function codexPlanMetadata(planType) {
   if (typeof planType !== 'string' || !planType.trim()) return null;
   const raw = planType.trim();
@@ -245,8 +264,21 @@ export class ModelDeckService {
     // adapter script with the same Node.
     this.claudeStatuslineDir = options.claudeStatuslineDir
       || path.join(path.dirname(this.claudeProfilesDir), 'statusline');
+    this.dataDir = options.dataDir || path.dirname(this.claudeProfilesDir);
+    this.claudeRenewalScratchDir = options.claudeRenewalScratchDir
+      || path.join(this.dataDir, 'claude-renewal');
     this.statuslineExecPath = options.statuslineExecPath || process.execPath;
     this.statuslineSea = options.statuslineSea ?? isSea();
+    // Issue #185: the daemon can outlive its own executable — a staged
+    // release bundle (temp worktree) registers launchd, the worktree is
+    // deleted, and the running process keeps answering /api/state while
+    // every SEA self-spawn (the Claude usage probe) fails ENOENT. The app
+    // can only repair what the daemon admits, so /api/state self-reports
+    // whether the executable still exists on disk.
+    this.daemonExecPath = options.daemonExecPath || process.execPath;
+    this.daemonExecPathExists = options.daemonExecPathExists
+      || ((execPath) => fs.existsSync(execPath));
+    this.daemonSea = options.daemonSea ?? isSea();
     this.statuslineScriptPath = options.statuslineScriptPath
       || (this.statuslineSea ? null : fileURLToPath(new URL('./adapters/claude-statusline.mjs', import.meta.url)));
     this.statuslineWatcher = null;
@@ -268,6 +300,7 @@ export class ModelDeckService {
     this.claudeCredentialsPresent = options.claudeCredentialsPresent || claudeCredentialsPresent;
     this.migrateClaude = options.migrateClaude || migrateClaudeSwapProfiles;
     this.exec = options.exec || options.execFile || options.run || execFileAsync;
+    this.childEnv = options.childEnv || process.env;
     this.listProviderProcesses = options.listProviderProcesses || (async () => {
       const result = await this.exec('/bin/ps', ['-U', os.userInfo().username, '-o', 'comm='], {
         timeout: 5_000,
@@ -291,6 +324,11 @@ export class ModelDeckService {
     this.pausedForActiveSessions = false;
     this.activeProviderSessionPresent = false;
     this.refreshPromise = null;
+    // Issue #176: every operation that flips ~/.claude shares this queue.
+    // Renewal additionally has an immediate conflict guard because its HTTP
+    // contract returns 409 for a second renewal instead of silently queuing it.
+    this.claudeActivationTail = Promise.resolve();
+    this.claudeRenewalPromise = null;
     this.toolProbeCache = null;
     this.toolProbePromise = null;
     this.toolProbePromiseGeneration = null;
@@ -329,6 +367,10 @@ export class ModelDeckService {
     this.autoRefreshStarted = true;
     // Local, credential-free startup migration for pre-#62 Claude rows.
     void this.backfillClaudeIdentities();
+    // Issue #189: before anything else statusline, repair tees still
+    // pointing at a daemon binary that has since moved or been deleted
+    // (same bug class as #185's dead release-worktree daemon).
+    void this.reconcileClaudeStatuslineInstalls().catch(() => {});
     // Issue #174: pick up statusline captures written while the daemon was
     // down, then watch for new ones — server-truth windows should not wait
     // for the next scheduled provider refresh.
@@ -439,6 +481,45 @@ export class ModelDeckService {
     } catch {
       return false;
     }
+  }
+
+  /// Startup reconcile (issue #189, same bug class as #185): a tee written
+  /// by a daemon that has since moved or been deleted — the #185 incident
+  /// was a temp release worktree — keeps spawning the dead binary on every
+  /// statusline render, silently breaking the user's statusline (their own
+  /// chained command included) even after the daemon itself is repaired,
+  /// because nothing ever rewrote the settings.json command. For every
+  /// Claude profile carrying our tee, rewrite it with the CURRENT paths
+  /// when the embedded executable differs from ours in SEA mode (the daemon
+  /// binary IS the statusline executable, so any other path is wrong) or no
+  /// longer exists on disk in either mode. Re-install is idempotent: the
+  /// user's chained statusLine and the original pre-install backup survive.
+  /// Per-account best effort — one unreadable profile never blocks the rest.
+  async reconcileClaudeStatuslineInstalls() {
+    const repaired = [];
+    for (const account of this.store.listAccounts()) {
+      if (account.provider !== 'claude') continue;
+      let command;
+      try {
+        const profileRef = managedClaudeProfile(account.profileRef, this.claudeProfilesDir);
+        const parsed = JSON.parse(await fs.promises.readFile(path.join(profileRef, 'settings.json'), 'utf8'));
+        command = parsed?.statusLine?.command;
+      } catch {
+        continue; // no profile, no settings.json, or unparseable: nothing of ours to repair
+      }
+      if (!isModelDeckStatuslineCommand(command)) continue;
+      const embedded = execPathFromStatuslineCommand(command);
+      if (!embedded || embedded === this.statuslineExecPath) continue;
+      if (!this.statuslineSea && fs.existsSync(embedded)) continue;
+      try {
+        await this.installClaudeStatusline(account.id);
+        repaired.push(account.id);
+        console.error(`[modeldeck] statusline tee for account ${account.id} repointed from stale executable ${embedded}`);
+      } catch (error) {
+        console.error(`[modeldeck] statusline tee reconcile failed for account ${account.id}: ${error?.message || error}`);
+      }
+    }
+    return repaired;
   }
 
   /// Opt-in install (issue #174): write ModelDeck's statusline tee into the
@@ -711,10 +792,20 @@ export class ModelDeckService {
 
     this.pausedForActiveSessions = false;
     try {
-      await this.refreshAll();
+      const refresh = await this.refreshAll();
+      // A settings change or shutdown can invalidate this generation while
+      // the provider refresh is in flight. Do not begin a new CLI mutation
+      // after the scheduled work that authorized it has been cancelled.
+      if (this.autoRefreshStarted && generation === this.autoRefreshGeneration) {
+        await this.runScheduledClaudeRenewals(refresh);
+      }
     } finally {
       this.lastCompletedRefreshAt = this.now();
     }
+  }
+
+  async runningClaudeProcessCount() {
+    return (await this.listProviderProcesses()).filter((command) => command === 'claude').length;
   }
 
   scanProjects(root = this.projectsRoot) {
@@ -780,6 +871,12 @@ export class ModelDeckService {
         return { accountId: account.id, ok: false, error: error.message };
       }
     }));
+    this.updateClaudeWeeklyFingerprints(accounts, refreshedSnapshots);
+    this.recordAccountRefreshResults(results);
+    return results;
+  }
+
+  updateClaudeWeeklyFingerprints(accounts, refreshedSnapshots) {
     // Fingerprints update only on usable evidence: a failed fetch or a
     // missing/stale/invalid weekly leaves the prior fingerprint — and any
     // duplicate-token flag — in place rather than silently clearing it.
@@ -798,8 +895,30 @@ export class ModelDeckService {
     // toolProbeTtlMs; a duplicate-token transition must not hide behind it.
     const changed = next.size !== previous.size || [...next].some((id) => !previous.has(id));
     if (changed) this.invalidateToolProbe();
-    this.recordAccountRefreshResults(results);
-    return results;
+  }
+
+  async refreshClaudeAccount(accountId) {
+    const account = this.store.getAccount(accountId);
+    if (!account || account.provider !== 'claude' || !account.enabled) return null;
+    await this.refreshClaudeProfileMetadata(account).catch(() => {});
+    let result;
+    const refreshedSnapshots = new Map();
+    try {
+      const snapshots = await this.fetchClaude({
+        claudeConfigDir: account.profileRef,
+        profilesDir: this.claudeProfilesDir,
+      });
+      for (const snapshot of snapshots) this.store.recordUsage(account.id, snapshot);
+      refreshedSnapshots.set(account.id, snapshots);
+      result = { accountId: account.id, ok: true, snapshotCount: snapshots.length };
+    } catch (error) {
+      result = { accountId: account.id, ok: false, error: error.message };
+    }
+    const enabled = this.store.listAccounts()
+      .filter((item) => item.provider === 'claude' && item.enabled);
+    this.updateClaudeWeeklyFingerprints(enabled, refreshedSnapshots);
+    this.recordAccountRefreshResults([result]);
+    return result;
   }
 
   async refreshClaudeProfileMetadata(account) {
@@ -958,7 +1077,7 @@ export class ModelDeckService {
   // Daemon-owned metadata keys are written by verify/refresh, never by API
   // callers — an edit that re-sends a stale metadata object must not clobber
   // them (CodeRabbit, PR #29).
-  static DAEMON_OWNED_METADATA = ['claudePlan', 'claudeAccountUuid', 'identitySource', 'codexPlan', 'migratedFromClaudeSwap'];
+  static DAEMON_OWNED_METADATA = ['claudePlan', 'claudeAccountUuid', 'identitySource', 'claudeRenewal', 'codexPlan', 'migratedFromClaudeSwap'];
 
   preserveDaemonMetadata(input) {
     if (!input?.id || input.metadata == null) return input;
@@ -1247,6 +1366,344 @@ export class ModelDeckService {
     }
   }
 
+  async claudeAuthOverrideState(profileRef) {
+    let raw;
+    try {
+      raw = await fs.promises.readFile(path.join(profileRef, 'settings.json'), 'utf8');
+    } catch (error) {
+      if (error.code === 'ENOENT') return { authOverride: false, readable: true };
+      return { authOverride: false, readable: false };
+    }
+    let settings;
+    try {
+      settings = JSON.parse(raw);
+    } catch {
+      return { authOverride: false, readable: false };
+    }
+    const env = settings && typeof settings === 'object' && !Array.isArray(settings)
+      && settings.env && typeof settings.env === 'object' && !Array.isArray(settings.env)
+      ? settings.env
+      : null;
+    return {
+      authOverride: Boolean(env && CLAUDE_AUTH_OVERRIDE_KEYS.some((key) => Object.hasOwn(env, key))),
+      readable: true,
+    };
+  }
+
+  renewalAttemptHistory(account, timestamp = this.now()) {
+    const stored = account?.metadata?.claudeRenewal?.attempts;
+    if (!Array.isArray(stored)) return [];
+    const cutoff = timestamp - CLAUDE_RENEWAL_DAY_MS;
+    return stored.filter((at) => {
+      const parsed = Date.parse(at);
+      return Number.isFinite(parsed) && parsed > cutoff && parsed <= timestamp;
+    });
+  }
+
+  recordClaudeRenewalAttempt(accountId, attempt) {
+    const account = this.store.getAccount(accountId);
+    if (!account) return attempt;
+    const timestamp = Date.parse(attempt.at);
+    const attempts = this.renewalAttemptHistory(account, Number.isFinite(timestamp) ? timestamp : this.now());
+    attempts.push(attempt.at);
+    const metadata = {
+      ...account.metadata,
+      claudeRenewal: {
+        attempts,
+        lastAttempt: attempt,
+      },
+    };
+    this.store.saveAccount({
+      id: account.id,
+      provider: account.provider,
+      label: account.label,
+      identity: account.identity,
+      purpose: account.purpose,
+      profileRef: account.profileRef,
+      color: account.color,
+      enabled: account.enabled,
+      metadata,
+    });
+    return attempt;
+  }
+
+  renewalAttemptAllowed(account) {
+    const timestamp = this.now();
+    const history = this.renewalAttemptHistory(account, timestamp);
+    if (history.length >= CLAUDE_RENEWAL_DAILY_LIMIT) return false;
+    const lastAt = Date.parse(account?.metadata?.claudeRenewal?.lastAttempt?.at);
+    return !Number.isFinite(lastAt) || timestamp - lastAt >= CLAUDE_RENEWAL_BACKOFF_MS;
+  }
+
+  claudeRenewalEnv(profileRef) {
+    const env = { ...this.childEnv };
+    for (const key of CLAUDE_AUTH_OVERRIDE_KEYS) delete env[key];
+    env.CLAUDE_CONFIG_DIR = profileRef;
+    env.CLAUDE_SECURESTORAGE_CONFIG_DIR = profileRef;
+    return env;
+  }
+
+  async runClaudeRenewalCli(args, profileRef) {
+    await fs.promises.mkdir(this.claudeRenewalScratchDir, { recursive: true, mode: 0o700 });
+    await this.exec(this.claudePath, args, {
+      cwd: this.claudeRenewalScratchDir,
+      env: this.claudeRenewalEnv(profileRef),
+      timeout: CLAUDE_RENEWAL_TIMEOUT_MS,
+      maxBuffer: 1_000_000,
+    });
+  }
+
+  claudeModelRejected(error) {
+    const output = `${error?.stderr ?? ''}\n${error?.stdout ?? ''}\n${error?.message ?? ''}`;
+    return /(?:model.*(?:invalid|unknown|not found|unsupported|does not exist)|invalid.*--model|--model.*(?:invalid|unknown))/i.test(output);
+  }
+
+  async probeClaudeRenewal(account) {
+    try {
+      const snapshots = await this.fetchClaude({
+        claudeConfigDir: account.profileRef,
+        profilesDir: this.claudeProfilesDir,
+      });
+      for (const snapshot of snapshots) this.store.recordUsage(account.id, snapshot);
+      this.updateClaudeWeeklyFingerprints(
+        this.store.listAccounts().filter((item) => item.provider === 'claude' && item.enabled),
+        new Map([[account.id, snapshots]]),
+      );
+      this.authPresenceCache.delete(`claude:${account.profileRef}`);
+      this.recordAccountRefreshResults([{ accountId: account.id, ok: true, snapshotCount: snapshots.length }]);
+      return { ok: true, expired: false };
+    } catch (error) {
+      return {
+        ok: false,
+        expired: SIGN_IN_REQUIRED_ERROR_PATTERN.test(error.message)
+          && SIGN_IN_EXPIRED_ERROR_PATTERN.test(error.message),
+      };
+    }
+  }
+
+  async priorClaudeActivation() {
+    let stat;
+    try {
+      stat = await fs.promises.lstat(this.claudeActiveLink);
+    } catch (error) {
+      if (error.code === 'ENOENT') return { state: 'unlinked' };
+      throw error;
+    }
+    if (!stat.isSymbolicLink()) throw activeLinkBlockedError('Claude', this.claudeActiveLink);
+    return { state: 'linked', profileRef: await fs.promises.realpath(this.claudeActiveLink) };
+  }
+
+  async restoreClaudeActivation(previous) {
+    if (previous.state === 'linked') {
+      await this.activateClaude({
+        profileRef: previous.profileRef,
+        activeLink: this.claudeActiveLink,
+        profilesDir: this.claudeProfilesDir,
+      });
+      return;
+    }
+    let stat;
+    try {
+      stat = await fs.promises.lstat(this.claudeActiveLink);
+    } catch (error) {
+      if (error.code === 'ENOENT') return;
+      throw error;
+    }
+    if (!stat.isSymbolicLink()) throw new Error('Claude active profile link changed during renewal');
+    await fs.promises.unlink(this.claudeActiveLink);
+  }
+
+  async performClaudeRenewal(accountId) {
+    const account = this.store.getAccount(accountId);
+    if (account && account.provider !== 'claude') {
+      throw new Error('Claude renewal provider mismatch: this account is not a Claude account.');
+    }
+    const at = new Date(this.now()).toISOString();
+    const decided = (outcome, mechanism, detail, extra = {}) => this.recordClaudeRenewalAttempt(accountId, {
+      at, outcome, mechanism, detail, ...extra,
+    });
+    if (!account || !account.enabled) {
+      return decided('signin-required', null, 'This account requires an explicit Claude sign-in; automatic renewal was not attempted.');
+    }
+    let authState;
+    try {
+      authState = await this.accountAuthState(account);
+    } catch {
+      return decided('signin-required', null, 'This account requires an explicit Claude sign-in; automatic renewal was not attempted.');
+    }
+    if (this.signinReason(account, authState) !== 'expired') {
+      return decided('signin-required', null, 'This account requires an explicit Claude sign-in; automatic renewal was not attempted.');
+    }
+
+    const override = await this.claudeAuthOverrideState(account.profileRef);
+    if (override.authOverride) {
+      return decided('auth-overridden', null, 'This profile sets an Anthropic authentication override, so renewal was not attempted.');
+    }
+    if (!override.readable) {
+      return decided('failed', null, 'ModelDeck could not safely inspect this profile’s Claude settings, so renewal was not attempted.');
+    }
+    try {
+      if (await this.runningClaudeProcessCount()) {
+        return decided('busy', null, 'Claude is currently running, so renewal was not attempted.');
+      }
+    } catch {
+      return decided('failed', null, 'ModelDeck could not confirm that Claude was idle, so renewal was not attempted.');
+    }
+
+    let previous;
+    let activated = false;
+    let result = {
+      at,
+      outcome: 'failed',
+      mechanism: null,
+      detail: 'Claude did not refresh this account’s expired stored sign-in.',
+    };
+    try {
+      previous = await this.priorClaudeActivation();
+      if (previous.state === 'linked') {
+        try {
+          await validateClaudeProfileHome({
+            profileRef: previous.profileRef,
+            profilesDir: this.claudeProfilesDir,
+          });
+        } catch {
+          const error = new Error('unsafe Claude renewal restore path');
+          error.code = 'claude-renewal-restore-unsafe';
+          throw error;
+        }
+      }
+      await this.activateClaude({
+        profileRef: account.profileRef,
+        activeLink: this.claudeActiveLink,
+        profilesDir: this.claudeProfilesDir,
+      });
+      activated = true;
+
+      result.mechanism = 'auth-status';
+      try {
+        await this.runClaudeRenewalCli(['auth', 'status', '--json'], account.profileRef);
+      } catch {
+        // The provider command is only a trigger. Its exit status is never
+        // renewal evidence; the target profile's probe below is authoritative.
+      }
+      let verified = await this.probeClaudeRenewal(account);
+      if (verified.ok) {
+        result = {
+          at,
+          outcome: 'renewed',
+          mechanism: 'auth-status',
+          detail: 'Claude refreshed this account’s stored sign-in without an inference request.',
+        };
+      } else if (verified.expired) {
+        result.mechanism = 'invoke';
+        try {
+          await this.runClaudeRenewalCli(['-p', 'ok', '--model', CLAUDE_RENEWAL_MODEL], account.profileRef);
+        } catch (error) {
+          if (this.claudeModelRejected(error)) {
+            try {
+              await this.runClaudeRenewalCli(['-p', 'ok'], account.profileRef);
+            } catch {
+              // Verification, not CLI exit status, decides the outcome.
+            }
+          }
+        }
+        verified = await this.probeClaudeRenewal(account);
+        if (verified.ok) {
+          result = {
+            at,
+            outcome: 'renewed',
+            mechanism: 'invoke',
+            detail: 'Claude refreshed this account’s stored sign-in with the minimal renewal request.',
+          };
+        }
+      }
+    } catch (error) {
+      if (error?.code === 'claude-renewal-restore-unsafe') {
+        result.detail = 'ModelDeck could not safely verify the previously active Claude profile, so renewal was not attempted.';
+      }
+      // Keep the stable, non-sensitive failure sentence above. Child output
+      // and profile paths are intentionally never copied into API state.
+    } finally {
+      if (activated) {
+        try {
+          await this.restoreClaudeActivation(previous);
+        } catch {
+          result = {
+            at,
+            outcome: 'failed',
+            mechanism: result.mechanism,
+            detail: 'ModelDeck could not restore the previously active Claude profile after renewal.',
+            restoreFailed: true,
+          };
+        }
+      }
+    }
+    return this.recordClaudeRenewalAttempt(accountId, result);
+  }
+
+  async renewClaudeAccount(accountId) {
+    if (this.claudeRenewalPromise) throw new ClaudeRenewalConflictError();
+    const account = this.store.getAccount(accountId);
+    if (account?.provider === 'claude'
+      && this.renewalAttemptHistory(account).length >= CLAUDE_RENEWAL_DAILY_LIMIT) {
+      return {
+        at: new Date(this.now()).toISOString(),
+        outcome: 'rate-limited',
+        mechanism: null,
+        detail: 'This account has reached the Claude renewal limit for the last 24 hours; try again later.',
+      };
+    }
+    const promise = this.withClaudeActivationLock(() => this.performClaudeRenewal(accountId));
+    this.claudeRenewalPromise = promise;
+    try {
+      return await promise;
+    } finally {
+      if (this.claudeRenewalPromise === promise) this.claudeRenewalPromise = null;
+    }
+  }
+
+  async runScheduledClaudeRenewals(refresh) {
+    const currentSettings = this.store.getSettings();
+    if (!currentSettings.autoRefreshEnabled || !currentSettings.autoRenewEnabled || this.claudeRenewalPromise) return [];
+    const candidates = refresh?.claude?.profiles?.filter((item) => !item.ok
+      && SIGN_IN_REQUIRED_ERROR_PATTERN.test(item.error)
+      && SIGN_IN_EXPIRED_ERROR_PATTERN.test(item.error)) || [];
+    const outcomes = [];
+    for (const candidate of candidates) {
+      const settings = this.store.getSettings();
+      if (!settings.autoRefreshEnabled || !settings.autoRenewEnabled) break;
+      const account = this.store.getAccount(candidate.accountId);
+      if (!account || account.provider !== 'claude' || !account.enabled || !this.renewalAttemptAllowed(account)) continue;
+      try {
+        if (await this.runningClaudeProcessCount()) break;
+      } catch {
+        break;
+      }
+      try {
+        const renew = await this.renewClaudeAccount(account.id);
+        outcomes.push({ accountId: account.id, ...renew });
+        await this.refreshClaudeAccount(account.id);
+      } catch (error) {
+        if (error?.statusCode === 409) break;
+        console.error(`[modeldeck] scheduled Claude renewal failed: ${error?.message || error}`);
+      }
+    }
+    return outcomes;
+  }
+
+  async withClaudeActivationLock(operation) {
+    const previous = this.claudeActivationTail;
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    this.claudeActivationTail = previous.catch(() => {}).then(() => gate);
+    await previous.catch(() => {});
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
   async activateAccount(id) {
     const account = this.store.getAccount(id);
     if (!account) throw new Error('account not found');
@@ -1254,14 +1711,22 @@ export class ModelDeckService {
 
     let warnings = [];
     if (account.provider === 'claude') {
-      // Pre-flip honesty (issue #66): sessions launched before the pinned
-      // env existed still resolve storage through the ~/.claude symlink and
-      // can silently lose transcript history when it flips. Detect them
-      // before the flip so the response can say so; best-effort only —
-      // detection failure must never block activation.
-      warnings = await this.claudeRunningSessionWarnings();
-      await this.activateClaude({ profileRef: account.profileRef, activeLink: this.claudeActiveLink, profilesDir: this.claudeProfilesDir });
-      await this.scopeClaudeSecureStorage(account.profileRef);
+      return this.withClaudeActivationLock(async () => {
+        // Re-read after waiting: a queued activation must not revive a deleted
+        // or newly disabled account.
+        const latest = this.store.getAccount(id);
+        if (!latest) throw new Error('account not found');
+        if (!latest.enabled) throw new Error('account is disabled');
+        // Pre-flip honesty (issue #66): sessions launched before the pinned
+        // env existed still resolve storage through the ~/.claude symlink and
+        // can silently lose transcript history when it flips. Detect them
+        // before the flip so the response can say so; best-effort only —
+        // detection failure must never block activation.
+        warnings = await this.claudeRunningSessionWarnings();
+        await this.activateClaude({ profileRef: latest.profileRef, activeLink: this.claudeActiveLink, profilesDir: this.claudeProfilesDir });
+        await this.scopeClaudeSecureStorage(latest.profileRef);
+        return { account: this.setDefaultAccount(latest.provider, latest.id), warnings };
+      });
     } else {
       if (!this.codexActiveLink) throw new Error('Codex active profile link is not configured');
       await this.activateCodexProfile(account.profileRef);
@@ -1277,7 +1742,7 @@ export class ModelDeckService {
   async claudeRunningSessionWarnings() {
     let running = 0;
     try {
-      running = (await this.listProviderProcesses()).filter((command) => command === 'claude').length;
+      running = await this.runningClaudeProcessCount();
     } catch {
       return [];
     }
@@ -1510,12 +1975,35 @@ export class ModelDeckService {
       const claudeStatusline = account.provider === 'claude'
         ? { installed: await this.claudeStatuslineInstalled(account.profileRef) }
         : null;
+      let renew = null;
+      if (account.provider === 'claude') {
+        const override = await this.claudeAuthOverrideState(account.profileRef);
+        const storedAttempt = account.metadata?.claudeRenewal?.lastAttempt;
+        const lastAttempt = storedAttempt?.at && storedAttempt?.outcome
+          ? {
+            at: storedAttempt.at,
+            outcome: storedAttempt.outcome,
+            mechanism: storedAttempt.mechanism ?? null,
+          }
+          : null;
+        renew = {
+          // Busy is deliberately excluded: `available` describes whether the
+          // account is intrinsically renewable, even while a running Claude
+          // process makes this particular moment unsuitable.
+          available: account.enabled && signinReason === 'expired'
+            && !override.authOverride && override.readable,
+          authOverride: override.authOverride,
+          lastAttempt,
+          ...(storedAttempt?.restoreFailed ? { error: storedAttempt.detail } : {}),
+        };
+      }
       return {
         ...account,
         authState,
         ...(signinReason ? { signinReason } : {}),
         ...(lastRefreshError ? { lastRefreshError } : {}),
         ...(claudeStatusline ? { claudeStatusline } : {}),
+        ...(renew ? { renew } : {}),
       };
     }));
   }
@@ -1598,6 +2086,22 @@ export class ModelDeckService {
     };
   }
 
+  // Issue #185: the daemon's runtime self-report for /api/state. A daemon
+  // launched from a since-deleted bundle keeps running (the process holds
+  // its text pages) but can never again spawn its own binary — the Claude
+  // usage probe re-exec fails ENOENT while everything else looks healthy.
+  // `binaryPresent: false` is the app's cue to re-register the service from
+  // its own (installed) bundle. Cheap: one existsSync per state read.
+  daemonRuntimeStatus() {
+    let binaryPresent;
+    try {
+      binaryPresent = Boolean(this.daemonExecPathExists(this.daemonExecPath));
+    } catch {
+      binaryPresent = false;
+    }
+    return { execPath: this.daemonExecPath, binaryPresent, sea: this.daemonSea };
+  }
+
   async state() {
     const value = this.store.state();
     const [accounts, claudeActivation, codexActivation] = await Promise.all([
@@ -1614,6 +2118,7 @@ export class ModelDeckService {
       activation: { claude: claudeActivation, codex: codexActivation },
       claudeSecureStorage,
       scheduler: this.refreshSchedulerStatus(),
+      daemon: this.daemonRuntimeStatus(),
     };
   }
 

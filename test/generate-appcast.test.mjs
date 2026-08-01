@@ -219,3 +219,29 @@ test('release-dmg.sh --appcast-only fails loudly without a signing key path', (t
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /generate_keys/);
 });
+
+test('runs main when invoked through a symlinked path (v0.3.9/v0.3.10 release flake)', (t) => {
+  // The release builds in a mktemp worktree under /var/folders — a symlink
+  // to /private/var/folders. Node canonicalizes the MAIN module's URL while
+  // argv[1] keeps the symlinked spelling; the old naive entry comparison
+  // then skipped main() and exited 0 without writing anything, while
+  // release-dmg.sh reported the appcast written. Invoke the script through
+  // a symlink and require the output to actually exist.
+  const dir = tmpdir(t);
+  const linkedRepo = path.join(dir, 'linked-repo');
+  fs.symlinkSync(path.dirname(path.dirname(script)), linkedRepo);
+  const linkedScript = path.join(linkedRepo, 'scripts', 'generate-appcast.mjs');
+  const dmg = writeDmg(dir, 8192);
+  const stub = writeSignUpdateStub(dir);
+  const out = path.join(dir, 'appcast.xml');
+  const result = spawnSync(process.execPath, [linkedScript,
+    '--version', '0.9.9', '--build', '512',
+    '--dmg', dmg,
+    '--url', 'https://github.com/timharris707/modeldeck/releases/download/v0.9.9/ModelDeck-0.9.9.dmg',
+    '--sign-update', stub, '--key-file', fakeKeyFile,
+    '--out', out,
+  ], { encoding: 'utf8', env: { ...process.env } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(fs.existsSync(out), 'appcast must be written even via a symlinked entry path');
+  assert.match(fs.readFileSync(out, 'utf8'), /<sparkle:shortVersionString>0\.9\.9</);
+});

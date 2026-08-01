@@ -28,8 +28,9 @@
 //     [--min-system 14.0] \
 //     --out dist/appcast.xml
 import { execFileSync } from "node:child_process";
-import { statSync, writeFileSync, existsSync } from "node:fs";
+import { statSync, writeFileSync, existsSync, realpathSync } from "node:fs";
 import process from "node:process";
+import { pathToFileURL } from "node:url";
 
 const KEY_HELP = `
 generate-appcast: the Sparkle EdDSA signature step failed.
@@ -186,6 +187,21 @@ function main() {
 }
 
 // Import-safe for tests; executes only when run directly.
-if (import.meta.url === `file://${process.argv[1]}`) {
+//
+// The v0.3.9/v0.3.10 release flake (roadmap "appcast reported written but
+// absent"): the release runs from a mktemp worktree under /var/folders — a
+// symlink to /private/var/folders — and Node canonicalizes the MAIN entry
+// module's URL (realpath, preserve-symlinks off) while process.argv[1]
+// keeps the symlinked spelling. The naive `file://${argv[1]}` comparison
+// then fails, main() silently never runs, and node exits 0 — the caller
+// prints "appcast written" for a file that does not exist. Canonicalize
+// argv[1] the same way (and URL-encode via pathToFileURL) before comparing;
+// release-dmg.sh additionally asserts the output file exists post-write.
+const entryHref = (() => {
+  if (!process.argv[1]) return null;
+  try { return pathToFileURL(realpathSync(process.argv[1])).href; }
+  catch { return null; }
+})();
+if (entryHref === import.meta.url) {
   main();
 }

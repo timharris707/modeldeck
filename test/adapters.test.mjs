@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  HELPER_MISSING_ERROR,
   activateClaudeProfile,
   claudePinnedEnvFileContent,
   claudeProfileEnv,
@@ -613,6 +614,49 @@ test('darwin usage refresh lets the isolated probe resolve an absent credential 
     platform: 'linux',
     run: async () => { throw new Error('must not spawn'); },
   }), /sign in explicitly before refreshing/);
+});
+
+test('SEA usage refresh names the missing helper instead of the dead spawn path (issue #185)', async (t) => {
+  const root = temporaryRoot(t);
+  const profile = path.join(root, 'sea-profile');
+  fs.mkdirSync(profile, { mode: 0o700 });
+  // The SEA probe re-execs the daemon's own binary — ENOENT means OUR
+  // executable vanished (launched from a since-deleted staging bundle),
+  // not an account problem. The message must carry the classifiable
+  // phrase and never the dead spawn path.
+  await assert.rejects(fetchClaudeUsage({
+    claudeConfigDir: profile,
+    platform: 'darwin',
+    sea: true,
+    run: async () => {
+      const error = new Error('spawn /private/var/folders/tmp.gone/modeldeckd ENOENT');
+      error.code = 'ENOENT';
+      throw error;
+    },
+  }), (error) => {
+    assert.equal(error.message, HELPER_MISSING_ERROR);
+    assert.doesNotMatch(error.message, /private\/var\/folders/);
+    return true;
+  });
+  // Any other SEA failure keeps the verbatim wrap.
+  await assert.rejects(fetchClaudeUsage({
+    claudeConfigDir: profile,
+    platform: 'darwin',
+    sea: true,
+    run: async () => { throw new Error('probe exploded'); },
+  }), /Claude usage refresh failed: probe exploded/);
+  // Source mode: the spawned binary is Node itself, not the bundled
+  // helper — an ENOENT there keeps the honest raw message.
+  await assert.rejects(fetchClaudeUsage({
+    claudeConfigDir: profile,
+    platform: 'darwin',
+    sea: false,
+    run: async () => {
+      const error = new Error('spawn node ENOENT');
+      error.code = 'ENOENT';
+      throw error;
+    },
+  }), /Claude usage refresh failed: spawn node ENOENT/);
 });
 
 test('darwin usage refresh still rejects a present credential symlink before spawning', async (t) => {
