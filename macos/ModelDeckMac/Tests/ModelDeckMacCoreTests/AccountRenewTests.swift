@@ -168,7 +168,7 @@ final class AccountRenewTests: XCTestCase {
         )
         XCTAssertEqual(
             AccountRenew.outcomeText(for: AccountRenewal(outcome: "busy")),
-            "Claude is in use right now — renewal will retry later."
+            AccountRenew.busyFallback
         )
         XCTAssertEqual(
             AccountRenew.outcomeText(for: AccountRenewal(outcome: "signin-required")),
@@ -319,7 +319,8 @@ final class AccountRenewTests: XCTestCase {
             AccountRenewPresentation(
                 action: .renewNow,
                 isRenewing: false,
-                outcomeText: "A Claude session is running."
+                outcomeText: "A Claude session is running.",
+                outcomeKind: .busy
             )
         )
     }
@@ -331,6 +332,166 @@ final class AccountRenewTests: XCTestCase {
         XCTAssertNil(model.presentation(for: claudeAccount(authState: "ok", signinReason: nil, renew: AccountRenewCapability(available: true))))
         XCTAssertNil(model.presentation(for: claudeAccount(renew: nil)))
         XCTAssertNil(model.presentation(for: claudeAccount(provider: "codex", renew: AccountRenewCapability(available: true))))
+    }
+
+    // MARK: - Issue #199: outcomes answer at the click site
+
+    func testBusyFallbackMatchesEnginePinnedDetail() {
+        // The engine (#199 daemon half) pins busy's detail sentence; a
+        // daemon that omits it must read identically — busy is a promise
+        // to renew at the next quiet moment, never a shrug.
+        XCTAssertEqual(
+            AccountRenew.busyFallback,
+            "A Claude session is running; ModelDeck will renew at the next quiet moment."
+        )
+        XCTAssertEqual(
+            AccountRenew.outcomeText(for: AccountRenewal(outcome: "busy")),
+            AccountRenew.busyFallback
+        )
+    }
+
+    func testOutcomeKindClassifiesContractOutcomesAndToleratesUnknowns() {
+        XCTAssertEqual(AccountRenew.outcomeKind(for: AccountRenewal(outcome: "renewed")), .renewed)
+        XCTAssertEqual(AccountRenew.outcomeKind(for: AccountRenewal(outcome: "busy")), .busy)
+        XCTAssertEqual(AccountRenew.outcomeKind(for: AccountRenewal(outcome: "rate-limited")), .rateLimited)
+        XCTAssertEqual(AccountRenew.outcomeKind(for: AccountRenewal(outcome: "failed")), .failed)
+        // Calm refusals and outcomes this client doesn't know yet (the
+        // daemon may grow `mechanism`/outcome values) land in .other.
+        XCTAssertEqual(AccountRenew.outcomeKind(for: AccountRenewal(outcome: "signin-required")), .other)
+        XCTAssertEqual(AccountRenew.outcomeKind(for: AccountRenewal(outcome: "auth-overridden")), .other)
+        XCTAssertEqual(AccountRenew.outcomeKind(for: AccountRenewal(outcome: "surprise")), .other)
+    }
+
+    @MainActor
+    func testEveryDecidedOutcomeSurfacesAtTheClickSite() async {
+        // Issue #199 (Tim's field report): whatever the daemon decides, the
+        // click site's display slot must carry it — never only the
+        // explanation's "Last renewal attempt" small print.
+        let cases: [(outcome: String, kind: AccountRenew.OutcomeKind)] = [
+            ("renewed", .renewed),
+            ("busy", .busy),
+            ("rate-limited", .rateLimited),
+            ("failed", .failed),
+            ("signin-required", .other),
+            ("auth-overridden", .other),
+            ("surprise", .other),
+        ]
+        for testCase in cases {
+            let renewal = AccountRenewal(outcome: testCase.outcome)
+            let model = AccountRenewModel(
+                renewer: RenewStub(result: .success(renewal)),
+                stateProvider: RenewStateStub()
+            )
+            let account = claudeAccount(renew: AccountRenewCapability(available: true))
+
+            await model.renew(account: account)
+
+            XCTAssertEqual(
+                model.presentation(for: account)?.display,
+                .outcome(text: AccountRenew.outcomeText(for: renewal), kind: testCase.kind),
+                "outcome \(testCase.outcome) must surface at the click site"
+            )
+        }
+    }
+
+    @MainActor
+    func testRenewedOutcomeStaysVisibleAfterTheChipHeals() async {
+        // Success removes the renew affordance (the fresh state flips the
+        // chip healthy) — but the decided outcome still answers where the
+        // button was, until dismissed. Before #199 the presentation went
+        // nil with the affordance and success feedback was chip-only.
+        let model = AccountRenewModel(
+            renewer: RenewStub(result: .success(AccountRenewal(outcome: "renewed"))),
+            stateProvider: RenewStateStub()
+        )
+        await model.renew(account: claudeAccount(renew: AccountRenewCapability(available: true)))
+
+        let healed = claudeAccount(authState: "ok", signinReason: nil, renew: nil)
+        let presentation = model.presentation(for: healed)
+        XCTAssertNil(presentation?.action)
+        XCTAssertEqual(
+            presentation?.display,
+            .outcome(text: "Sign-in renewed.", kind: .renewed)
+        )
+
+        model.dismissOutcome(accountID: "acct-1")
+        XCTAssertNil(model.presentation(for: healed))
+    }
+
+    @MainActor
+    func testFinishedOutcomeNeverSilentlyReArmsTheButton() async {
+        // Issue #199: while an outcome is showing, the display slot holds
+        // it — the armed action returns only after an explicit dismiss, so
+        // the button can never quietly reappear over an unread answer.
+        let model = AccountRenewModel(
+            renewer: RenewStub(result: .success(AccountRenewal(outcome: "busy"))),
+            stateProvider: RenewStateStub()
+        )
+        let account = claudeAccount(renew: AccountRenewCapability(available: true))
+
+        XCTAssertEqual(model.presentation(for: account)?.display, .action(.renewNow))
+
+        await model.renew(account: account)
+
+        // The affordance is still armed underneath (the account stays
+        // expired-idle after busy) — but the display slot says outcome.
+        XCTAssertEqual(model.presentation(for: account)?.action, .renewNow)
+        XCTAssertEqual(
+            model.presentation(for: account)?.display,
+            .outcome(text: AccountRenew.busyFallback, kind: .busy)
+        )
+
+        model.dismissOutcome(accountID: "acct-1")
+        XCTAssertEqual(model.presentation(for: account)?.display, .action(.renewNow))
+    }
+
+    @MainActor
+    func testTransportErrorSurfacesAtTheClickSiteAsFailed() async {
+        // Daemon unreachable / 409 lands in the same display slot with the
+        // failed styling — a transport error must not look like a no-op
+        // any more than a decided refusal may.
+        let model = AccountRenewModel(
+            renewer: RenewStub(result: .failure(DaemonClientError.daemonError(
+                message: "A renewal for this account is already running", status: 409
+            ))),
+            stateProvider: RenewStateStub()
+        )
+        let account = claudeAccount(renew: AccountRenewCapability(available: true))
+
+        await model.renew(account: account)
+
+        XCTAssertEqual(
+            model.presentation(for: account)?.display,
+            .outcome(text: "A renewal for this account is already running", kind: .failed)
+        )
+
+        model.dismissOutcome(accountID: "acct-1")
+        XCTAssertEqual(model.presentation(for: account)?.display, .action(.renewNow))
+    }
+
+    func testProgressOutranksOutcomeAndAction() {
+        // The display precedence itself: progress > outcome > action.
+        let running = AccountRenewPresentation(
+            action: .renewNow,
+            isRenewing: true,
+            outcomeText: "stale", outcomeKind: .busy
+        )
+        XCTAssertEqual(running.display, .progress)
+        XCTAssertEqual(
+            AccountRenewPresentation(action: .authOverridden).display,
+            .action(.authOverridden)
+        )
+        XCTAssertNil(AccountRenewPresentation(action: nil).display)
+    }
+
+    func testGlyphsAreSingleSourcedPerOutcomeKind() {
+        // The deck card and Settings row share these; busy stays a calm
+        // hourglass (a promise), never an alarm symbol.
+        XCTAssertEqual(AccountRenew.glyph(for: .renewed), "checkmark.circle")
+        XCTAssertEqual(AccountRenew.glyph(for: .busy), "hourglass")
+        XCTAssertEqual(AccountRenew.glyph(for: .rateLimited), "clock")
+        XCTAssertEqual(AccountRenew.glyph(for: .failed), "exclamationmark.circle")
+        XCTAssertEqual(AccountRenew.glyph(for: .other), "info.circle")
     }
 
     // MARK: - autoRenewEnabled setting

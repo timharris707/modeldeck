@@ -681,10 +681,6 @@ struct AccountRosterRow: View {
                             ? "This account's sign-in renews when it is next used; its usage data is paused until then"
                             : "This account needs a fresh sign-in"))
                 }
-                // Issue #176: the renew affordance rides beside the idle
-                // chip (nil presentation — old daemon, Codex, signed-out
-                // alarm — renders nothing at all).
-                renewControls
             } else if account.hasDuplicateToken, let onSignIn {
                 // Issue #152 (Tim: "I need something clickable to fix the
                 // issue"): a duplicate-flagged row keeps its honest Unknown
@@ -702,21 +698,36 @@ struct AccountRosterRow: View {
                     ))
                     .accessibilityLabel("Re-log in \(account.label)")
             }
+            // Issue #176: the renew surface rides in the same trailing slot
+            // (nil presentation — old daemon, Codex, signed-out alarm —
+            // renders nothing at all). Issue #199: it now renders OUTSIDE
+            // the idle-chip condition, because a just-renewed row heals its
+            // chip immediately while the decided outcome ("Sign-in
+            // renewed.") must still answer where the button was until
+            // dismissed — the heal alone read as a dead button in Tim's
+            // field report.
+            renewControls
         }
     }
 
     /// Issue #176: the expired-idle row's renew surface, in the same
     /// trailing slot family as the sign-in flow above. Running → calm
-    /// progress; finished → the daemon's decided outcome verbatim (calm
-    /// secondary, dismissible — a renewed account flips its chip healthy via
-    /// the fresh state, which is the real success feedback); otherwise the
-    /// small "Renew now" action, or the honest authOverride caption instead
-    /// of the button (never an error tone — that profile is configured to
-    /// authenticate elsewhere).
+    /// progress; finished → the daemon's decided outcome verbatim, held
+    /// until dismissed (issue #199: the chip flipping healthy is nice, but
+    /// the outcome line itself is the answer to the click — busy especially
+    /// must be seen, not inferred); otherwise the small "Renew now" action,
+    /// or the honest authOverride caption instead of the button (never an
+    /// error tone — that profile is configured to authenticate elsewhere).
     @ViewBuilder
     private var renewControls: some View {
+        // Issue #199: the row renders the presentation's single display
+        // slot (progress → decided outcome → armed action), so a finished
+        // attempt always answers AT the click site and the button never
+        // silently re-arms over an unread answer — the precedence lives in
+        // `AccountRenewPresentation.display`, where it's tested.
         if let renew {
-            if renew.isRenewing {
+            switch renew.display {
+            case .progress:
                 HStack(spacing: 5) {
                     ProgressView().controlSize(.small)
                     Text("Renewing…")
@@ -725,13 +736,18 @@ struct AccountRosterRow: View {
                 }
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel("Renewing sign-in for \(account.label)")
-            } else if let outcome = renew.outcomeText ?? renew.errorText {
+            case .outcome(let text, let kind):
+                // Daemon detail verbatim, dismissible (#196's pattern).
+                // Busy is prominent-and-calm (#199): primary tone and an
+                // hourglass — a promise to renew at the next quiet moment,
+                // never an alarm.
                 HStack(spacing: 5) {
-                    Text(outcome)
+                    Image(systemName: AccountRenew.glyph(for: kind))
+                        .font(.system(size: 9, weight: .semibold))
+                    Text(text)
                         .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
                         .lineLimit(1)
-                        .help(outcome)
+                        .help(text)
                     if let onDismissRenewOutcome {
                         Button(action: onDismissRenewOutcome) {
                             Image(systemName: "xmark")
@@ -742,23 +758,23 @@ struct AccountRosterRow: View {
                         .accessibilityLabel("Dismiss renewal result for \(account.label)")
                     }
                 }
-            } else {
-                switch renew.action {
-                case .renewNow:
-                    if let onRenewNow {
-                        Button("Renew now", action: onRenewNow)
-                            .controlSize(.small)
-                            .help("Renews this account's sign-in in the background — no Terminal, no browser. "
-                                + AccountRenew.disclosure)
-                            .accessibilityLabel("Renew sign-in for \(account.label)")
-                    }
-                case .authOverridden:
-                    Text(AccountRenew.authOverrideShort)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                        .help(AccountRenew.authOverrideExplanation)
-                        .accessibilityLabel(AccountRenew.authOverrideExplanation)
+                .foregroundStyle(kind == .busy ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+            case .action(.renewNow):
+                if let onRenewNow {
+                    Button("Renew now", action: onRenewNow)
+                        .controlSize(.small)
+                        .help("Renews this account's sign-in in the background — no Terminal, no browser. "
+                            + AccountRenew.disclosure)
+                        .accessibilityLabel("Renew sign-in for \(account.label)")
                 }
+            case .action(.authOverridden):
+                Text(AccountRenew.authOverrideShort)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .help(AccountRenew.authOverrideExplanation)
+                    .accessibilityLabel(AccountRenew.authOverrideExplanation)
+            case nil:
+                EmptyView()
             }
         }
     }

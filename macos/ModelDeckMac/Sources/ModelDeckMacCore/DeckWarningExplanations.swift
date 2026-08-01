@@ -121,6 +121,10 @@ public struct DeckWarningExplanation: Equatable, Sendable {
                 body += "\n\n\(AccountRenew.disclosure)"
             case .authOverridden:
                 body += "\n\n\(AccountRenew.authOverrideExplanation)"
+            case nil:
+                // Issue #199: no armed action (e.g. a healed row whose
+                // outcome still lingers) — nothing renew-specific to offer.
+                break
             }
             if let outcome = renew.outcomeText ?? renew.errorText {
                 body += "\n\nLast renewal attempt: \(outcome)"

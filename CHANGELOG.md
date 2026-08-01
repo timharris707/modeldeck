@@ -4,6 +4,26 @@ All notable changes to ModelDeck are documented here. Versioning follows the
 roadmap in `design/mac-app-roadmap.md`: `v0.1-web` tags the retired web MVP,
 and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 
+## 0.3.12 — 2026-07-31
+
+Auto-renew, now for people who actually work: renewal no longer waits
+for a moment when Claude isn't running.
+
+### Fixed
+- **Idle accounts renew even while you're working (issue #199, Tim
+  report, first hour on 0.3.11)**: renewal used to defer whenever any
+  Claude session was open — which for busy users meant it never ran.
+  ModelDeck now renews without touching the active-account switch: it
+  first verifies — for free — which account actually answers under the
+  target profile, and proceeds only on a confirmed match, so the wrong
+  account can never be billed. The switch-flipping path (which still
+  needs a quiet machine) remains only as a rare fallback, and deferred
+  attempts no longer count against renewal's daily budget.
+- **Renew now answers where you clicked (issue #199)**: the button now
+  shows its outcome inline — renewed, busy ("a Claude session is
+  running; ModelDeck will renew at the next quiet moment"), limit
+  reached, or failed — instead of burying it in the details text.
+
 ## 0.3.11 — 2026-07-31
 
 The hands-off release: idle accounts now keep themselves fresh, so the

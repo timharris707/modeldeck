@@ -275,6 +275,11 @@ struct DeckPopoverView: View {
                             renewPresentation: { renewModel.presentation(for: $0.account) },
                             onRenewNow: { row in
                                 Task { await renewModel.renew(account: row.account) }
+                            },
+                            onDismissRenewOutcome: { row in
+                                // Issue #199: explicit dismiss re-arms the
+                                // affordance — never a silent timeout.
+                                renewModel.dismissOutcome(accountID: row.account.id)
                             }
                         )
                         .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -295,6 +300,9 @@ struct DeckPopoverView: View {
                             renew: renewModel.presentation(for: row.account),
                             onRenewNow: {
                                 Task { await renewModel.renew(account: row.account) }
+                            },
+                            onDismissRenewOutcome: {
+                                renewModel.dismissOutcome(accountID: row.account.id)
                             }
                         ) {
                             withAnimation(.easeOut(duration: 0.15)) {
@@ -461,6 +469,8 @@ struct DeckColumnView: View {
     /// `staleness`). Defaults render nothing for previews/tests.
     var renewPresentation: (DeckAccountRow) -> AccountRenewPresentation? = { _ in nil }
     var onRenewNow: (DeckAccountRow) -> Void = { _ in }
+    /// Issue #199: per-row dismiss for the inline renew outcome line.
+    var onDismissRenewOutcome: (DeckAccountRow) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -493,7 +503,8 @@ struct DeckColumnView: View {
                         isExpanded: deckModel.isExpanded(row.id),
                         staleness: staleness(row),
                         renew: renewPresentation(row),
-                        onRenewNow: { onRenewNow(row) }
+                        onRenewNow: { onRenewNow(row) },
+                        onDismissRenewOutcome: { onDismissRenewOutcome(row) }
                     ) {
                         withAnimation(.easeOut(duration: 0.15)) {
                             deckModel.toggleExpansion(of: row.id)
@@ -568,6 +579,10 @@ struct DeckAccountRowView: View {
     /// the card stays free of the renew model (the popover observes it).
     var renew: AccountRenewPresentation? = nil
     var onRenewNow: (() -> Void)? = nil
+    /// Issue #199: clears the inline outcome line (the click site's answer)
+    /// and re-arms the renew affordance — the row's explicit dismiss, same
+    /// contract as the Settings row's xmark.
+    var onDismissRenewOutcome: (() -> Void)? = nil
     let onToggle: () -> Void
     /// Issue #118: the "Sign in again…" action opens the Settings window
     /// (Accounts pane, via the model's routed selection) — the environment
@@ -689,7 +704,7 @@ struct DeckAccountRowView: View {
             // SAME slot with the SAME click path — only glyph, color, and
             // wording calm down (neutral secondary, never amber). Zero
             // functionality lost in either tone.
-            if row.signInRecovery != nil, renew?.isRenewing == true {
+            if renew?.display == .progress {
                 // Issue #176: while the daemon runs this account's renewal
                 // the notice slot itself carries the progress — the SAME
                 // single-line footprint (Tim's constraint on PR #150: the
@@ -704,6 +719,34 @@ struct DeckAccountRowView: View {
                 .foregroundStyle(Color.secondary)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel("Renewing sign-in for \(row.account.label)")
+            } else if case .outcome(let text, let kind)? = renew?.display {
+                // Issue #199 (Tim's field report, first hour on 0.3.11): the
+                // decided outcome renders HERE, in the very slot the progress
+                // line just occupied — never only in the explanation's "Last
+                // renewal attempt" small print, where a busy refusal read as
+                // a dead button. Same one-line footprint (the PR #150
+                // no-growth contract), daemon detail verbatim, and it holds
+                // the slot until dismissed (the #196 Settings outcome-line
+                // pattern) so the button can't silently re-arm into an
+                // apparent no-op. Busy is prominent-and-calm: primary tone,
+                // hourglass — a promise to renew, not an alarm.
+                HStack(spacing: 4) {
+                    Image(systemName: AccountRenew.glyph(for: kind))
+                        .font(.system(size: 9, weight: .semibold))
+                    Text(text)
+                        .font(.system(size: 10))
+                        .lineLimit(1)
+                    if let onDismissRenewOutcome {
+                        Button(action: onDismissRenewOutcome) {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 8))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Dismiss renewal result for \(row.account.label)")
+                    }
+                }
+                .foregroundStyle(kind == .busy ? Color.primary : Color.secondary)
+                .help(text)
             } else if let recovery = row.signInRecovery {
                 let warningID = DeckWarningID(topic: .signInRequired, elementID: row.id)
                 Button {

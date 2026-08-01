@@ -56,11 +56,83 @@ const CLAUDE_RENEWAL_BACKOFF_MS = 30 * 60_000;
 const CLAUDE_RENEWAL_DAY_MS = 24 * 60 * 60_000;
 const CLAUDE_RENEWAL_DAILY_LIMIT = 6;
 const CLAUDE_RENEWAL_MODEL = 'claude-haiku-4-5-20251001';
+const CLAUDE_RENEWAL_BUSY_DETAIL = 'A Claude session is running; ModelDeck will renew at the next quiet moment.';
+const CLAUDE_RENEWAL_BUDGET_OUTCOMES = new Set(['renewed', 'failed']);
 const CLAUDE_AUTH_OVERRIDE_KEYS = [
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_BASE_URL',
 ];
+
+const CLAUDE_RENEWAL_EMAIL_PATTERN = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+const CLAUDE_RENEWAL_EMAIL_KEYS = new Set([
+  'email', 'emailaddress', 'email_address', 'signedinas', 'signed_in_as',
+]);
+const CLAUDE_RENEWAL_UUID_KEYS = new Set(['accountuuid', 'account_uuid']);
+const CLAUDE_RENEWAL_AUTHENTICATED_KEYS = new Set([
+  'authenticated', 'isauthenticated', 'is_authenticated', 'loggedin', 'logged_in',
+]);
+
+// Issue #199: `claude auth status --json` is allowed to authorize a renewal
+// without flipping ~/.claude only when the command itself names the intended
+// account. Keep this parser deliberately stricter than the onboarding status
+// parser: no plain-text fallback, and no search for arbitrary email-shaped
+// strings or generic IDs elsewhere in the payload.
+function claudeRenewalStatusIdentity(output) {
+  const text = String(output ?? '').trim();
+  if (!text) return null;
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return null; }
+  if (parsed == null || typeof parsed !== 'object') return null;
+
+  const identity = {
+    emails: new Set(),
+    accountUuids: new Set(),
+    malformed: false,
+    explicitlyUnauthenticated: false,
+  };
+  const visit = (value, depth = 0) => {
+    if (depth > 4 || value == null || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1);
+      return;
+    }
+    for (const [key, item] of Object.entries(value)) {
+      const normalizedKey = key.toLowerCase();
+      if (CLAUDE_RENEWAL_EMAIL_KEYS.has(normalizedKey) && typeof item === 'string' && item.trim()) {
+        const email = item.trim().toLowerCase();
+        if (CLAUDE_RENEWAL_EMAIL_PATTERN.test(email)) identity.emails.add(email);
+        else identity.malformed = true;
+      }
+      if (CLAUDE_RENEWAL_UUID_KEYS.has(normalizedKey) && typeof item === 'string' && item.trim()) {
+        identity.accountUuids.add(item.trim());
+      }
+      if (CLAUDE_RENEWAL_AUTHENTICATED_KEYS.has(normalizedKey)
+        && (item === false || (typeof item === 'string' && item.trim().toLowerCase() === 'false'))) {
+        identity.explicitlyUnauthenticated = true;
+      }
+      visit(item, depth + 1);
+    }
+  };
+  visit(parsed);
+  return identity.emails.size || identity.accountUuids.size ? identity : null;
+}
+
+function claudeRenewalIdentityMatches(account, reported) {
+  if (!reported || reported.malformed || reported.explicitlyUnauthenticated) return false;
+  const expectedEmail = account?.identity?.trim().toLowerCase() || null;
+  const expectedAccountUuid = typeof account?.metadata?.claudeAccountUuid === 'string'
+    ? account.metadata.claudeAccountUuid.trim() || null
+    : null;
+  const comparisons = [];
+  if (expectedEmail && reported.emails.size) {
+    comparisons.push(...[...reported.emails].map((email) => email === expectedEmail));
+  }
+  if (expectedAccountUuid && reported.accountUuids.size) {
+    comparisons.push(...[...reported.accountUuids].map((uuid) => uuid === expectedAccountUuid));
+  }
+  return comparisons.length > 0 && comparisons.every(Boolean);
+}
 
 // Issue #90 provenance: "customized" is the persisted change-event flag
 // (db.mjs saveSettings flips it — permanently — when a write CHANGES the
@@ -301,6 +373,7 @@ export class ModelDeckService {
     this.migrateClaude = options.migrateClaude || migrateClaudeSwapProfiles;
     this.exec = options.exec || options.execFile || options.run || execFileAsync;
     this.childEnv = options.childEnv || process.env;
+    this.userInfo = options.userInfo || os.userInfo;
     this.listProviderProcesses = options.listProviderProcesses || (async () => {
       const result = await this.exec('/bin/ps', ['-U', os.userInfo().username, '-o', 'comm='], {
         timeout: 5_000,
@@ -1405,7 +1478,7 @@ export class ModelDeckService {
     if (!account) return attempt;
     const timestamp = Date.parse(attempt.at);
     const attempts = this.renewalAttemptHistory(account, Number.isFinite(timestamp) ? timestamp : this.now());
-    attempts.push(attempt.at);
+    if (CLAUDE_RENEWAL_BUDGET_OUTCOMES.has(attempt.outcome)) attempts.push(attempt.at);
     const metadata = {
       ...account.metadata,
       claudeRenewal: {
@@ -1431,8 +1504,8 @@ export class ModelDeckService {
     const timestamp = this.now();
     const history = this.renewalAttemptHistory(account, timestamp);
     if (history.length >= CLAUDE_RENEWAL_DAILY_LIMIT) return false;
-    const lastAt = Date.parse(account?.metadata?.claudeRenewal?.lastAttempt?.at);
-    return !Number.isFinite(lastAt) || timestamp - lastAt >= CLAUDE_RENEWAL_BACKOFF_MS;
+    const lastAt = history.reduce((latest, at) => Math.max(latest, Date.parse(at)), Number.NEGATIVE_INFINITY);
+    return timestamp - lastAt >= CLAUDE_RENEWAL_BACKOFF_MS;
   }
 
   claudeRenewalEnv(profileRef) {
@@ -1440,12 +1513,16 @@ export class ModelDeckService {
     for (const key of CLAUDE_AUTH_OVERRIDE_KEYS) delete env[key];
     env.CLAUDE_CONFIG_DIR = profileRef;
     env.CLAUDE_SECURESTORAGE_CONFIG_DIR = profileRef;
+    // Native Claude resolves its Keychain item from USER. launchd does not
+    // reliably supply it, so restore only the OS username just as the normal
+    // auth-status adapter does.
+    env.USER = this.userInfo().username;
     return env;
   }
 
   async runClaudeRenewalCli(args, profileRef) {
     await fs.promises.mkdir(this.claudeRenewalScratchDir, { recursive: true, mode: 0o700 });
-    await this.exec(this.claudePath, args, {
+    return this.exec(this.claudePath, args, {
       cwd: this.claudeRenewalScratchDir,
       env: this.claudeRenewalEnv(profileRef),
       timeout: CLAUDE_RENEWAL_TIMEOUT_MS,
@@ -1513,6 +1590,114 @@ export class ModelDeckService {
     await fs.promises.unlink(this.claudeActiveLink);
   }
 
+  async finishClaudeRenewal(account, at, renewalPath) {
+    let result = {
+      at,
+      outcome: 'failed',
+      mechanism: 'auth-status',
+      detail: 'Claude did not refresh this account’s expired stored sign-in.',
+      path: renewalPath,
+    };
+    let verified = await this.probeClaudeRenewal(account);
+    if (verified.ok) {
+      return {
+        at,
+        outcome: 'renewed',
+        mechanism: 'auth-status',
+        detail: 'Claude refreshed this account’s stored sign-in without an inference request.',
+        path: renewalPath,
+      };
+    }
+    if (!verified.expired) return result;
+
+    result.mechanism = 'invoke';
+    try {
+      await this.runClaudeRenewalCli(['-p', 'ok', '--model', CLAUDE_RENEWAL_MODEL], account.profileRef);
+    } catch (error) {
+      if (this.claudeModelRejected(error)) {
+        try {
+          await this.runClaudeRenewalCli(['-p', 'ok'], account.profileRef);
+        } catch {
+          // Verification, not CLI exit status, decides the outcome.
+        }
+      }
+    }
+    verified = await this.probeClaudeRenewal(account);
+    if (verified.ok) {
+      result = {
+        at,
+        outcome: 'renewed',
+        mechanism: 'invoke',
+        detail: 'Claude refreshed this account’s stored sign-in with the minimal renewal request.',
+        path: renewalPath,
+      };
+    }
+    return result;
+  }
+
+  async performClaudeFlipRenewal(account, at) {
+    let previous;
+    let activated = false;
+    let result = {
+      at,
+      outcome: 'failed',
+      mechanism: null,
+      detail: 'Claude did not refresh this account’s expired stored sign-in.',
+      path: 'flip',
+    };
+    try {
+      previous = await this.priorClaudeActivation();
+      if (previous.state === 'linked') {
+        try {
+          await validateClaudeProfileHome({
+            profileRef: previous.profileRef,
+            profilesDir: this.claudeProfilesDir,
+          });
+        } catch {
+          const error = new Error('unsafe Claude renewal restore path');
+          error.code = 'claude-renewal-restore-unsafe';
+          throw error;
+        }
+      }
+      await this.activateClaude({
+        profileRef: account.profileRef,
+        activeLink: this.claudeActiveLink,
+        profilesDir: this.claudeProfilesDir,
+      });
+      activated = true;
+
+      try {
+        await this.runClaudeRenewalCli(['auth', 'status', '--json'], account.profileRef);
+      } catch {
+        // The provider command is only a trigger. Its exit status is never
+        // renewal evidence; the target profile's probe below is authoritative.
+      }
+      result = await this.finishClaudeRenewal(account, at, 'flip');
+    } catch (error) {
+      if (error?.code === 'claude-renewal-restore-unsafe') {
+        result.detail = 'ModelDeck could not safely verify the previously active Claude profile, so renewal was not attempted.';
+      }
+      // Keep the stable, non-sensitive failure sentence above. Child output
+      // and profile paths are intentionally never copied into API state.
+    } finally {
+      if (activated) {
+        try {
+          await this.restoreClaudeActivation(previous);
+        } catch {
+          result = {
+            at,
+            outcome: 'failed',
+            mechanism: result.mechanism,
+            detail: 'ModelDeck could not restore the previously active Claude profile after renewal.',
+            path: 'flip',
+            restoreFailed: true,
+          };
+        }
+      }
+    }
+    return result;
+  }
+
   async performClaudeRenewal(accountId) {
     const account = this.store.getAccount(accountId);
     if (account && account.provider !== 'claude') {
@@ -1542,102 +1727,29 @@ export class ModelDeckService {
     if (!override.readable) {
       return decided('failed', null, 'ModelDeck could not safely inspect this profile’s Claude settings, so renewal was not attempted.');
     }
+
+    let authStatus;
+    try {
+      authStatus = await this.runClaudeRenewalCli(['auth', 'status', '--json'], account.profileRef);
+    } catch (error) {
+      authStatus = error;
+    }
+
+    const reportedIdentity = claudeRenewalStatusIdentity(authStatus?.stdout);
+    if (claudeRenewalIdentityMatches(account, reportedIdentity)) {
+      const result = await this.finishClaudeRenewal(account, at, 'no-flip');
+      return this.recordClaudeRenewalAttempt(accountId, result);
+    }
+
     try {
       if (await this.runningClaudeProcessCount()) {
-        return decided('busy', null, 'Claude is currently running, so renewal was not attempted.');
+        return decided('busy', null, CLAUDE_RENEWAL_BUSY_DETAIL, { path: 'flip' });
       }
     } catch {
-      return decided('failed', null, 'ModelDeck could not confirm that Claude was idle, so renewal was not attempted.');
+      return decided('failed', null, 'ModelDeck could not confirm that Claude was idle, so renewal was not attempted.', { path: 'flip' });
     }
 
-    let previous;
-    let activated = false;
-    let result = {
-      at,
-      outcome: 'failed',
-      mechanism: null,
-      detail: 'Claude did not refresh this account’s expired stored sign-in.',
-    };
-    try {
-      previous = await this.priorClaudeActivation();
-      if (previous.state === 'linked') {
-        try {
-          await validateClaudeProfileHome({
-            profileRef: previous.profileRef,
-            profilesDir: this.claudeProfilesDir,
-          });
-        } catch {
-          const error = new Error('unsafe Claude renewal restore path');
-          error.code = 'claude-renewal-restore-unsafe';
-          throw error;
-        }
-      }
-      await this.activateClaude({
-        profileRef: account.profileRef,
-        activeLink: this.claudeActiveLink,
-        profilesDir: this.claudeProfilesDir,
-      });
-      activated = true;
-
-      result.mechanism = 'auth-status';
-      try {
-        await this.runClaudeRenewalCli(['auth', 'status', '--json'], account.profileRef);
-      } catch {
-        // The provider command is only a trigger. Its exit status is never
-        // renewal evidence; the target profile's probe below is authoritative.
-      }
-      let verified = await this.probeClaudeRenewal(account);
-      if (verified.ok) {
-        result = {
-          at,
-          outcome: 'renewed',
-          mechanism: 'auth-status',
-          detail: 'Claude refreshed this account’s stored sign-in without an inference request.',
-        };
-      } else if (verified.expired) {
-        result.mechanism = 'invoke';
-        try {
-          await this.runClaudeRenewalCli(['-p', 'ok', '--model', CLAUDE_RENEWAL_MODEL], account.profileRef);
-        } catch (error) {
-          if (this.claudeModelRejected(error)) {
-            try {
-              await this.runClaudeRenewalCli(['-p', 'ok'], account.profileRef);
-            } catch {
-              // Verification, not CLI exit status, decides the outcome.
-            }
-          }
-        }
-        verified = await this.probeClaudeRenewal(account);
-        if (verified.ok) {
-          result = {
-            at,
-            outcome: 'renewed',
-            mechanism: 'invoke',
-            detail: 'Claude refreshed this account’s stored sign-in with the minimal renewal request.',
-          };
-        }
-      }
-    } catch (error) {
-      if (error?.code === 'claude-renewal-restore-unsafe') {
-        result.detail = 'ModelDeck could not safely verify the previously active Claude profile, so renewal was not attempted.';
-      }
-      // Keep the stable, non-sensitive failure sentence above. Child output
-      // and profile paths are intentionally never copied into API state.
-    } finally {
-      if (activated) {
-        try {
-          await this.restoreClaudeActivation(previous);
-        } catch {
-          result = {
-            at,
-            outcome: 'failed',
-            mechanism: result.mechanism,
-            detail: 'ModelDeck could not restore the previously active Claude profile after renewal.',
-            restoreFailed: true,
-          };
-        }
-      }
-    }
+    const result = await this.performClaudeFlipRenewal(account, at);
     return this.recordClaudeRenewalAttempt(accountId, result);
   }
 
@@ -1646,12 +1758,12 @@ export class ModelDeckService {
     const account = this.store.getAccount(accountId);
     if (account?.provider === 'claude'
       && this.renewalAttemptHistory(account).length >= CLAUDE_RENEWAL_DAILY_LIMIT) {
-      return {
+      return this.recordClaudeRenewalAttempt(account.id, {
         at: new Date(this.now()).toISOString(),
         outcome: 'rate-limited',
         mechanism: null,
         detail: 'This account has reached the Claude renewal limit for the last 24 hours; try again later.',
-      };
+      });
     }
     const promise = this.withClaudeActivationLock(() => this.performClaudeRenewal(accountId));
     this.claudeRenewalPromise = promise;
@@ -1674,11 +1786,6 @@ export class ModelDeckService {
       if (!settings.autoRefreshEnabled || !settings.autoRenewEnabled) break;
       const account = this.store.getAccount(candidate.accountId);
       if (!account || account.provider !== 'claude' || !account.enabled || !this.renewalAttemptAllowed(account)) continue;
-      try {
-        if (await this.runningClaudeProcessCount()) break;
-      } catch {
-        break;
-      }
       try {
         const renew = await this.renewClaudeAccount(account.id);
         outcomes.push({ accountId: account.id, ...renew });

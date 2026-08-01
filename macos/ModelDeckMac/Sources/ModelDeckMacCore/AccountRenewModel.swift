@@ -30,25 +30,62 @@ public enum AccountRenewAction: Equatable, Sendable {
 /// Everything a row (deck card or Settings roster) needs to render its renew
 /// state: derived by `AccountRenewModel.presentation(for:)`, plain values so
 /// child views stay free of the model.
+///
+/// Issue #199 (Tim field report, first hour on 0.3.11): `action` is now
+/// optional — a just-renewed account heals its chip and loses the renew
+/// affordance, but the decided outcome ("Sign-in renewed.") must still
+/// render where the button was, so the click can never look like a no-op.
 public struct AccountRenewPresentation: Equatable, Sendable {
-    public var action: AccountRenewAction
+    public var action: AccountRenewAction?
     public var isRenewing: Bool
     /// Calm one-line outcome of the last finished attempt (daemon `detail`
     /// preferred verbatim); nil until an attempt finishes.
     public var outcomeText: String?
+    /// Issue #199: which family the finished outcome belongs to, so the
+    /// click site can style busy prominently-but-calmly without re-parsing
+    /// the text. nil whenever `outcomeText` is nil.
+    public var outcomeKind: AccountRenew.OutcomeKind?
     /// Transport-level failure (daemon unreachable, 409 renewal-in-flight).
     public var errorText: String?
 
     public init(
-        action: AccountRenewAction,
+        action: AccountRenewAction?,
         isRenewing: Bool = false,
         outcomeText: String? = nil,
+        outcomeKind: AccountRenew.OutcomeKind? = nil,
         errorText: String? = nil
     ) {
         self.action = action
         self.isRenewing = isRenewing
         self.outcomeText = outcomeText
+        self.outcomeKind = outcomeKind
         self.errorText = errorText
+    }
+
+    /// Issue #199 — the ONE thing the click site renders right now, in
+    /// strict precedence: progress while the daemon runs, then the decided
+    /// outcome (or transport error) until dismissed, and only then the
+    /// armed action. Encoding the precedence here (not in each view) is
+    /// what makes "the button never silently re-arms over an unread
+    /// answer" a testable invariant instead of a per-surface hope.
+    public enum Display: Equatable, Sendable {
+        case progress
+        case outcome(text: String, kind: AccountRenew.OutcomeKind)
+        case action(AccountRenewAction)
+    }
+
+    public var display: Display? {
+        if isRenewing { return .progress }
+        if let outcomeText {
+            return .outcome(text: outcomeText, kind: outcomeKind ?? .other)
+        }
+        if let errorText {
+            // Transport failures answer at the click site too — the failed
+            // styling, the daemon's own message verbatim.
+            return .outcome(text: errorText, kind: .failed)
+        }
+        if let action { return .action(action) }
+        return nil
     }
 }
 
@@ -82,6 +119,48 @@ public enum AccountRenew {
         return renew.available ? .renewNow : nil
     }
 
+    /// Issue #199: the busy fallback matches the engine's own pinned detail
+    /// sentence for the deferred case, so a daemon that omits `detail`
+    /// reads identically to one that sends it — busy is a promise to renew
+    /// at the next quiet moment, never a shrug.
+    public static let busyFallback = "A Claude session is running; ModelDeck will renew at the next quiet moment."
+
+    /// Issue #199: the outcome families the click site styles differently
+    /// (busy prominent-and-calm, renewed a quiet confirmation, failures
+    /// matter-of-fact). Unknown daemon outcomes land in `.other` — the
+    /// #196 tolerate-unknowns contract, unchanged.
+    public enum OutcomeKind: Equatable, Sendable {
+        case renewed
+        case busy
+        case rateLimited
+        case failed
+        case other
+    }
+
+    public static func outcomeKind(for renewal: AccountRenewal) -> OutcomeKind {
+        switch renewal.outcome {
+        case "renewed": return .renewed
+        case "busy": return .busy
+        case "rate-limited": return .rateLimited
+        case "failed": return .failed
+        default: return .other
+        }
+    }
+
+    /// Issue #199: the click-site outcome line's SF Symbol per family —
+    /// single-sourced here so the deck card and the Settings row can never
+    /// drift apart. Calm glyphs by design: busy is an hourglass, not an
+    /// alarm.
+    public static func glyph(for kind: OutcomeKind) -> String {
+        switch kind {
+        case .renewed: return "checkmark.circle"
+        case .busy: return "hourglass"
+        case .rateLimited: return "clock"
+        case .failed: return "exclamationmark.circle"
+        case .other: return "info.circle"
+        }
+    }
+
     /// Calm one-line text for a decided outcome. The daemon's own `detail`
     /// sentence is preferred verbatim; the fallbacks below cover a daemon
     /// that sent none. Refusals stay matter-of-fact — never alarm copy.
@@ -93,7 +172,7 @@ public enum AccountRenew {
         case "renewed":
             return "Sign-in renewed."
         case "busy":
-            return "Claude is in use right now — renewal will retry later."
+            return busyFallback
         case "signin-required":
             return "This account needs a fresh sign-in — renewal can't fix that."
         case "auth-overridden":
@@ -143,19 +222,31 @@ public final class AccountRenewModel: ObservableObject {
 
     /// The row's complete renew rendering state; nil whenever the account
     /// doesn't earn a renew affordance (healthy, signed out, Codex, old
-    /// daemon) — the daemon's state is authoritative, so a mid-run heal
-    /// simply makes the affordance (and any leftover outcome) disappear.
+    /// daemon) AND holds no attempt state.
+    ///
+    /// Issue #199: a finished attempt (or transport error) keeps the
+    /// presentation alive even after the affordance itself is gone — the
+    /// success path heals the chip via the fresh state, which removes the
+    /// action, but the decided outcome must still answer at the click site
+    /// until dismissed. Tim's field report: an outcome that lives only in
+    /// the explanation's small print reads as a dead button.
     public func presentation(for account: DeckAccount) -> AccountRenewPresentation? {
-        guard let action = AccountRenew.action(for: account) else { return nil }
+        let action = AccountRenew.action(for: account)
+        let phase = phases[account.id]
+        let error = errors[account.id]
+        guard action != nil || phase != nil || error != nil else { return nil }
         var outcome: String?
-        if case .finished(let renewal) = phases[account.id] {
+        var kind: AccountRenew.OutcomeKind?
+        if case .finished(let renewal) = phase {
             outcome = AccountRenew.outcomeText(for: renewal)
+            kind = AccountRenew.outcomeKind(for: renewal)
         }
         return AccountRenewPresentation(
             action: action,
-            isRenewing: isRenewing(account.id),
+            isRenewing: phase == .running,
             outcomeText: outcome,
-            errorText: errors[account.id]
+            outcomeKind: kind,
+            errorText: error
         )
     }
 
