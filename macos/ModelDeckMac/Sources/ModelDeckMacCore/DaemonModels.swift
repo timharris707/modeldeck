@@ -615,23 +615,30 @@ public struct DeckState: Codable, Equatable, Sendable {
     /// contract as `activation` — absent or unexpectedly shaped reads as
     /// nil (and a nil block never triggers the missing-binary repair).
     public var daemon: DeckDaemonRuntime?
+    /// Issue #204: the shared-user-scope feature state (`sharedScope:
+    /// {enabled, lastOutcome}`). The WHOLE object is optional for
+    /// daemon-version skew — the #174 claudeStatusline / #196 renew
+    /// precedents: a pre-#204 daemon omits it, nil renders nothing.
+    public var sharedScope: SharedScopeStatus?
 
     public init(
         accounts: [DeckAccount] = [],
         usage: [UsageSnapshot] = [],
         activation: DeckActivation? = nil,
         scheduler: DeckScheduler? = nil,
-        daemon: DeckDaemonRuntime? = nil
+        daemon: DeckDaemonRuntime? = nil,
+        sharedScope: SharedScopeStatus? = nil
     ) {
         self.accounts = accounts
         self.usage = usage
         self.activation = activation
         self.scheduler = scheduler
         self.daemon = daemon
+        self.sharedScope = sharedScope
     }
 
     private enum CodingKeys: String, CodingKey {
-        case accounts, usage, activation, scheduler, daemon
+        case accounts, usage, activation, scheduler, daemon, sharedScope
     }
 
     public init(from decoder: Decoder) throws {
@@ -641,6 +648,7 @@ public struct DeckState: Codable, Equatable, Sendable {
         self.activation = try? container.decodeIfPresent(DeckActivation.self, forKey: .activation)
         self.scheduler = try? container.decodeIfPresent(DeckScheduler.self, forKey: .scheduler)
         self.daemon = try? container.decodeIfPresent(DeckDaemonRuntime.self, forKey: .daemon)
+        self.sharedScope = try? container.decodeIfPresent(SharedScopeStatus.self, forKey: .sharedScope)
     }
 
     /// Issue #185: true exactly when the daemon ADMITTED its executable no

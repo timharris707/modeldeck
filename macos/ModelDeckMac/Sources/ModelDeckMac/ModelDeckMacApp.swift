@@ -13,6 +13,9 @@ struct ModelDeckMacApp: App {
     /// Issue #176: "Renew now" for expired-idle Claude accounts — one shared
     /// state behind the deck cards and the Settings roster rows.
     @StateObject private var renewModel: AccountRenewModel
+    /// Issue #204: shared user scope (tools & memory across Claude
+    /// accounts) — the confirmation-gated enable/disable state machine.
+    @StateObject private var sharedScopeModel: SharedScopeModel
     @StateObject private var toolUpdateModel: ToolUpdateModel
     @StateObject private var appUpdateModel: AppUpdateModel
     @StateObject private var appUpdateAutoChecker: AppUpdateAutoChecker
@@ -90,6 +93,10 @@ struct ModelDeckMacApp: App {
         // verify); the model only asks, shows progress, and relays the
         // decided outcome calmly.
         let renewModel = AccountRenewModel(renewer: client, stateProvider: client)
+        // Issue #204: the daemon owns the shared-scope mechanism end to end
+        // (backups, section-level merge, reversibility); the model only asks
+        // for the guarded op and relays the disclosed outcome calmly.
+        let sharedScopeModel = SharedScopeModel(controller: client, stateProvider: client)
         let toolUpdateModel = ToolUpdateModel(updater: client)
         // Issue #33: the app's own update check against the PUBLIC repo's
         // GitHub releases feed. Strictly separate from CLI updates; no
@@ -241,6 +248,12 @@ struct ModelDeckMacApp: App {
         renewModel.onStateChanged = { [weak statusModel] state in
             statusModel?.apply(deckState: state)
         }
+        // Issue #204: every finished (or refused) shared-scope op lands its
+        // fresh state in the deck immediately — the Settings toggle renders
+        // the daemon-reported enabled flag, so state honesty is this wire.
+        sharedScopeModel.onStateChanged = { [weak statusModel] state in
+            statusModel?.apply(deckState: state)
+        }
         // Issue #118: the deck's sign-in-needed notice offers a one-click
         // "Sign in again…" that must run the SAME flow as the roster chip.
         // Resolve the requested id against the freshest state (no-op when
@@ -301,6 +314,7 @@ struct ModelDeckMacApp: App {
         _addAccountModel = StateObject(wrappedValue: addAccountModel)
         _signInModel = StateObject(wrappedValue: signInModel)
         _renewModel = StateObject(wrappedValue: renewModel)
+        _sharedScopeModel = StateObject(wrappedValue: sharedScopeModel)
         _toolUpdateModel = StateObject(wrappedValue: toolUpdateModel)
         _appUpdateModel = StateObject(wrappedValue: appUpdateModel)
         _appUpdateAutoChecker = StateObject(wrappedValue: appUpdateAutoChecker)
@@ -402,7 +416,8 @@ struct ModelDeckMacApp: App {
                 appUpdateAutoChecker: appUpdateAutoChecker,
                 appUpdateInstallModel: appUpdateInstallModel,
                 daemonSetupModel: daemonSetupModel,
-                launchAtLoginModel: launchAtLoginModel
+                launchAtLoginModel: launchAtLoginModel,
+                sharedScopeModel: sharedScopeModel
             )
         }
     }

@@ -284,6 +284,28 @@ public struct DaemonClient: Sendable {
         return envelope.renew
     }
 
+    // MARK: - Shared user scope (issue #204)
+
+    /// `POST /api/shared-scope/{enable|disable}` — the guarded shared-scope
+    /// op. NEVER the plain settings PUT: enabling runs the daemon's
+    /// disclosed one-time merge (backups, section-level union, symlinks) and
+    /// disabling restores per-profile state. Every decided outcome answers
+    /// 200 with `{"sharedScope": {...}}`; 409 means an op is already in
+    /// flight and surfaces as the standard daemon error (the model relays it
+    /// as the calm "already in progress" notice, never a failure).
+    public func setSharedScope(enabled: Bool) async throws -> SharedScopeOutcome {
+        struct Envelope: Decodable { var sharedScope: SharedScopeOutcome }
+        var request = try await authorizedRequest(
+            method: "POST",
+            pathComponents: ["api", "shared-scope", enabled ? "enable" : "disable"]
+        )
+        // The merge/restore walks every profile's files with pre-op backups;
+        // give the round trip more room than the instant reads.
+        request.timeoutInterval = 60
+        let envelope: Envelope = try await send(request)
+        return envelope.sharedScope
+    }
+
     // MARK: - Account editing (issue #7)
 
     /// `POST /api/accounts` — upsert. With an existing account's `id` and

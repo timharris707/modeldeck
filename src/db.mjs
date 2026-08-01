@@ -43,6 +43,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
   // the #90 active-session cap are opt-in via the Settings toggle; a
   // stored value from an older install is preserved as-is.
   pauseWhileActive: false,
+  // Issue #204: sharing Claude's user-scope MCP configuration and memory is
+  // deliberately opt-in. The engine never infers consent from shared files
+  // left behind by an earlier enable/disable cycle.
+  sharedUserScopeEnabled: false,
   layout: 'two-column',
   defaultSort: 'next-reset',
   notificationThresholdPercent: 25,
@@ -58,7 +62,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
 
 function validateSetting(key, value) {
   if (!Object.hasOwn(DEFAULT_SETTINGS, key)) throw new Error(`unknown setting: ${key}`);
-  if (['autoRefreshEnabled', 'autoRenewEnabled', 'autoRefreshIntervalCustomized', 'pauseWhileActive'].includes(key) && typeof value !== 'boolean') {
+  if (['autoRefreshEnabled', 'autoRenewEnabled', 'autoRefreshIntervalCustomized', 'pauseWhileActive', 'sharedUserScopeEnabled'].includes(key) && typeof value !== 'boolean') {
     throw new Error(`${key} must be a boolean`);
   }
   if (key === 'autoRefreshIntervalSeconds' && (!Number.isInteger(value) || value < 60 || value > 3600)) {

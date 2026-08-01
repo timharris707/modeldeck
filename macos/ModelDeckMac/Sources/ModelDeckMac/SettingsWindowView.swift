@@ -32,6 +32,9 @@ struct SettingsWindowView: View {
     /// Shared launch-at-login state; the SMAppService status read lives in
     /// the model's load(), not in any view-struct initializer.
     @ObservedObject var launchAtLoginModel: LaunchAtLoginModel
+    /// Issue #204: shared user scope (tools & memory across Claude accounts)
+    /// — confirmation-gated enable/disable with the disclosed merge outcome.
+    @ObservedObject var sharedScopeModel: SharedScopeModel
 
     var body: some View {
         // Issue #118: the tab selection is model state so the deck's
@@ -59,7 +62,8 @@ struct SettingsWindowView: View {
                 appUpdateAutoChecker: appUpdateAutoChecker,
                 appUpdateInstallModel: appUpdateInstallModel,
                 daemonSetupModel: daemonSetupModel,
-                launchAtLoginModel: launchAtLoginModel
+                launchAtLoginModel: launchAtLoginModel,
+                sharedScopeModel: sharedScopeModel
             )
             .tabItem { Label("General", systemImage: "gearshape") }
             .tag(SettingsPane.general)
@@ -921,6 +925,10 @@ struct GeneralSettingsPane: View {
     /// Shared with the popover gear menu — one status read at load(), one
     /// published value behind both toggles.
     @ObservedObject var launchAtLoginModel: LaunchAtLoginModel
+    /// Issue #204: the shared-user-scope section's state machine. The
+    /// section renders only when `/api/state` reported the `sharedScope`
+    /// object — a pre-#204 daemon renders nothing at all (the contract).
+    @ObservedObject var sharedScopeModel: SharedScopeModel
 
     @Environment(\.openURL) private var openURL
 
@@ -1048,6 +1056,18 @@ struct GeneralSettingsPane: View {
                     : "The pinned account's percentage stays visible while it has a usable non-spend window; otherwise the plain glyph is shown. Notifications still watch every account.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            // Issue #204 (Tim approved direction): shared user scope —
+            // user-scope MCP registrations + user memory as one set across
+            // every managed Claude account, opt-in, enable runs a disclosed
+            // one-time merge. Rendered ONLY when the daemon reports the
+            // feature (`/api/state` `sharedScope` — the #174 precedent: an
+            // old daemon shows no control instead of a dead one).
+            if statusModel.deckState?.sharedScope != nil {
+                Section("Claude accounts") {
+                    sharedScopeControls
+                }
             }
 
             Section("Notifications") {
@@ -1191,6 +1211,22 @@ struct GeneralSettingsPane: View {
             }
         }
         .formStyle(.grouped)
+        // Issue #204: nothing is sent to the daemon until this sheet's
+        // explicit confirm — the toggle itself never mutates anything.
+        .sheet(isPresented: Binding(
+            get: { sharedScopeModel.confirmationTarget != nil },
+            set: { if !$0 { sharedScopeModel.cancelConfirmation() } }
+        )) {
+            SharedScopeConfirmationSheet(
+                target: sharedScopeModel.confirmationTarget ?? true,
+                // confirmPending() consumes the target SYNCHRONOUSLY before
+                // the sheet's dismissal echo (`isPresented` → cancel) can
+                // clear it — the PR #207 review race: a Task that read the
+                // target after dismissal would silently no-op.
+                onConfirm: { sharedScopeModel.confirmPending() },
+                onCancel: { sharedScopeModel.cancelConfirmation() }
+            )
+        }
         // Issue #33: pane appear → automatic CLI re-probe (debounced in the
         // model; the daemon's /api/tools?refresh=1 cache absorbs the rest).
         // Users never have to ask the app to look for CLI updates.
@@ -1201,6 +1237,77 @@ struct GeneralSettingsPane: View {
             launchAtLoginModel.load()
             await toolsModel.probeOnPaneOpen()
         }
+    }
+
+    /// Issue #204 — the shared-user-scope controls. State honesty: the
+    /// toggle always renders the daemon-reported `sharedScope.enabled`
+    /// (state wins over local optimism, the #68 echo-loop discipline); its
+    /// setter only raises the confirmation sheet, so a cancelled sheet
+    /// simply snaps the switch back to the truth. While the op runs the
+    /// controls disable behind a calm progress line; the finished op's
+    /// disclosed outcome (merged counts, conflicts, skipped) renders inline
+    /// until dismissed.
+    @ViewBuilder
+    private var sharedScopeControls: some View {
+        let enabled = SharedScopeModel.isEnabled(
+            state: statusModel.deckState,
+            settings: settingsSync.settings
+        )
+        Toggle(SharedScope.toggleTitle, isOn: Binding(
+            get: { enabled },
+            set: { sharedScopeModel.requestChange(to: $0, currentlyEnabled: enabled) }
+        ))
+        .disabled(sharedScopeModel.isBusy)
+        .help(SharedScope.toggleHelp)
+        if let target = sharedScopeModel.runningTarget {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text(target ? SharedScope.enableProgress : SharedScope.disableProgress)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } else {
+            // State-honest caption (the #196 precedent): describe what is
+            // actually in effect, never a hypothetical.
+            Text(enabled ? SharedScope.enabledCaption : SharedScope.disabledCaption)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        if case .finished(let outcome) = sharedScopeModel.phase {
+            SharedScopeOutcomeView(
+                presentation: SharedScope.presentation(for: outcome),
+                onDismiss: { sharedScopeModel.dismissOutcome() }
+            )
+        }
+        if let info = sharedScopeModel.infoText {
+            // The tolerated 409 — calm, never an error tone.
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                Text(info)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                sharedScopeDismiss
+            }
+        }
+        if let error = sharedScopeModel.errorText {
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                sharedScopeDismiss
+            }
+        }
+    }
+
+    private var sharedScopeDismiss: some View {
+        Button(action: { sharedScopeModel.dismissOutcome() }) {
+            Image(systemName: "xmark")
+                .font(.system(size: 8))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .accessibilityLabel("Dismiss shared-scope result")
     }
 
     /// Outcome line under "Check for App Updates". Issue #121 (Tim
@@ -1482,6 +1589,115 @@ struct ToolStatusRow: View {
             .foregroundStyle(.secondary)
             .accessibilityLabel("Dismiss update result for \(name)")
         }
+    }
+}
+
+// MARK: - Shared user scope (issue #204)
+
+/// The pre-op confirmation sheet, house style (the AccountEditSheet frame):
+/// what will be shared, what never is, and that the one-time merge is
+/// reversible — stated BEFORE anything runs. All copy is single-sourced in
+/// `SharedScope` so the sheet and the toggle's tooltip can never drift.
+struct SharedScopeConfirmationSheet: View {
+    /// True = enabling (merge), false = disabling (restore).
+    let target: Bool
+    // Both actions clear the model's confirmationTarget, and the sheet's
+    // `isPresented` binding dismisses on that — no environment dismiss()
+    // here, so dismissal can never race the confirm capture (PR #207
+    // review).
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(target ? SharedScope.enableTitle : SharedScope.disableTitle)
+                .font(.headline)
+            VStack(alignment: .leading, spacing: 8) {
+                if target {
+                    sheetLine(glyph: "arrow.triangle.merge", text: SharedScope.enableShares)
+                    sheetLine(glyph: "lock", text: SharedScope.enableNeverShares)
+                    sheetLine(glyph: "arrow.uturn.backward", text: SharedScope.enableMerge)
+                } else {
+                    sheetLine(glyph: "arrow.uturn.backward", text: SharedScope.disableRestores)
+                    sheetLine(glyph: "lock", text: SharedScope.disableNeverShared)
+                }
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    onCancel()
+                }
+                .keyboardShortcut(.cancelAction)
+                Button(target ? SharedScope.enableConfirm : SharedScope.disableConfirm) {
+                    onConfirm()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(18)
+        .frame(width: 380)
+    }
+
+    private func sheetLine(glyph: String, text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: glyph)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 14)
+            Text(text)
+                .font(.system(size: 11))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// The finished op's disclosed outcome, rendered calmly inline under the
+/// toggle: merged counts headline, one line per resolved conflict (name +
+/// which account's version won), one line per skipped item with the
+/// daemon's reason verbatim. Dismissible; never an alarm tone — every line
+/// here describes work that completed as disclosed.
+struct SharedScopeOutcomeView: View {
+    let presentation: SharedScope.OutcomePresentation
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                Image(systemName: "checkmark.circle")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Text(presentation.headline)
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Dismiss shared-scope result")
+            }
+            // Position-keyed ids (PR #207 review): identical lines are
+            // legitimate — the same skip reason from two profiles — and
+            // `id: \.self` would collide and drop rows. The lists are
+            // rebuilt whole per outcome, so offsets are stable ids here.
+            ForEach(Array(presentation.conflictLines.enumerated()), id: \.offset) { _, line in
+                detailLine(line)
+            }
+            ForEach(Array(presentation.skippedLines.enumerated()), id: \.offset) { _, line in
+                detailLine(line)
+            }
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private func detailLine(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 10))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.leading, 14)
     }
 }
 

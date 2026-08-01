@@ -111,9 +111,33 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
       }
       if (req.method === 'GET' && url.pathname === '/api/settings') return json(res, 200, ownedStore.getSettings());
       if (req.method === 'PUT' && url.pathname === '/api/settings') {
+        const previous = ownedStore.getSettings();
         const settings = ownedStore.saveSettings(await body(req));
-        ownedService.rescheduleAutoRefresh(settings);
-        return json(res, 200, settings);
+        try {
+          await ownedService.applySharedScopeSettings(previous, settings);
+        } catch (error) {
+          // A conflict means this request never started, so restore its prior
+          // opt-in value. Genuinely started operations retain recovery intent:
+          // disable failures keep the previous true bit and enable failures
+          // keep the requested true bit. Other validated settings stay applied.
+          ownedStore.saveSettings({
+            sharedUserScopeEnabled: error.statusCode === 409
+              ? previous.sharedUserScopeEnabled
+              : settings.sharedUserScopeEnabled
+                ? true
+                : previous.sharedUserScopeEnabled,
+          });
+          throw error;
+        }
+        const current = ownedStore.getSettings();
+        ownedService.rescheduleAutoRefresh(current);
+        return json(res, 200, current);
+      }
+      if (req.method === 'POST' && url.pathname === '/api/shared-scope/enable') {
+        return json(res, 200, { sharedScope: await ownedService.enableSharedScope() });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/shared-scope/disable') {
+        return json(res, 200, { sharedScope: await ownedService.disableSharedScope() });
       }
       if (req.method === 'GET' && url.pathname === '/api/capacity/worst') return json(res, 200, ownedService.worstCapacity());
       if (req.method === 'POST' && url.pathname === '/api/claude/migrate-cswap') {
@@ -207,7 +231,7 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
       }
       const accountMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)$/);
       if (req.method === 'DELETE' && accountMatch) {
-        const deleted = ownedService.deleteAccount(decodeURIComponent(accountMatch[1]));
+        const deleted = await ownedService.deleteAccount(decodeURIComponent(accountMatch[1]));
         return json(res, deleted ? 200 : 404, deleted ? { deleted: true } : { error: 'account not found' });
       }
       const projectMatch = url.pathname.match(/^\/api\/projects\/([^/]+)$/);

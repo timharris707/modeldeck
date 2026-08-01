@@ -30,6 +30,12 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
     /// of expired-idle Claude accounts. Default ON — the whole point is zero
     /// user effort; the honest cost disclosure lives on the toggle.
     public var autoRenewEnabled: Bool
+    /// Issue #204: shared user scope (MCP registrations + user memory across
+    /// Claude accounts). Default OFF — opt-in by direction. READ-ONLY here:
+    /// the UI never PUTs this key; enabling/disabling runs through the
+    /// mutation-guarded /api/shared-scope endpoints because enabling is a
+    /// disclosed one-time merge, not a plain settings write.
+    public var sharedUserScopeEnabled: Bool
 
     /// Mirrors src/db.mjs DEFAULT_SETTINGS exactly.
     /// Issue #187 (Tim directive 2026-07-29): pauseWhileActive defaults OFF
@@ -44,7 +50,8 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         notificationThresholdPercent: 25,
         menuBarStyle: "icon-only",
         menuBarAccountId: "",
-        autoRenewEnabled: true
+        autoRenewEnabled: true,
+        sharedUserScopeEnabled: false
     )
 
     public init(
@@ -57,7 +64,8 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         notificationThresholdPercent: Int,
         menuBarStyle: String,
         menuBarAccountId: String = "",
-        autoRenewEnabled: Bool = true
+        autoRenewEnabled: Bool = true,
+        sharedUserScopeEnabled: Bool = false
     ) {
         self.autoRefreshEnabled = autoRefreshEnabled
         self.autoRefreshIntervalSeconds = autoRefreshIntervalSeconds
@@ -69,6 +77,7 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         self.menuBarStyle = menuBarStyle
         self.menuBarAccountId = menuBarAccountId
         self.autoRenewEnabled = autoRenewEnabled
+        self.sharedUserScopeEnabled = sharedUserScopeEnabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -91,6 +100,9 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
             ?? defaults.menuBarAccountId
         autoRenewEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoRenewEnabled)
             ?? defaults.autoRenewEnabled
+        // Issue #204: absent on pre-#204 daemons → the opt-in default (off).
+        sharedUserScopeEnabled = try container.decodeIfPresent(Bool.self, forKey: .sharedUserScopeEnabled)
+            ?? defaults.sharedUserScopeEnabled
     }
 
     /// Typed view of `layout`; falls back to the locked two-column default.

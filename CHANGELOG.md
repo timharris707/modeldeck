@@ -4,6 +4,34 @@ All notable changes to ModelDeck are documented here. Versioning follows the
 roadmap in `design/mac-app-roadmap.md`: `v0.1-web` tags the retired web MVP,
 and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 
+## 0.3.13 — 2026-08-01
+
+One you, many accounts: your tools and memory can now follow you across
+every Claude account — and agents stop lecturing you about ModelDeck in
+projects that have nothing to do with it.
+
+### Added
+- **Share tools & memory across Claude accounts (issue #204, opt-in)**:
+  a new Settings → General switch makes your user-scope setup — MCP
+  server registrations and memory — one shared set visible from every
+  Claude account, so a tool you register once exists everywhere,
+  whichever account is active. Sign-ins and credentials stay strictly
+  per-account. Enabling runs a one-time, fully reversible merge with
+  backups taken first and an honest summary of what merged, what
+  conflicted (and which account's version won), and anything skipped;
+  turning it off restores per-account state. The sync engine never
+  rewrites anything outside the shared section of a profile's config,
+  survives crashes and concurrent Claude sessions without losing edits,
+  and defers politely when a session is mid-write.
+
+### Fixed
+- **Agents stop narrating ModelDeck in unrelated projects (issue #203)**:
+  every managed profile now carries a small standing note that tells
+  sessions to treat it as a normal Claude home — so working in your own
+  projects no longer comes with impromptu ModelDeck lectures. The note
+  is maintained non-destructively alongside anything you keep in the
+  profile's own memory file.
+
 ## 0.3.12 — 2026-07-31
 
 Auto-renew, now for people who actually work: renewal no longer waits

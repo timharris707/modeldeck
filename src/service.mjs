@@ -19,6 +19,7 @@ import {
   validateClaudeProfileHome,
 } from './adapters/claude.mjs';
 import { claudeCredentialsPresent } from './adapters/claude-keychain.mjs';
+import { reconcileClaudeProfileExplainer } from './adapters/claude-profile-explainer.mjs';
 import {
   buildStatuslineCommand,
   chainCommandFromStatuslineCommand,
@@ -36,6 +37,7 @@ import {
 } from './adapters/codex.mjs';
 import { evaluateWorstCapacity } from './capacity.mjs';
 import { scanProjectRoot } from './projects.mjs';
+import { SharedScopeEngine } from './shared-scope.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -362,6 +364,8 @@ export class ModelDeckService {
     this.fetchCodex = options.fetchCodex || fetchCodexRateLimits;
     this.activateClaude = options.activateClaude || activateClaudeProfile;
     this.createClaudeProfile = options.createClaudeProfile || createClaudeProfileHome;
+    this.ensureClaudeProfileExplainer = options.reconcileClaudeProfileExplainer
+      || reconcileClaudeProfileExplainer;
     this.createCodexProfile = options.createCodexProfile || createCodexProfileHome;
     this.readClaudeAuth = options.readClaudeAuth || readClaudeAuthStatus;
     this.readClaudeTier = options.readClaudeTier || readClaudeRateLimitTier;
@@ -431,6 +435,16 @@ export class ModelDeckService {
     this.demoFixtures = options.demoFixtures === true;
     this.claudeSecureStorage = { value: null, status: this.platform === 'darwin' ? 'inactive' : 'not-applicable' };
     this.claudeSecureStorageSupported = null;
+    this.sharedScope = options.sharedScopeEngine || new SharedScopeEngine(this.store, {
+      profilesDir: this.claudeProfilesDir,
+      sharedDir: options.sharedScopeDir || path.join(this.dataDir, 'shared'),
+      watch: options.sharedScopeWatch,
+      setTimeout: options.sharedScopeSetTimeout,
+      clearTimeout: options.sharedScopeClearTimeout,
+      debounceMs: options.sharedScopeDebounceMs,
+      beforeAtomicRename: options.sharedScopeBeforeAtomicRename,
+      afterMcpRead: options.sharedScopeAfterMcpRead,
+    });
   }
 
   startAutoRefresh() {
@@ -440,6 +454,10 @@ export class ModelDeckService {
     this.autoRefreshStarted = true;
     // Local, credential-free startup migration for pre-#62 Claude rows.
     void this.backfillClaudeIdentities();
+    // Issue #203: every managed Claude home carries the same inert profile
+    // explainer. Reconcile alongside the #190/#189 statusline startup repair
+    // so upgrades to the pinned block reach profiles created by older builds.
+    void this.reconcileClaudeProfileExplainers().catch(() => {});
     // Issue #189: before anything else statusline, repair tees still
     // pointing at a daemon binary that has since moved or been deleted
     // (same bug class as #185's dead release-worktree daemon).
@@ -451,6 +469,13 @@ export class ModelDeckService {
     this.startClaudeStatuslineWatcher();
     const generation = ++this.autoRefreshGeneration;
     const settings = this.store.getSettings();
+    if (settings.sharedUserScopeEnabled) {
+      void this.sharedScope.start().catch(() => {
+        // Provider paths can contain account labels; never echo them into the
+        // daemon log from a filesystem exception.
+        console.error('[modeldeck] shared-scope startup reconcile failed');
+      });
+    }
     if (settings.autoRefreshEnabled) {
       if (this.lastCompletedRefreshAt == null) this.lastCompletedRefreshAt = this.now();
       this.armAutoRefresh(this.autoRefreshInitialDelayMs, generation);
@@ -470,6 +495,29 @@ export class ModelDeckService {
       try { this.statuslineWatcher.close(); } catch { /* already closed */ }
       this.statuslineWatcher = null;
     }
+    this.sharedScope.stopWatchers();
+  }
+
+  // -------------------------------------------------------------------------
+  // Issue #203 — managed Claude profile explainer.
+
+  /// Best-effort per account: one missing or malformed profile never prevents
+  /// the remaining managed profiles from reconciling. Errors contain only the
+  /// account id and filesystem diagnosis; profile document bytes are never
+  /// returned or logged.
+  async reconcileClaudeProfileExplainers() {
+    const reconciled = [];
+    for (const account of this.store.listAccounts()) {
+      if (account.provider !== 'claude') continue;
+      try {
+        const profileRef = managedClaudeProfile(account.profileRef, this.claudeProfilesDir);
+        const result = await this.ensureClaudeProfileExplainer({ profileRef });
+        if (result.changed) reconciled.push(account.id);
+      } catch (error) {
+        console.error(`[modeldeck] profile explainer reconcile failed for account ${account.id}: ${error?.message || error}`);
+      }
+    }
+    return reconciled;
   }
 
   // -------------------------------------------------------------------------
@@ -754,6 +802,41 @@ export class ModelDeckService {
     } catch (error) {
       await fs.promises.unlink(temporary).catch(() => {});
       throw error;
+    }
+  }
+
+  // Issue #204 — shared Claude user scope. The engine owns the operation
+  // guard, filesystem transaction discipline, and persisted outcome; these
+  // service methods keep the HTTP layer free of storage knowledge.
+  enableSharedScope(options) {
+    return this.sharedScope.enable(options);
+  }
+
+  disableSharedScope(options) {
+    return this.sharedScope.disable(options);
+  }
+
+  applySharedScopeSettings(previous, settings) {
+    return this.sharedScope.applySettings(previous, settings);
+  }
+
+  reconcileSharedScope(options) {
+    return this.sharedScope.reconcile(options);
+  }
+
+  async accountProfileSetChanged() {
+    try { return await this.sharedScope.profileSetChanged(); }
+    catch (error) {
+      if (error?.statusCode !== 409) throw error;
+      return this.sharedScope.deferProfileSetChanged();
+    }
+  }
+
+  async accountDetachProfile(account) {
+    try { return await this.sharedScope.detachProfile(account); }
+    catch (error) {
+      if (error?.statusCode !== 409) throw error;
+      return this.sharedScope.deferDetachProfile(account);
     }
   }
 
@@ -1075,6 +1158,11 @@ export class ModelDeckService {
     try {
       for (const profile of imported) {
         if (this.store.findAccount('claude', profile.profileRef)) throw new Error(`Claude profile is already registered: ${profile.profileRef}`);
+        try {
+          await this.ensureClaudeProfileExplainer({ profileRef: profile.profileRef });
+        } catch (error) {
+          console.error(`[modeldeck] profile explainer install failed during Claude profile import: ${error?.message || error}`);
+        }
         let account = this.store.saveAccount({
           provider: 'claude',
           label: profile.label,
@@ -1084,6 +1172,7 @@ export class ModelDeckService {
         account = await this.refreshClaudeProfileMetadata(account);
         saved.push(account);
       }
+      await this.accountProfileSetChanged();
       return saved;
     } catch (error) {
       for (const account of saved) this.store.deleteAccount(account.id);
@@ -1119,12 +1208,19 @@ export class ModelDeckService {
     const profileRef = await this.createClaudeProfile({ profilesDir: this.claudeProfilesDir, profileName: label });
     let account;
     try {
+      try {
+        await this.ensureClaudeProfileExplainer({ profileRef });
+      } catch (error) {
+        console.error(`[modeldeck] profile explainer install failed during Claude account creation: ${error?.message || error}`);
+      }
       account = this.store.saveAccount({ provider: 'claude', label, identity, purpose, color, profileRef });
       account = await this.refreshClaudeProfileMetadata(account);
-      return isDefault ? this.setDefaultAccount('claude', account.id) : account;
+      account = isDefault ? this.setDefaultAccount('claude', account.id) : account;
+      await this.accountProfileSetChanged();
+      return account;
     } catch (error) {
       if (account) this.store.deleteAccount(account.id);
-      await fs.promises.rmdir(profileRef).catch(() => {});
+      await fs.promises.rm(profileRef, { recursive: true, force: true }).catch(() => {});
       throw error;
     }
   }
@@ -1181,9 +1277,15 @@ export class ModelDeckService {
     }
     if (!input.profileRef) return this.createClaudeAccount(input);
     const profileRef = await validateClaudeProfileHome({ profileRef: input.profileRef, profilesDir: this.claudeProfilesDir });
+    try {
+      await this.ensureClaudeProfileExplainer({ profileRef });
+    } catch (error) {
+      console.error(`[modeldeck] profile explainer install failed during Claude profile registration: ${error?.message || error}`);
+    }
     let account = this.store.saveAccount({ ...input, profileRef });
     account = await this.refreshClaudeProfileMetadata(account);
     if (input.isDefault) this.invalidateToolProbe();
+    await this.accountProfileSetChanged();
     return account;
   }
 
@@ -1946,11 +2048,13 @@ export class ModelDeckService {
     return account;
   }
 
-  deleteAccount(accountId) {
+  async deleteAccount(accountId) {
     const account = this.store.getAccount(accountId);
+    await this.accountDetachProfile(account);
     const deleted = this.store.deleteAccount(accountId);
     if (deleted) this.accountRefreshErrors.delete(accountId);
     if (deleted && account?.isDefault) this.invalidateToolProbe();
+    if (deleted) await this.accountProfileSetChanged();
     return deleted;
   }
 
@@ -2226,6 +2330,7 @@ export class ModelDeckService {
       claudeSecureStorage,
       scheduler: this.refreshSchedulerStatus(),
       daemon: this.daemonRuntimeStatus(),
+      sharedScope: this.sharedScope.status(),
     };
   }
 

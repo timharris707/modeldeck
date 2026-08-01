@@ -358,6 +358,22 @@ test('state exposes per-account auth and update endpoint returns 409 for an unsu
   assert.match(result.body.error, /unsupported direct\/native install method/);
 });
 
+test('migrate-cswap succeeds when explainer installation fails', async (t) => {
+  const fixture = await startFixture({
+    migrateClaude: async () => [{
+      label: 'Imported', profileRef: path.join(fixture.root, 'claude-profiles', 'imported'),
+    }],
+    reconcileClaudeProfileExplainer: async () => { throw new Error('fixture explainer write failure'); },
+  });
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  const migrated = await request(fixture, '/api/claude/migrate-cswap', {
+    method: 'POST', body: JSON.stringify({ selections: [{ label: 'Imported' }] }),
+  });
+  assert.equal(migrated.response.status, 201);
+  assert.equal(migrated.body.accounts[0].label, 'Imported');
+});
+
 // Issue #89: /api/state carries each account's last refresh failure
 // ({message, at}) and flips authState to signin-required when the failure
 // means the stored credentials are unusable — even though the presence
@@ -405,6 +421,7 @@ test('settings API validates partial updates and drives worst-capacity threshold
     // Issue #187: pause-while-active is opt-in — live updates during an
     // active session are the default experience.
     pauseWhileActive: false,
+    sharedUserScopeEnabled: false,
     layout: 'two-column',
     defaultSort: 'next-reset',
     notificationThresholdPercent: 25,
