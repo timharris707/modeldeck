@@ -65,6 +65,11 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
     /// Codex account) omits the object entirely and no renew affordance
     /// renders anywhere.
     public var renew: AccountRenewCapability?
+    /// CLIProxyAPI routing weight (0–10 band the hourly rebalance job
+    /// maintains from live quota). Optional by design — a machine without
+    /// the proxy, an account the proxy doesn't route, or an old daemon
+    /// omits it and nothing renders.
+    public var proxyWeight: Int?
 
     public init(
         id: String,
@@ -81,7 +86,8 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         lastRefreshError: AccountRefreshError? = nil,
         signinReason: String? = nil,
         claudeStatusline: ClaudeStatuslineOptIn? = nil,
-        renew: AccountRenewCapability? = nil
+        renew: AccountRenewCapability? = nil,
+        proxyWeight: Int? = nil
     ) {
         self.id = id
         self.provider = provider
@@ -98,6 +104,7 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         self.signinReason = signinReason
         self.claudeStatusline = claudeStatusline
         self.renew = renew
+        self.proxyWeight = proxyWeight
     }
 
     /// Per-account health chip (issue #32): each roster row reads its OWN

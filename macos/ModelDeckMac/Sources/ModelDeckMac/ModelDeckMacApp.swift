@@ -270,17 +270,27 @@ struct ModelDeckMacApp: App {
             }
         }
         // Issue #152: the duplicate-login warning's "Re-log in" button runs
-        // the SAME flow — resolve the id against fresh state (no-op when the
-        // flag cleared or the account vanished), then the existing
-        // beginSignIn launches the provider's own profile-scoped login
-        // (CODEX_HOME=<profileRef> codex login / the Claude equivalent) in
-        // Terminal for the user to complete. Never touches tokens or
-        // running sessions; nothing automatic.
+        // the SAME flow — resolve the id against fresh state, then the
+        // existing beginSignIn launches the provider's own profile-scoped
+        // login (CODEX_HOME=<profileRef> codex login / the Claude
+        // equivalent) in Terminal for the user to complete. Never touches
+        // tokens or running sessions; nothing automatic.
+        // Issue #213: the flow now answers inline on the deck card, so a
+        // click whose target doesn't resolve (flag cleared or account
+        // vanished between render and dispatch) reports itself there too —
+        // the old silent return was half of Tim's "clicking does nothing"
+        // field report.
         deckModel.onDuplicateRelogin = { [weak statusModel, weak signInModel] accountID in
             guard let account = DeckPopoverModel.duplicateReloginTarget(
                 accountID: accountID,
                 state: statusModel?.deckState
-            ) else { return }
+            ) else {
+                signInModel?.noteStartFailure(
+                    accountID: accountID,
+                    message: AccountSignInModel.duplicateReloginUnresolvedMessage
+                )
+                return
+            }
             Task { @MainActor [weak signInModel] in
                 await signInModel?.beginSignIn(account: account)
             }
@@ -357,6 +367,7 @@ struct ModelDeckMacApp: App {
                 statusModel: statusModel,
                 deckModel: deckModel,
                 renewModel: renewModel,
+                signInModel: signInModel,
                 appUpdateModel: appUpdateModel,
                 appUpdateInstallModel: appUpdateInstallModel,
                 setupModel: daemonSetupModel,

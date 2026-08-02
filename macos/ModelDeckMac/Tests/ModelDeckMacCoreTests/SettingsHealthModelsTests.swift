@@ -108,7 +108,12 @@ final class StubSignInBackend: AccountReauthenticating, DeckStateProviding, Logi
     }
 
     func activateAccount(id: String) async throws -> AccountActivation {
-        try locked {
+        // CodeRabbit PR #218: DaemonClient's URLSession calls are
+        // cancellation-aware, so the stub throws on a cancelled task too —
+        // a success tail running on a task it just cancelled fails here
+        // exactly like production would.
+        try Task.checkCancellation()
+        return try locked {
             activatedIDs.append(id)
             if let activateError { throw activateError }
             return AccountActivation(
@@ -153,7 +158,8 @@ final class StubSignInBackend: AccountReauthenticating, DeckStateProviding, Logi
     }
 
     func deckState() async throws -> DeckState {
-        locked {
+        try Task.checkCancellation() // mirrors the cancellation-aware client
+        return locked {
             stateReads += 1
             return stateAfterVerify
         }
@@ -536,6 +542,347 @@ struct AccountSignInModelTests {
     }
 }
 
+// MARK: - Issue #217: auto-verify while awaiting sign-in
+
+/// Gated clock for the auto-verify poller: every sleep suspends until the
+/// test ticks it, so poll beats are fully deterministic. Cancellation (flow
+/// ended) resumes pending sleeps by throwing, like the real Task.sleep.
+final class StubSleeper: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: [CheckedContinuation<Void, Error>] = []
+    private(set) var requestedDelays: [Duration] = []
+
+    private var cancelled = false
+
+    func sleep(_ duration: Duration) async throws {
+        locked { requestedDelays.append(duration) }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                // CodeRabbit PR #218: the cancelled check and the append
+                // must share one critical section — onCancel draining
+                // between them would strand the continuation forever.
+                let alreadyCancelled: Bool = locked {
+                    if cancelled || Task.isCancelled { return true }
+                    pending.append(continuation)
+                    return false
+                }
+                if alreadyCancelled { continuation.resume(throwing: CancellationError()) }
+            }
+        } onCancel: {
+            let drained: [CheckedContinuation<Void, Error>] = locked {
+                defer {
+                    cancelled = true
+                    pending.removeAll()
+                }
+                return pending
+            }
+            for continuation in drained { continuation.resume(throwing: CancellationError()) }
+        }
+    }
+
+    /// Release the oldest pending sleep — one poll beat.
+    func tick() {
+        let continuation: CheckedContinuation<Void, Error>? = locked {
+            pending.isEmpty ? nil : pending.removeFirst()
+        }
+        continuation?.resume()
+    }
+
+    var armedSleeps: Int { locked { requestedDelays.count } }
+    /// Sleeps currently suspended and tickable — the settle target before a
+    /// tick (armedSleeps alone races the continuation arming).
+    var pendingSleeps: Int { locked { pending.count } }
+
+    private func locked<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
+    }
+}
+
+@Suite("Auto-verify while awaiting sign-in (issue #217)")
+@MainActor
+struct AutoVerifyTests {
+    private var account: DeckAccount {
+        DeckAccount(
+            id: "acct-1", provider: "claude", label: "Deck One",
+            profileRef: "/placeholder/profiles/claude/acct-1", authState: "signin-required"
+        )
+    }
+
+    private func makeModel(_ backend: StubSignInBackend, sleeper: StubSleeper) -> AccountSignInModel {
+        let model = AccountSignInModel(reauth: backend, launcher: backend, stateProvider: backend, activator: backend)
+        model.autoVerifySleep = { try await sleeper.sleep($0) }
+        return model
+    }
+
+    /// Yield until `condition` holds (the poller is an unstructured task).
+    private func settle(_ condition: () -> Bool) async {
+        for _ in 0..<2000 {
+            if condition() { return }
+            await Task.yield()
+        }
+    }
+
+    @Test func finishedLoginClearsTheFlowWithoutAVerifyClick() async {
+        let backend = StubSignInBackend()
+        backend.stateAfterVerify = DeckState(accounts: [
+            DeckAccount(id: "acct-1", provider: "claude", label: "Deck One", authState: "ok"),
+        ])
+        let sleeper = StubSleeper()
+        let model = makeModel(backend, sleeper: sleeper)
+        var pushedStates: [DeckState] = []
+        var signedIn = 0
+        model.onStateChanged = { pushedStates.append($0) }
+        model.onSignedIn = { signedIn += 1 }
+
+        await model.beginSignIn(account: account)
+        await settle { sleeper.pendingSleeps == 1 }
+        sleeper.tick()
+        await settle { signedIn == 1 }
+
+        #expect(model.phase(for: "acct-1") == nil)
+        #expect(model.error(for: "acct-1") == nil)
+        #expect(backend.verifiedIDs == ["acct-1"])
+        #expect(pushedStates.first?.accounts.first?.healthChip == .healthy)
+        #expect(signedIn == 1)
+    }
+
+    @Test func signedOutReadsStaySilentAndPollingContinues() async {
+        let backend = StubSignInBackend()
+        backend.verifyResult = AccountVerification(
+            account: DeckAccount(id: "acct-1", provider: "claude", label: "Deck One"),
+            authenticated: false
+        )
+        let sleeper = StubSleeper()
+        let model = makeModel(backend, sleeper: sleeper)
+        var signedIn = 0
+        model.onSignedIn = { signedIn += 1 }
+
+        await model.beginSignIn(account: account)
+        await settle { sleeper.pendingSleeps == 1 }
+        sleeper.tick()
+        // The poller went back to sleep — the failed read changed nothing.
+        await settle { sleeper.pendingSleeps == 1 }
+        #expect(sleeper.armedSleeps == 2)
+        #expect(backend.verifiedIDs == ["acct-1"])
+        if case .awaitingSignIn? = model.phase(for: "acct-1") {} else {
+            Issue.record("expected to stay on awaitingSignIn")
+        }
+        #expect(model.error(for: "acct-1") == nil)
+        #expect(signedIn == 0)
+
+        // The login finishes; the next beat completes the flow.
+        backend.verifyResult = nil
+        sleeper.tick()
+        await settle { signedIn == 1 }
+        #expect(model.phase(for: "acct-1") == nil)
+        #expect(signedIn == 1)
+    }
+
+    @Test func transportErrorsStaySilent() async {
+        let backend = StubSignInBackend()
+        backend.verifyError = DaemonClientError.daemonError(message: "mutation token or origin rejected", status: 403)
+        let sleeper = StubSleeper()
+        let model = makeModel(backend, sleeper: sleeper)
+
+        await model.beginSignIn(account: account)
+        await settle { sleeper.pendingSleeps == 1 }
+        sleeper.tick()
+        await settle { sleeper.pendingSleeps == 1 }
+
+        #expect(sleeper.armedSleeps == 2)
+        #expect(backend.verifiedIDs == ["acct-1"])
+        #expect(model.error(for: "acct-1") == nil)
+        if case .awaitingSignIn? = model.phase(for: "acct-1") {} else {
+            Issue.record("expected to stay on awaitingSignIn")
+        }
+    }
+
+    @Test func identityMismatchStaysSilentUntilManualVerify() async {
+        // The poller must never auto-complete (or auto-alarm) a wrong-identity
+        // login; the manual Verify keeps reporting it honestly.
+        let backend = StubSignInBackend()
+        backend.verifyResult = AccountVerification(
+            account: DeckAccount(id: "acct-1", provider: "claude", label: "Deck One"),
+            authenticated: true,
+            identity: "wrong@example.invalid",
+            identityMismatch: .init(expected: "intended@example.invalid", actual: "wrong@example.invalid")
+        )
+        let sleeper = StubSleeper()
+        let model = makeModel(backend, sleeper: sleeper)
+        var signedIn = 0
+        model.onSignedIn = { signedIn += 1 }
+
+        await model.beginSignIn(account: account)
+        await settle { sleeper.pendingSleeps == 1 }
+        sleeper.tick()
+        await settle { sleeper.pendingSleeps == 1 }
+        #expect(model.error(for: "acct-1") == nil)
+        #expect(signedIn == 0)
+
+        let confirmed = await model.confirmSignedIn(account: account)
+        #expect(!confirmed)
+        #expect(model.error(for: "acct-1")?.contains("intended@example.invalid") == true)
+        if case .awaitingSignIn? = model.phase(for: "acct-1") {} else {
+            Issue.record("expected to stay on awaitingSignIn for a corrective /login")
+        }
+    }
+
+    @Test func backoffEasesToTheCap() async {
+        let backend = StubSignInBackend()
+        backend.verifyResult = AccountVerification(
+            account: DeckAccount(id: "acct-1", provider: "claude", label: "Deck One"),
+            authenticated: false
+        )
+        let sleeper = StubSleeper()
+        let model = makeModel(backend, sleeper: sleeper)
+
+        await model.beginSignIn(account: account)
+        for _ in 1...3 {
+            await settle { sleeper.pendingSleeps == 1 }
+            sleeper.tick()
+        }
+        await settle { sleeper.pendingSleeps == 1 }
+
+        #expect(Array(sleeper.requestedDelays.prefix(4)) == [
+            .seconds(5), .seconds(7), .seconds(10), .seconds(10),
+        ])
+    }
+
+    @Test func pollerStopsAtItsDeadlineLeavingManualVerifyAsThePath() async {
+        // CodeRabbit PR #218: an abandoned card must not poll forever —
+        // each verify spawns a provider CLI daemon-side. After the budget
+        // the poller stops silently; the manual Verify button still works.
+        let backend = StubSignInBackend()
+        backend.verifyResult = AccountVerification(
+            account: DeckAccount(id: "acct-1", provider: "claude", label: "Deck One"),
+            authenticated: false
+        )
+        let sleeper = StubSleeper()
+        let model = makeModel(backend, sleeper: sleeper)
+        // 5s + 7s fit the budget; the third beat (17s cumulative + 10s) does not.
+        model.autoVerifyDeadline = .seconds(12)
+        var signedIn = 0
+        model.onSignedIn = { signedIn += 1 }
+
+        await model.beginSignIn(account: account)
+        for _ in 1...2 {
+            await settle { sleeper.pendingSleeps == 1 }
+            sleeper.tick()
+        }
+        for _ in 0..<200 { await Task.yield() }
+
+        // Budget exhausted: no third sleep, no verify spam, still awaiting,
+        // and still silent.
+        #expect(sleeper.armedSleeps == 2)
+        #expect(backend.verifiedIDs == ["acct-1", "acct-1"])
+        if case .awaitingSignIn? = model.phase(for: "acct-1") {} else {
+            Issue.record("expected to stay on awaitingSignIn")
+        }
+        #expect(model.error(for: "acct-1") == nil)
+
+        backend.verifyResult = nil
+        let confirmed = await model.confirmSignedIn(account: account)
+        #expect(confirmed)
+        #expect(signedIn == 1)
+    }
+
+    @Test func cancelStopsThePoller() async {
+        let backend = StubSignInBackend()
+        let sleeper = StubSleeper()
+        let model = makeModel(backend, sleeper: sleeper)
+
+        await model.beginSignIn(account: account)
+        await settle { sleeper.pendingSleeps == 1 }
+        model.cancel(accountID: "acct-1")
+
+        // A late tick is a no-op: the cancelled poller never verifies.
+        sleeper.tick()
+        for _ in 0..<50 { await Task.yield() }
+        #expect(backend.verifiedIDs.isEmpty)
+        #expect(model.phase(for: "acct-1") == nil)
+        #expect(sleeper.armedSleeps == 1)
+    }
+
+    @Test func manualVerifySuccessStopsThePoller() async {
+        let backend = StubSignInBackend()
+        let sleeper = StubSleeper()
+        let model = makeModel(backend, sleeper: sleeper)
+
+        await model.beginSignIn(account: account)
+        await settle { sleeper.pendingSleeps == 1 }
+        let confirmed = await model.confirmSignedIn(account: account)
+        #expect(confirmed)
+
+        sleeper.tick()
+        for _ in 0..<50 { await Task.yield() }
+        // Only the manual verify ever reached the daemon.
+        #expect(backend.verifiedIDs == ["acct-1"])
+        #expect(sleeper.armedSleeps == 1)
+    }
+
+    @Test func lateAutoSuccessAfterCancelIsDropped() async {
+        // The poller's verify is in flight when the user dismisses the flow —
+        // the late success must not resurrect it (same contract as the manual
+        // path's cancel guards).
+        let backend = StubSignInBackend()
+        let sleeper = StubSleeper()
+        let model = makeModel(backend, sleeper: sleeper)
+        var pushedStates = 0
+        var signedIn = 0
+        model.onStateChanged = { _ in pushedStates += 1 }
+        model.onSignedIn = { signedIn += 1 }
+
+        await model.beginSignIn(account: account)
+        await settle { sleeper.pendingSleeps == 1 }
+        backend.waitForRelease = true
+        await withCheckedContinuation { (gated: CheckedContinuation<Void, Never>) in
+            backend.onGated = { gated.resume() }
+            sleeper.tick()
+        }
+        #expect(backend.verifiedIDs == ["acct-1"])
+
+        model.cancel(accountID: "acct-1")
+        backend.release()
+        for _ in 0..<200 { await Task.yield() }
+
+        #expect(model.phase(for: "acct-1") == nil)
+        #expect(model.error(for: "acct-1") == nil)
+        #expect(pushedStates == 0)
+        #expect(signedIn == 0)
+    }
+
+    @Test func autoSuccessRestoresPriorActiveStrictlyAfterVerify() async {
+        // Issue #99 sequencing holds on the zero-click path too.
+        let backend = StubSignInBackend()
+        backend.loginResultByID["acct-1"] = LoginCommand(
+            provider: "claude",
+            command: "'claude' /login",
+            flow: "activation",
+            requiresActivation: true
+        )
+        backend.stateAfterVerify = DeckState(accounts: [
+            DeckAccount(id: "acct-prior", provider: "claude", label: "Prior", isDefault: true),
+            DeckAccount(id: "acct-1", provider: "claude", label: "Deck One", authState: "ok"),
+        ])
+        let sleeper = StubSleeper()
+        let model = makeModel(backend, sleeper: sleeper)
+        var signedIn = 0
+        model.onSignedIn = { signedIn += 1 }
+
+        await model.beginSignIn(account: account)
+        #expect(backend.activatedIDs == ["acct-1"])
+        await settle { sleeper.pendingSleeps == 1 }
+        sleeper.tick()
+        await settle { signedIn == 1 }
+
+        #expect(backend.activatedIDs == ["acct-1", "acct-prior"])
+        #expect(model.phase(for: "acct-1") == nil)
+        #expect(signedIn == 1)
+    }
+}
+
 // MARK: - Update pill
 
 final class StubToolUpdater: ToolUpdating, @unchecked Sendable {
@@ -574,6 +921,61 @@ final class StubToolUpdater: ToolUpdating, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return body()
+    }
+}
+
+// Issue #213 — the deck card's inline duplicate re-login: a flow that fails
+// to START must land its reason at the click site (this path has no Settings
+// window to fall back to), and a parked error needs an explicit dismiss that
+// can never clobber a live flow's state.
+@Suite("Inline sign-in start failures (issue #213)")
+@MainActor
+struct SignInStartFailureTests {
+    private func makeModel(_ backend: StubSignInBackend) -> AccountSignInModel {
+        AccountSignInModel(reauth: backend, launcher: backend, stateProvider: backend, activator: backend)
+    }
+
+    @Test func startFailureLandsInTheAccountsErrorSlot() {
+        let model = makeModel(StubSignInBackend())
+        model.noteStartFailure(
+            accountID: "acct-1",
+            message: AccountSignInModel.duplicateReloginUnresolvedMessage
+        )
+        #expect(model.error(for: "acct-1") == AccountSignInModel.duplicateReloginUnresolvedMessage)
+        #expect(model.phase(for: "acct-1") == nil)
+    }
+
+    @Test func startFailureNeverClobbersALiveFlow() async {
+        // A stale refusal arriving while a newer flow runs must not overwrite
+        // that flow's slot — the phase UI already owns it.
+        let backend = StubSignInBackend()
+        backend.loginCommandByID["acct-1"] = "true"
+        let model = makeModel(backend)
+        await model.beginSignIn(account: DeckAccount(id: "acct-1", provider: "claude", label: "Deck One"))
+        model.noteStartFailure(accountID: "acct-1", message: "late refusal")
+        #expect(model.error(for: "acct-1") == nil)
+        #expect(model.phase(for: "acct-1") == .awaitingSignIn(command: "true"))
+    }
+
+    @Test func dismissClearsAParkedError() {
+        let model = makeModel(StubSignInBackend())
+        model.noteStartFailure(accountID: "acct-1", message: "didn't start")
+        model.dismissError(accountID: "acct-1")
+        #expect(model.error(for: "acct-1") == nil)
+    }
+
+    @Test func dismissLeavesALiveFlowsErrorAlone() async {
+        // Mid-flow errors (a failed Terminal launch, "Still signed out…")
+        // clear via the flow's own actions — the parked-error dismiss must
+        // not offer a second, conflicting path into a running flow.
+        let backend = StubSignInBackend()
+        backend.loginCommandByID["acct-1"] = "true"
+        backend.launchError = CocoaError(.fileNoSuchFile)
+        let model = makeModel(backend)
+        await model.beginSignIn(account: DeckAccount(id: "acct-1", provider: "claude", label: "Deck One"))
+        #expect(model.error(for: "acct-1") != nil)
+        model.dismissError(accountID: "acct-1")
+        #expect(model.error(for: "acct-1") != nil)
     }
 }
 

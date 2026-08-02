@@ -432,13 +432,22 @@ final class SharedScopeTests: XCTestCase {
 // MARK: - Stub backend
 
 /// Stubs both the shared-scope endpoints and the post-op state re-read.
+///
+/// `SharedScopeControlling` is a nonisolated seam, so this runs OFF the
+/// MainActor while the test body runs on it — every mutable access shares
+/// one lock (the StubSleeper lesson from PR #218: a request-recorded /
+/// continuation-parked pair observed from another thread is a torn state).
 private final class StubSharedScopeBackend: SharedScopeControlling, DeckStateProviding, @unchecked Sendable {
-    private(set) var requests: [Bool] = []
+    private let lock = NSLock()
+    private var recordedRequests: [Bool] = []
     private let results: [Result<SharedScopeOutcome, DaemonClientError>]
     private let state: DeckState
     /// When true, requests park until `release()` — for in-flight assertions.
     var holdRequests = false
+    private var released = false
     private var continuations: [CheckedContinuation<Void, Never>] = []
+
+    var requests: [Bool] { locked { recordedRequests } }
 
     init(results: [Result<SharedScopeOutcome, DaemonClientError>], state: DeckState) {
         self.results = results
@@ -446,10 +455,25 @@ private final class StubSharedScopeBackend: SharedScopeControlling, DeckStatePro
     }
 
     func setSharedScope(enabled: Bool) async throws -> SharedScopeOutcome {
-        let index = requests.count
-        requests.append(enabled)
-        if holdRequests {
-            await withCheckedContinuation { continuations.append($0) }
+        let (index, shouldPark) = locked { () -> (Int, Bool) in
+            let index = recordedRequests.count
+            recordedRequests.append(enabled)
+            return (index, holdRequests)
+        }
+        if shouldPark {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                // The released check and the append share one critical
+                // section: the test's spin loop wakes on the request being
+                // recorded (above), so `release()` can land BEFORE this park
+                // — resuming nothing and stranding the continuation forever
+                // (the intermittent 0%-CPU suite hang).
+                let parked: Bool = locked {
+                    guard !released else { return false }
+                    continuations.append(continuation)
+                    return true
+                }
+                if !parked { continuation.resume() }
+            }
         }
         guard index < results.count else {
             throw DaemonClientError.httpStatus(500)
@@ -458,11 +482,23 @@ private final class StubSharedScopeBackend: SharedScopeControlling, DeckStatePro
     }
 
     func release() {
-        continuations.forEach { $0.resume() }
-        continuations = []
+        let drained: [CheckedContinuation<Void, Never>] = locked {
+            defer {
+                released = true
+                continuations = []
+            }
+            return continuations
+        }
+        drained.forEach { $0.resume() }
     }
 
     func deckState() async throws -> DeckState {
         state
+    }
+
+    private func locked<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
     }
 }

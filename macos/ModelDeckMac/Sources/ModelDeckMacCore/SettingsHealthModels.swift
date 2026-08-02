@@ -37,7 +37,9 @@ public final class AccountSignInModel: ObservableObject {
         /// the target account is being activated before the login runs.
         case activating
         /// The provider's login is running in Terminal; the command is kept
-        /// for relaunch/copy if the user closed the window.
+        /// for relaunch/copy if the user closed the window. Issue #217: a
+        /// background poller verifies periodically so a finished login
+        /// usually clears the flow without a Verify click.
         case awaitingSignIn(command: String)
         /// The daemon is reading back the profile's auth status.
         case verifying
@@ -52,6 +54,27 @@ public final class AccountSignInModel: ObservableObject {
     /// before the flip so the flow can put it back when it settles.
     private var priorActiveByAccountID: [String: String] = [:]
     private var activatedForLogin: Set<String> = []
+
+    /// Issue #217: while the provider's login runs in Terminal, the flow
+    /// polls the daemon's verify endpoint in the background so a finished
+    /// login usually clears the card without a Verify click. One poller per
+    /// in-flight flow, keyed by account id; dies with the flow.
+    private var autoVerifyTasks: [String: Task<Void, Never>] = [:]
+
+    /// Clock seam for the auto-verify poller; tests swap in a gated stub.
+    var autoVerifySleep: (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+
+    /// Issue #217: gentle backoff — first check 5s after Terminal opens
+    /// (a browser OAuth is rarely faster), easing to a steady 10s cap so a
+    /// slow login never sees the daemon hammered.
+    static let autoVerifyDelays: [Duration] = [.seconds(5), .seconds(7), .seconds(10)]
+
+    /// CodeRabbit PR #218: the poller is a convenience, not a watchdog —
+    /// each verify spawns a provider CLI daemon-side, so an abandoned card
+    /// must not keep spawning them forever. After this budget the poller
+    /// stops and the manual Verify button is the completion path. Instance
+    /// var so tests can shrink it.
+    var autoVerifyDeadline: Duration = .seconds(600)
 
     /// Fresh daemon state after a verified sign-in (per-account authState
     /// now healthy); pushed into `MenuBarStatusModel` by the app.
@@ -134,6 +157,84 @@ public final class AccountSignInModel: ObservableObject {
         }
         phases[account.id] = .awaitingSignIn(command: login.command)
         launch(command: login.command, accountID: account.id)
+        startAutoVerify(account: account)
+    }
+
+    /// Issue #217: the background poller behind `.awaitingSignIn`. Sleeps
+    /// first (never probes the instant Terminal opens), then checks; a flow
+    /// that ended while it slept ends the poller too. A manual Verify in
+    /// flight (`.verifying`) just skips the beat — if that verify fails back
+    /// to awaiting, polling resumes on the next tick.
+    private func startAutoVerify(account: DeckAccount) {
+        stopAutoVerify(accountID: account.id)
+        autoVerifyTasks[account.id] = Task { [weak self] in
+            var attempt = 0
+            var elapsed = Duration.zero
+            while !Task.isCancelled {
+                guard let self else { return }
+                let delays = Self.autoVerifyDelays
+                let delay = delays[min(attempt, delays.count - 1)]
+                attempt += 1
+                elapsed += delay
+                guard elapsed <= self.autoVerifyDeadline else { return }
+                do { try await self.autoVerifySleep(delay) } catch { return }
+                switch self.phases[account.id] {
+                case .awaitingSignIn:
+                    if await self.autoVerifyOnce(account: account) { return }
+                case .verifying:
+                    break
+                default:
+                    return
+                }
+            }
+        }
+    }
+
+    /// One silent background check; returns true when it completed the flow
+    /// (the poller is done). Only a clean success may touch state: the user
+    /// may still be mid-login in the provider's browser, so a signed-out
+    /// read, an identity mismatch, and a transport error are all invisible
+    /// here — the manual Verify button stays the honest reporter for those,
+    /// and cannot be spammed over by the poller.
+    private func autoVerifyOnce(account: DeckAccount) async -> Bool {
+        guard let verification = try? await reauth.verifyAccount(accountID: account.id) else { return false }
+        guard verification.authenticated, verification.identityMismatch == nil else { return false }
+        // Cancel or a manual Verify may have taken over while the daemon
+        // read — the late success belongs to that path's outcome, not this
+        // poller's.
+        guard case .awaitingSignIn = phases[account.id] else { return false }
+        await completeVerifiedSignIn(accountID: account.id, cancelPoller: false)
+        return true
+    }
+
+    private func stopAutoVerify(accountID: String) {
+        autoVerifyTasks.removeValue(forKey: accountID)?.cancel()
+    }
+
+    /// Shared success tail for the manual Verify and the issue-#217 poller.
+    /// Issue #99: the previously active account comes back strictly AFTER
+    /// verification — the identity read-back is only trustworthy while the
+    /// target profile is active.
+    ///
+    /// CodeRabbit PR #218: `cancelPoller: false` is the poller completing
+    /// ITSELF — cancelling its own task here would poison the restore and
+    /// state-refresh awaits below (DaemonClient's URLSession calls are
+    /// cancellation-aware), so the poller only unregisters and returns via
+    /// `autoVerifyOnce`. The manual path cancels the (elsewhere-suspended)
+    /// poller outright.
+    private func completeVerifiedSignIn(accountID: String, cancelPoller: Bool) async {
+        if cancelPoller {
+            stopAutoVerify(accountID: accountID)
+        } else {
+            autoVerifyTasks[accountID] = nil
+        }
+        phases[accountID] = nil
+        errors[accountID] = nil
+        await restorePriorActive(accountID: accountID)
+        if let fresh = try? await stateProvider.deckState() {
+            onStateChanged?(fresh)
+        }
+        onSignedIn?()
     }
 
     /// The provider's current default (active) account id, for restoring
@@ -174,6 +275,34 @@ public final class AccountSignInModel: ObservableObject {
             return false
         }
     }
+
+    /// Issue #213: the deck card's inline duplicate re-login has no Settings
+    /// window to fall back to — a flow that fails to START (the clicked
+    /// account resolved to nothing against fresh state) must land its reason
+    /// in this account's error slot, where the click site renders it.
+    /// Refused while a flow is in flight: the phase UI already owns the slot
+    /// and a live flow's errors come from the flow itself.
+    public func noteStartFailure(accountID: String, message: String) {
+        guard phases[accountID] == nil else { return }
+        errors[accountID] = message
+    }
+
+    /// Issue #213: explicit dismiss for an error shown with no active phase
+    /// (the deck card's xmark). Mid-flow errors stay — the flow's own
+    /// actions (verify/relaunch/cancel) clear them.
+    public func dismissError(accountID: String) {
+        guard phases[accountID] == nil else { return }
+        errors[accountID] = nil
+    }
+
+    /// Issue #213: the start-failure wording for a duplicate re-login whose
+    /// clicked account no longer resolves against fresh daemon state. In
+    /// Core so the message ships with the mechanism it explains (and stays
+    /// testable beside it).
+    public static let duplicateReloginUnresolvedMessage =
+        "Re-login didn't start: this account no longer matches the duplicate "
+        + "warning (it may have been resolved or removed). Refresh the deck "
+        + "if the warning persists."
 
     /// Re-open Terminal with the stored login command (e.g. after denying
     /// the automation prompt the first time).
@@ -216,16 +345,7 @@ public final class AccountSignInModel: ObservableObject {
             errors[account.id] = AddAccountModel.identityMismatchMessage(mismatch)
             return false
         }
-        phases[account.id] = nil
-        errors[account.id] = nil
-        // Issue #99: verified success — the previously active account comes
-        // back now. Strictly AFTER verification: the identity read-back is
-        // only trustworthy while the target profile is active.
-        await restorePriorActive(accountID: account.id)
-        if let fresh = try? await stateProvider.deckState() {
-            onStateChanged?(fresh)
-        }
-        onSignedIn?()
+        await completeVerifiedSignIn(accountID: account.id, cancelPoller: true)
         return true
     }
 
@@ -242,6 +362,7 @@ public final class AccountSignInModel: ObservableObject {
         // refilled in the meantime.
         let needsRestore = activatedForLogin.remove(accountID) != nil
         let prior = priorActiveByAccountID.removeValue(forKey: accountID)
+        stopAutoVerify(accountID: accountID)
         phases[accountID] = nil
         errors[accountID] = nil
         guard needsRestore else { return }

@@ -647,11 +647,15 @@ struct DuplicateReloginActionTests {
         #expect(model.presentedWarning == nil)
     }
 
-    @Test func requestRoutesSettingsToTheAccountsPane() {
+    @Test func requestLeavesSettingsRoutingAlone() {
+        // Issue #213: the flow answers inline on the deck card — no
+        // Settings hop, so the request must not touch the pane routing
+        // (the old .accounts route opened a window that came up behind the
+        // status-level deck and read as a no-op).
         let model = model()
         model.settingsPane = .general
         model.requestDuplicateRelogin(for: row(id: "codex-1"))
-        #expect(model.settingsPane == .accounts)
+        #expect(model.settingsPane == .general)
     }
 
     @Test func requestNoOpsWhenTheFlagAlreadyCleared() {
@@ -670,7 +674,6 @@ struct DuplicateReloginActionTests {
     @Test func requestWithoutAHandlerIsSafe() {
         let model = model()
         model.requestDuplicateRelogin(for: row(id: "codex-1")) // no crash
-        #expect(model.settingsPane == .accounts)
     }
 
     @Test func requestWorksForClaudeDuplicatesToo() {

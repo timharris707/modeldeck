@@ -13,6 +13,11 @@ struct DeckPopoverView: View {
     /// popover observes the shared model (same instance as Settings →
     /// Accounts) and hands each card plain presentation values.
     @ObservedObject var renewModel: AccountRenewModel
+    /// Issue #213: the duplicate "Re-log in…" flow renders inline on the
+    /// deck card, so the popover observes the SAME sign-in model instance
+    /// as Settings → Accounts — one flow, two honest surfaces, and the
+    /// roster's own controls can never restart what the deck launched.
+    @ObservedObject var signInModel: AccountSignInModel
     /// Issue #33 final placement: the gear menu carries the PRIMARY
     /// "Check for App Updates…" affordance, wired to the same shared model
     /// as the Settings mirror — one check state, two entry points.
@@ -49,6 +54,13 @@ struct DeckPopoverView: View {
         // meter rows carry "Weekly · all models" left and
         // "Resets Wed 5:59 PM" right on every card (zone-free per #137).
         .frame(width: deckModel.layout == .twoColumn ? 640 : 420)
+        .onAppear {
+            // Tim directive 2026-08-02: one diff per open, against the
+            // snapshot stored at the PREVIOUS open — the changed cards glow
+            // and roll their percent (see DeckAccountRowView). Cards animate
+            // via onChange, so parent-after-child onAppear ordering is fine.
+            deckModel.captureUsageChanges(state: statusModel.deckState)
+        }
         .task {
             launchAtLoginModel.load()
             await statusModel.refresh()
@@ -280,7 +292,15 @@ struct DeckPopoverView: View {
                                 // Issue #199: explicit dismiss re-arms the
                                 // affordance — never a silent timeout.
                                 renewModel.dismissOutcome(accountID: row.account.id)
-                            }
+                            },
+                            signInPhase: { signInModel.phase(for: $0.id) },
+                            signInError: { signInModel.error(for: $0.id) },
+                            onVerifySignIn: { row in
+                                Task { await signInModel.confirmSignedIn(account: row.account) }
+                            },
+                            onRelaunchSignIn: { signInModel.relaunch(accountID: $0.id) },
+                            onCancelSignIn: { signInModel.cancel(accountID: $0.id) },
+                            onDismissSignInError: { signInModel.dismissError(accountID: $0.id) }
                         )
                         .frame(maxWidth: .infinity, alignment: .topLeading)
                     }
@@ -303,7 +323,15 @@ struct DeckPopoverView: View {
                             },
                             onDismissRenewOutcome: {
                                 renewModel.dismissOutcome(accountID: row.account.id)
-                            }
+                            },
+                            signInPhase: signInModel.phase(for: row.id),
+                            signInError: signInModel.error(for: row.id),
+                            onVerifySignIn: {
+                                Task { await signInModel.confirmSignedIn(account: row.account) }
+                            },
+                            onRelaunchSignIn: { signInModel.relaunch(accountID: row.id) },
+                            onCancelSignIn: { signInModel.cancel(accountID: row.id) },
+                            onDismissSignInError: { signInModel.dismissError(accountID: row.id) }
                         ) {
                             withAnimation(.easeOut(duration: 0.15)) {
                                 deckModel.toggleExpansion(of: row.id)
@@ -471,6 +499,16 @@ struct DeckColumnView: View {
     var onRenewNow: (DeckAccountRow) -> Void = { _ in }
     /// Issue #199: per-row dismiss for the inline renew outcome line.
     var onDismissRenewOutcome: (DeckAccountRow) -> Void = { _ in }
+    /// Issue #213: per-row sign-in flow state + actions, supplied by the
+    /// popover so the column stays free of the sign-in model (same seam
+    /// shape as `renewPresentation`). Defaults render nothing for
+    /// previews/tests.
+    var signInPhase: (DeckAccountRow) -> AccountSignInModel.Phase? = { _ in nil }
+    var signInError: (DeckAccountRow) -> String? = { _ in nil }
+    var onVerifySignIn: (DeckAccountRow) -> Void = { _ in }
+    var onRelaunchSignIn: (DeckAccountRow) -> Void = { _ in }
+    var onCancelSignIn: (DeckAccountRow) -> Void = { _ in }
+    var onDismissSignInError: (DeckAccountRow) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -504,7 +542,13 @@ struct DeckColumnView: View {
                         staleness: staleness(row),
                         renew: renewPresentation(row),
                         onRenewNow: { onRenewNow(row) },
-                        onDismissRenewOutcome: { onDismissRenewOutcome(row) }
+                        onDismissRenewOutcome: { onDismissRenewOutcome(row) },
+                        signInPhase: signInPhase(row),
+                        signInError: signInError(row),
+                        onVerifySignIn: { onVerifySignIn(row) },
+                        onRelaunchSignIn: { onRelaunchSignIn(row) },
+                        onCancelSignIn: { onCancelSignIn(row) },
+                        onDismissSignInError: { onDismissSignInError(row) }
                     ) {
                         withAnimation(.easeOut(duration: 0.15)) {
                             deckModel.toggleExpansion(of: row.id)
@@ -583,11 +627,75 @@ struct DeckAccountRowView: View {
     /// and re-arms the renew affordance — the row's explicit dismiss, same
     /// contract as the Settings row's xmark.
     var onDismissRenewOutcome: (() -> Void)? = nil
+    /// Issue #213: this account's sign-in-flow state (`AccountSignInModel`,
+    /// the SAME per-account slots the Settings roster renders), so the
+    /// duplicate "Re-log in…" flow answers on the card that launched it.
+    /// Plain values + callbacks, same seam shape as `renew` — the card
+    /// stays free of the sign-in model (the popover observes it).
+    var signInPhase: AccountSignInModel.Phase? = nil
+    var signInError: String? = nil
+    var onVerifySignIn: (() -> Void)? = nil
+    var onRelaunchSignIn: (() -> Void)? = nil
+    var onCancelSignIn: (() -> Void)? = nil
+    /// Issue #213: dismisses an error shown with no active phase (a flow
+    /// that failed to start); mid-flow errors clear via the flow's own
+    /// actions instead.
+    var onDismissSignInError: (() -> Void)? = nil
     let onToggle: () -> Void
     /// Issue #118: the "Sign in again…" action opens the Settings window
     /// (Accounts pane, via the model's routed selection) — the environment
     /// action lives here because only views can reach it.
     @Environment(\.openSettings) private var openSettings
+
+    // Tim directive 2026-08-02 ("what changed since I last looked"): when
+    // the popover-open diff says this card's headline moved, the card glows
+    // softly for a moment and the percent rolls from the old value to the
+    // new one. Purely decorative — VoiceOver reads the live values only.
+    @State private var glowOpacity: Double = 0
+    /// Non-nil only during the roll: the value the headline TEXT renders
+    /// while the odometer transition plays; cleared afterwards so a mid-open
+    /// refresh can never leave a stale number on screen.
+    @State private var rollingRemaining: Double?
+    /// The last capture generation this card animated for. Generation-keyed
+    /// (not a one-shot flag) because MenuBarExtra window content can stay
+    /// alive across opens — surviving @State must not silence later opens.
+    @State private var animatedGeneration = 0
+
+    private var usageChange: DeckUsageChange? {
+        deckModel.usageChange(for: row.id)
+    }
+
+    private func animateChangeIfNeeded() {
+        guard animatedGeneration != deckModel.usageCaptureGeneration else { return }
+        animatedGeneration = deckModel.usageCaptureGeneration
+        guard let change = usageChange else { return }
+        glowOpacity = 1
+        rollingRemaining = change.previousRemaining
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+            withAnimation(.easeOut(duration: 1.1)) {
+                rollingRemaining = change.currentRemaining
+            }
+            withAnimation(.easeOut(duration: 2.6).delay(0.4)) {
+                glowOpacity = 0
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
+            rollingRemaining = nil
+        }
+    }
+
+    /// The collapsed headline's text: the old value only while the roll
+    /// plays AND the diffed window is still the one displayed (same scope,
+    /// percent form) — a card whose binding window switched mid-open renders
+    /// the live truth immediately.
+    private func headlineText(worst: DeckWindow, live: String) -> String {
+        guard let rolling = rollingRemaining,
+              let change = usageChange,
+              change.scope == worst.scope,
+              worst.remainingText != nil
+        else { return live }
+        return "\(Int(rolling.rounded()))% left"
+    }
 
     /// Issue #118 — the one-click path from the sign-in-needed notice into
     /// the roster's existing re-login flow: dismiss the explanation, route
@@ -601,17 +709,20 @@ struct DeckAccountRowView: View {
         SettingsWindowFronting.activateAndFront()
     }
 
-    /// Issue #152 — the duplicate-login warning's one-click path, the same
-    /// shape as `beginSignInAgain` with the model request keyed on the
-    /// duplicate flag: dismiss the explanation, route Settings to the
-    /// Accounts pane, fire the model's re-login request (which the app
+    /// Issue #152 — the duplicate-login warning's one-click path: dismiss
+    /// the explanation and fire the model's re-login request, which the app
     /// resolves against fresh state and hands to the SAME
-    /// `AccountSignInModel.beginSignIn` flow), and front Settings so the
-    /// in-progress flow is visible.
+    /// `AccountSignInModel.beginSignIn` flow as the roster chip.
+    ///
+    /// Issue #213 (Tim's field report 2026-08-02): NO Settings hop anymore.
+    /// The old `openSettings()` + fronting raced Terminal's own `activate`
+    /// and lost to the status-level deck window, so the click read as a
+    /// no-op — and the roster's identical "Re-log in" button then invited a
+    /// restart. The flow now renders inline on this card (`signInFlow`
+    /// below), and Terminal — the thing the user must interact with — is
+    /// the only window the launch brings forward.
     private func beginDuplicateRelogin() {
         deckModel.requestDuplicateRelogin(for: row)
-        openSettings()
-        SettingsWindowFronting.activateAndFront()
     }
 
     var body: some View {
@@ -655,6 +766,15 @@ struct DeckAccountRowView: View {
             if isExpanded {
                 expandedWindows
             }
+
+            // Issue #213: the sign-in flow answers ON the card that
+            // launched it — progress, the awaiting step (Verify /
+            // Re-log in / cancel, the same anatomy as the Settings
+            // roster's slot), and any error, all from the shared
+            // per-account `AccountSignInModel` state. The roster and this
+            // card render the same flow; neither can restart it behind the
+            // other's back (`beginSignIn` is re-entrancy-guarded).
+            signInFlow
 
             // Issue #98: the Keychain recovery notice — macOS refused the
             // daemon's read of this account's existing credentials (the
@@ -879,6 +999,22 @@ struct DeckAccountRowView: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.07))
         )
+        // The change glow: a soft accent halo (hairline + shadow, no fill)
+        // that fades out over ~3 s — noticeable when you look, invisible
+        // when you don't. Accent, never a severity color: "this moved" is
+        // information, not an alarm. Decorative only (glowOpacity is 0 for
+        // unchanged cards and the overlay hit-tests nothing).
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.accentColor.opacity(0.5 * glowOpacity), lineWidth: 1)
+                .allowsHitTesting(false)
+        )
+        .shadow(color: Color.accentColor.opacity(0.32 * glowOpacity), radius: 7)
+        .onAppear(perform: animateChangeIfNeeded)
+        // The open-diff publishes AFTER children appear (parent onAppear
+        // ordering), so the trigger listens for the capture generation too;
+        // the per-generation guard keeps it one-shot per open.
+        .onChange(of: deckModel.usageCaptureGeneration) { animateChangeIfNeeded() }
         // Menu bar pin (account percentage picker follow-up, Tim's call):
         // right-click a card to pin its percentage to the menu bar — or
         // follow the provider's ACTIVE account so the menu bar tracks every
@@ -899,6 +1035,81 @@ struct DeckAccountRowView: View {
                     )
                 )
             }
+        }
+    }
+
+    /// Issue #213: the card's inline sign-in flow surface — the same phase
+    /// grammar as the Settings roster's `signInControls`, sized to the card
+    /// (10 pt text, mini controls). The awaiting step keeps all three
+    /// affordances — Verify (daemon read-back), Re-log in (reopens Terminal
+    /// with the SAME stored command, never a flow restart), cancel —
+    /// because Terminal can be closed or its automation prompt denied. The
+    /// error line renders in warning tint; a flow that never started
+    /// (phase nil) carries its own dismiss xmark.
+    @ViewBuilder
+    private var signInFlow: some View {
+        switch signInPhase {
+        case .launching, .activating, .verifying:
+            HStack(spacing: 4) {
+                ProgressView().controlSize(.mini)
+                Text(signInProgressText)
+                    .font(.system(size: 10))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(Color.secondary)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(signInProgressText) \(row.account.label)")
+        case .awaitingSignIn:
+            HStack(spacing: 5) {
+                Text("Waiting for login in Terminal…")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Button("Verify") { onVerifySignIn?() }
+                    .controlSize(.mini)
+                    .help("Check with the provider that this profile is now signed in")
+                Button("Re-log in") { onRelaunchSignIn?() }
+                    .controlSize(.mini)
+                    .help("Open Terminal with the provider's login command again — use this if no Terminal window appeared or you closed it")
+                Button {
+                    onCancelSignIn?()
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .controlSize(.mini)
+                .accessibilityLabel("Cancel sign-in for \(row.account.label)")
+            }
+        case nil:
+            EmptyView()
+        }
+        if let signInError {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 9, weight: .semibold))
+                Text(signInError)
+                    .font(.system(size: 10))
+                    .fixedSize(horizontal: false, vertical: true)
+                if signInPhase == nil, let onDismissSignInError {
+                    Button(action: onDismissSignInError) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 8))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Dismiss sign-in error for \(row.account.label)")
+                }
+            }
+            .foregroundStyle(severityColor(.warning))
+            .help(signInError)
+        }
+    }
+
+    /// Issue #213: same wording as the Settings roster's progress line.
+    private var signInProgressText: String {
+        switch signInPhase {
+        case .verifying: return "Verifying…"
+        case .activating: return "Activating this account for sign-in…"
+        default: return "Opening Terminal…"
         }
     }
 
@@ -946,6 +1157,13 @@ struct DeckAccountRowView: View {
                         onRelogin: { beginDuplicateRelogin() }
                     )
                 }
+                if let weight = row.account.proxyWeight {
+                    // Proxy routing weight: deliberately the quietest element
+                    // on the row — tier-scale, secondary, grouped with the
+                    // title cluster so it never competes with the headline
+                    // percent. Absent field (no proxy) renders nothing.
+                    ProxyWeightBadge(weight: weight)
+                }
                 Spacer(minLength: 8)
                 // Issue #33 amendment: the headline percent only exists
                 // while collapsed — expanded rows carry their own numbers.
@@ -953,10 +1171,15 @@ struct DeckAccountRowView: View {
                 // the value is the payload-stated dollars, like the row.
                 if let worst = row.headlineWindow(isExpanded: isExpanded),
                    let remainingText = worst.valueText {
-                    Text(remainingText)
+                    Text(headlineText(worst: worst, live: remainingText))
                         .font(DeckType.value)
                         .foregroundStyle(valueColor(for: worst))
                         .monospacedDigit()
+                        // The old→new odometer roll during the change
+                        // animation; inert (no text change) otherwise.
+                        .contentTransition(.numericText(
+                            countsDown: (usageChange?.currentRemaining ?? 0) < (usageChange?.previousRemaining ?? 0)
+                        ))
                 }
             }
             if showsIdentity, let identity = row.account.identity, !identity.isEmpty {
@@ -1203,6 +1426,29 @@ struct MenuBarSourceCheckmark: View {
             .foregroundStyle(Color.accentColor)
             .help(tooltip)
             .accessibilityLabel("Shown in menu bar")
+    }
+}
+
+/// CLIProxyAPI routing weight beside the account title: a small branch
+/// glyph + digit at the tier scale, secondary throughout — ambient context
+/// (which accounts the proxy currently favors), never a headline. The
+/// tooltip explains the number; the glyph is routing, not health, so it
+/// never uses severity color. Weight 0 renders too: "the proxy has parked
+/// this account" is exactly the fact worth seeing.
+struct ProxyWeightBadge: View {
+    let weight: Int
+
+    var body: some View {
+        HStack(spacing: 2) {
+            Image(systemName: "arrow.triangle.branch")
+                .font(.system(size: 8.5))
+            Text("\(weight)")
+                .font(DeckType.tier)
+                .monospacedDigit()
+        }
+        .foregroundStyle(.secondary)
+        .help("Proxy routing weight \(weight) — rebalanced hourly from remaining quota")
+        .accessibilityLabel("Proxy routing weight \(weight)")
     }
 }
 

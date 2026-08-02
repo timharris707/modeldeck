@@ -271,6 +271,17 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     /// window filtering). Feeds the per-card staleness marker; nil when no
     /// snapshot carries a parseable `observedAt`.
     public var newestObservedAt: Date?
+    /// Tim directive 2026-08-02: when ON, the card's binding window prefers
+    /// the model-scoped weekly (the "Weekly · Fable" class of window) over
+    /// the generic pool — the burst 5-hour window is noise for someone who
+    /// only plans around the model quota. Deliberately NOT keyed to a model
+    /// name: the preference follows whatever model-scoped window the daemon
+    /// reports, so a provider-side rename never strands it. Rows without a
+    /// measurable model-scoped window keep today's behavior (the preference
+    /// can never hide the only data a card has), and every derived value —
+    /// sort keys, summary, meter — follows the binding window, preserving
+    /// the #43 "visible order matches visible text" invariant.
+    public var prefersModelWindowHeadline: Bool
 
     public var id: String { account.id }
 
@@ -344,7 +355,11 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     public var worstWindow: DeckWindow? {
         let measurable = windows.filter { $0.remainingPercent != nil }
         let rateLimits = measurable.filter { !$0.isSpend }
-        let eligible = rateLimits.isEmpty ? measurable : rateLimits
+        var eligible = rateLimits.isEmpty ? measurable : rateLimits
+        if prefersModelWindowHeadline {
+            let modelScoped = eligible.filter { DeckBuilder.windowRank(scope: $0.scope) == 2 }
+            if !modelScoped.isEmpty { eligible = modelScoped }
+        }
         guard let worst = eligible.compactMap(\.remainingPercent).min() else {
             // Issue #139 (CodeRabbit, PR #142): an amount-only spend row —
             // the daemon stated dollars but no percent — is still a live
@@ -425,7 +440,8 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
         windows: [DeckWindow],
         isActive: Bool,
         activationState: ProviderActivationState = .unknown,
-        newestObservedAt: Date? = nil
+        newestObservedAt: Date? = nil,
+        prefersModelWindowHeadline: Bool = false
     ) {
         self.account = account
         self.provider = provider
@@ -433,6 +449,7 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
         self.isActive = isActive
         self.activationState = activationState
         self.newestObservedAt = newestObservedAt
+        self.prefersModelWindowHeadline = prefersModelWindowHeadline
     }
 }
 
@@ -453,13 +470,87 @@ public struct DeckColumn: Equatable, Identifiable, Sendable {
     }
 }
 
+// MARK: - What changed since the last open (Tim directive 2026-08-02)
+
+/// One card's headline movement between two popover opens: the displayed
+/// (binding) window's remaining % then and now. Only produced for the SAME
+/// scope — a card whose binding window switched (say 5-hour → Fable weekly
+/// via the headline preference) shows fresh numbers with no animation, never
+/// a misleading cross-window "drop".
+public struct DeckUsageChange: Equatable, Sendable {
+    public var scope: String
+    public var previousRemaining: Double
+    public var currentRemaining: Double
+
+    public init(scope: String, previousRemaining: Double, currentRemaining: Double) {
+        self.scope = scope
+        self.previousRemaining = previousRemaining
+        self.currentRemaining = currentRemaining
+    }
+}
+
+/// Persists each account's displayed headline at every popover open and
+/// answers "what moved since I last looked" — the cards that changed glow
+/// briefly and roll their percent from the old value to the new one.
+/// App-local UserDefaults (the #73 pattern); one snapshot per open, so a
+/// mid-open refresh simply glows on the NEXT open. Whole-percent threshold:
+/// the headline renders integers, so sub-point drift that cannot change the
+/// text cannot glow either.
+public final class DeckChangeTracker {
+    static let defaultsKey = "modeldeck.popover.lastSeenHeadlines"
+    private struct Seen: Codable {
+        var scope: String
+        var remaining: Double
+    }
+
+    private let defaults: UserDefaults
+
+    public init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    /// Diffs the rows' binding windows against the previous open's snapshot,
+    /// stores the current snapshot, and returns the changes by account id.
+    public func capture(rows: [DeckAccountRow]) -> [String: DeckUsageChange] {
+        let previous = load()
+        var next: [String: Seen] = [:]
+        var changes: [String: DeckUsageChange] = [:]
+        for row in rows {
+            guard let worst = row.worstWindow, let remaining = worst.remainingPercent else { continue }
+            next[row.id] = Seen(scope: worst.scope, remaining: remaining)
+            guard let prior = previous[row.id], prior.scope == worst.scope else { continue }
+            if Int(prior.remaining.rounded()) != Int(remaining.rounded()) {
+                changes[row.id] = DeckUsageChange(
+                    scope: worst.scope,
+                    previousRemaining: prior.remaining,
+                    currentRemaining: remaining
+                )
+            }
+        }
+        save(next)
+        return changes
+    }
+
+    private func load() -> [String: Seen] {
+        guard let data = defaults.data(forKey: Self.defaultsKey) else { return [:] }
+        return (try? JSONDecoder().decode([String: Seen].self, from: data)) ?? [:]
+    }
+
+    private func save(_ snapshot: [String: Seen]) {
+        if let data = try? JSONEncoder().encode(snapshot) {
+            defaults.set(data, forKey: Self.defaultsKey)
+        }
+    }
+}
+
 /// Pure builders turning daemon `DeckState` into deck rows/columns.
 public enum DeckBuilder {
     /// All rows for enabled accounts, unsorted.
     public static func rows(
         state: DeckState,
         thresholds: UsageThresholds = .default,
-        now: Date = Date()
+        now: Date = Date(),
+        preferModelWindowHeadline: Bool = false
     ) -> [DeckAccountRow] {
         let usageByAccount = Dictionary(grouping: state.usage, by: \.accountId)
         return state.accounts
@@ -486,7 +577,8 @@ public enum DeckBuilder {
                     // data age must not shift when a spend row is hidden.
                     newestObservedAt: snapshots
                         .compactMap { DeckDateParsing.date(from: $0.observedAt) }
-                        .max()
+                        .max(),
+                    prefersModelWindowHeadline: preferModelWindowHeadline
                 )
             }
     }
@@ -575,9 +667,10 @@ public enum DeckBuilder {
         sortOrder: DeckSortOrder,
         direction: DeckSortDirection = .ascending,
         thresholds: UsageThresholds = .default,
-        now: Date = Date()
+        now: Date = Date(),
+        preferModelWindowHeadline: Bool = false
     ) -> [DeckColumn] {
-        let allRows = rows(state: state, thresholds: thresholds, now: now)
+        let allRows = rows(state: state, thresholds: thresholds, now: now, preferModelWindowHeadline: preferModelWindowHeadline)
         return [DeckProvider.claude, .codex].map { provider in
             DeckColumn(
                 provider: provider,
@@ -592,9 +685,13 @@ public enum DeckBuilder {
         sortOrder: DeckSortOrder,
         direction: DeckSortDirection = .ascending,
         thresholds: UsageThresholds = .default,
-        now: Date = Date()
+        now: Date = Date(),
+        preferModelWindowHeadline: Bool = false
     ) -> [DeckAccountRow] {
-        sorted(rows(state: state, thresholds: thresholds, now: now), by: sortOrder, direction: direction)
+        sorted(
+            rows(state: state, thresholds: thresholds, now: now, preferModelWindowHeadline: preferModelWindowHeadline),
+            by: sortOrder, direction: direction
+        )
     }
 
     // MARK: - Windows
@@ -903,6 +1000,7 @@ public final class DeckPopoverModel: ObservableObject {
     static let layoutDefaultsKey = "modeldeck.popover.layout"
     static let sortDefaultsKey = "modeldeck.popover.sort"
     static let showEmailsDefaultsKey = "modeldeck.popover.showEmails"
+    static let preferModelWindowDefaultsKey = "modeldeck.popover.preferModelWindow"
 
     @Published public var layout: DeckLayout {
         didSet {
@@ -1186,16 +1284,20 @@ public final class DeckPopoverModel: ObservableObject {
     }
 
     /// Issue #152: the duplicate-login warning's "Re-log in" action —
-    /// the exact anatomy of `requestSignInAgain` with the guard keyed on
-    /// the duplicate flag instead of the sign-in recovery. Dismisses the
-    /// explanation the button lives in, routes Settings to the Accounts
-    /// pane, and fires `onDuplicateRelogin`. No-op (beyond the dismissal)
-    /// when the flag has cleared — a fresh /login may have resolved the
-    /// pair between render and click.
+    /// the anatomy of `requestSignInAgain` with the guard keyed on the
+    /// duplicate flag instead of the sign-in recovery. Dismisses the
+    /// explanation the button lives in and fires `onDuplicateRelogin`.
+    /// No-op (beyond the dismissal) when the flag has cleared — a fresh
+    /// /login may have resolved the pair between render and click.
+    ///
+    /// Issue #213 (Tim's field report 2026-08-02): this path no longer
+    /// routes Settings anywhere — the flow renders INLINE on the deck card
+    /// (phase + error from `AccountSignInModel`, same per-account slots the
+    /// roster reads), and the Settings window the old hop opened came up
+    /// behind the status-level deck window anyway, reading as a no-op.
     public func requestDuplicateRelogin(for row: DeckAccountRow) {
         presentedWarning = nil
         guard row.account.hasDuplicateToken else { return }
-        settingsPane = .accounts
         onDuplicateRelogin?(row.id)
     }
 
@@ -1226,6 +1328,31 @@ public final class DeckPopoverModel: ObservableObject {
     @Published public var showAccountEmails: Bool {
         didSet { defaults.set(showAccountEmails, forKey: Self.showEmailsDefaultsKey) }
     }
+
+    /// Tim directive 2026-08-02: Claude cards lead with the model-scoped
+    /// weekly window (the "Weekly · Fable" class) instead of the lowest
+    /// window — the 5-hour burst limit is noise for planning around the
+    /// model quota. DEFAULT OFF: today's lowest-remaining behavior stays
+    /// the default; this is the settings distinction Tim asked for. App-
+    /// local preference (UserDefaults, the #73 pattern); never synced to
+    /// the daemon. Cards without a measurable model-scoped window are
+    /// unaffected (the preference can never hide the only data a card has).
+    @Published public var preferModelWindowHeadline: Bool {
+        didSet { defaults.set(preferModelWindowHeadline, forKey: Self.preferModelWindowDefaultsKey) }
+    }
+
+    /// Tim directive 2026-08-02: on each popover open, the cards whose
+    /// headline moved since the PREVIOUS open glow briefly and roll their
+    /// percent old → new — "what changed since I last looked" at a glance.
+    /// Captured once per open (`captureUsageChanges`); purely decorative
+    /// state, so it never syncs anywhere.
+    @Published public private(set) var usageChangesByAccount: [String: DeckUsageChange] = [:]
+    /// Bumped by every capture. Cards animate at most once per generation —
+    /// a plain one-shot flag broke because MenuBarExtra window content can
+    /// stay alive across opens, so per-card @State survives and a consumed
+    /// flag silenced every later open's changes.
+    @Published public private(set) var usageCaptureGeneration = 0
+    private let changeTracker: DeckChangeTracker
 
     // MARK: Activation state (issue #6)
 
@@ -1273,6 +1400,7 @@ public final class DeckPopoverModel: ObservableObject {
         self.defaults = defaults
         self.activator = activator
         self.stateProvider = stateProvider
+        self.changeTracker = DeckChangeTracker(defaults: defaults)
         self.layout = defaults.string(forKey: Self.layoutDefaultsKey)
             .flatMap(DeckLayout.init(rawValue:)) ?? .twoColumn
         self.sortOrder = defaults.string(forKey: Self.sortDefaultsKey)
@@ -1288,10 +1416,35 @@ public final class DeckPopoverModel: ObservableObject {
         )
         // Absent key reads false — the issue #73 default-off requirement.
         self.showAccountEmails = defaults.bool(forKey: Self.showEmailsDefaultsKey)
+        // Absent key reads false — today's lowest-remaining default.
+        self.preferModelWindowHeadline = defaults.bool(forKey: Self.preferModelWindowDefaultsKey)
     }
 
     public func isExpanded(_ accountID: String) -> Bool {
         expandedAccountIDs.contains(accountID)
+    }
+
+    /// Call once per popover open, BEFORE the cards render: diffs the
+    /// current state's binding windows against the snapshot stored at the
+    /// previous open and publishes the changed cards. Rows are built with
+    /// the same headline preference the deck renders with, so the diffed
+    /// number is exactly the number on screen.
+    public func captureUsageChanges(state: DeckState?, now: Date = Date()) {
+        guard let state else {
+            usageChangesByAccount = [:]
+            return
+        }
+        usageChangesByAccount = changeTracker.capture(
+            rows: DeckBuilder.rows(
+                state: state, thresholds: thresholds, now: now,
+                preferModelWindowHeadline: preferModelWindowHeadline
+            )
+        )
+        usageCaptureGeneration += 1
+    }
+
+    public func usageChange(for accountID: String) -> DeckUsageChange? {
+        usageChangesByAccount[accountID]
     }
 
     public func toggleExpansion(of accountID: String) {
@@ -1304,14 +1457,20 @@ public final class DeckPopoverModel: ObservableObject {
 
     /// Two-column mode content.
     public func columns(for state: DeckState, now: Date = Date()) -> [DeckColumn] {
-        DeckBuilder.columns(state: state, sortOrder: sortOrder, direction: sortDirection, thresholds: thresholds, now: now)
-            .map { DeckColumn(provider: $0.provider, rows: applyingActivation($0.rows)) }
+        DeckBuilder.columns(
+            state: state, sortOrder: sortOrder, direction: sortDirection, thresholds: thresholds, now: now,
+            preferModelWindowHeadline: preferModelWindowHeadline
+        )
+        .map { DeckColumn(provider: $0.provider, rows: applyingActivation($0.rows)) }
     }
 
     /// Single-column mode content (both providers interleaved by sort).
     public func interleavedRows(for state: DeckState, now: Date = Date()) -> [DeckAccountRow] {
         applyingActivation(
-            DeckBuilder.interleavedRows(state: state, sortOrder: sortOrder, direction: sortDirection, thresholds: thresholds, now: now)
+            DeckBuilder.interleavedRows(
+                state: state, sortOrder: sortOrder, direction: sortDirection, thresholds: thresholds, now: now,
+                preferModelWindowHeadline: preferModelWindowHeadline
+            )
         )
     }
 

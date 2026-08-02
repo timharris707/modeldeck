@@ -1027,6 +1027,12 @@ struct GeneralSettingsPane: View {
                 // identities: it's the management surface.
                 Toggle("Show account emails", isOn: $deckModel.showAccountEmails)
                     .help("Show each account's identity (email) under its name in the popover. Off by default; applies to both providers. The Accounts pane always shows identities.")
+                // Tim directive 2026-08-02: the model window (e.g. Fable
+                // weekly) is the quota he plans around; the 5-hour burst
+                // limit kept stealing the headline. Off by default —
+                // today's lowest-window behavior stays until chosen.
+                Toggle("Lead with the model window (e.g. Fable)", isOn: $deckModel.preferModelWindowHeadline)
+                    .help("Claude cards headline the model-specific weekly window (like Fable) instead of whichever window is lowest. The 5-hour and all-model windows stay visible when a card is expanded, and sorting follows the displayed window. Cards without a model window are unaffected.")
             }
 
             // Menu bar percent source (Tim, 2026-07-22): "lowest across

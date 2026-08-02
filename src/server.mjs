@@ -10,6 +10,7 @@ import { runStatuslineCli as runClaudeStatusline, STATUSLINE_SEA_COMMAND } from 
 import {
   HOST, PORT, DB_PATH, PROJECTS_ROOT, CLAUDE_PATH, CLAUDE_PROFILES_DIR, CLAUDE_ACTIVE_LINK,
   CLAUDE_SHELL_ENV_FILE, CLAUDE_STATUSLINE_DIR, CODEX_PATH, CODEX_ACTIVE_LINK, CODEX_PROFILES_DIR,
+  CLIPROXY_AUTH_DIR,
 } from './paths.mjs';
 
 // esbuild replaces the build-only identifier with a string literal for SEA;
@@ -72,6 +73,7 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
     codexPath: CODEX_PATH,
     codexActiveLink: CODEX_ACTIVE_LINK,
     codexProfilesDir: CODEX_PROFILES_DIR,
+    cliproxyAuthDir: CLIPROXY_AUTH_DIR,
     // DEMO/DEV ONLY (issue #129): seeded fixture snapshots are authoritative —
     // provider refresh becomes a no-op and nothing is ever scheduled. Set by
     // scripts/demo-daemon.sh for screenshot instances; never in production.

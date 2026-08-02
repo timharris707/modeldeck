@@ -163,6 +163,22 @@ for (const name of ['acme-webapp', 'robot-garden', 'modeldeck']) {
 }
 store.close();
 
+// CLIProxyAPI weight fixtures (proxy-weight display): placeholder auth files
+// carrying ONLY the join fields the daemon reads (type/email/weight) — no
+// token keys at all, matching the no-credentials rule above. Claude joins by
+// identity email; the codex join needs the refresh pass the demo daemon
+// disables, so demo codex cards stay weightless (honest: the demo never
+// refreshes). Weights span the bands so screenshots show the spread.
+const cliproxyDir = path.join(dataDir, 'cliproxy-auth');
+assertDemoPath('cliproxy auth dir', cliproxyDir);
+fs.mkdirSync(cliproxyDir, { recursive: true });
+for (const [name, weight] of [['personal', 10], ['business', 5], ['hobby', 8], ['school', 3]]) {
+  fs.writeFileSync(
+    path.join(cliproxyDir, `claude-${identities.claude[name]}.json`),
+    JSON.stringify({ type: 'claude', email: identities.claude[name], weight }, null, 2),
+  );
+}
+
 // Active-provider symlinks INSIDE the demo dir. The demo daemon must be
 // launched with MODELDECK_CLAUDE_ACTIVE_LINK / MODELDECK_CODEX_ACTIVE_LINK
 // pointing here (scripts/demo-daemon.sh does) — never at ~/.claude or

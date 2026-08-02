@@ -12,12 +12,23 @@ import ModelDeckMacCore
 enum SettingsWindowFronting {
     /// Activate the app, then front + key the Settings window. The window
     /// is created asynchronously by `openSettings()`, so fronting retries
-    /// briefly until it appears (10 x 50 ms covers window creation
-    /// comfortably; if it never appears, there is nothing to front and the
-    /// retries end silently).
+    /// until it appears; if it never appears, there is nothing to front and
+    /// the retries end silently.
+    ///
+    /// Issue #213 (Tim's field report 2026-08-02): the old single
+    /// front-once-found inside a ~500 ms window lost two races — cooperative
+    /// activation can be DENIED on the first ask (the window then sits
+    /// behind the frontmost app, non-key), and a Terminal login launched
+    /// alongside activates ~a daemon round-trip later, past the retry
+    /// window. Fronting now keeps re-asserting (re-activate + key + order)
+    /// until the window is genuinely key, for up to ~2.5 s — and cedes the
+    /// moment another app takes activation away after we held it, because
+    /// that app (e.g. Terminal running a provider login) is then the thing
+    /// the user must interact with; stealing front back would be worse than
+    /// the bug.
     static func activateAndFront() {
         activate()
-        front(attempt: 0)
+        front(attempt: 0, heldActivation: NSApp.isActive)
     }
 
     /// Activate the app so an alert/dialog presented from the popover comes
@@ -38,18 +49,26 @@ enum SettingsWindowFronting {
         }
     }
 
-    private static func front(attempt: Int) {
+    /// One assertion pass per tick: done when the window is key; ceded when
+    /// activation was held once and then lost to another app; otherwise
+    /// re-activate + re-front and try again. `heldActivation` latches the
+    /// first observed active state so a slow cooperative-activation grant is
+    /// never misread as "another app took over".
+    private static func front(attempt: Int, heldActivation: Bool) {
+        let isActive = NSApp.isActive
         if let window = settingsWindow() {
+            if window.isKeyWindow { return } // settled in front
+            if heldActivation && !isActive { return } // ceded (e.g. to Terminal)
+            activate()
             window.makeKeyAndOrderFront(nil)
             // Accessory-policy apps can lose the key-window race to the
             // previously frontmost app; regardless-ordering keeps the
             // window visually on top even then.
             window.orderFrontRegardless()
-            return
         }
-        guard attempt < 10 else { return }
+        guard attempt < 50 else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
-            front(attempt: attempt + 1)
+            front(attempt: attempt + 1, heldActivation: heldActivation || isActive)
         }
     }
 

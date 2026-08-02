@@ -41,3 +41,11 @@ export const CODEX_PROFILES_DIR = path.resolve(
 export const CODEX_ACTIVE_LINK = path.resolve(
   process.env.MODELDECK_CODEX_ACTIVE_LINK || path.join(os.homedir(), '.codex'),
 );
+// CLIProxyAPI auth-file directory (an external tool's state, read-only):
+// each account file carries the routing `weight` an hourly rebalance job
+// maintains from live quota. The daemon only ever READS the non-secret
+// weight/identity fields to enrich /api/state; a missing directory means the
+// proxy simply isn't installed and nothing renders.
+export const CLIPROXY_AUTH_DIR = path.resolve(
+  process.env.MODELDECK_CLIPROXY_AUTH_DIR || path.join(os.homedir(), '.config', 'cliproxyapi', 'auth'),
+);

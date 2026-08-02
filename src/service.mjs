@@ -338,6 +338,11 @@ export class ModelDeckService {
     // adapter script with the same Node.
     this.claudeStatuslineDir = options.claudeStatuslineDir
       || path.join(path.dirname(this.claudeProfilesDir), 'statusline');
+    // CLIProxyAPI auth dir (external tool, read-only weight display). No
+    // homedir default here: only the production server wires the real path
+    // (CLIPROXY_AUTH_DIR), so test fixtures can never accidentally read a
+    // developer's live proxy files. Null = enrichment off.
+    this.cliproxyAuthDir = options.cliproxyAuthDir || null;
     this.dataDir = options.dataDir || path.dirname(this.claudeProfilesDir);
     this.claudeRenewalScratchDir = options.claudeRenewalScratchDir
       || path.join(this.dataDir, 'claude-renewal');
@@ -2171,7 +2176,55 @@ export class ModelDeckService {
     return 'missing';
   }
 
+  // CLIProxyAPI weight display: reads the non-secret identity + `weight`
+  // fields from each auth file in the configured proxy directory. Join keys
+  // mirror what each side reliably has — Claude by identity email, Codex by
+  // the `tokens.account_id` identifier the #108 duplicate detection already
+  // remembers (Codex daemon identities are empty). Every failure mode
+  // (missing dir, unreadable/malformed file, non-integer weight) reads as
+  // absence: the proxy is optional tooling and must never degrade /api/state.
+  async readProxyWeights() {
+    if (!this.cliproxyAuthDir) return null;
+    let names;
+    try { names = await fs.promises.readdir(this.cliproxyAuthDir); }
+    catch { return null; }
+    const byClaudeEmail = new Map();
+    const byCodexAccountId = new Map();
+    for (const name of names) {
+      if (!name.endsWith('.json')) continue;
+      try {
+        const data = JSON.parse(await fs.promises.readFile(path.join(this.cliproxyAuthDir, name), 'utf8'));
+        const weight = data?.weight;
+        if (!Number.isInteger(weight) || weight < 0) continue;
+        if (data.type === 'claude' && typeof data.email === 'string' && data.email.trim()) {
+          byClaudeEmail.set(data.email.trim().toLowerCase(), weight);
+        } else if (data.type === 'codex' && typeof data.account_id === 'string' && data.account_id.trim()) {
+          byCodexAccountId.set(data.account_id.trim(), weight);
+        }
+      } catch { /* malformed or unreadable auth file: no weight for it */ }
+    }
+    return { byClaudeEmail, byCodexAccountId };
+  }
+
+  // Weight 0 is a real value (the proxy stops routing there) — every lookup
+  // distinguishes "mapped to 0" from "not mapped" via has(), never truthiness.
+  proxyWeightFor(account, weights) {
+    if (!weights) return null;
+    if (account.provider === 'claude') {
+      const email = account.identity?.trim().toLowerCase();
+      if (!email || !weights.byClaudeEmail.has(email)) return null;
+      return weights.byClaudeEmail.get(email);
+    }
+    if (account.provider === 'codex') {
+      const identifier = this.codexAccountIdentifiers.get(account.id);
+      if (identifier == null || !weights.byCodexAccountId.has(identifier)) return null;
+      return weights.byCodexAccountId.get(identifier);
+    }
+    return null;
+  }
+
   async accountsWithAuthState(accounts = this.store.listAccounts()) {
+    const proxyWeights = await this.readProxyWeights();
     return Promise.all(accounts.map(async (account) => {
       // Issue #89: surface the per-account refresh failure refreshAll used
       // to drop, so the deck and Settings can render honest staleness.
@@ -2208,6 +2261,18 @@ export class ModelDeckService {
           ...(storedAttempt?.restoreFailed ? { error: storedAttempt.detail } : {}),
         };
       }
+      // Additive (the #149/#174 discipline): accounts the proxy doesn't
+      // know — or a machine without the proxy at all — omit the key.
+      const proxyWeight = this.proxyWeightFor(account, proxyWeights);
+      // Additive Codex identity evidence: the #108 remembered
+      // `tokens.account_id` IDENTIFIER (never a token value). Codex daemon
+      // identities are empty, so external tools joining accounts to their
+      // own records (the CLIProxyAPI rebalance job) need this or must read
+      // profile files themselves. Absent until the first refresh remembers
+      // it — evidence, never a guess.
+      const codexAccountId = account.provider === 'codex'
+        ? this.codexAccountIdentifiers.get(account.id)
+        : null;
       return {
         ...account,
         authState,
@@ -2215,6 +2280,8 @@ export class ModelDeckService {
         ...(lastRefreshError ? { lastRefreshError } : {}),
         ...(claudeStatusline ? { claudeStatusline } : {}),
         ...(renew ? { renew } : {}),
+        ...(proxyWeight != null ? { proxyWeight } : {}),
+        ...(codexAccountId ? { codexAccountId } : {}),
       };
     }));
   }

@@ -1673,3 +1673,149 @@ struct NoResetPlaceholderTests {
         #expect(row.worstSummary?.contains(" · ") == true)
     }
 }
+
+// MARK: - Model-window headline preference (Tim directive 2026-08-02)
+
+/// When ON, cards lead with the model-scoped weekly (the "Weekly · Fable"
+/// class) instead of the lowest window; every derived value (sort keys,
+/// summary) follows the binding window so the #43 "visible order matches
+/// visible text" invariant holds. OFF by default; cards without a
+/// measurable model-scoped window keep today's behavior either way.
+@Suite("Model-window headline preference")
+struct ModelWindowHeadlineTests {
+    /// The exact annoyance behind the directive: a drained 5-hour burst
+    /// steals the headline from a healthy model window.
+    private func burstDrainedState() -> DeckState {
+        DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio", isDefault: true)],
+            usage: [
+                snapshot("c1", scope: "5h", remaining: 10, resetsIn: 40 * 60),
+                snapshot("c1", scope: "week", remaining: 63, resetsIn: 2 * 86_400),
+                snapshot("c1", scope: "Fable weekly", remaining: 49, resetsIn: 3 * 86_400),
+            ]
+        )
+    }
+
+    @Test func offByDefaultKeepsTheLowestWindow() {
+        let row = DeckBuilder.rows(state: burstDrainedState(), now: now).first
+        #expect(row?.prefersModelWindowHeadline == false)
+        #expect(row?.worstWindow?.scope == "5h")
+    }
+
+    @Test func preferenceHeadlinesTheModelWindowAndSortKeysFollow() {
+        let row = DeckBuilder.rows(state: burstDrainedState(), now: now, preferModelWindowHeadline: true).first
+        #expect(row?.worstWindow?.scope == "Fable weekly")
+        // Issue #43 invariant: the sort keys are the DISPLAYED window's.
+        #expect(row?.lowestRemaining == 49)
+        #expect(row?.displayedReset == DeckDateParsing.date(from: iso(3 * 86_400)))
+        #expect(row?.worstSummary?.hasPrefix("Weekly · Fable") == true)
+    }
+
+    @Test func worstAmongSeveralModelWindowsWins() {
+        let state = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio")],
+            usage: [
+                snapshot("c1", scope: "5h", remaining: 5),
+                snapshot("c1", scope: "Fable weekly", remaining: 70, resetsIn: 86_400),
+                snapshot("c1", scope: "week:opus", remaining: 41, resetsIn: 86_400),
+            ]
+        )
+        let row = DeckBuilder.rows(state: state, now: now, preferModelWindowHeadline: true).first
+        #expect(row?.worstWindow?.scope == "week:opus")
+    }
+
+    @Test func cardWithoutAModelWindowIsUnaffected() {
+        // Codex shape (and any pre-model-scope Claude payload): the
+        // preference can never hide the only data a card has.
+        let state = DeckState(
+            accounts: [account("x1", provider: "codex", label: "Workshop")],
+            usage: [
+                snapshot("x1", scope: "5h", remaining: 12, resetsIn: 60 * 60),
+                snapshot("x1", scope: "week", remaining: 80, resetsIn: 86_400),
+            ]
+        )
+        let row = DeckBuilder.rows(state: state, now: now, preferModelWindowHeadline: true).first
+        #expect(row?.worstWindow?.scope == "5h")
+    }
+
+    @Test func modelWindowWithoutDataFallsBackToTheGeneralPool() {
+        let state = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio")],
+            usage: [
+                snapshot("c1", scope: "5h", remaining: 33, resetsIn: 60 * 60),
+                snapshot("c1", scope: "Fable weekly", remaining: nil),
+            ]
+        )
+        let row = DeckBuilder.rows(state: state, now: now, preferModelWindowHeadline: true).first
+        #expect(row?.worstWindow?.scope == "5h")
+    }
+}
+
+// MARK: - What changed since the last open (Tim directive 2026-08-02)
+
+/// The popover-open diff behind the change glow: each open stores the
+/// displayed (binding) window per account and reports which cards moved
+/// since the PREVIOUS open. Same-scope only (a switched binding window is
+/// fresh display, never a fake "drop"), whole-percent threshold (text that
+/// cannot change cannot glow), spend/percentless rows never participate.
+@Suite("Deck change tracker")
+struct DeckChangeTrackerTests {
+    private func freshDefaults(_ name: String) -> UserDefaults {
+        let defaults = UserDefaults(suiteName: "modeldeck-tests-\(name)")!
+        defaults.removePersistentDomain(forName: "modeldeck-tests-\(name)")
+        return defaults
+    }
+
+    private func rows(remaining: Double, scope: String = "week") -> [DeckAccountRow] {
+        DeckBuilder.rows(
+            state: DeckState(
+                accounts: [account("c1", provider: "claude", label: "Studio")],
+                usage: [snapshot("c1", scope: scope, remaining: remaining, resetsIn: 86_400)]
+            ),
+            now: now
+        )
+    }
+
+    @Test func firstOpenHasNothingToCompareAgainst() {
+        let tracker = DeckChangeTracker(defaults: freshDefaults("first-open"))
+        #expect(tracker.capture(rows: rows(remaining: 63)).isEmpty)
+    }
+
+    @Test func movedHeadlineReportsOldAndNew() {
+        let tracker = DeckChangeTracker(defaults: freshDefaults("moved"))
+        _ = tracker.capture(rows: rows(remaining: 63))
+        let changes = tracker.capture(rows: rows(remaining: 49))
+        #expect(changes["c1"] == DeckUsageChange(scope: "week", previousRemaining: 63, currentRemaining: 49))
+    }
+
+    @Test func unchangedHeadlineStaysQuiet() {
+        let tracker = DeckChangeTracker(defaults: freshDefaults("unchanged"))
+        _ = tracker.capture(rows: rows(remaining: 63))
+        #expect(tracker.capture(rows: rows(remaining: 63)).isEmpty)
+    }
+
+    @Test func subPointDriftThatCannotChangeTheTextCannotGlow() {
+        let tracker = DeckChangeTracker(defaults: freshDefaults("drift"))
+        _ = tracker.capture(rows: rows(remaining: 49.3))
+        #expect(tracker.capture(rows: rows(remaining: 49.4)).isEmpty)
+    }
+
+    @Test func switchedBindingWindowIsFreshDisplayNotAChange() {
+        let tracker = DeckChangeTracker(defaults: freshDefaults("scope-switch"))
+        _ = tracker.capture(rows: rows(remaining: 90, scope: "5h"))
+        // e.g. the model-window preference toggled between opens: the number
+        // moved 90 → 49 but across windows — no misleading animation.
+        let changes = tracker.capture(rows: rows(remaining: 49, scope: "Fable weekly"))
+        #expect(changes.isEmpty)
+        // The NEW window is the baseline from here on.
+        #expect(tracker.capture(rows: rows(remaining: 40, scope: "Fable weekly"))["c1"]?.previousRemaining == 49)
+    }
+
+    @Test func vanishedAccountLosesItsBaseline() {
+        let tracker = DeckChangeTracker(defaults: freshDefaults("vanished"))
+        _ = tracker.capture(rows: rows(remaining: 63))
+        _ = tracker.capture(rows: [])
+        // Re-appearing later compares against nothing — no stale-baseline glow.
+        #expect(tracker.capture(rows: rows(remaining: 20)).isEmpty)
+    }
+}

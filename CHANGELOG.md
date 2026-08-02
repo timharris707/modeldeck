@@ -4,6 +4,72 @@ All notable changes to ModelDeck are documented here. Versioning follows the
 roadmap in `design/mac-app-roadmap.md`: `v0.1-web` tags the retired web MVP,
 and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 
+## 0.3.15 — 2026-08-02
+
+The deck learns what you already know matters: which account the proxy
+will pick next, which window you actually plan around, and what moved
+since you last looked.
+
+### Added
+- **Proxy routing weights on deck cards**: accounts routed through a
+  local CLIProxyAPI instance show their current routing weight as a
+  quiet badge beside the plan tier — glance the deck and see both the
+  usage *and* how strongly the balancer favors each account right now.
+  The daemon reads only the non-secret weight and identity fields from
+  the proxy's auth files (Claude accounts match by email, Codex by the
+  account identifier it already remembers); machines without the proxy
+  show nothing and nothing changes shape. The state payload also carries
+  the Codex account identifier additively, so external tools (like a
+  weight-rebalancing job) can match accounts without touching profile
+  files.
+- **"Lead with the model window" (Settings → Deck, off by default)**:
+  when on, Claude cards headline the model-scoped weekly window (e.g.
+  "Weekly · Fable") instead of whichever window is lowest — for anyone
+  who plans around the model quota and finds the 5-hour burst limit
+  noisy. Sorting follows the displayed window, expanded cards still show
+  every window, and cards without a model window are unaffected. The
+  preference tracks whatever model window the provider reports, so a
+  model rename won't strand it.
+- **Opening the deck shows what changed**: cards whose displayed
+  percentage moved since the last time you opened the deck glow with a
+  soft accent halo for a moment while the number rolls from the old
+  value to the new one — "what happened since I last looked" at a
+  glance, with no alarm colors and nothing on unchanged cards. Honest
+  by design: a card whose *displayed window* switched shows fresh
+  numbers without a fake animated "drop", and sub-point drift that
+  can't change the text never glows.
+
+### Fixed
+- **Test-suite reliability**: an intermittent hang in the Mac test suite
+  (a stranded continuation in a shared-scope test stub) is fixed;
+  verified with a 200+-run soak.
+
+## 0.3.14 — 2026-08-02
+
+The fix-it button now behaves like one: re-logging a duplicate-flagged
+account answers right where you clicked, instead of opening windows
+behind everything.
+
+### Fixed
+- **Duplicate-login "Re-log in…" no longer reads as a no-op (issue
+  #213)**: clicking it in the deck used to open Settings behind the deck
+  popover while the Terminal login could land behind everything — so
+  nothing appeared to happen, and the roster's identical button invited
+  an accidental second launch. The deck path no longer opens Settings at
+  all: the sign-in flow (progress, "Waiting for login in Terminal…" with
+  Verify / Re-log in / cancel, and any errors) now renders inline on the
+  deck card that launched it, Terminal — the window you actually type
+  into — comes to the front, and a flow that can't start says so on the
+  card instead of failing silently. The deck card and the Settings
+  roster show one shared flow, so a second click can never restart a
+  login already in progress.
+- **Settings window fronting is reliable (issue #213)**: the paths that
+  still open Settings programmatically (the gear menu, the
+  sign-in-needed notice) keep bringing the window forward until it is
+  genuinely focused instead of giving up after half a second — and step
+  aside the moment a Terminal login takes over, since that's the window
+  you need.
+
 ## 0.3.13 — 2026-08-01
 
 One you, many accounts: your tools and memory can now follow you across

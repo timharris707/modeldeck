@@ -56,6 +56,10 @@ export MODELDECK_CLAUDE_ACTIVE_LINK="$DEMO_DIR/active-claude"
 export MODELDECK_CODEX_ACTIVE_LINK="$DEMO_DIR/active-codex"
 export MODELDECK_CLAUDE_SHELL_ENV_FILE="$DEMO_DIR/claude-env.sh"
 export MODELDECK_SKIP_KEYCHAIN=1
+# Proxy-weight display reads auth-file weights from this dir; pin it inside
+# the demo dir (seeded placeholder files) so the demo daemon can never read
+# the machine's real ~/.config/cliproxyapi/auth files.
+export MODELDECK_CLIPROXY_AUTH_DIR="$DEMO_DIR/cliproxy-auth"
 # Fixture snapshots are authoritative: no provider refresh, no scheduler
 # (src/service.mjs demoFixtures — placeholder accounts hold no credentials,
 # so any real refresh could only fail and degrade the seeded healthy chips).
