@@ -356,7 +356,12 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
         let measurable = windows.filter { $0.remainingPercent != nil }
         let rateLimits = measurable.filter { !$0.isSpend }
         var eligible = rateLimits.isEmpty ? measurable : rateLimits
-        if prefersModelWindowHeadline {
+        // Claude cards ONLY (Tim's 0.3.15 report): Codex also reports a
+        // model-scoped weekly ("GPT-…-Codex weekly"), and the preference
+        // grabbing it replaced the real weekly headline with a fresh-window
+        // 100%. The directive was always about the Claude/Fable quota;
+        // Codex keeps its lowest-window headline regardless of the setting.
+        if prefersModelWindowHeadline, provider == .claude {
             let modelScoped = eligible.filter { DeckBuilder.windowRank(scope: $0.scope) == 2 }
             if !modelScoped.isEmpty { eligible = modelScoped }
         }

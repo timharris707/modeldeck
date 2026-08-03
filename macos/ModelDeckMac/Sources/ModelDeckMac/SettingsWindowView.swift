@@ -684,6 +684,13 @@ struct AccountRosterRow: View {
                         .help(signInAgainHelp(base: account.healthChip == .idleSignIn
                             ? "This account's sign-in renews when it is next used; its usage data is paused until then"
                             : "This account needs a fresh sign-in"))
+                        // CodeRabbit PR #222: the pill shrank to "Idle", so
+                        // VoiceOver needs the renewal context spoken here —
+                        // stated as fact, no "Sign in now" (no action exists
+                        // on this branch).
+                        .accessibilityLabel(account.healthChip == .idleSignIn
+                            ? "Idle, sign-in renews on next use: \(account.label)"
+                            : "\(account.healthChip.text): \(account.label)")
                 }
             } else if account.hasDuplicateToken, let onSignIn {
                 // Issue #152 (Tim: "I need something clickable to fix the
@@ -772,11 +779,11 @@ struct AccountRosterRow: View {
                         .accessibilityLabel("Renew sign-in for \(account.label)")
                 }
             case .action(.authOverridden):
-                Text(AccountRenew.authOverrideShort)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .help(AccountRenew.authOverrideExplanation)
-                    .accessibilityLabel(AccountRenew.authOverrideExplanation)
+                // Tim's 0.3.15 report: the "Renewal handled elsewhere"
+                // caption was verbose noise on the row. The state renders
+                // nothing — calm absence of a Renew button — and the full
+                // explanation stays available on the row's health chip.
+                EmptyView()
             case nil:
                 EmptyView()
             }
@@ -825,6 +832,10 @@ struct HealthChipView: View {
     var body: some View {
         Text(chip.text)
             .font(.system(size: 10, weight: .medium))
+            // A pill must never text-wrap (Tim's 0.3.15 report): one line,
+            // sized to its text, always.
+            .lineLimit(1)
+            .fixedSize()
             .padding(.horizontal, 7)
             .padding(.vertical, 2.5)
             .background(Capsule().fill(color.opacity(0.16)))

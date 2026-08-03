@@ -786,12 +786,14 @@ struct SignInRecoveryTests {
         let recovery = row(authState: "signin-required", signinReason: "expired").signInRecovery
         #expect(recovery?.tone == .idle)
         // Pinned EXACTLY (orchestrator verify on PR #150, Tim's constraint
-        // 1): this string matches the Settings chip and fits the two-column
-        // card on one line — the view adds lineLimit(1) as the structural
-        // guard, and this pin catches wording drift toward a longer copy.
-        // The full renewal sentence lives in the tooltip/explanation only.
+        // 1): this string fits the two-column card on one line — the view
+        // adds lineLimit(1) as the structural guard, and this pin catches
+        // wording drift toward a longer copy. The full renewal sentence
+        // lives in the tooltip/explanation only. Deliberately LONGER than
+        // the Settings chip since Tim's 0.3.15 report: the roster pill
+        // shrank to "Idle" (a capsule must never wrap), while this card
+        // notice line has the width to keep the mechanics visible.
         #expect(recovery?.text == "Idle — renews on next use")
-        #expect(recovery?.text == ToolProbe.HealthChip.idleSignIn.text)
         // The calm lead: paused data, automatic renewal on next use.
         #expect(recovery?.tooltip.contains("renews the sign-in automatically") == true)
         // The full #114 structural story stays in the explanation…

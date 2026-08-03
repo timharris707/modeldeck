@@ -1724,6 +1724,23 @@ struct ModelWindowHeadlineTests {
         #expect(row?.worstWindow?.scope == "week:opus")
     }
 
+    @Test func codexModelWindowNeverTakesTheHeadline() {
+        // The 0.3.15 live regression, pinned: Codex reports its own
+        // model-scoped weekly ("GPT-5.3-Codex-Spark weekly", a fresh window
+        // at 100%) — with the preference ON it stole the headline from the
+        // real weekly. The preference is Claude-only by directive.
+        let state = DeckState(
+            accounts: [account("x1", provider: "codex", label: "Workshop")],
+            usage: [
+                snapshot("x1", scope: "weekly", remaining: 60, resetsIn: 5 * 86_400),
+                snapshot("x1", scope: "GPT-5.3-Codex-Spark weekly", remaining: 100, resetsIn: 7 * 86_400),
+            ]
+        )
+        let row = DeckBuilder.rows(state: state, now: now, preferModelWindowHeadline: true).first
+        #expect(row?.worstWindow?.scope == "weekly")
+        #expect(row?.lowestRemaining == 60)
+    }
+
     @Test func cardWithoutAModelWindowIsUnaffected() {
         // Codex shape (and any pre-model-scope Claude payload): the
         // preference can never hide the only data a card has.

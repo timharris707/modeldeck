@@ -43,7 +43,9 @@ struct PerAccountHealthChipTests {
             authState: "signin-required", signinReason: "revoked-future-value"
         ).healthChip == .signInAgain)
         // The chip copy is the at-a-glance distinction Tim asked for.
-        #expect(ToolProbe.HealthChip.idleSignIn.text == "Idle — renews on next use")
+        // Tim's 0.3.15 report: the long form wrapped the roster pill —
+        // the pill states the fact, the tooltip carries the mechanics.
+        #expect(ToolProbe.HealthChip.idleSignIn.text == "Idle")
         #expect(ToolProbe.HealthChip.signInAgain.text == "Sign in again")
     }
 

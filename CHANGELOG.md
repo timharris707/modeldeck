@@ -4,6 +4,23 @@ All notable changes to ModelDeck are documented here. Versioning follows the
 roadmap in `design/mac-app-roadmap.md`: `v0.1-web` tags the retired web MVP,
 and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
 
+## 0.3.16 — 2026-08-02
+
+Same-day fixes from the field: the model-window preference knows which
+provider it was for, and the Accounts page stops wearing wrapped pills.
+
+### Fixed
+- **"Lead with the model window" is Claude-only**: Codex also reports a
+  model-scoped weekly window (e.g. "GPT-5.3-Codex-Spark weekly" — a
+  fresh window sitting at 100%), and the preference grabbing it replaced
+  the real Codex weekly headline. The setting now applies to Claude
+  cards only; Codex always headlines its lowest window.
+- **Accounts roster pills never wrap**: the idle chip is now simply
+  "Idle" (the renews-on-next-use explanation stays in its tooltip and
+  VoiceOver label), every health pill is structurally one-line, and the
+  verbose "Renewal handled elsewhere" caption is gone — the state reads
+  as the calm absence of a Renew button.
+
 ## 0.3.15 — 2026-08-02
 
 The deck learns what you already know matters: which account the proxy

@@ -48,7 +48,10 @@ public struct ToolProbe: Codable, Equatable, Sendable {
             switch self {
             case .healthy: return "Healthy"
             case .signInAgain: return "Sign in again"
-            case .idleSignIn: return "Idle — renews on next use"
+            // Tim's 0.3.15 report: the long form wrapped the roster pill
+            // into two ugly lines. The pill states the fact; the renewal
+            // mechanics stay in the chip's tooltip and VoiceOver label.
+            case .idleSignIn: return "Idle"
             case .unknown: return "Unknown"
             }
         }
