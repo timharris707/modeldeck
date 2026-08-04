@@ -258,9 +258,28 @@ struct DeckPopoverView: View {
 
     // MARK: - Content
 
+    /// Issue #226: launches the SAME add-account flow Settings uses — route
+    /// the deck model's pending request to the Accounts pane (which presents
+    /// the existing #8 `AddAccountSheet`), then open + front Settings. The
+    /// #118 `beginSignInAgain` anatomy exactly; presenting the sheet inside
+    /// the MenuBarExtra window instead would die the moment the popover
+    /// auto-closes for the flow's own Terminal sign-in step.
+    private func beginAddAccount() {
+        deckModel.requestAddAccount()
+        openSettings()
+        SettingsWindowFronting.activateAndFront()
+    }
+
     @ViewBuilder
     private var content: some View {
-        if let state = statusModel.deckState {
+        if let state = statusModel.deckState, deckModel.isDeckEmpty(state: state) {
+            // Issue #226: the fresh-install dead end (Tim's 2026-08-04 field
+            // report) becomes the surface's ONE prominent next step. A single
+            // provider-neutral CTA — the add flow's first screen already asks
+            // Claude vs Codex — replaces two "No accounts" columns that
+            // offered nothing actionable.
+            emptyDeckCTA
+        } else if let state = statusModel.deckState {
             // Issue #131: the ONE account whose window currently feeds the
             // menu bar percentage — the deck's single checkmark. Resolved
             // here (pin → fallback, MenuBarSourceResolver) so both layouts
@@ -281,6 +300,7 @@ struct DeckPopoverView: View {
                         DeckColumnView(
                             column: column,
                             deckModel: deckModel,
+                            healthPresentation: healthPresentation(for: column.provider, state: state),
                             menuBarSourceAccountID: sourceID,
                             menuBarSourceTooltip: sourceTooltip,
                             staleness: { statusModel.cardStaleness(for: $0) },
@@ -345,6 +365,58 @@ struct DeckPopoverView: View {
         } else {
             placeholder("No usage data yet.")
         }
+    }
+
+    /// Issue #226: the empty-deck call to action — quiet copy in the deck's
+    /// muted voice plus one small prominent button (the same Direction-A
+    /// restraint as SignInExplanationView's single primary action; never an
+    /// oversized hero button in a menu-bar popover).
+    private var emptyDeckCTA: some View {
+        VStack(spacing: 6) {
+            Text("No accounts yet")
+                .font(.system(size: 12, weight: .semibold))
+            Text("Connect a Claude or Codex account to see its usage here.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button("Add Account…") { beginAddAccount() }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .padding(.top, 4)
+                .help("Create an isolated profile and sign in via the provider's own flow")
+                .accessibilityLabel("Add account")
+                .accessibilityHint("Opens Settings and starts the add-account flow")
+        }
+        .frame(maxWidth: .infinity, minHeight: 96)
+    }
+
+    /// Issue #226: the populated deck carries the quiet footer affordance
+    /// instead — never both at once, so each state offers exactly ONE
+    /// "Add Account" entry point (Tim's clarification on #226). Gated on a
+    /// live connection too (CodeRabbit on PR #232): a failed refresh RETAINS
+    /// the last deckState while flipping connection to `.unreachable`, and
+    /// the flow's first step needs the daemon — same reason Settings
+    /// disables its button — so retained stale state must not keep the
+    /// affordance up while the daemon is down.
+    private var showsFooterAddAccount: Bool {
+        guard statusModel.connection == .connected,
+              let state = statusModel.deckState else { return false }
+        return !deckModel.isDeckEmpty(state: state)
+    }
+
+    /// Issue #235: one Availability Health evaluation per provider column,
+    /// derived fresh from the same state render the columns use. Pure and
+    /// cheap (a few dozen 168-step sims), so per-render recomputation is
+    /// fine; tests exercise the engine with an injected clock.
+    private func healthPresentation(
+        for provider: DeckProvider,
+        state: DeckState
+    ) -> AvailabilityHealthPresentation {
+        let now = Date()
+        return AvailabilityHealthPresentation.make(
+            report: AvailabilityHealthEngine.report(for: provider, state: state, now: now),
+            now: now
+        )
     }
 
     private func placeholder(_ text: String) -> some View {
@@ -455,6 +527,21 @@ struct DeckPopoverView: View {
                 }
             }
             Spacer()
+            if showsFooterAddAccount {
+                // Issue #226: growing the pool never requires the Settings
+                // detour. One modest surface-level affordance in the footer —
+                // where the deck's other surface action (Refresh) already
+                // lives — never per-column buttons (the add flow's next
+                // screen asks Claude vs Codex itself).
+                Button {
+                    beginAddAccount()
+                } label: {
+                    Label("Add account", systemImage: "plus")
+                }
+                .help("Create an isolated profile and sign in via the provider's own flow")
+                .accessibilityLabel("Add account")
+                .accessibilityHint("Opens Settings and starts the add-account flow")
+            }
             Button {
                 // Issue #72: manual Refresh = forced provider poll + state
                 // re-read, so the "Data from…" counter actually restarts
@@ -481,6 +568,10 @@ struct DeckPopoverView: View {
 struct DeckColumnView: View {
     let column: DeckColumn
     @ObservedObject var deckModel: DeckPopoverModel
+    /// Issue #235: the provider's Availability Health chip content — the
+    /// tier-aware 7-day runway verdict beside the column title. Nil renders
+    /// no chip (previews/tests default).
+    var healthPresentation: AvailabilityHealthPresentation? = nil
     /// Issue #131: the account whose window feeds the menu bar — at most one
     /// row across the WHOLE deck matches, so the two columns can never show
     /// two checkmarks.
@@ -516,6 +607,20 @@ struct DeckColumnView: View {
                 ProviderMarkView(provider: column.provider, size: 20)
                 Text(column.title)
                     .font(.system(size: 13, weight: .semibold))
+                if let healthPresentation {
+                    // Issue #235: the Availability Health chip — a colored
+                    // dot + verdict word in the deck's quiet caption voice.
+                    // Click opens the detail popover (gauge, readout,
+                    // facts); never a banner.
+                    AvailabilityHealthChip(
+                        presentation: healthPresentation,
+                        deckModel: deckModel,
+                        warningID: DeckWarningID(
+                            topic: .availabilityHealth,
+                            elementID: column.provider.rawValue
+                        )
+                    )
+                }
                 Spacer()
                 Text(column.accountCountText)
                     .font(.caption)
@@ -1392,6 +1497,148 @@ struct SignInExplanationView: View {
         }
         .padding(12)
         .frame(width: 280, alignment: .leading)
+    }
+}
+
+// MARK: - Availability Health (issue #235)
+
+/// The verdict's display color: green/gold/red matching the band names
+/// (the deck's blue-healthy palette is per-window severity; the health
+/// verdict is its own locked traffic-light language). Nil verdict — no
+/// usable accounts — renders the muted secondary tone.
+func availabilityColor(_ verdict: AvailabilityVerdict?) -> Color {
+    switch verdict {
+    case .green: return Color(nsColor: .systemGreen)
+    case .yellow: return severityColor(.warning)
+    case .red: return .red
+    case nil: return .secondary
+    }
+}
+
+/// Issue #235: the per-provider Availability Health chip beside the column
+/// title — colored dot + verdict word, deliberately in the deck's quiet
+/// caption voice. Clicking opens the detail popover through the model's
+/// one-at-a-time presentation slot (the #113 click-to-explain idiom;
+/// tooltips are unreliable inside MenuBarExtra windows).
+struct AvailabilityHealthChip: View {
+    let presentation: AvailabilityHealthPresentation
+    @ObservedObject var deckModel: DeckPopoverModel
+    let warningID: DeckWarningID
+
+    var body: some View {
+        Button {
+            deckModel.toggleWarning(warningID)
+        } label: {
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(availabilityColor(presentation.verdict))
+                    .frame(width: 7, height: 7)
+                Text(presentation.chipWord)
+                    .font(DeckType.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 2)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(presentation.chipTooltip)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(presentation.accessibilitySummary)
+        .accessibilityHint("Shows the availability details")
+        .popover(isPresented: deckModel.warningBinding(warningID), arrowEdge: .bottom) {
+            AvailabilityHealthPopoverView(presentation: presentation)
+        }
+    }
+}
+
+/// Tim's #235 refinement: the 0–100 sustainable-pace bar — three colored
+/// segments (red 0–33, yellow 33–66, green 66–100) with a needle at the
+/// current score, so "where within the band" is visible at a glance.
+/// Decorative: the readout sentence beside it speaks the same value.
+struct AvailabilityGaugeView: View {
+    /// 0–100, from `AvailabilityHealthEngine.displayScore(forMultiple:)`.
+    let score: Double
+
+    var body: some View {
+        GeometryReader { proxy in
+            let width = proxy.size.width
+            ZStack(alignment: .leading) {
+                HStack(spacing: 2) {
+                    RoundedRectangle(cornerRadius: 2, style: .continuous)
+                        .fill(Color.red.opacity(0.35))
+                        .frame(width: width * 0.33)
+                    RoundedRectangle(cornerRadius: 2, style: .continuous)
+                        .fill(severityColor(.warning).opacity(0.4))
+                        .frame(width: width * 0.33)
+                    RoundedRectangle(cornerRadius: 2, style: .continuous)
+                        .fill(Color(nsColor: .systemGreen).opacity(0.4))
+                        .frame(maxWidth: .infinity)
+                }
+                .frame(height: 6)
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(Color.primary)
+                    .frame(width: 2, height: 12)
+                    .offset(x: min(max(score / 100, 0), 1) * (width - 2))
+            }
+            .frame(height: 12)
+        }
+        .frame(height: 12)
+        .accessibilityHidden(true)
+    }
+}
+
+/// Issue #235: the chip's click-open detail popover — gauge + needle, the
+/// plain-language sustainable-pace readout, the non-jargon decision
+/// paragraph, then the numbers (pool, pace, 7-day low, drought time when
+/// applicable, burst headroom, next big reset) and the honest exclusions.
+/// Every string comes from `AvailabilityHealthPresentation` (Core, tested).
+struct AvailabilityHealthPopoverView: View {
+    let presentation: AvailabilityHealthPresentation
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(presentation.title)
+                .font(.system(size: 12, weight: .semibold))
+            if let score = presentation.score {
+                AvailabilityGaugeView(score: score)
+            }
+            Text(presentation.readout)
+                .font(.system(size: 11, weight: .medium))
+                .fixedSize(horizontal: false, vertical: true)
+            Text(AvailabilityHealthPresentation.meaningParagraph)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if !presentation.factLines.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(presentation.factLines, id: \.self) { line in
+                        Text(line)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            if let excluded = presentation.excludedLine {
+                Text(excluded)
+                    .font(.system(size: 10))
+                    .foregroundStyle(severityColor(.warning))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let unknownTiers = presentation.unknownTierLine {
+                Text(unknownTiers)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text(AvailabilityHealthPresentation.pointsFootnote)
+                .font(.system(size: 9))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .frame(width: 300, alignment: .leading)
     }
 }
 

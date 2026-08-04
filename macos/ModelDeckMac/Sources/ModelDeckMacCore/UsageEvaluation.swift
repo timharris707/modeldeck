@@ -68,6 +68,16 @@ public enum MenuBarIconState: Equatable, Sendable {
     case pinned(percentRemaining: Int)
     case warning(percentRemaining: Int)
     case critical(percentRemaining: Int)
+    /// Issue #235: the Availability Health display mode — the menu bar
+    /// shows the provider's verdict as a full-color, shape-coded status
+    /// dot beside the template glyph (green circle / yellow triangle /
+    /// red octagon; the verdict stays available as text via accessibility
+    /// and the deck chip). A nil verdict (no state yet, or no usable
+    /// accounts) renders a muted hollow ring so the mode never claims a
+    /// health it can't compute. Display-only, like #229's icon-only mode:
+    /// `worstRemaining` and the notification path keep watching every
+    /// account.
+    case health(provider: DeckProvider, verdict: AvailabilityVerdict?)
 
     /// `alwaysShowPercent` is the pinned-account mode: a healthy percent
     /// renders as `.pinned` instead of hiding behind the plain glyph.
@@ -88,10 +98,11 @@ public enum MenuBarIconState: Equatable, Sendable {
     }
 
     /// "N%" when the percent is shown, the neutral "–%" placeholder while
-    /// loading; nil when the icon is plain.
+    /// loading; nil when the icon is plain. Health mode carries no percent
+    /// — its verdict word renders through the renderer's dedicated path.
     public var percentLabel: String? {
         switch self {
-        case .plain: return nil
+        case .plain, .health: return nil
         case .loading: return "–%"
         case .pinned(let percent), .warning(let percent), .critical(let percent): return "\(percent)%"
         }
@@ -100,13 +111,61 @@ public enum MenuBarIconState: Equatable, Sendable {
 
 /// The stored `menuBarAccountId` setting's grammar (account percentage
 /// picker): "" = lowest across accounts, a plain account id = that account,
-/// and the "active:<provider>" sentinels = whichever account is currently
+/// the "active:<provider>" sentinels = whichever account is currently
 /// ACTIVE for that provider — Tim's "track my current active account" mode,
-/// which follows every activation switch automatically.
+/// which follows every activation switch automatically — "none"
+/// (issue #229) = hide the percentage entirely, glyph only, and
+/// "health:<provider>" (issue #235) = show that provider's Availability
+/// Health verdict instead of a percentage.
 public enum MenuBarPinResolver {
     /// The stored value that follows a provider's active account.
     public static func followActiveSentinel(for provider: DeckProvider) -> String {
         "active:\(provider.rawValue)"
+    }
+
+    /// Issue #235: the stored value that shows a provider's Availability
+    /// Health verdict in the menu bar instead of a percentage. Rides the
+    /// same free-string setting as the #229 "none" sentinel, with the same
+    /// downgrade contract: a pre-#235 build reading "health:claude" finds
+    /// no matching account id, treats it as an unresolvable pin, and falls
+    /// back to the lowest-across percentage — degraded but never a crash.
+    public static func healthSentinel(for provider: DeckProvider) -> String {
+        "health:\(provider.rawValue)"
+    }
+
+    /// The provider a stored health sentinel names, or nil when the value
+    /// isn't a recognizable health sentinel (including "health:" values for
+    /// providers this build doesn't know — those fall back to the
+    /// unresolvable-pin behavior, the same forward-compatibility path as
+    /// any unknown future sentinel).
+    public static func healthProvider(_ stored: String) -> DeckProvider? {
+        guard stored.hasPrefix("health:") else { return nil }
+        return DeckProvider(rawValue: String(stored.dropFirst("health:".count)))
+    }
+
+    /// Whether a stored value selects the issue #235 health display mode.
+    public static func isHealth(_ stored: String) -> Bool {
+        healthProvider(stored) != nil
+    }
+
+    /// Issue #229: the stored value that hides the menu bar percentage
+    /// entirely — the ModelDeck glyph with no number, at every severity.
+    /// Display-only, like the pin itself: `worstRemaining` and the
+    /// notification path keep watching every account. Chosen to ride the
+    /// existing free-string setting so a DOWNGRADED build reading "none"
+    /// never crashes: with no account id equal to the literal string, the
+    /// pin doesn't resolve and the old build falls back to lowest-across.
+    /// (An account id that literally equals "none" WOULD be pinned by a
+    /// pre-#229 build, which has no sentinel guard — ids are
+    /// store-generated UUIDs, so the collision is implausible, but no
+    /// sentinel string is collision-proof on old builds: they treat every
+    /// non-"active:" value as a candidate account id. THIS build guards
+    /// the collision explicitly in `resolve`.)
+    public static let noneSentinel = "none"
+
+    /// Whether a stored value is the issue #229 icon-only sentinel.
+    public static func isNone(_ stored: String) -> Bool {
+        stored == noneSentinel
     }
 
     /// Resolves a stored pin to a concrete account id against the current
@@ -115,6 +174,14 @@ public enum MenuBarPinResolver {
     /// caller then falls back to lowest-across behavior.
     public static func resolve(_ stored: String, in state: DeckState) -> String? {
         guard !stored.isEmpty else { return nil }
+        // Issue #229: "none" is a display-mode sentinel, never an account
+        // pin — it must not resolve even if some account id collides with
+        // the literal string.
+        guard !isNone(stored) else { return nil }
+        // Issue #235: every "health:"-prefixed value is likewise a
+        // display-mode sentinel, never an account pin — the prefix guard
+        // covers unknown future providers too.
+        guard !stored.hasPrefix("health:") else { return nil }
         if stored.hasPrefix("active:") {
             guard let provider = DeckProvider(rawValue: String(stored.dropFirst("active:".count))) else {
                 return nil
@@ -156,6 +223,22 @@ public enum MenuBarSourceResolver {
         state: DeckState?,
         worstRemaining: WorstRemaining?
     ) -> String? {
+        // Issue #229: icon-only mode shows no percentage at all, so no
+        // account feeds the menu bar and no card gets the checkmark —
+        // mirroring recomputeIconState's plain-glyph short-circuit.
+        if let pinnedSetting, MenuBarPinResolver.isNone(pinnedSetting) {
+            return nil
+        }
+        // Issue #235: health mode shows a pool-wide verdict, not one
+        // account's window — no single account feeds the menu bar, so no
+        // card gets the checkmark. Keyed on the RECOGNIZED sentinel only
+        // (`isHealth`), matching recomputeIconState: an unknown
+        // "health:<future>" value falls through to the unresolvable-pin
+        // fallback exactly like any unknown sentinel, and the checkmark
+        // then honestly marks the lowest-across account the icon shows.
+        if let pinnedSetting, MenuBarPinResolver.isHealth(pinnedSetting) {
+            return nil
+        }
         if let pinnedSetting, let state,
            let resolved = MenuBarPinResolver.resolve(pinnedSetting, in: state) {
             return resolved

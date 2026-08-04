@@ -200,10 +200,24 @@ struct ModelDeckMacApp: App {
             // refreshed, keychain granted, cadence cap lifted) is dismissed
             // at the model, and the one-at-a-time slot can never desync.
             if let statusModel, let deckModel, let state {
+                // Issue #228: a fresh daemon state that contradicts a
+                // leftover optimistic activation override clears it — the
+                // deck must never keep a ✓ the daemon disowns once no
+                // activation is in flight.
+                deckModel.reconcileActivation(with: state)
                 deckModel.reconcileWarnings(
                     rows: deckModel.interleavedRows(for: state),
                     staleness: { statusModel.cardStaleness(for: $0) },
-                    cadenceNoticeVisible: statusModel.refreshCadenceNotice != nil
+                    cadenceNoticeVisible: statusModel.refreshCadenceNotice != nil,
+                    // Issue #235: the header health chips render exactly
+                    // when the two-column deck does (single-column has no
+                    // column headers; the empty deck shows the #226 CTA
+                    // instead) — mirror that condition so an open detail
+                    // popover survives refreshes but never outlives its
+                    // chip.
+                    healthChipProviders: deckModel.layout == .twoColumn
+                        && !deckModel.isDeckEmpty(state: state)
+                        ? [.claude, .codex] : []
                 )
             }
             // Issue #185: a daemon running from a since-deleted bundle keeps

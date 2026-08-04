@@ -147,6 +147,7 @@ test('daemon CJS bundle inlines its version and has no import.meta warnings', (t
     fileURLToPath(new URL('../src/server.mjs', import.meta.url)),
     '--bundle', '--platform=node', '--target=node24', '--format=cjs',
     '--define:__MODELDECK_VERSION__="9.8.7"',
+    '--define:__MODELDECK_GIT_COMMIT__="cafe42"',
     '--define:import.meta.url="file:///__modeldeck_sea_bundle__.mjs"',
     `--outfile=${bundle}`,
   ], { encoding: 'utf8' });
@@ -155,7 +156,19 @@ test('daemon CJS bundle inlines its version and has no import.meta warnings', (t
   assert.doesNotMatch(result.stderr, /import\.meta.*not available/i);
   const content = fs.readFileSync(bundle, 'utf8');
   assert.match(content, /VERSION = true \? "9\.8\.7"/);
+  // The self-reported build commit inlines the same way (stale-daemon
+  // verification: the app compares this against the bundle manifest).
+  assert.match(content, /"cafe42"/);
   assert.doesNotMatch(content, /readFileSync\(new URL\("\.\.\/package\.json"/);
+});
+
+test('daemon build inlines the manifest git commit for /api/health self-reporting', () => {
+  const script = fs.readFileSync(buildScript, 'utf8');
+  // Both must come from the same $GIT_COMMIT the manifest records — the
+  // whole point is that the running process and the on-disk manifest are
+  // comparable.
+  assert.match(script, /--define:__MODELDECK_GIT_COMMIT__="\$GIT_COMMIT_DEFINE"/);
+  assert.match(script, /GIT_COMMIT_DEFINE=.*"\$GIT_COMMIT"/);
 });
 
 test('daemon manifest records artifact, Node version, commit, and SHA-256', (t) => {

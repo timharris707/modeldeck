@@ -48,6 +48,12 @@ struct MenuBarIconView: View {
             return "ModelDeck: \(percent) percent left on the lowest window"
         case .critical(let percent):
             return "ModelDeck: critical, \(percent) percent left on the lowest window"
+        case .health(let provider, let verdict):
+            // Issue #235: speak the provider and verdict, not a percent.
+            if let verdict {
+                return "ModelDeck: \(provider.displayName) availability \(verdict.displayWord.lowercased())"
+            }
+            return "ModelDeck: \(provider.displayName) availability unknown"
         }
     }
 }

@@ -223,10 +223,97 @@ public final class UserDefaultsRegistrationMarker: RegistrationMarkerStore, @unc
 // MARK: - Reachability
 
 extension DaemonClient: DaemonReachabilityProbing {
-    /// Reachable iff `GET /api/health` on the configured loopback port
-    /// answers with a decodable health document.
-    public func checkReachable() async -> Bool {
-        (try? await health()) != nil
+    /// One `GET /api/health` round-trip on the configured loopback port:
+    /// nil iff no decodable health document answered. A decoded answer
+    /// without `MDGitCommit` is a pre-self-reporting daemon, NOT a failure —
+    /// the snapshot keeps that distinction.
+    public func probeDaemon() async -> DaemonProbeSnapshot? {
+        guard let health = try? await health() else { return nil }
+        return DaemonProbeSnapshot(runningCommit: health.MDGitCommit)
+    }
+}
+
+// MARK: - launchd-level service control
+
+/// launchctl access to our SMAppService agent's gui-domain job, for the
+/// states SMAppService can't see or fix from above (stale still-running
+/// process after a no-op re-register; enabled-but-absent wedge). Same label
+/// as the registration: launchd is the single source of truth here.
+public struct LaunchctlDaemonServiceController: LaunchdServiceControlling {
+    /// Shared with the legacy inspector on purpose — every ModelDeck
+    /// service artifact carries the ONE label (that's the anti-double-daemon
+    /// invariant), so the probe target can never drift from what the plists
+    /// actually register.
+    public static let label = LegacyLaunchAgentInspector.label
+
+    public init() {}
+
+    public func probeService() async -> LaunchdServiceProbe {
+        // Exit-code semantics live in the pure classifier: only launchctl's
+        // explicit "could not find service" (113) reads as absent; every
+        // other failure — including launchctl not running at all — is
+        // unknown and can never trigger the wedge repair.
+        classifyLaunchctlPrintExit(
+            await Self.runLaunchctl(["print", "gui/\(getuid())/\(Self.label)"])
+        )
+    }
+
+    public func bootOutService() async {
+        // Best-effort by contract: booting out an absent service exits
+        // non-zero and that's already the goal state. The caller always
+        // verifies the outcome through the running daemon's self-report.
+        _ = await Self.runLaunchctl(["bootout", "gui/\(getuid())/\(Self.label)"])
+    }
+
+    /// Serializes exactly one resume of the continuation across the three
+    /// competing paths (termination handler, launch failure, deadline).
+    private final class ResumeOnce: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Int32, Never>?
+        init(_ continuation: CheckedContinuation<Int32, Never>) {
+            self.continuation = continuation
+        }
+        func resume(_ status: Int32) {
+            lock.lock()
+            let continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
+            continuation?.resume(returning: status)
+        }
+    }
+
+    /// Runs /bin/launchctl without ever blocking the calling actor — the
+    /// model drives this from the main actor at launch — and with a hard
+    /// deadline: a hung launchctl is terminated and reported as the same
+    /// synthetic 127 as "couldn't launch", which the classifier maps to
+    /// `.unknown` (never repair, never bootout on a probe that didn't
+    /// actually answer).
+    private static func runLaunchctl(
+        _ arguments: [String],
+        deadline: TimeInterval = 5
+    ) async -> Int32 {
+        await withCheckedContinuation { continuation in
+            let resumeOnce = ResumeOnce(continuation)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            process.arguments = arguments
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            process.terminationHandler = { finished in
+                resumeOnce.resume(finished.terminationStatus)
+            }
+            do {
+                try process.run()
+            } catch {
+                resumeOnce.resume(127)
+                return
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + deadline) {
+                guard process.isRunning else { return }
+                process.terminate()
+                resumeOnce.resume(127)
+            }
+        }
     }
 }
 
@@ -243,6 +330,7 @@ extension DaemonSetupModel.Dependencies {
             legacyAgent: LegacyLaunchAgentInspector(),
             marker: UserDefaultsRegistrationMarker(),
             probe: client,
+            launchdControl: LaunchctlDaemonServiceController(),
             bundledCommit: DaemonBundleManifest.load(from: bundle)?.MDGitCommit
         )
     }

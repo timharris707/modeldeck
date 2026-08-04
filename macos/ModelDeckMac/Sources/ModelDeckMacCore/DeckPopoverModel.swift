@@ -1129,13 +1129,15 @@ public final class DeckPopoverModel: ObservableObject {
     public func reconcileWarnings(
         rows: [DeckAccountRow],
         staleness: (DeckAccountRow) -> DeckFreshness.CardStaleness?,
-        cadenceNoticeVisible: Bool
+        cadenceNoticeVisible: Bool,
+        healthChipProviders: [DeckProvider] = []
     ) {
         guard let presented = presentedWarning,
               !Self.liveWarningIDs(
                   rows: rows,
                   staleness: staleness,
-                  cadenceNoticeVisible: cadenceNoticeVisible
+                  cadenceNoticeVisible: cadenceNoticeVisible,
+                  healthChipProviders: healthChipProviders
               ).contains(presented)
         else { return }
         presentedWarning = nil
@@ -1145,14 +1147,28 @@ public final class DeckPopoverModel: ObservableObject {
     /// the view's `if` conditions, kept here so the reconcile is testable.
     /// The footer's oldest-data line always renders (even "Not updated yet"
     /// is clickable), so `.footerFreshness` is always live.
+    /// Issue #235: `healthChipProviders` names the providers whose header
+    /// health chips currently render (both in two-column mode, none in
+    /// single-column, which has no column headers), so an open detail
+    /// popover survives refreshes but is released on a layout switch.
+    /// The release rides the next fresh-state reconcile rather than the
+    /// switch itself; in practice the anchor can't linger visibly either
+    /// way — layout changes come from Settings or the gear menu, and
+    /// opening Settings closes the deck popover (#231's fronting), taking
+    /// any anchored popover with it. This reconcile is the model-side
+    /// safety net for the presented-warning slot.
     public static func liveWarningIDs(
         rows: [DeckAccountRow],
         staleness: (DeckAccountRow) -> DeckFreshness.CardStaleness?,
-        cadenceNoticeVisible: Bool
+        cadenceNoticeVisible: Bool,
+        healthChipProviders: [DeckProvider] = []
     ) -> Set<DeckWarningID> {
         var live: Set<DeckWarningID> = [DeckWarningID(topic: .footerFreshness)]
         if cadenceNoticeVisible {
             live.insert(DeckWarningID(topic: .refreshCadence))
+        }
+        for provider in healthChipProviders {
+            live.insert(DeckWarningID(topic: .availabilityHealth, elementID: provider.rawValue))
         }
         for row in rows {
             if row.account.hasDuplicateToken {
@@ -1213,6 +1229,66 @@ public final class DeckPopoverModel: ObservableObject {
     public func requestStaleRefresh() {
         presentedWarning = nil
         onStaleRefresh?()
+    }
+
+    // MARK: Add account from the deck (issue #226)
+
+    /// Issue #226: true while a deck-initiated "Add Account…" request is
+    /// waiting for Settings → Accounts to pick it up. Published so the pane
+    /// can react the moment the request lands even when the Settings window
+    /// is already open on the Accounts tab (no onAppear fires then).
+    @Published public private(set) var pendingAddAccountRequest = false
+
+    /// The deck's "Add Account…" path (both the fresh-install CTA and the
+    /// populated footer affordance): routes Settings to the Accounts pane —
+    /// same navigation contract as `requestSignInAgain` — and marks the
+    /// pending request the pane consumes to present its EXISTING
+    /// `AddAccountSheet`. Pure navigation plumbing: the #8 three-step flow
+    /// (`AddAccountModel`) is reused untouched, exactly as issue #226
+    /// requires. The next screen already asks Claude vs Codex, so the deck
+    /// deliberately carries ONE provider-neutral entry point per surface
+    /// (Tim's clarification on #226), never per-column buttons.
+    public func requestAddAccount() {
+        presentedWarning = nil
+        settingsPane = .accounts
+        pendingAddAccountRequest = true
+    }
+
+    /// One-shot consume for the Accounts pane: true exactly once per
+    /// `requestAddAccount()`, then false until the next request — so a pane
+    /// re-appear (tab switch, window reopen) can never resurrect a request
+    /// that already presented the sheet.
+    public func consumeAddAccountRequest() -> Bool {
+        guard pendingAddAccountRequest else { return false }
+        pendingAddAccountRequest = false
+        return true
+    }
+
+    /// Issue #226: whether the deck should render the fresh-install
+    /// empty-state CTA — no VISIBLE rows in the GIVEN layout (disabled
+    /// accounts never count). Layout-aware (CodeRabbit on PR #232) because
+    /// the two layouts genuinely disagree about visibility: two-column mode
+    /// omits unknown-provider rows (`DeckBuilder.columns` renders Claude and
+    /// Codex columns only) while single-column mode keeps them
+    /// (`interleavedRows`). Keying both on the layout's own derivation keeps
+    /// the CTA and the rendered deck from ever disagreeing about emptiness —
+    /// a bare `rows.isEmpty` showed two dead columns with no CTA when the
+    /// only enabled account had an unknown provider.
+    nonisolated public static func isDeckEmpty(
+        state: DeckState,
+        layout: DeckLayout,
+        now: Date = Date()
+    ) -> Bool {
+        let rows = DeckBuilder.rows(state: state, now: now)
+        switch layout {
+        case .twoColumn: return rows.allSatisfy { $0.provider == nil }
+        case .singleColumn: return rows.isEmpty
+        }
+    }
+
+    /// The view-facing form: emptiness in THIS model's current layout.
+    public func isDeckEmpty(state: DeckState, now: Date = Date()) -> Bool {
+        Self.isDeckEmpty(state: state, layout: layout, now: now)
     }
 
     // MARK: - Menu bar pin (account percentage picker)
@@ -1627,6 +1703,34 @@ public final class DeckPopoverModel: ObservableObject {
               code == DaemonClientError.activeLinkBlockedCode
         else { return nil }
         return message
+    }
+
+    /// Issue #228 safety net: drop any optimistic override that a fresh
+    /// daemon state CONTRADICTS while no activation is in flight. On every
+    /// normal path the flight itself clears the override (verified success)
+    /// or reverts it (any failure), so a surviving contradicted override is
+    /// a leak — and an optimistic ✓ the daemon disowns must never outlive
+    /// the attempt that painted it. Called with each fresh state the app
+    /// applies; a mid-flight refresh is left alone (the stale daemon state
+    /// hasn't caught up with the switch yet — that is what the override is
+    /// FOR).
+    public func reconcileActivation(with state: DeckState) {
+        guard activatingAccountID == nil, !optimisticActive.isEmpty else { return }
+        for key in Self.staleOptimisticKeys(optimisticActive, state: state) {
+            optimisticActive[key] = nil
+        }
+    }
+
+    /// The override entries the given daemon state contradicts: the target
+    /// account is missing or not the provider's default. Pure so the
+    /// reconcile rule is directly unit-testable.
+    nonisolated static func staleOptimisticKeys(
+        _ overrides: [String: String],
+        state: DeckState
+    ) -> [String] {
+        overrides.compactMap { key, target in
+            state.accounts.first(where: { $0.id == target })?.isDefault == true ? nil : key
+        }
     }
 
     /// Rows with the optimistic ACTIVE override applied: within an

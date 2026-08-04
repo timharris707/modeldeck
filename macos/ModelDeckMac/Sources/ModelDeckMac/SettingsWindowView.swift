@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import ModelDeckMacCore
 
@@ -178,6 +179,18 @@ struct AccountsSettingsPane: View {
         .sheet(isPresented: $isAddingAccount) {
             AddAccountSheet(model: addAccountModel)
         }
+        // Issue #226: the deck popover's "Add Account…" entry points route
+        // here — one-shot consume (the model clears the flag) so a later
+        // tab switch or window reopen can never resurrect a request that
+        // already presented the sheet. Both hooks are needed: onAppear for
+        // a Settings window the request just opened, onChange for a window
+        // already sitting on this pane when the deck fires.
+        .onAppear {
+            if deckModel.consumeAddAccountRequest() { isAddingAccount = true }
+        }
+        .onChange(of: deckModel.pendingAddAccountRequest) {
+            if deckModel.consumeAddAccountRequest() { isAddingAccount = true }
+        }
         .sheet(item: $editingAccount) { account in
             AccountEditSheet(account: account, accountsModel: accountsModel)
         }
@@ -322,12 +335,33 @@ struct ProviderActivationBannerView: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: 6) {
-                Button("Retry", action: onRetry)
+                // Issue #227: the blocked banner's click-level action. The
+                // app can't safely move a directory that may hold another
+                // tool's live login, but it can put the user's hands on it:
+                // reveal the blocking path in Finder so "move or rename it"
+                // is one drag away. Offered only when the path actually
+                // exists (revealURL checks) — never a reveal Finder can't
+                // honor.
+                if let revealURL = banner.blockedPath
+                    .flatMap({ AccountsRoster.revealURL(forBlockedPath: $0) }) {
+                    Button("Reveal in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([revealURL])
+                    }
                     .controlSize(.small)
-                    .disabled(isActivationInFlight)
-                    .help(banner.retryRunsActivation
-                        ? "Run activation again for the affected account. New sessions only — running sessions are never touched."
-                        : "Re-check the provider's activation state")
+                    .help("Show the blocking directory in Finder so you can move or rename it")
+                }
+                // Issue #228: no dead Retry. A banner with no affected
+                // account and no activation to re-run (fresh install with
+                // no default; orphaned trouble) renders no button — its
+                // message carries the next step instead.
+                if banner.offersRetry {
+                    Button("Retry", action: onRetry)
+                        .controlSize(.small)
+                        .disabled(isActivationInFlight)
+                        .help(banner.retryRunsActivation
+                            ? "Run activation again for the affected account. New sessions only — running sessions are never touched."
+                            : "Re-check the provider's activation state")
+                }
                 Button("Why?") { isShowingWhy = true }
                     .controlSize(.small)
                     .buttonStyle(.borderless)
@@ -577,6 +611,15 @@ struct AccountRosterRow: View {
                         .frame(width: 7, height: 7)
                 }
             }
+            // Issue #228 (fresh-install field report): a stroked shape only
+            // hit-tests on its painted band, and a `.plain` Button's click
+            // area IS its label's content shape — so a non-selected row's
+            // hollow ring accepted clicks only on the 1.5 pt stroke itself.
+            // Clicking the CENTER of the radio (the natural target) fell
+            // through to the List row and did nothing, silently, every
+            // time. The explicit content shape makes the whole circle
+            // clickable.
+            .contentShape(Circle())
         }
         .buttonStyle(.plain)
         .disabled(account.isDefault || onActivate == nil
@@ -1055,6 +1098,9 @@ struct GeneralSettingsPane: View {
                     get: { $0.menuBarAccountId },
                     set: { model, value in await model.setMenuBarAccount(id: value) }
                 )) {
+                    // Issue #229: no number at all — just the glyph. At the
+                    // top: it's the "least menu bar" end of the spectrum.
+                    Text("None — icon only").tag(MenuBarPinResolver.noneSentinel)
                     Text("Lowest across all accounts").tag("")
                     // Tim's follow-up: after an account switch the menu bar
                     // should usually track the newly active account — these
@@ -1063,14 +1109,23 @@ struct GeneralSettingsPane: View {
                         .tag(MenuBarPinResolver.followActiveSentinel(for: .claude))
                     Text("Active Codex account")
                         .tag(MenuBarPinResolver.followActiveSentinel(for: .codex))
+                    // Issue #235: the Availability Health display modes —
+                    // the menu bar shows the provider's tier-aware 7-day
+                    // runway verdict (Green / Yellow / Red) instead of a
+                    // percentage. Same free-string setting, "health:…"
+                    // sentinels; older builds read them as an unresolvable
+                    // pin and fall back to lowest-across (#229's downgrade
+                    // contract).
+                    Text("Claude availability health")
+                        .tag(MenuBarPinResolver.healthSentinel(for: .claude))
+                    Text("Codex availability health")
+                        .tag(MenuBarPinResolver.healthSentinel(for: .codex))
                     ForEach(menuBarAccountOptions, id: \.id) { option in
                         Text(option.title).tag(option.id)
                     }
                 }
-                .help("A pinned account shows its lowest non-spend usage window in the menu bar continuously when one is available — normal color while healthy, gold at warning, red at critical; without a usable window the plain glyph is shown. \"Active … account\" follows whichever account is currently active for that provider. \"Lowest across all accounts\" shows a percentage only when some account drops below the warning threshold.")
-                Text(settingsSync.settings.menuBarAccountId.isEmpty
-                    ? "The percentage appears only when any account drops below the warning threshold."
-                    : "The pinned account's percentage stays visible while it has a usable non-spend window; otherwise the plain glyph is shown. Notifications still watch every account.")
+                .help("A pinned account shows its lowest non-spend usage window in the menu bar continuously when one is available — normal color while healthy, gold at warning, red at critical; without a usable window the plain glyph is shown. \"Active … account\" follows whichever account is currently active for that provider. \"Lowest across all accounts\" shows a percentage only when some account drops below the warning threshold. \"… availability health\" shows that provider's Availability Health verdict as a colored status dot beside the icon (green circle, yellow triangle, red octagon — the deck column chip's 7-day runway simulation) instead of a percentage. \"None — icon only\" never shows a percentage; notifications still watch every account.")
+                Text(menuBarPercentCaption)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1422,12 +1477,37 @@ struct GeneralSettingsPane: View {
             return (id: account.id, title: "\(provider) — \(account.label)")
         }
         let current = settingsSync.settings.menuBarAccountId
-        // Follow-active sentinels have their own static rows above.
+        // Follow-active sentinels, the #229 "none" sentinel, and the #235
+        // health sentinels have their own static rows above. (An
+        // unrecognized "health:<future>" value still earns the fallback
+        // row — this build treats it exactly like a removed pin.)
         if !current.isEmpty && !current.hasPrefix("active:")
+            && !MenuBarPinResolver.isNone(current)
+            && !MenuBarPinResolver.isHealth(current)
             && !options.contains(where: { $0.id == current }) {
             options.append((id: current, title: "Removed account"))
         }
         return options
+    }
+
+    /// The Menu bar section's state-honest caption (issue #229 adds the
+    /// icon-only branch): every mode names its own display behavior, and
+    /// the modes that change what's shown reaffirm that notifications keep
+    /// watching every account.
+    private var menuBarPercentCaption: String {
+        let current = settingsSync.settings.menuBarAccountId
+        if MenuBarPinResolver.isNone(current) {
+            return "The menu bar shows only the ModelDeck icon — never a percentage. Notifications still watch every account."
+        }
+        // Issue #235: the health modes name their own display behavior,
+        // like every other branch here.
+        if let provider = MenuBarPinResolver.healthProvider(current) {
+            return "The menu bar shows \(provider.displayName)'s availability health as a colored status dot — green circle, yellow triangle, or red octagon from the 7-day runway simulation — instead of a percentage. Notifications still watch every account."
+        }
+        if current.isEmpty {
+            return "The percentage appears only when any account drops below the warning threshold."
+        }
+        return "The pinned account's percentage stays visible while it has a usable non-spend window; otherwise the plain glyph is shown. Notifications still watch every account."
     }
 
     /// Threshold choices (daemon validates 1–99). Includes the current value

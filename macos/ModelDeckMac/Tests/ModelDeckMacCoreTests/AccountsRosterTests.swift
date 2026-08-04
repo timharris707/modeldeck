@@ -109,6 +109,79 @@ struct AccountsRosterSectionTests {
         }
     }
 
+    // MARK: - Fresh install: no default account (issue #228)
+
+    @Test func unlinkedWithNoDefaultGuidesSelectionInsteadOfDeadRetry() {
+        // Tim's fresh-install field state (v0.3.16, 2026-08-04): provider
+        // `unlinked`, NO account ever set default. The old banner promised
+        // "Complete Activation on the selected account" (a button that
+        // exists nowhere) and offered a Retry whose handler could only
+        // re-read state — a dead end on its only button.
+        let s = state(claudeState: "unlinked", accounts: [
+            account(id: "a1", label: "Work"),
+            account(id: "a2", label: "Other"),
+        ])
+        let banner = AccountsRoster.sections(state: s)[0].banner
+        #expect(banner != nil)
+        #expect(banner?.message.contains("Pick an account below") == true)
+        #expect(banner?.message.contains("Complete Activation") != true)
+        #expect(banner?.retryRunsActivation == false)
+        #expect(banner?.affectedAccountID == nil)
+        #expect(banner?.offersRetry == false, "no dead Retry on the fresh-install banner")
+    }
+
+    @Test func blockedWithNoDefaultOffersNoRetryEither() {
+        // Same principle for every link-level state without a selected row:
+        // retry has no account to re-activate, so it must not be promised.
+        for raw in ["blocked", "mismatched"] {
+            let s = state(claudeState: raw, accounts: [
+                account(id: "a1", label: "Work"),
+            ])
+            let banner = AccountsRoster.sections(state: s)[0].banner
+            #expect(banner != nil, "state \(raw)")
+            #expect(banner?.retryRunsActivation == false, "state \(raw)")
+            #expect(banner?.offersRetry == false, "state \(raw)")
+        }
+    }
+
+    @Test func unlinkedWithSelectedAccountKeepsRetryAndCompleteActivationCopy() {
+        // The pre-#228 behavior is untouched once a default exists.
+        let s = state(claudeState: "unlinked", accounts: [
+            account(id: "a1", label: "Work", isDefault: true),
+        ])
+        let banner = AccountsRoster.sections(state: s)[0].banner
+        #expect(banner?.message.contains("Complete Activation on Work") == true)
+        #expect(banner?.retryRunsActivation == true)
+        #expect(banner?.affectedAccountID == "a1")
+        #expect(banner?.offersRetry == true)
+    }
+
+    @Test func offersRetryTracksTargetOrReRunnableActivation() {
+        // Identity states: Retry can't re-run activation but re-checks a
+        // specific selected row's state — still offered. Orphaned trouble:
+        // no account and nothing to re-run — not offered.
+        let identity = state(claudeState: "identity-mismatch", accounts: [
+            account(id: "a1", label: "Work", isDefault: true),
+        ])
+        #expect(AccountsRoster.sections(state: identity)[0].banner?.offersRetry == true)
+
+        let orphaned = state(claudeState: "effective", accounts: [
+            account(id: "a1", label: "Work", isDefault: true),
+        ])
+        let sections = AccountsRoster.sections(
+            state: orphaned,
+            troubleForProvider: { provider in
+                provider == .claude
+                    ? ActivationTrouble(
+                        accountID: "ghost", kind: .error,
+                        message: "Couldn't activate: account not found"
+                    )
+                    : nil
+            }
+        )
+        #expect(sections[0].banner?.offersRetry == false)
+    }
+
     @Test func identityStatesBannerWithoutActivationRetry() {
         // Identity trouble is never fixed by another symlink flip (issue
         // #61's button semantics) — Retry must not re-run activate.
@@ -140,9 +213,123 @@ struct AccountsRosterSectionTests {
             guidanceForAccount: { $0 == "a2" ? "Move ~/.claude aside, then retry." : nil }
         )
         let banner = sections[0].banner
-        #expect(banner?.message == "Move ~/.claude aside, then retry.")
+        // Issue #227: the daemon's guidance still leads VERBATIM (the #55
+        // requirement); the appended sentence adds the radio step only.
+        #expect(banner?.message.hasPrefix("Move ~/.claude aside, then retry.") == true)
         #expect(banner?.affectedAccountID == "a2")
         #expect(banner?.retryRunsActivation == true)
+    }
+
+    // MARK: - Blocked banner names the path + click-level action (issue #227)
+
+    @Test func guidanceBannerAppendsRadioStepAndCarriesParsedPath() {
+        // The daemon's real guidance format ends with the blocking path;
+        // the banner parses it for Reveal in Finder and names the working
+        // retry path (the account's radio, post-#234) after the daemon's
+        // own move instruction. Placeholder path only — safety contract.
+        let guidance = "claude activation requires a one-time migration: "
+            + "move the existing directory aside at a quiet moment before "
+            + "activating: /placeholder/home/.claude"
+        let s = state(claudeState: "blocked", accounts: [
+            account(id: "a1", label: "Work", isDefault: true),
+        ])
+        let sections = AccountsRoster.sections(
+            state: s,
+            guidanceForAccount: { $0 == "a1" ? guidance : nil }
+        )
+        let banner = sections[0].banner
+        #expect(banner?.message.hasPrefix(guidance) == true)
+        #expect(banner?.message.contains("click Work's radio to activate") == true)
+        #expect(banner?.blockedPath == "/placeholder/home/.claude")
+    }
+
+    @Test func blockedPathParsingOnlyAcceptsTrailingPaths() {
+        #expect(AccountsRoster.blockedPath(
+            inGuidance: "codex activation requires a one-time migration: "
+                + "move the existing directory aside at a quiet moment "
+                + "before activating: /placeholder/home/.codex"
+        ) == "/placeholder/home/.codex")
+        #expect(AccountsRoster.blockedPath(
+            inGuidance: "move it aside before activating: ~/.codex"
+        ) == "~/.codex")
+        // No trailing path → no reveal affordance, never a guess.
+        #expect(AccountsRoster.blockedPath(inGuidance: "Move it aside, then retry.") == nil)
+        #expect(AccountsRoster.blockedPath(inGuidance: "something went wrong: not a path") == nil)
+    }
+
+    @Test func stateDerivedBlockedNamesConventionalPathAndRadioStep() {
+        // Tim's fresh-install field data (#227): the old copy ("a one-time
+        // migration must run") named neither the blocker nor an action, so
+        // repeated Retry read as a bug. The state payload carries no path,
+        // so the copy names the conventional active-link location and the
+        // radio as the retry path once the directory is moved.
+        let s = state(claudeState: "blocked", accounts: [
+            account(id: "a1", label: "Work", isDefault: true),
+        ])
+        let banner = AccountsRoster.sections(state: s)[0].banner
+        #expect(banner?.message.contains("existing Claude directory") == true)
+        #expect(banner?.message.contains("~/.claude") == true)
+        #expect(banner?.message.contains("Move or rename") == true)
+        #expect(banner?.message.contains("click Work's radio to activate") == true)
+        #expect(banner?.blockedPath == "~/.claude")
+    }
+
+    @Test func stateDerivedBlockedWithNoDefaultPointsAtPickingAnAccount() {
+        // Post-#234 fresh-install pattern: no selected row, no dead Retry —
+        // the message carries the whole path out (move the directory, then
+        // pick an account; its radio runs activation).
+        let s = state(claudeState: "blocked", accounts: [
+            account(id: "a1", label: "Work"),
+        ])
+        let banner = AccountsRoster.sections(state: s)[0].banner
+        #expect(banner?.message.contains("pick an account below") == true)
+        #expect(banner?.offersRetry == false)
+        #expect(banner?.blockedPath == "~/.claude")
+    }
+
+    @Test func onlyBlockedStateCarriesABlockedPath() {
+        for raw in ["mismatched", "unlinked", "identity-mismatch", "identity-unverified"] {
+            let s = state(claudeState: raw, accounts: [
+                account(id: "a1", label: "Work", isDefault: true),
+            ])
+            #expect(AccountsRoster.sections(state: s)[0].banner?.blockedPath == nil, "state \(raw)")
+        }
+    }
+
+    @Test func orphanedGuidanceTroubleKeepsTheRevealPath() {
+        // Issue #100's orphan fallback still names a real on-disk blocker
+        // when the record is clobber-guard guidance; a generic error
+        // record carries no path.
+        let s = state(claudeState: "effective", accounts: [
+            account(id: "a1", label: "Work", isDefault: true),
+        ])
+        let guidance = "codex activation requires a one-time migration: "
+            + "move the existing directory aside at a quiet moment before "
+            + "activating: /placeholder/home/.codex"
+        let sections = AccountsRoster.sections(
+            state: s,
+            troubleForProvider: { provider in
+                provider == .claude
+                    ? ActivationTrouble(accountID: "ghost", kind: .guidance, message: guidance)
+                    : nil
+            }
+        )
+        #expect(sections[0].banner?.blockedPath == "/placeholder/home/.codex")
+    }
+
+    @Test func revealURLExpandsTildeAndRequiresExistence() {
+        let home = NSHomeDirectory()
+        let url = AccountsRoster.revealURL(
+            forBlockedPath: "~/.codex",
+            fileExists: { $0 == home + "/.codex" }
+        )
+        #expect(url?.path == home + "/.codex")
+        // The path is gone (already moved, or a custom active-link
+        // override) — no reveal Finder can't honor.
+        #expect(AccountsRoster.revealURL(
+            forBlockedPath: "/placeholder/home/.codex",
+            fileExists: { _ in false }
+        ) == nil)
     }
 
     @Test func activationErrorSurfacesInBannerWhenNoGuidance() {

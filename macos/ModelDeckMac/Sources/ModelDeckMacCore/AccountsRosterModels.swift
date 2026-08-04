@@ -31,19 +31,40 @@ public struct ProviderActivationBanner: Equatable, Sendable {
     /// was refused, else the provider's DB-default account. That row renders
     /// the amber radio and (for link-level states) Complete Activation.
     public var affectedAccountID: String?
+    /// Issue #227: the filesystem path blocking activation, when the banner
+    /// knows one — parsed from the daemon's clobber-guard guidance (which
+    /// ends with the exact path), or the provider's conventional active-link
+    /// location for the state-derived blocked banner. Drives the view's
+    /// "Reveal in Finder" action; nil renders no reveal affordance.
+    public var blockedPath: String?
 
     public init(
         provider: DeckProvider,
         message: String,
         detail: String,
         retryRunsActivation: Bool,
-        affectedAccountID: String? = nil
+        affectedAccountID: String? = nil,
+        blockedPath: String? = nil
     ) {
         self.provider = provider
         self.message = message
         self.detail = detail
         self.retryRunsActivation = retryRunsActivation
         self.affectedAccountID = affectedAccountID
+        self.blockedPath = blockedPath
+    }
+
+    /// Issue #228: whether the banner renders a [Retry] button at all.
+    /// Retry is offered only when it can DO something — re-run activation
+    /// (link-level trouble on a known account) or re-check state for a
+    /// specific affected row (identity states, duplicate-token flag). A
+    /// banner with no affected account and no activation to re-run (fresh
+    /// install with no default selected; orphaned trouble whose account
+    /// left the roster) must not offer a button whose click can never
+    /// change what the banner reports — the message carries the real next
+    /// step instead.
+    public var offersRetry: Bool {
+        retryRunsActivation || affectedAccountID != nil
     }
 }
 
@@ -219,14 +240,21 @@ public enum AccountsRoster {
         let detail = detailText(for: provider, selectedLabel: selected?.label)
 
         // 1. A refused activation attempt (clobber guard) — daemon guidance
-        //    verbatim, attached to the account that attempted it.
+        //    verbatim, attached to the account that attempted it. Issue #227:
+        //    the guidance names WHAT to do but not what comes after — append
+        //    the click-level next step (the radio re-runs this activation,
+        //    per #234's semantics) and carry the parsed blocking path so the
+        //    view can offer Reveal in Finder.
         if let (accountID, guidance) = firstValue(guidanceForAccount, in: accounts) {
+            let label = accounts.first { $0.id == accountID }?.label
             return ProviderActivationBanner(
                 provider: provider,
-                message: guidance,
+                message: guidance + " "
+                    + blockedResolutionSentence(accountLabel: label, afterDaemonGuidance: true),
                 detail: detail,
                 retryRunsActivation: true,
-                affectedAccountID: accountID
+                affectedAccountID: accountID,
+                blockedPath: blockedPath(inGuidance: guidance)
             )
         }
         // 2. A generic activation failure surfaced by the deck model.
@@ -252,7 +280,11 @@ public enum AccountsRoster {
                     + " (The account this concerns is no longer in the roster.)",
                 detail: detail,
                 retryRunsActivation: false,
-                affectedAccountID: nil
+                affectedAccountID: nil,
+                // Issue #227: an orphaned clobber-guard record still names a
+                // real on-disk blocker — keep the reveal affordance.
+                blockedPath: trouble.kind == .guidance
+                    ? blockedPath(inGuidance: trouble.message) : nil
             )
         }
         // 3. The verified activation state. Only providers with an enabled
@@ -267,8 +299,21 @@ public enum AccountsRoster {
                 provider: provider,
                 message: message,
                 detail: detail,
-                retryRunsActivation: state.activationState(for: provider).needsLinkCompletion,
-                affectedAccountID: selected?.id
+                // Issue #228 (fresh install): with NO selected account there
+                // is no row [Retry] could re-activate — `affectedAccountID`
+                // is nil, so the old `retryRunsActivation: true` promised an
+                // activation the retry handler could never run (it silently
+                // degraded to a state re-read). Honest gating: retry runs
+                // activation only when a selected row exists to run it on.
+                retryRunsActivation: state.activationState(for: provider).needsLinkCompletion
+                    && selected != nil,
+                affectedAccountID: selected?.id,
+                // Issue #227: the state-derived blocked banner has no daemon
+                // guidance to parse a path from, so the provider's
+                // conventional active-link location is the honest pointer —
+                // the view double-checks it exists before offering Reveal.
+                blockedPath: state.activationState(for: provider) == .blocked
+                    ? conventionalActiveLinkPath(for: provider) : nil
             )
         }
         // 4. The usage-fingerprint duplicate-token flag (issue #65). Ranked
@@ -324,6 +369,57 @@ public enum AccountsRoster {
             + "Redo /login for one of them."
     }
 
+    // MARK: - Issue #227: blocked-path naming + click-level resolution
+
+    /// The click-level next step for a blocked activation, appended to both
+    /// the daemon's verbatim guidance and the state-derived blocked message.
+    /// Post-#234 the radio click IS the working retry path, so the copy
+    /// points there (mirroring the "Pick an account below" pattern) instead
+    /// of leaving the user to rediscover Retry. `afterDaemonGuidance` skips
+    /// the move instruction the daemon's own text already gives.
+    static func blockedResolutionSentence(
+        accountLabel: String?,
+        afterDaemonGuidance: Bool = false
+    ) -> String {
+        let target = accountLabel.map { "click \($0)'s radio" }
+            ?? "pick an account below"
+        return afterDaemonGuidance
+            ? "Once it's moved or renamed, \(target) to activate."
+            : "Move or rename that directory, then \(target) to activate."
+    }
+
+    /// The blocking path named by the daemon's clobber-guard guidance —
+    /// `activeLinkBlockedError` always ends "…before activating: <path>" —
+    /// or nil when the text carries no trailing path. Parsed, never
+    /// guessed: only a trailing absolute or tilde path counts.
+    static func blockedPath(inGuidance guidance: String) -> String? {
+        guard let range = guidance.range(of: ": ", options: .backwards) else { return nil }
+        let candidate = guidance[range.upperBound...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard candidate.hasPrefix("/") || candidate.hasPrefix("~") else { return nil }
+        return candidate
+    }
+
+    /// The provider's conventional active-link location (`~/.claude` /
+    /// `~/.codex` — the daemon's defaults). Display copy for the
+    /// state-derived blocked banner, which knows no exact path.
+    static func conventionalActiveLinkPath(for provider: DeckProvider) -> String {
+        "~/.\(provider.rawValue)"
+    }
+
+    /// The URL "Reveal in Finder" should select for a banner's
+    /// `blockedPath`, or nil when nothing exists there (a custom
+    /// active-link override, or the user already moved it) — never offer a
+    /// reveal that Finder can't honor.
+    public static func revealURL(
+        forBlockedPath path: String,
+        fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) -> URL? {
+        let expanded = (path as NSString).expandingTildeInPath
+        guard fileExists(expanded) else { return nil }
+        return URL(fileURLWithPath: expanded)
+    }
+
     private static func firstValue(
         _ lookup: (String) -> String?,
         in accounts: [DeckAccount]
@@ -356,12 +452,29 @@ public enum AccountsRoster {
         case .effective, .unknown:
             return nil
         case .blocked:
-            return "Activation pending — a one-time migration must run before "
-                + "\(provider.displayName) activation can take hold."
+            // Issue #227 (Tim's fresh-install field data): "a one-time
+            // migration must run" named neither the blocker nor an action,
+            // so repeated Retry read as a bug. Name the KIND of thing and
+            // WHERE (the daemon's blocked verdict comes from lstat'ing the
+            // active link — conventionally ~/.claude / ~/.codex — but the
+            // state payload carries no path, so "usually" stays honest),
+            // then give the click-level resolution.
+            return "Activation blocked — an existing \(provider.displayName) "
+                + "directory from a previous install is in the way (usually "
+                + "\(conventionalActiveLinkPath(for: provider))). "
+                + blockedResolutionSentence(accountLabel: selectedLabel)
         case .mismatched:
             return "Activation pending — the active link on disk points at a "
                 + "different profile than \(selected)."
         case .unlinked:
+            // Issue #228 (fresh install): with no selected account there is
+            // no Complete Activation button anywhere — pointing at it was a
+            // dead end. The real next step is picking an account: its radio
+            // runs the same activation.
+            guard selectedLabel != nil else {
+                return "Activation ready — no \(provider.displayName) account is "
+                    + "active yet. Pick an account below to activate it."
+            }
             return "Activation ready — no active link exists yet. "
                 + "Complete Activation on \(selected) finishes the switch."
         case .identityMismatch:

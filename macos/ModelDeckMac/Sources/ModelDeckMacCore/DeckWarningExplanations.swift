@@ -27,6 +27,12 @@ public enum DeckWarningTopic: Hashable, Sendable {
     case refreshCadence
     /// The footer's "Oldest data N min ago" line (issues #42/#89).
     case footerFreshness
+    /// The per-provider Availability Health chip beside a column header
+    /// (issue #235) — element id is the provider's raw value. Not a
+    /// warning, but it shares the popover model's one-at-a-time
+    /// presentation slot so the detail popover behaves exactly like every
+    /// other click-to-explain affordance.
+    case availabilityHealth
 }
 
 /// Identity of ONE clickable warning affordance: the topic plus the element

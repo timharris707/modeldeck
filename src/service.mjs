@@ -358,6 +358,10 @@ export class ModelDeckService {
     this.daemonExecPathExists = options.daemonExecPathExists
       || ((execPath) => fs.existsSync(execPath));
     this.daemonSea = options.daemonSea ?? isSea();
+    // Build commit the running process was compiled from (server.mjs inlines
+    // it at SEA build time). Self-reported so the app can tell a stale
+    // still-running daemon apart from the build it just registered.
+    this.daemonGitCommit = options.daemonGitCommit || null;
     this.statuslineScriptPath = options.statuslineScriptPath
       || (this.statuslineSea ? null : fileURLToPath(new URL('./adapters/claude-statusline.mjs', import.meta.url)));
     this.statuslineWatcher = null;
@@ -2377,7 +2381,7 @@ export class ModelDeckService {
     } catch {
       binaryPresent = false;
     }
-    return { execPath: this.daemonExecPath, binaryPresent, sea: this.daemonSea };
+    return { execPath: this.daemonExecPath, binaryPresent, sea: this.daemonSea, MDGitCommit: this.daemonGitCommit };
   }
 
   async state() {

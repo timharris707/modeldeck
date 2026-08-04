@@ -187,11 +187,16 @@ SEA_CONFIG="$BUILD_DIR/sea-config.json"
 SEA_BLOB="$BUILD_DIR/sea-prep.blob"
 STAGED_BINARY="$BUILD_DIR/modeldeckd"
 VERSION_DEFINE="$("$RUNNING_NODE_BINARY" -e 'process.stdout.write(JSON.stringify(process.argv[1]))' "$PACKAGE_VERSION")"
+# Same commit the manifest records as MDGitCommit — inlined so the RUNNING
+# daemon can self-report its build on /api/health and the app can verify an
+# upgrade actually replaced the process (empty string decodes to null).
+GIT_COMMIT_DEFINE="$("$RUNNING_NODE_BINARY" -e 'process.stdout.write(JSON.stringify(process.argv[1] || ""))' "$GIT_COMMIT")"
 
 echo "==> bundling daemon and embedded usage probe"
 "$ESBUILD" "$REPO_ROOT/src/server.mjs" \
   --bundle --platform=node --target=node24 --format=cjs \
   --define:__MODELDECK_VERSION__="$VERSION_DEFINE" \
+  --define:__MODELDECK_GIT_COMMIT__="$GIT_COMMIT_DEFINE" \
   --define:import.meta.url='"file:///__modeldeck_sea_bundle__.mjs"' \
   --outfile="$BUNDLE"
 

@@ -19,6 +19,17 @@ const VERSION = typeof __MODELDECK_VERSION__ === 'string'
   ? __MODELDECK_VERSION__
   : packageMetadata.version;
 
+// The daemon's own build commit, inlined by esbuild the same way as VERSION.
+// Self-reported on /api/health (and /api/state's daemon section) so the app
+// can verify that the RUNNING process is the build it just registered — the
+// 0.3.13→0.3.15 incident: SMAppService re-register no-ops at the BTM layer
+// while the old process keeps answering, and nothing else can tell them
+// apart (the on-disk manifest always matches the new bundle). Null in
+// source-mode runs, which never go through SMAppService registration.
+const GIT_COMMIT = typeof __MODELDECK_GIT_COMMIT__ === 'string' && __MODELDECK_GIT_COMMIT__ !== ''
+  ? __MODELDECK_GIT_COMMIT__
+  : null;
+
 function json(res, status, payload, extraHeaders = {}) {
   const body = JSON.stringify(payload);
   res.writeHead(status, {
@@ -74,6 +85,7 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
     codexActiveLink: CODEX_ACTIVE_LINK,
     codexProfilesDir: CODEX_PROFILES_DIR,
     cliproxyAuthDir: CLIPROXY_AUTH_DIR,
+    daemonGitCommit: GIT_COMMIT,
     // DEMO/DEV ONLY (issue #129): seeded fixture snapshots are authoritative —
     // provider refresh becomes a no-op and nothing is ever scheduled. Set by
     // scripts/demo-daemon.sh for screenshot instances; never in production.
@@ -94,7 +106,7 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
         });
       }
       if (req.method === 'GET' && url.pathname === '/api/health') {
-        return json(res, 200, { ok: true, name: 'ModelDeck', version: VERSION, tokenSource, projectsRoot: ownedService.projectsRoot });
+        return json(res, 200, { ok: true, name: 'ModelDeck', version: VERSION, MDGitCommit: GIT_COMMIT, tokenSource, projectsRoot: ownedService.projectsRoot });
       }
       if (req.method === 'GET' && url.pathname === '/api/state') return json(res, 200, await ownedService.state());
       if (req.method === 'GET' && url.pathname === '/api/tools') {

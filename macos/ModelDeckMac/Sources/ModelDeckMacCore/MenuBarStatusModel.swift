@@ -111,6 +111,36 @@ public final class MenuBarStatusModel: ObservableObject {
     private var hasLoadedOnce = false
 
     private func recomputeIconState() {
+        // Issue #229: "None — icon only" hides the number entirely —
+        // including the cold-start "–%" placeholder, since the user asked
+        // for a bare glyph. Display-only: `worstRemaining` and
+        // `onStateUpdate` are untouched, so notifications keep watching
+        // every account exactly as before.
+        if let pinnedAccountId, MenuBarPinResolver.isNone(pinnedAccountId) {
+            iconState = .plain
+            return
+        }
+        // Issue #235: the Availability Health display mode — the icon
+        // shows the provider's shape-coded verdict dot instead of a
+        // percentage, including before the first load (a muted hollow
+        // ring rather than the "–%" percent placeholder, which would
+        // claim a mode the user turned off). Display-only like #229:
+        // `worstRemaining` and
+        // `onStateUpdate` are untouched, so notifications keep watching
+        // every account. An unrecognized "health:<future>" value is NOT
+        // health mode — it falls through to the unresolvable-pin fallback
+        // below, the #229 downgrade contract in this build's own forward
+        // direction.
+        if let pinnedAccountId,
+           let healthProvider = MenuBarPinResolver.healthProvider(pinnedAccountId) {
+            let verdict = deckState.flatMap {
+                AvailabilityHealthEngine.report(
+                    for: healthProvider, state: $0, now: clock()
+                ).verdict
+            }
+            iconState = .health(provider: healthProvider, verdict: verdict)
+            return
+        }
         guard hasLoadedOnce else {
             iconState = .loading
             return

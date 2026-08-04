@@ -26,7 +26,17 @@ enum SettingsWindowFronting {
     /// that app (e.g. Terminal running a provider login) is then the thing
     /// the user must interact with; stealing front back would be worse than
     /// the bug.
+    /// Issue #230 (Tim's field report 2026-08-04): the deck popover is a
+    /// status-level panel, so it floats ABOVE the Settings window no matter
+    /// how hard the fronting below pushes — Settings opened from the deck
+    /// came up fully occluded every time. The popover is transient chrome
+    /// and the click's intent ("open Settings") has left its context, so
+    /// dismissing it is the standard macOS behavior — and because EVERY
+    /// popover path that opens Settings fronts through here (gear menu,
+    /// deck-card sign-in), the dismissal covers all entry points at one
+    /// choke point.
     static func activateAndFront() {
+        closeDeckPopover()
         activate()
         front(attempt: 0, heldActivation: NSApp.isActive)
     }
@@ -69,6 +79,19 @@ enum SettingsWindowFronting {
         guard attempt < 50 else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
             front(attempt: attempt + 1, heldActivation: heldActivation || isActive)
+        }
+    }
+
+    /// Issue #230: close the `.window`-style MenuBarExtra panel (the deck).
+    /// `close()` (not a bare `orderOut`) so SwiftUI's presentation state
+    /// resets and the next status-item click reopens the deck first try.
+    /// Identification lives in Core (`DeckPopoverWindowMatcher`) where it is
+    /// tested; no match — popover already closed, or the private class name
+    /// churned — is a harmless no-op.
+    private static func closeDeckPopover() {
+        for window in NSApp.windows
+        where DeckPopoverWindowMatcher.matches(className: window.className) {
+            window.close()
         }
     }
 

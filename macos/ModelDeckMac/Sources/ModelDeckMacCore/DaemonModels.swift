@@ -10,12 +10,18 @@ public struct DaemonHealth: Codable, Equatable, Sendable {
     public var ok: Bool
     public var name: String
     public var version: String
+    /// The RUNNING process's build commit, self-reported since the
+    /// 0.3.13→0.3.15 stale-daemon incident. Optional by design: an old (or
+    /// source-mode) daemon omits it — which is itself the signal that the
+    /// process predates the bundle that just registered it.
+    public var MDGitCommit: String?
     public var projectsRoot: String?
 
-    public init(ok: Bool, name: String, version: String, projectsRoot: String? = nil) {
+    public init(ok: Bool, name: String, version: String, MDGitCommit: String? = nil, projectsRoot: String? = nil) {
         self.ok = ok
         self.name = name
         self.version = version
+        self.MDGitCommit = MDGitCommit
         self.projectsRoot = projectsRoot
     }
 }
@@ -428,6 +434,13 @@ public enum PlanTierFormatter {
             }
         }
         return nil
+    }
+
+    /// "default_claude_max_20x" → 20 — the numeric form of the same tier
+    /// token, for consumers that weigh capacity by tier (issue #235's
+    /// Availability Health). Nil when no numeric multiplier token exists.
+    public static func multiplierValue(in rateLimitTier: String?) -> Double? {
+        multiplier(in: rateLimitTier).flatMap { Double($0.dropLast()) }
     }
 }
 

@@ -96,6 +96,10 @@ test('health, scan, account, mapping, launch, and refresh APIs work together', a
   let result = await request(fixture, '/api/health');
   assert.equal(result.response.status, 200);
   assert.equal(result.body.name, 'ModelDeck');
+  // Source-mode daemons have no inlined build commit; the field is still
+  // present so the app's stale-daemon verification has an explicit answer.
+  assert.ok('MDGitCommit' in result.body);
+  assert.strictEqual(result.body.MDGitCommit, null);
 
   result = await request(fixture, '/api/scan', { method: 'POST', body: '{}' });
   assert.equal(result.body.projects.length, 1);

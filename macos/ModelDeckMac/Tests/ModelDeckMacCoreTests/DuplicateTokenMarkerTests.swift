@@ -260,7 +260,8 @@ struct DuplicateTokenBannerTests {
             state: s,
             guidanceForAccount: { $0 == "a1" ? "Verbatim daemon guidance" : nil }
         )
-        #expect(sections[0].banner?.message == "Verbatim daemon guidance")
+        // Issue #227: guidance leads verbatim, with the radio step appended.
+        #expect(sections[0].banner?.message.hasPrefix("Verbatim daemon guidance") == true)
     }
 
     @Test func duplicateBannerCarriesItsOwnHonestDetail() {

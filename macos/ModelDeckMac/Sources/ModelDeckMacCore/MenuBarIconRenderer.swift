@@ -52,6 +52,12 @@ public enum MenuBarIconRenderer {
     /// dynamic `NSColor.labelColor`, which resolves against the current
     /// appearance each time the (drawing-handler-backed) image is drawn.
     public static func labelImage(for state: MenuBarIconState) -> NSImage {
+        // Issue #235: health mode composites a shape-coded status dot (not
+        // a percent) beside the glyph — its own path so the percent
+        // grammar stays untouched.
+        if case .health(let provider, let verdict) = state {
+            return healthLabelImage(provider: provider, verdict: verdict)
+        }
         guard let label = state.percentLabel else { return deckGlyph }
         let color: NSColor
         switch state {
@@ -68,9 +74,112 @@ public enum MenuBarIconRenderer {
             color = .labelColor
         case .plain, .warning:
             color = warningColor
+        case .health:
+            // Unreachable — health mode returned above with its dot
+            // composite. Listed only for exhaustiveness, and returning the
+            // bare glyph (not a color assignment) so this switch can never
+            // imply health text renders gold.
+            return deckGlyph
         }
+        return composite(text: label, color: color, accessibility: "ModelDeck \(label)")
+    }
 
-        let attributed = NSAttributedString(string: label, attributes: [
+    /// Issue #235: the health-mode label — the template-drawn deck glyph
+    /// plus a small FULL-COLOR status dot (Tim's design call: color is
+    /// permitted and desired in the menu bar; the glyph half keeps
+    /// adapting to light/dark because it draws in dynamic labelColor).
+    /// Color is never the only signal: the shapes differ per verdict —
+    /// green filled circle, yellow triangle, red octagon (traffic-sign
+    /// shape language, distinguishable for colorblind users) — and the
+    /// verdict is available as text via the accessibility description and
+    /// the deck chip's detail popover. A nil verdict renders a muted
+    /// hollow ring: data hasn't arrived or no account qualified, and the
+    /// mode must never claim a health it can't compute. Non-template by
+    /// necessity (a template composite would flatten the tint), so the dot
+    /// does not invert on highlight — the saturated system colors stay
+    /// readable on the highlight tint as on both bar appearances.
+    public static func healthLabelImage(
+        provider: DeckProvider,
+        verdict: AvailabilityVerdict?
+    ) -> NSImage {
+        let dotSize: CGFloat = 8
+        let size = NSSize(
+            width: glyphSize.width + glyphPercentSpacing + dotSize,
+            height: glyphSize.height
+        )
+        let dotRect = NSRect(
+            x: glyphSize.width + glyphPercentSpacing,
+            y: (glyphSize.height - dotSize) / 2,
+            width: dotSize,
+            height: dotSize
+        )
+        let image = NSImage(size: size, flipped: false) { _ in
+            drawDeckBars(fill: .labelColor)
+            drawVerdictDot(verdict, in: dotRect)
+            return true
+        }
+        image.isTemplate = false
+        image.accessibilityDescription = "ModelDeck \(provider.displayName) availability "
+            + (verdict?.displayWord.lowercased() ?? "unknown")
+        return image
+    }
+
+    /// The shape-coded status dot: circle / triangle / octagon so the
+    /// verdict never relies on color alone.
+    private static func drawVerdictDot(_ verdict: AvailabilityVerdict?, in rect: NSRect) {
+        switch verdict {
+        case .green:
+            NSColor.systemGreen.setFill()
+            NSBezierPath(ovalIn: rect).fill()
+        case .yellow:
+            warningColor.setFill()
+            trianglePath(in: rect).fill()
+        case .red:
+            criticalColor.setFill()
+            octagonPath(in: rect).fill()
+        case nil:
+            NSColor.secondaryLabelColor.setStroke()
+            let ring = NSBezierPath(ovalIn: rect.insetBy(dx: 0.75, dy: 0.75))
+            ring.lineWidth = 1.5
+            ring.stroke()
+        }
+    }
+
+    private static func trianglePath(in rect: NSRect) -> NSBezierPath {
+        let path = NSBezierPath()
+        path.move(to: NSPoint(x: rect.midX, y: rect.maxY))
+        path.line(to: NSPoint(x: rect.maxX, y: rect.minY))
+        path.line(to: NSPoint(x: rect.minX, y: rect.minY))
+        path.close()
+        return path
+    }
+
+    private static func octagonPath(in rect: NSRect) -> NSBezierPath {
+        let inset = rect.width * 0.29
+        let points = [
+            NSPoint(x: rect.minX + inset, y: rect.minY),
+            NSPoint(x: rect.maxX - inset, y: rect.minY),
+            NSPoint(x: rect.maxX, y: rect.minY + inset),
+            NSPoint(x: rect.maxX, y: rect.maxY - inset),
+            NSPoint(x: rect.maxX - inset, y: rect.maxY),
+            NSPoint(x: rect.minX + inset, y: rect.maxY),
+            NSPoint(x: rect.minX, y: rect.maxY - inset),
+            NSPoint(x: rect.minX, y: rect.minY + inset),
+        ]
+        let path = NSBezierPath()
+        path.move(to: points[0])
+        for point in points.dropFirst() { path.line(to: point) }
+        path.close()
+        return path
+    }
+
+    /// The single composite the status bar shows: glyph + colored text.
+    /// Non-template because a template composite would let the menu bar
+    /// flatten the tint; the glyph half keeps adapting because it draws in
+    /// dynamic `NSColor.labelColor`, resolved per draw of the
+    /// drawing-handler-backed image.
+    private static func composite(text: String, color: NSColor, accessibility: String) -> NSImage {
+        let attributed = NSAttributedString(string: text, attributes: [
             .font: percentFont,
             .foregroundColor: color,
         ])
@@ -86,7 +195,7 @@ public enum MenuBarIconRenderer {
             return true
         }
         image.isTemplate = false
-        image.accessibilityDescription = "ModelDeck \(label)"
+        image.accessibilityDescription = accessibility
         return image
     }
 

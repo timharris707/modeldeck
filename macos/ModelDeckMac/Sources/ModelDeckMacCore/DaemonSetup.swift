@@ -62,9 +62,73 @@ public protocol RegistrationMarkerStore: AnyObject, Sendable {
     var registeredCommit: String? { get set }
 }
 
+/// One decoded `/api/health` answer. "The daemon answered but predates
+/// self-reporting" (a snapshot with a nil commit) and "no answer" (no
+/// snapshot at all) must never be conflated: the first is the stale-process
+/// signal, the second is plain unreachability. Keeping both in one value
+/// also forces every evaluation to use a SINGLE health round-trip — with
+/// separate reachability and commit requests, a transient failure between
+/// them would read as "reachable but no commit" and boot out a healthy
+/// daemon (CodeRabbit, PR #223).
+public struct DaemonProbeSnapshot: Equatable, Sendable {
+    /// The RUNNING daemon's self-reported build commit (`MDGitCommit`);
+    /// nil for pre-0.3.17 daemons that don't self-report.
+    public var runningCommit: String?
+    public init(runningCommit: String? = nil) {
+        self.runningCommit = runningCommit
+    }
+}
+
 /// Loopback reachability of the daemon on the configured port.
 public protocol DaemonReachabilityProbing: Sendable {
-    func checkReachable() async -> Bool
+    /// A single `/api/health` round-trip: nil iff the daemon didn't answer.
+    func probeDaemon() async -> DaemonProbeSnapshot?
+}
+
+/// launchd-level control of our SMAppService agent, below the SMAppService
+/// API. Needed because SMAppService.register()/unregister() can silently
+/// no-op at the BTM layer while a stale daemon process keeps running (and
+/// its stale job record then makes every respawn fail EX_CONFIG). The live
+/// implementation shells out to /bin/launchctl for the gui domain.
+/// What `launchctl print` said about our service. Three-valued on purpose:
+/// only a CONFIRMED absence may trigger the wedge repair — a probe that
+/// failed for any other reason (launchctl couldn't run, permission trouble,
+/// an exit code we don't recognize) must read as "don't know", never as
+/// "absent" (CodeRabbit, PR #223).
+public enum LaunchdServiceProbe: Equatable, Sendable {
+    /// Exit 0: the service exists in the launchd domain.
+    case loaded
+    /// launchctl's "could not find service" — the confirmed-absent state
+    /// the wedge repair keys on.
+    case notFound
+    /// The probe itself failed; treat as loaded for repair purposes.
+    case unknown
+}
+
+/// `launchctl print` exit-code classification, kept pure for tests. 113 is
+/// launchctl's stable "could not find service" status; anything else that
+/// isn't success — including our runner's synthetic 127 for "launchctl
+/// couldn't run at all" — is an unknown probe outcome, not evidence of
+/// absence.
+public func classifyLaunchctlPrintExit(_ code: Int32) -> LaunchdServiceProbe {
+    switch code {
+    case 0: return .loaded
+    case 113: return .notFound
+    default: return .unknown
+    }
+}
+
+public protocol LaunchdServiceControlling: Sendable {
+    /// Probes `launchctl print gui/<uid>/<label>`. `.notFound` + registrar
+    /// `.enabled` is the wedged state observed live after a manual bootout:
+    /// SMAppService still says enabled, launchd has nothing, register()
+    /// no-ops. Async by contract: the model runs on the main actor and
+    /// launchctl must never block it.
+    func probeService() async -> LaunchdServiceProbe
+    /// `launchctl bootout gui/<uid>/<label>` — kills the running process
+    /// AND removes the stale job record that references the old bundle.
+    /// Best-effort: booting out an absent service is already the goal state.
+    func bootOutService() async
 }
 
 // MARK: - Bundle manifest
@@ -106,6 +170,18 @@ public enum DaemonSetupDecision: Equatable, Sendable {
     /// The registered service's recorded MDGitCommit differs from the
     /// bundle's manifest — replace the registration.
     case driftReregister(recorded: String?, bundled: String)
+    /// SMAppService claims `.enabled` but the launchd gui domain has no such
+    /// service (observed live after a manual bootout, and the end state of
+    /// the 0.3.13→0.3.15 stale-record incident once the old process died:
+    /// "spawn failed", synthesized exit 78 EX_CONFIG). Plain register()
+    /// no-ops here — route to the forced bootout + fresh-register repair.
+    case wedgedServiceRepair(bundled: String)
+    /// Our registration, our recorded commit — but the RUNNING process
+    /// self-reports a different build (or none: pre-0.3.17 daemons don't
+    /// self-report). The marker comparison can't see this: the incident
+    /// daemon survived TWO upgrades because each drift re-register advanced
+    /// the marker while the old process kept answering. Forced restart.
+    case staleDaemonRestart(running: String?, bundled: String)
     /// Daemon answering on the loopback port; nothing to do.
     case running
     /// Legacy LaunchAgent installed but the daemon isn't answering. Never
@@ -124,12 +200,19 @@ public enum DaemonSetupDecision: Equatable, Sendable {
 /// 1. no bundled daemon → dev build, stand down;
 /// 2. registered + commit drift → re-register (even while running: the
 ///    running daemon is the OLD build);
-/// 3. reachable → running;
-/// 4. legacy plist present → never install over it;
-/// 5. registration status → approval / retry / first-run consent.
+/// 3. registered + answering, but the running process self-reports a build
+///    other than the bundle's → forced restart (the marker can't see this);
+/// 4. registered but absent from launchd AND not answering → wedged
+///    (register() would no-op; needs the forced repair). A daemon that IS
+///    answering without a launchd job is a hand-started dev daemon — leave
+///    it alone, same courtesy as rule 5;
+/// 5. reachable → running;
+/// 6. legacy plist present → never install over it;
+/// 7. registration status → approval / retry / first-run consent.
 public func decideDaemonSetup(
-    reachable: Bool,
+    probe: DaemonProbeSnapshot?,
     registration: ServiceRegistrationStatus,
+    launchdService: LaunchdServiceProbe,
     legacyPresent: Bool,
     recordedCommit: String?,
     bundledCommit: String?
@@ -140,13 +223,53 @@ public func decideDaemonSetup(
     if registration == .enabled, recordedCommit != bundledCommit {
         return .driftReregister(recorded: recordedCommit, bundled: bundledCommit)
     }
-    if reachable { return .running }
+    if registration == .enabled, let probe, probe.runningCommit != bundledCommit {
+        return .staleDaemonRestart(running: probe.runningCommit, bundled: bundledCommit)
+    }
+    if registration == .enabled, launchdService == .notFound, probe == nil {
+        return .wedgedServiceRepair(bundled: bundledCommit)
+    }
+    if probe != nil { return .running }
     if legacyPresent { return .legacyInstalledNotRunning }
     switch registration {
     case .requiresApproval: return .awaitingApproval
     case .enabled: return .registeredNotRunning
     case .notRegistered, .notFound, .unknown: return .needsConsent
     }
+}
+
+// MARK: - Post-re-register verification
+
+/// What probing the daemon AFTER a re-register concluded. Pure output of
+/// `verifyDaemonAfterReregister`.
+public enum ReregisterVerification: Equatable, Sendable {
+    /// The running daemon self-reports the bundle's commit — the update took.
+    case verified
+    /// Something is answering, but it is NOT this bundle's build: wrong
+    /// commit, or no commit at all (a daemon old enough not to self-report
+    /// is by definition not the build we just registered — the exact
+    /// 0.3.13 incident shape). SMAppService replaced the registration on
+    /// paper while the old process kept running; only a launchd-level
+    /// bootout + fresh register actually restarts it.
+    case staleProcessNeedsRestart
+    /// Nothing answering — not a verification failure; the caller's normal
+    /// starting-up handling covers it.
+    case unreachable
+}
+
+/// The post-re-register check `reregister()` runs once the daemon answers,
+/// kept pure for tests. Found in the 0.3.13→0.3.15 incident: register()
+/// after unregister() can no-op at the BTM layer while the old daemon keeps
+/// running, so "registration replaced" must never be trusted without asking
+/// the RUNNING process what build it is. Takes the ONE probe snapshot the
+/// startup wait already collected — never a fresh request that could fail
+/// independently of it.
+public func verifyDaemonAfterReregister(
+    probe: DaemonProbeSnapshot?,
+    bundledCommit: String
+) -> ReregisterVerification {
+    guard let probe else { return .unreachable }
+    return probe.runningCommit == bundledCommit ? .verified : .staleProcessNeedsRestart
 }
 
 // MARK: - System prompt coaching (issue #98)
@@ -203,6 +326,7 @@ public final class DaemonSetupModel: ObservableObject {
         public var legacyAgent: any LegacyAgentInspecting
         public var marker: any RegistrationMarkerStore
         public var probe: any DaemonReachabilityProbing
+        public var launchdControl: any LaunchdServiceControlling
         /// MDGitCommit from the bundle's daemon manifest; nil in dev builds.
         public var bundledCommit: String?
 
@@ -212,6 +336,7 @@ public final class DaemonSetupModel: ObservableObject {
             legacyAgent: any LegacyAgentInspecting,
             marker: any RegistrationMarkerStore,
             probe: any DaemonReachabilityProbing,
+            launchdControl: any LaunchdServiceControlling,
             bundledCommit: String?
         ) {
             self.registrar = registrar
@@ -219,6 +344,7 @@ public final class DaemonSetupModel: ObservableObject {
             self.legacyAgent = legacyAgent
             self.marker = marker
             self.probe = probe
+            self.launchdControl = launchdControl
             self.bundledCommit = bundledCommit
         }
     }
@@ -267,9 +393,15 @@ public final class DaemonSetupModel: ObservableObject {
     public func evaluateOnLaunch() async {
         phase = .checking
         legacyAgentPresent = deps.legacyAgent.isLegacyAgentPresent()
+        let registration = deps.registrar.status
         let decision = decideDaemonSetup(
-            reachable: await deps.probe.checkReachable(),
-            registration: deps.registrar.status,
+            // ONE health round-trip answers both reachability and staleness.
+            probe: await deps.probe.probeDaemon(),
+            registration: registration,
+            // Only consulted for the enabled-but-wedged check; skip the
+            // launchctl spawn on the paths that can't be wedged.
+            launchdService: registration == .enabled
+                ? await deps.launchdControl.probeService() : .loaded,
             legacyPresent: legacyAgentPresent,
             recordedCommit: deps.marker.registeredCommit,
             bundledCommit: deps.bundledCommit
@@ -287,6 +419,8 @@ public final class DaemonSetupModel: ObservableObject {
             phase = .legacyNotRunning
         case .driftReregister(_, let bundled):
             await reregister(bundledCommit: bundled)
+        case .wedgedServiceRepair(let bundled), .staleDaemonRestart(_, let bundled):
+            await forceRestartService(bundledCommit: bundled)
         }
     }
 
@@ -392,7 +526,7 @@ public final class DaemonSetupModel: ObservableObject {
             phase = .awaitingApproval
             return
         }
-        await waitForDaemon()
+        _ = await waitForDaemon()
     }
 
     private func reregister(bundledCommit: String) async {
@@ -423,19 +557,87 @@ public final class DaemonSetupModel: ObservableObject {
             phase = .awaitingApproval
             return
         }
-        await waitForDaemon()
+        await verifyAfterReregister(probe: await waitForDaemon(), bundledCommit: bundledCommit)
     }
 
-    private func waitForDaemon() async {
+    /// Guards verification escalation to ONE launchd-level forced restart
+    /// per launch evaluation chain — same rationale as the #185 repair
+    /// guard: a restart that can't take must degrade to a visible state,
+    /// never loop bootout/register against launchd. Set by
+    /// `forceRestartService` itself, so a decision-driven forced restart
+    /// (wedge, launch-time staleness) counts as the one attempt too; a
+    /// user-clicked Retry re-evaluates and may legitimately try again.
+    private var didForceRestartService = false
+
+    /// The 0.3.13→0.3.15 lesson: a re-register that "succeeded" is a claim
+    /// about BTM bookkeeping, not about the process. Once the daemon
+    /// answers, ask it what build it is; a stale answer escalates to the
+    /// launchd-level restart (once), and a stale answer AFTER that restart
+    /// surfaces as an actionable failure instead of a silent wrong-version
+    /// steady state.
+    private func verifyAfterReregister(probe: DaemonProbeSnapshot?, bundledCommit: String) async {
+        // Reuses the snapshot waitForDaemon() already collected — a second
+        // request could fail independently and misread a healthy daemon as
+        // stale. Not answering is not a verification failure: waitForDaemon()
+        // already left the starting-up state with its retry affordance.
+        let verification = verifyDaemonAfterReregister(
+            probe: probe,
+            bundledCommit: bundledCommit
+        )
+        guard verification == .staleProcessNeedsRestart else { return }
+        guard !didForceRestartService else {
+            phase = .failed(Self.staleDaemonAfterRestartMessage)
+            return
+        }
+        await forceRestartService(bundledCommit: bundledCommit)
+    }
+
+    public static let staleDaemonAfterRestartMessage = "The background service is still running an older ModelDeck build after a forced restart. Restart your Mac, then click Retry."
+
+    /// The launchd-level repair for the states SMAppService can't fix from
+    /// above: bootout kills a stale process AND its stale job record, then
+    /// unregister clears SMAppService's own belief so register() actually
+    /// registers this bundle instead of no-opping (the manual recovery
+    /// sequence from the 2026-08-02 incident, automated).
+    private func forceRestartService(bundledCommit: String) async {
+        didForceRestartService = true
+        await deps.launchdControl.bootOutService()
+        try? deps.registrar.unregister()
+        do {
+            try deps.registrar.register()
+        } catch {
+            if deps.registrar.status == .requiresApproval {
+                deps.marker.registeredCommit = bundledCommit
+                didReregisterForUpdate = true
+                phase = .awaitingApproval
+                return
+            }
+            phase = .failed("Couldn't restart the background service: \(error.localizedDescription)")
+            return
+        }
+        deps.marker.registeredCommit = bundledCommit
+        didReregisterForUpdate = true
+        if deps.registrar.status == .requiresApproval {
+            phase = .awaitingApproval
+            return
+        }
+        await verifyAfterReregister(probe: await waitForDaemon(), bundledCommit: bundledCommit)
+    }
+
+    /// Polls until the daemon answers, returning the answering probe
+    /// snapshot so callers can verify the build WITHOUT a second request.
+    @discardableResult
+    private func waitForDaemon() async -> DaemonProbeSnapshot? {
         phase = .startingUp
         for attempt in 0..<startupProbeAttempts {
             if attempt > 0 { await startupProbeDelay() }
-            if await deps.probe.checkReachable() {
+            if let snapshot = await deps.probe.probeDaemon() {
                 phase = .quiet
-                return
+                return snapshot
             }
         }
         // Still starting (or failing); leave the retry affordance up.
         phase = .startingUp
+        return nil
     }
 }

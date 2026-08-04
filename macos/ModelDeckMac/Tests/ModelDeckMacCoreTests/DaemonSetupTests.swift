@@ -75,10 +75,37 @@ private final class FakeMarker: RegistrationMarkerStore, @unchecked Sendable {
 private final class FakeProbe: DaemonReachabilityProbing, @unchecked Sendable {
     /// Consumed front-to-first; the last value repeats.
     var results: [Bool]
-    init(_ results: [Bool]) { self.results = results }
-    func checkReachable() async -> Bool {
-        if results.count > 1 { return results.removeFirst() }
-        return results.first ?? false
+    /// What the reachable daemon self-reports as its build commit. Defaults
+    /// to the fixture's bundled commit so happy paths verify; nil models a
+    /// pre-self-reporting (stale) daemon.
+    var runningCommit: String?
+    init(_ results: [Bool], runningCommit: String? = "new") {
+        self.results = results
+        self.runningCommit = runningCommit
+    }
+    /// Health round-trips this fake has served — the model must make ONE
+    /// per launch evaluation (CodeRabbit PR #223: split reachability/commit
+    /// requests could disagree and boot out a healthy daemon).
+    var probeCalls = 0
+    func probeDaemon() async -> DaemonProbeSnapshot? {
+        probeCalls += 1
+        let reachable: Bool
+        if results.count > 1 { reachable = results.removeFirst() } else { reachable = results.first ?? false }
+        return reachable ? DaemonProbeSnapshot(runningCommit: runningCommit) : nil
+    }
+}
+
+private final class FakeLaunchdControl: LaunchdServiceControlling, @unchecked Sendable {
+    var probeResult: LaunchdServiceProbe = .loaded
+    var bootOutCalls = 0
+    /// Models the real-world effect of the bootout (e.g. the stale process
+    /// dies and the next registration starts the NEW build).
+    var onBootOut: (() -> Void)?
+    func probeService() async -> LaunchdServiceProbe { probeResult }
+    func bootOutService() async {
+        bootOutCalls += 1
+        probeResult = .notFound
+        onBootOut?()
     }
 }
 
@@ -89,23 +116,42 @@ private struct TestError: LocalizedError {
 // MARK: - Pure decision
 
 final class DaemonSetupDecisionTests: XCTestCase {
+    /// Baseline call with the non-pathological extras: service present in
+    /// launchd, probe snapshot assembled from reachable + runningCommit.
+    private func decide(
+        reachable: Bool,
+        runningCommit: String? = nil,
+        registration: ServiceRegistrationStatus,
+        launchdService: LaunchdServiceProbe = .loaded,
+        legacyPresent: Bool = false,
+        recordedCommit: String?,
+        bundledCommit: String?
+    ) -> DaemonSetupDecision {
+        decideDaemonSetup(
+            probe: reachable ? DaemonProbeSnapshot(runningCommit: runningCommit) : nil,
+            registration: registration, launchdService: launchdService,
+            legacyPresent: legacyPresent,
+            recordedCommit: recordedCommit, bundledCommit: bundledCommit
+        )
+    }
+
     func testNoBundledDaemonStandsDown() {
         XCTAssertEqual(
-            decideDaemonSetup(reachable: false, registration: .notRegistered,
-                              legacyPresent: false, recordedCommit: nil, bundledCommit: nil),
+            decide(reachable: false, registration: .notRegistered,
+                   recordedCommit: nil, bundledCommit: nil),
             .bundledServiceUnavailable
         )
         XCTAssertEqual(
-            decideDaemonSetup(reachable: false, registration: .notRegistered,
-                              legacyPresent: false, recordedCommit: nil, bundledCommit: ""),
+            decide(reachable: false, registration: .notRegistered,
+                   recordedCommit: nil, bundledCommit: ""),
             .bundledServiceUnavailable
         )
     }
 
     func testReachableAndCurrentIsRunning() {
         XCTAssertEqual(
-            decideDaemonSetup(reachable: true, registration: .enabled,
-                              legacyPresent: false, recordedCommit: "abc", bundledCommit: "abc"),
+            decide(reachable: true, runningCommit: "abc", registration: .enabled,
+                   recordedCommit: "abc", bundledCommit: "abc"),
             .running
         )
     }
@@ -113,16 +159,16 @@ final class DaemonSetupDecisionTests: XCTestCase {
     func testReachableWithoutRegistrationIsRunning() {
         // Dev daemon started by hand — never nag while something answers.
         XCTAssertEqual(
-            decideDaemonSetup(reachable: true, registration: .notRegistered,
-                              legacyPresent: false, recordedCommit: nil, bundledCommit: "abc"),
+            decide(reachable: true, registration: .notRegistered,
+                   recordedCommit: nil, bundledCommit: "abc"),
             .running
         )
     }
 
     func testTrueFirstRunNeedsConsent() {
         XCTAssertEqual(
-            decideDaemonSetup(reachable: false, registration: .notRegistered,
-                              legacyPresent: false, recordedCommit: nil, bundledCommit: "abc"),
+            decide(reachable: false, registration: .notRegistered,
+                   recordedCommit: nil, bundledCommit: "abc"),
             .needsConsent
         )
     }
@@ -130,49 +176,183 @@ final class DaemonSetupDecisionTests: XCTestCase {
     func testDriftWinsEvenWhileRunning() {
         // The running daemon is the OLD build; re-register replaces it.
         XCTAssertEqual(
-            decideDaemonSetup(reachable: true, registration: .enabled,
-                              legacyPresent: false, recordedCommit: "old", bundledCommit: "new"),
+            decide(reachable: true, runningCommit: "old", registration: .enabled,
+                   recordedCommit: "old", bundledCommit: "new"),
             .driftReregister(recorded: "old", bundled: "new")
         )
     }
 
     func testMissingMarkerCountsAsDrift() {
         XCTAssertEqual(
-            decideDaemonSetup(reachable: false, registration: .enabled,
-                              legacyPresent: false, recordedCommit: nil, bundledCommit: "new"),
+            decide(reachable: false, registration: .enabled,
+                   recordedCommit: nil, bundledCommit: "new"),
             .driftReregister(recorded: nil, bundled: "new")
         )
     }
 
     func testLegacyPresentBlocksConsent() {
         XCTAssertEqual(
-            decideDaemonSetup(reachable: false, registration: .notRegistered,
-                              legacyPresent: true, recordedCommit: nil, bundledCommit: "abc"),
+            decide(reachable: false, registration: .notRegistered,
+                   legacyPresent: true, recordedCommit: nil, bundledCommit: "abc"),
             .legacyInstalledNotRunning
         )
     }
 
     func testLegacyPresentButReachableIsRunning() {
         XCTAssertEqual(
-            decideDaemonSetup(reachable: true, registration: .notRegistered,
-                              legacyPresent: true, recordedCommit: nil, bundledCommit: "abc"),
+            decide(reachable: true, registration: .notRegistered,
+                   legacyPresent: true, recordedCommit: nil, bundledCommit: "abc"),
             .running
         )
     }
 
     func testRegisteredAwaitingApproval() {
         XCTAssertEqual(
-            decideDaemonSetup(reachable: false, registration: .requiresApproval,
-                              legacyPresent: false, recordedCommit: nil, bundledCommit: "abc"),
+            decide(reachable: false, registration: .requiresApproval,
+                   recordedCommit: nil, bundledCommit: "abc"),
             .awaitingApproval
         )
     }
 
     func testRegisteredCurrentButDownIsRegisteredNotRunning() {
         XCTAssertEqual(
-            decideDaemonSetup(reachable: false, registration: .enabled,
-                              legacyPresent: false, recordedCommit: "abc", bundledCommit: "abc"),
+            decide(reachable: false, registration: .enabled,
+                   recordedCommit: "abc", bundledCommit: "abc"),
             .registeredNotRunning
+        )
+    }
+
+    // The 2026-08-02 incident states
+
+    func testStaleRunningDaemonForcesRestartEvenWithCurrentMarker() {
+        // The incident's hidden state: two drift re-registers advanced the
+        // marker while the 0.3.13 process kept answering. Only the running
+        // daemon's self-report can expose it.
+        XCTAssertEqual(
+            decide(reachable: true, runningCommit: "old", registration: .enabled,
+                   recordedCommit: "new", bundledCommit: "new"),
+            .staleDaemonRestart(running: "old", bundled: "new")
+        )
+    }
+
+    func testNonSelfReportingDaemonCountsAsStale() {
+        // A daemon old enough not to self-report is by definition not the
+        // build this app registered (self-reporting shipped with the fix).
+        XCTAssertEqual(
+            decide(reachable: true, runningCommit: nil, registration: .enabled,
+                   recordedCommit: "new", bundledCommit: "new"),
+            .staleDaemonRestart(running: nil, bundled: "new")
+        )
+    }
+
+    func testDriftStillWinsOverStaleness() {
+        // Drift re-register runs first; its own verification escalates to
+        // the forced restart if the process survives.
+        XCTAssertEqual(
+            decide(reachable: true, runningCommit: nil, registration: .enabled,
+                   recordedCommit: "old", bundledCommit: "new"),
+            .driftReregister(recorded: "old", bundled: "new")
+        )
+    }
+
+    func testEnabledButAbsentFromLaunchdIsWedged() {
+        // Observed live after a manual bootout: SMAppService still claims
+        // .enabled, launchd has nothing, register() no-ops.
+        XCTAssertEqual(
+            decide(reachable: false, registration: .enabled,
+                   launchdService: .notFound,
+                   recordedCommit: "abc", bundledCommit: "abc"),
+            .wedgedServiceRepair(bundled: "abc")
+        )
+    }
+
+    func testWedgeCheckNeverFiresWhileSomethingAnswers() {
+        // Enabled + answering + no launchd job = hand-started dev daemon
+        // holding the port; leave it alone.
+        XCTAssertEqual(
+            decide(reachable: true, runningCommit: "abc", registration: .enabled,
+                   launchdService: .notFound,
+                   recordedCommit: "abc", bundledCommit: "abc"),
+            .running
+        )
+    }
+
+    func testUnknownLaunchdProbeNeverWedges() {
+        // A failed/unrecognized launchctl probe is NOT evidence of absence
+        // (CodeRabbit PR #223) — fall through to plain starting-up handling.
+        XCTAssertEqual(
+            decide(reachable: false, registration: .enabled,
+                   launchdService: .unknown,
+                   recordedCommit: "abc", bundledCommit: "abc"),
+            .registeredNotRunning
+        )
+    }
+
+    func testNotRegisteredIsNeverWedged() {
+        XCTAssertEqual(
+            decide(reachable: false, registration: .notRegistered,
+                   launchdService: .notFound,
+                   recordedCommit: nil, bundledCommit: "abc"),
+            .needsConsent
+        )
+    }
+}
+
+// MARK: - launchctl print exit classification (pure)
+
+final class LaunchctlPrintExitTests: XCTestCase {
+    func testZeroIsLoaded() {
+        XCTAssertEqual(classifyLaunchctlPrintExit(0), .loaded)
+    }
+
+    func testCouldNotFindServiceIsNotFound() {
+        // launchctl's "could not find service" status — the ONLY exit that
+        // may arm the wedge repair.
+        XCTAssertEqual(classifyLaunchctlPrintExit(113), .notFound)
+    }
+
+    func testRunnerLaunchFailureIsUnknown() {
+        // The runner's synthetic exit when /bin/launchctl couldn't run.
+        XCTAssertEqual(classifyLaunchctlPrintExit(127), .unknown)
+    }
+
+    func testOtherFailuresAreUnknown() {
+        XCTAssertEqual(classifyLaunchctlPrintExit(1), .unknown)
+        XCTAssertEqual(classifyLaunchctlPrintExit(64), .unknown)
+    }
+}
+
+// MARK: - Post-re-register verification (pure)
+
+final class ReregisterVerificationTests: XCTestCase {
+    func testMatchingCommitVerifies() {
+        XCTAssertEqual(
+            verifyDaemonAfterReregister(probe: DaemonProbeSnapshot(runningCommit: "new"), bundledCommit: "new"),
+            .verified
+        )
+    }
+
+    func testWrongCommitIsStale() {
+        XCTAssertEqual(
+            verifyDaemonAfterReregister(probe: DaemonProbeSnapshot(runningCommit: "old"), bundledCommit: "new"),
+            .staleProcessNeedsRestart
+        )
+    }
+
+    func testMissingCommitIsStale() {
+        // The exact incident shape: the surviving 0.3.13 daemon answers
+        // /api/health but predates self-reporting — a DECODED answer with no
+        // commit, which must never be confused with an unreachable daemon.
+        XCTAssertEqual(
+            verifyDaemonAfterReregister(probe: DaemonProbeSnapshot(runningCommit: nil), bundledCommit: "new"),
+            .staleProcessNeedsRestart
+        )
+    }
+
+    func testUnreachableIsNotAVerificationFailure() {
+        XCTAssertEqual(
+            verifyDaemonAfterReregister(probe: nil, bundledCommit: "new"),
+            .unreachable
         )
     }
 }
@@ -186,6 +366,7 @@ final class DaemonSetupModelTests: XCTestCase {
     private var legacy = FakeLegacyAgent()
     private var marker = FakeMarker()
     private var probe = FakeProbe([false])
+    private var launchd = FakeLaunchdControl()
 
     override func setUp() {
         super.setUp()
@@ -194,6 +375,7 @@ final class DaemonSetupModelTests: XCTestCase {
         legacy = FakeLegacyAgent()
         marker = FakeMarker()
         probe = FakeProbe([false])
+        launchd = FakeLaunchdControl()
     }
 
     private func makeModel(bundledCommit: String? = "new") -> DaemonSetupModel {
@@ -204,6 +386,7 @@ final class DaemonSetupModelTests: XCTestCase {
                 legacyAgent: legacy,
                 marker: marker,
                 probe: probe,
+                launchdControl: launchd,
                 bundledCommit: bundledCommit
             ),
             startupProbeAttempts: 3,
@@ -336,6 +519,128 @@ final class DaemonSetupModelTests: XCTestCase {
         XCTAssertEqual(registrar.unregisterCalls, 0)
         XCTAssertEqual(registrar.registerCalls, 0)
         XCTAssertFalse(model.didReregisterForUpdate)
+    }
+
+    // Stale-process verification + forced restart (2026-08-02 incident)
+
+    func testStaleSurvivorAfterDriftReregisterGetsBootedOut() async {
+        // The incident replay: upgrade drift triggers re-register, the BTM
+        // layer no-ops, and the 0.3.13 process (which doesn't self-report a
+        // commit) keeps answering. Verification must catch it and escalate
+        // to the launchd bootout; only then does the NEW build start.
+        registrar.statusValue = .enabled
+        marker.registeredCommit = "old"
+        probe = FakeProbe([true], runningCommit: nil)
+        launchd.onBootOut = { [probe] in probe.runningCommit = "new" }
+        let model = makeModel()
+        await model.evaluateOnLaunch()
+        XCTAssertEqual(launchd.bootOutCalls, 1)
+        XCTAssertEqual(registrar.unregisterCalls, 2, "drift replace, then the forced re-register")
+        XCTAssertEqual(registrar.registerCalls, 2)
+        XCTAssertEqual(marker.registeredCommit, "new")
+        XCTAssertTrue(model.didReregisterForUpdate)
+        XCTAssertFalse(model.keychainPromptCoachingActive, "same-signature update keeps its ACLs")
+        XCTAssertEqual(model.phase, .quiet)
+    }
+
+    func testVerifiedReregisterNeverTouchesLaunchd() async {
+        registrar.statusValue = .enabled
+        marker.registeredCommit = "old"
+        probe = FakeProbe([true], runningCommit: "new")
+        let model = makeModel()
+        await model.evaluateOnLaunch()
+        XCTAssertEqual(launchd.bootOutCalls, 0)
+        XCTAssertEqual(registrar.registerCalls, 1)
+        XCTAssertEqual(model.phase, .quiet)
+    }
+
+    func testQuietLaunchEvaluationMakesExactlyOneHealthRequest() async {
+        // CodeRabbit PR #223: reachability and the staleness check must ride
+        // ONE decoded /api/health answer — a second request could fail
+        // independently and boot out a healthy daemon.
+        registrar.statusValue = .enabled
+        marker.registeredCommit = "new"
+        probe = FakeProbe([true], runningCommit: "new")
+        let model = makeModel()
+        await model.evaluateOnLaunch()
+        XCTAssertEqual(model.phase, .quiet)
+        XCTAssertEqual(probe.probeCalls, 1)
+        XCTAssertEqual(launchd.bootOutCalls, 0)
+    }
+
+    func testStillStaleAfterForcedRestartFailsActionably() async {
+        // The stale process survives even the bootout (or something else old
+        // grabs the port): exactly ONE forced restart per session, then an
+        // actionable failure — never a silent wrong-version steady state and
+        // never a bootout/register loop against launchd.
+        registrar.statusValue = .enabled
+        marker.registeredCommit = "old"
+        probe = FakeProbe([true], runningCommit: nil)
+        let model = makeModel()
+        await model.evaluateOnLaunch()
+        XCTAssertEqual(launchd.bootOutCalls, 1)
+        XCTAssertEqual(model.phase, .failed(DaemonSetupModel.staleDaemonAfterRestartMessage))
+    }
+
+    func testLaunchTimeStaleDecisionForcesExactlyOneRestartWhenItDoesNotTake() async {
+        // CodeRabbit PR #223: the decision-driven forced restart counts as
+        // THE one attempt — its own verification must fail out, not grant a
+        // second bootout/register cycle.
+        registrar.statusValue = .enabled
+        marker.registeredCommit = "new"
+        probe = FakeProbe([true], runningCommit: "old") // stale, and stays stale
+        let model = makeModel()
+        await model.evaluateOnLaunch()
+        XCTAssertEqual(launchd.bootOutCalls, 1)
+        XCTAssertEqual(registrar.unregisterCalls, 1)
+        XCTAssertEqual(registrar.registerCalls, 1)
+        XCTAssertEqual(model.phase, .failed(DaemonSetupModel.staleDaemonAfterRestartMessage))
+    }
+
+    func testStaleDaemonCaughtAtLaunchEvenWithCurrentMarker() async {
+        // Post-incident safety net: if a forced restart failed in an earlier
+        // session, the marker already matches the bundle — but the running
+        // daemon still betrays itself at every launch evaluation.
+        registrar.statusValue = .enabled
+        marker.registeredCommit = "new"
+        probe = FakeProbe([true], runningCommit: "old")
+        launchd.onBootOut = { [probe] in probe.runningCommit = "new" }
+        let model = makeModel()
+        await model.evaluateOnLaunch()
+        XCTAssertEqual(launchd.bootOutCalls, 1)
+        XCTAssertEqual(registrar.unregisterCalls, 1)
+        XCTAssertEqual(registrar.registerCalls, 1)
+        XCTAssertEqual(model.phase, .quiet)
+    }
+
+    // Wedged registration repair (enabled in SMAppService, absent in launchd)
+
+    func testWedgedServiceRepairsAtLaunch() async {
+        // Observed live: SMAppService .enabled, launchd domain empty, daemon
+        // down. Plain register() would no-op; the repair goes through
+        // bootout (a no-op there) + unregister + register.
+        registrar.statusValue = .enabled
+        marker.registeredCommit = "new"
+        launchd.probeResult = .notFound
+        probe = FakeProbe([false, true], runningCommit: "new")
+        let model = makeModel()
+        await model.evaluateOnLaunch()
+        XCTAssertEqual(launchd.bootOutCalls, 1)
+        XCTAssertEqual(registrar.unregisterCalls, 1)
+        XCTAssertEqual(registrar.registerCalls, 1)
+        XCTAssertEqual(marker.registeredCommit, "new")
+        XCTAssertEqual(model.phase, .quiet)
+    }
+
+    func testWedgedRepairLandingInRequiresApprovalRoutesToApproval() async {
+        registrar.statusValue = .enabled
+        registrar.statusAfterRegister = .requiresApproval
+        marker.registeredCommit = "new"
+        launchd.probeResult = .notFound
+        let model = makeModel()
+        await model.evaluateOnLaunch()
+        XCTAssertEqual(model.phase, .awaitingApproval)
+        XCTAssertEqual(launchd.bootOutCalls, 1)
     }
 
     // Missing-binary repair (issue #185)
@@ -550,6 +855,7 @@ final class KeychainPromptCoachingTests: XCTestCase {
     private var legacy = FakeLegacyAgent()
     private var marker = FakeMarker()
     private var probe = FakeProbe([false])
+    private var launchd = FakeLaunchdControl()
 
     override func setUp() {
         super.setUp()
@@ -558,6 +864,7 @@ final class KeychainPromptCoachingTests: XCTestCase {
         legacy = FakeLegacyAgent()
         marker = FakeMarker()
         probe = FakeProbe([false])
+        launchd = FakeLaunchdControl()
     }
 
     private func makeModel(bundledCommit: String? = "new") -> DaemonSetupModel {
@@ -568,6 +875,7 @@ final class KeychainPromptCoachingTests: XCTestCase {
                 legacyAgent: legacy,
                 marker: marker,
                 probe: probe,
+                launchdControl: launchd,
                 bundledCommit: bundledCommit
             ),
             startupProbeAttempts: 3,

@@ -1299,22 +1299,26 @@ test('state self-reports the daemon runtime and admits a missing executable (iss
     daemonExecPath: '/deleted-worktree/modeldeckd',
     daemonExecPathExists: () => false,
     daemonSea: true,
+    daemonGitCommit: 'abc123',
   });
   try {
     assert.deepEqual((await gone.service.state()).daemon, {
       execPath: '/deleted-worktree/modeldeckd',
       binaryPresent: false,
       sea: true,
+      MDGitCommit: 'abc123',
     });
   } finally { gone.close(); }
 
-  // Defaults: the live process executable, which exists.
+  // Defaults: the live process executable, which exists; source-mode runs
+  // have no inlined build commit to self-report.
   const healthy = fixture();
   try {
     assert.deepEqual((await healthy.service.state()).daemon, {
       execPath: process.execPath,
       binaryPresent: true,
       sea: false,
+      MDGitCommit: null,
     });
   } finally { healthy.close(); }
 

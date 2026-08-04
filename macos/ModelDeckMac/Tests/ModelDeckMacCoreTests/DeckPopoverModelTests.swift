@@ -854,6 +854,75 @@ struct DeckPopoverModelTests {
         #expect(DeckPopoverModel(defaults: defaults).showAccountEmails == false)
     }
 
+    // Issue #226: the deck's "Add Account…" entry points (empty-state CTA
+    // and populated footer affordance) route to Settings → Accounts through
+    // the model — same navigation contract as #118's sign-in path.
+    @Test func requestAddAccountRoutesToAccountsPaneAndMarksPending() {
+        let model = DeckPopoverModel(defaults: freshDefaults())
+        model.settingsPane = .general
+        model.toggleWarning(DeckWarningID(topic: .footerFreshness))
+        model.requestAddAccount()
+        #expect(model.settingsPane == .accounts)
+        #expect(model.pendingAddAccountRequest == true)
+        // Leaving the popover for Settings dismisses whatever explanation
+        // was up, like every other deck action that routes away.
+        #expect(model.presentedWarning == nil)
+    }
+
+    @Test func addAccountRequestConsumesExactlyOnce() {
+        let model = DeckPopoverModel(defaults: freshDefaults())
+        #expect(model.consumeAddAccountRequest() == false, "no request yet")
+        model.requestAddAccount()
+        #expect(model.consumeAddAccountRequest() == true)
+        #expect(model.pendingAddAccountRequest == false)
+        #expect(model.consumeAddAccountRequest() == false,
+            "one-shot: a pane re-appear must never re-present the sheet")
+    }
+
+    // Issue #226: the empty-state CTA keys on the rows VISIBLE in the
+    // current layout — the same derivation each layout renders from — so
+    // the CTA and the rendered deck can never disagree about emptiness.
+    @Test(arguments: [DeckLayout.twoColumn, .singleColumn])
+    func deckEmptinessKeysOnVisibleRows(layout: DeckLayout) {
+        #expect(DeckPopoverModel.isDeckEmpty(
+            state: DeckState(accounts: [], usage: []), layout: layout, now: now))
+        #expect(!DeckPopoverModel.isDeckEmpty(
+            state: fixtureState(), layout: layout, now: now))
+        let disabledOnly = DeckState(
+            accounts: [account("c9", provider: "claude", label: "Parked", enabled: false)],
+            usage: []
+        )
+        #expect(DeckPopoverModel.isDeckEmpty(state: disabledOnly, layout: layout, now: now),
+            "disabled accounts render no rows — the fresh-install CTA must still show")
+    }
+
+    // CodeRabbit on PR #232: an enabled unknown-provider account is omitted
+    // by the two-column layout but rendered by single-column mode — the
+    // emptiness verdict must match what each layout actually shows.
+    @Test func unknownProviderEmptinessIsLayoutAware() {
+        let unknownOnly = DeckState(
+            accounts: [account("m1", provider: "mystery", label: "Mystery")],
+            usage: []
+        )
+        #expect(DeckPopoverModel.isDeckEmpty(state: unknownOnly, layout: .twoColumn, now: now),
+            "two-column mode renders no unknown-provider rows — the deck IS empty there")
+        #expect(!DeckPopoverModel.isDeckEmpty(state: unknownOnly, layout: .singleColumn, now: now),
+            "single-column mode shows the row — no CTA over a visible card")
+    }
+
+    // The view-facing instance form follows the model's CURRENT layout.
+    @Test func instanceEmptinessFollowsTheModelsLayout() {
+        let model = DeckPopoverModel(defaults: freshDefaults())
+        let unknownOnly = DeckState(
+            accounts: [account("m1", provider: "mystery", label: "Mystery")],
+            usage: []
+        )
+        model.layout = .twoColumn
+        #expect(model.isDeckEmpty(state: unknownOnly, now: now))
+        model.layout = .singleColumn
+        #expect(!model.isDeckEmpty(state: unknownOnly, now: now))
+    }
+
     @Test func layoutAndSortPersistAcrossInstances() {
         let defaults = freshDefaults()
         let model = DeckPopoverModel(defaults: defaults)
@@ -1274,6 +1343,158 @@ struct DeckPopoverModelActivationTests {
     }
 }
 
+// MARK: - Fresh install: no default account anywhere (issue #228)
+
+/// Tim's fresh-install field state (v0.3.16, 2026-08-04): accounts added,
+/// both providers `unlinked`, NO default ever set. Placeholder identities.
+private func freshInstallState() -> DeckState {
+    DeckState(
+        accounts: [
+            account("c1", provider: "claude", label: "Studio"),
+            account("c2", provider: "claude", label: "Client"),
+            account("x1", provider: "codex", label: "Personal"),
+        ],
+        activation: DeckActivation(
+            claude: ProviderActivation(state: "unlinked"),
+            codex: ProviderActivation(state: "unlinked")
+        )
+    )
+}
+
+/// The daemon state after `POST /activate` landed for the given account.
+private func freshInstallSwitched(to id: String) -> DeckState {
+    var state = freshInstallState()
+    state.accounts = state.accounts.map { account in
+        var account = account
+        if account.id == id { account.isDefault = true }
+        return account
+    }
+    state.activation = DeckActivation(
+        claude: ProviderActivation(state: "effective"),
+        codex: ProviderActivation(state: "unlinked")
+    )
+    return state
+}
+
+@Suite("Fresh-install activation (issue #228)")
+@MainActor
+struct FreshInstallActivationTests {
+    private func freshDefaults() -> UserDefaults {
+        let suite = "fresh-install-activation-tests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        return defaults
+    }
+
+    private func claudeRow(_ model: DeckPopoverModel, id: String) -> DeckAccountRow {
+        model.columns(for: freshInstallState(), now: now)[0].rows.first { $0.id == id }!
+    }
+
+    @Test func activatingFromNoDefaultUnlinkedRunsThePostAndVerifies() async {
+        // The no-default path must gate NOTHING: the row is not active, so
+        // the radio's activate must POST, verify, and push the fresh state.
+        let activator = StubActivator(results: [
+            .success(account("c2", provider: "claude", label: "Client", isDefault: true)),
+        ])
+        let model = DeckPopoverModel(
+            defaults: freshDefaults(),
+            activator: activator,
+            stateProvider: StubDeckStateProvider(state: freshInstallSwitched(to: "c2"))
+        )
+        var verified: DeckState?
+        model.onVerifiedState = { verified = $0 }
+
+        let row = claudeRow(model, id: "c2")
+        #expect(!row.isActive)
+        #expect(row.activationState == .unlinked)
+        await model.activate(row)
+
+        #expect(activator.calls == ["c2"])
+        #expect(model.activationError(for: "c2") == nil)
+        #expect(model.activatingAccountID == nil)
+        #expect(verified?.accounts.first { $0.id == "c2" }?.isDefault == true)
+    }
+
+    @Test func failedActivateFromNoDefaultRevertsToNoActiveRowAndSurfacesError() async {
+        // Verify-or-revert on the fresh install: the previous state had NO
+        // default, so a failed attempt must land back on "no row active" —
+        // never a stuck optimistic ✓ — and the error must be visible.
+        let activator = StubActivator(results: [
+            .failure(DaemonClientError.daemonError(message: "profile locked", status: 409)),
+        ])
+        let model = DeckPopoverModel(
+            defaults: freshDefaults(),
+            activator: activator,
+            stateProvider: StubDeckStateProvider(state: freshInstallState())
+        )
+
+        await model.activate(claudeRow(model, id: "c2"))
+
+        let rows = model.columns(for: freshInstallState(), now: now)[0].rows
+        #expect(rows.allSatisfy { !$0.isActive }, "revert restores the no-default state")
+        #expect(model.activationError(for: "c2")?.contains("profile locked") == true)
+    }
+
+    @Test func unconfirmedActivateFromNoDefaultRevertsToo() async {
+        // POST "succeeds" but the fresh state still reports no default —
+        // the exact "daemon still has isDefault:false everywhere" field
+        // observation. The flip must revert and say so.
+        let activator = StubActivator(results: [
+            .success(account("c2", provider: "claude", label: "Client", isDefault: true)),
+        ])
+        let model = DeckPopoverModel(
+            defaults: freshDefaults(),
+            activator: activator,
+            stateProvider: StubDeckStateProvider(state: freshInstallState())
+        )
+
+        await model.activate(claudeRow(model, id: "c2"))
+
+        let rows = model.columns(for: freshInstallState(), now: now)[0].rows
+        #expect(rows.allSatisfy { !$0.isActive })
+        #expect(model.activationError(for: "c2")?.contains("not confirmed") == true)
+    }
+
+    @Test func staleOptimisticKeysFlagsOverridesTheDaemonDisowns() {
+        // Pure reconcile rule: an override whose target the state does not
+        // report as default (or does not contain at all) is stale.
+        let confirmed = freshInstallSwitched(to: "c2")
+        #expect(DeckPopoverModel.staleOptimisticKeys(["claude": "c2"], state: confirmed).isEmpty)
+        #expect(DeckPopoverModel.staleOptimisticKeys(["claude": "c2"], state: freshInstallState())
+            == ["claude"])
+        #expect(DeckPopoverModel.staleOptimisticKeys(["claude": "ghost"], state: confirmed)
+            == ["claude"])
+    }
+
+    @Test func reconcileNeverDropsAMidFlightFlip() async {
+        // A stale auto-refresh state landing DURING the flight is exactly
+        // what the optimistic override exists to outrank — reconcile must
+        // leave it alone until the flight settles.
+        let gate = ActivationGate()
+        let activator = StubActivator(
+            results: [.success(account("c2", provider: "claude", label: "Client", isDefault: true))],
+            gate: gate
+        )
+        let model = DeckPopoverModel(
+            defaults: freshDefaults(),
+            activator: activator,
+            stateProvider: StubDeckStateProvider(state: freshInstallSwitched(to: "c2"))
+        )
+
+        let task = Task { await model.activate(claudeRow(model, id: "c2")) }
+        while model.activatingAccountID == nil { await Task.yield() }
+
+        model.reconcileActivation(with: freshInstallState())
+        let midFlight = model.columns(for: freshInstallState(), now: now)[0].rows
+        #expect(midFlight.first { $0.id == "c2" }?.isActive == true,
+                "mid-flight reconcile keeps the optimistic flip")
+
+        await gate.open()
+        await task.value
+        #expect(model.activationError(for: "c2") == nil)
+    }
+}
+
 // MARK: - No silent activation outcomes (issue #100)
 
 private struct FailingStateProvider: DeckStateProviding {
@@ -1327,7 +1548,9 @@ struct SilentActivationOutcomeTests {
         await model.activate(claudeRow(model, id: "c2"))
 
         let banner = claudeBanner(model, state: fixtureState())
-        #expect(banner?.message == guidance, "daemon guidance renders verbatim")
+        // Issue #227: guidance leads verbatim; the appended sentence only
+        // adds the click-level radio step.
+        #expect(banner?.message.hasPrefix(guidance) == true, "daemon guidance renders verbatim")
         #expect(banner?.affectedAccountID == "c2")
         #expect(banner?.retryRunsActivation == true)
     }

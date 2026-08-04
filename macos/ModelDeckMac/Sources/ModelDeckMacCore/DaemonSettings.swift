@@ -24,7 +24,11 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
     public var menuBarStyle: String
     /// Menu bar percent source: "" = lowest remaining across all enabled
     /// accounts (original behavior); an account id pins the menu bar
-    /// percentage to that single account, shown continuously.
+    /// percentage to that single account, shown continuously;
+    /// "active:<provider>" follows that provider's active account; "none"
+    /// (issue #229) hides the percentage entirely — glyph only. The daemon
+    /// validates only string/length, so every sentinel round-trips through
+    /// old and new daemons alike.
     public var menuBarAccountId: String
     /// Issue #176 (Tim decision 2026-07-31): the daemon's scheduled renewal
     /// of expired-idle Claude accounts. Default ON — the whole point is zero
