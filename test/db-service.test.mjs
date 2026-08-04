@@ -385,3 +385,20 @@ test('menuBarAccountId accepts short strings and rejects everything else', () =>
     assert.throws(() => store.saveSettings({ menuBarAccountId: 'x'.repeat(129) }), /menuBarAccountId/);
   } finally { store.close(); }
 });
+
+// Issue #238 quiet mode: same free-string discipline as the pin — the app
+// owns the grammar ('' = always, 'below:<n>', 'yellow', 'red'), the store
+// validates only string/length so old and new builds round-trip each
+// other's values.
+test('menuBarShowWhen accepts short strings and rejects everything else', () => {
+  const store = new Store(':memory:');
+  try {
+    assert.equal(store.getSettings().menuBarShowWhen, '');
+    assert.equal(store.saveSettings({ menuBarShowWhen: 'yellow' }).menuBarShowWhen, 'yellow');
+    assert.equal(store.saveSettings({ menuBarShowWhen: 'below:25' }).menuBarShowWhen, 'below:25');
+    assert.equal(store.saveSettings({ menuBarShowWhen: '' }).menuBarShowWhen, '');
+    assert.throws(() => store.saveSettings({ menuBarShowWhen: 42 }), /menuBarShowWhen/);
+    assert.throws(() => store.saveSettings({ menuBarShowWhen: null }), /menuBarShowWhen/);
+    assert.throws(() => store.saveSettings({ menuBarShowWhen: 'x'.repeat(65) }), /menuBarShowWhen/);
+  } finally { store.close(); }
+});

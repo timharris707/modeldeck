@@ -77,6 +77,16 @@ public final class MenuBarStatusModel: ObservableObject {
         didSet { recomputeIconState() }
     }
 
+    /// Issue #238 quiet mode: the stored `menuBarShowWhen` value — WHEN the
+    /// menu bar shows the indicator the display mode selects
+    /// (`MenuBarShowWhen` grammar; "" = always, the default). Display-only
+    /// like the pin itself: `worstRemaining` and `onStateUpdate` are
+    /// untouched, so notifications keep watching every account no matter
+    /// how quiet the icon is.
+    @Published public var showWhen: String = MenuBarShowWhen.alwaysStored {
+        didSet { recomputeIconState() }
+    }
+
     /// The account id the stored pin currently resolves to; nil while
     /// unpinned or unresolvable (account removed, no active account yet).
     public var resolvedPinnedAccountId: String? {
@@ -138,7 +148,17 @@ public final class MenuBarStatusModel: ObservableObject {
                     for: healthProvider, state: $0, now: clock()
                 ).verdict
             }
-            iconState = .health(provider: healthProvider, verdict: verdict)
+            // Issue #238 quiet mode: "When yellow or worse" / "Only when
+            // red" render a GREEN deck as the plain glyph — all-clear is
+            // silence. A nil verdict (no data yet, empty pool) always keeps
+            // the muted no-data ring: quiet mode must never dress unknown
+            // up as all-clear. Display-only: notifications keep watching
+            // every account.
+            if MenuBarShowWhen.parse(showWhen).showsHealth(verdict: verdict) {
+                iconState = .health(provider: healthProvider, verdict: verdict)
+            } else {
+                iconState = .plain
+            }
             return
         }
         guard hasLoadedOnce else {
@@ -153,9 +173,36 @@ public final class MenuBarStatusModel: ObservableObject {
         // back to the global-worst behavior; a resolvable account with no
         // usable windows shows the plain glyph rather than borrowing
         // another account's number.
+        // Issue #238 quiet mode, percentage modes: "Show when below X%"
+        // hides the number (plain glyph) while the displayed percent sits
+        // at or above the threshold. Below it, the number renders with its
+        // usual severity colors — neutral above the warning line, gold and
+        // red under it. The gate reads the same percent the icon would
+        // display (the pinned account's when pinned, the global worst
+        // otherwise). The source account is unchanged while hidden — like
+        // #131's empty-window pin, the account still owns the (empty) menu
+        // bar slot, so the deck checkmark doesn't drift. Display-only:
+        // notifications keep watching every account.
+        let showWhenMode = MenuBarShowWhen.parse(showWhen)
         if let state = deckState, let resolved = resolvedPinnedAccountId {
             let pinned = WorstRemainingCalculator.worstRemaining(in: state, accountId: resolved)
+            if let pinned, !showWhenMode.showsPercent(pinned.percent) {
+                iconState = .plain
+                return
+            }
             iconState = MenuBarIconState.state(for: pinned, thresholds: thresholds, alwaysShowPercent: true)
+            return
+        }
+        if case .belowPercent = showWhenMode {
+            // Lowest-across with an explicit visibility threshold: the
+            // number shows exactly while the worst percent is below X —
+            // even above the warning line (neutral color) when X is set
+            // higher than the warning threshold.
+            if let worst = worstRemaining, showWhenMode.showsPercent(worst.percent) {
+                iconState = MenuBarIconState.state(for: worst, thresholds: thresholds, alwaysShowPercent: true)
+            } else {
+                iconState = .plain
+            }
             return
         }
         iconState = MenuBarIconState.state(for: worstRemaining, thresholds: thresholds)

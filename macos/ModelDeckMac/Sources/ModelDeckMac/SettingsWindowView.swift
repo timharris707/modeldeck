@@ -1094,7 +1094,11 @@ struct GeneralSettingsPane: View {
             // account — pinning one account makes the menu bar answer
             // "where am I on MY account" at a glance, continuously.
             Section("Menu bar") {
-                Picker("Show percentage for", selection: binding(
+                // Issue #238: renamed from "Show percentage for" — since
+                // #229/#235 the picker also selects Availability Health and
+                // None, so the label names the two-level structure instead:
+                // "Menu bar shows" = WHAT, "Show it" (below) = WHEN.
+                Picker("Menu bar shows", selection: binding(
                     get: { $0.menuBarAccountId },
                     set: { model, value in await model.setMenuBarAccount(id: value) }
                 )) {
@@ -1125,7 +1129,43 @@ struct GeneralSettingsPane: View {
                     }
                 }
                 .help("A pinned account shows its lowest non-spend usage window in the menu bar continuously when one is available — normal color while healthy, gold at warning, red at critical; without a usable window the plain glyph is shown. \"Active … account\" follows whichever account is currently active for that provider. \"Lowest across all accounts\" shows a percentage only when some account drops below the warning threshold. \"… availability health\" shows that provider's Availability Health verdict as a colored status dot beside the icon (green circle, yellow triangle, red octagon — the deck column chip's 7-day runway simulation) instead of a percentage. \"None — icon only\" never shows a percentage; notifications still watch every account.")
-                Text(menuBarPercentCaption)
+                // Issue #238 quiet mode — the mode-specific WHEN row (Tim's
+                // refinement): percentage modes gate on an editable inline
+                // threshold, health modes gate on the verdict; hidden for
+                // None (there is nothing to gate). Default Always in both
+                // — existing users see zero change. Display-only
+                // throughout: notifications keep watching every account.
+                if !MenuBarPinResolver.isNone(settingsSync.settings.menuBarAccountId) {
+                    if MenuBarPinResolver.isHealth(settingsSync.settings.menuBarAccountId) {
+                        Picker("Show it", selection: healthShowWhenBinding) {
+                            Text("Always").tag(MenuBarShowWhen.alwaysStored)
+                            Text("When yellow or worse").tag(MenuBarShowWhen.yellowOrWorse.stored)
+                            Text("Only when red").tag(MenuBarShowWhen.redOnly.stored)
+                        }
+                        .help("\"When yellow or worse\" shows the status dot only while the availability verdict is Yellow or Red — a green deck renders the plain icon. Display only: notifications keep watching every account regardless.")
+                    } else {
+                        Picker("Show it", selection: percentQuietEnabledBinding) {
+                            Text("Always").tag(false)
+                            Text("Only below a threshold").tag(true)
+                        }
+                        .help("\"Only below a threshold\" shows the percentage only while it is under the level you set — above it, just the icon. Display only: notifications keep watching every account regardless.")
+                        if quietPercentThreshold != nil {
+                            HStack(spacing: 6) {
+                                Text("Show when below")
+                                TextField("", value: quietThresholdBinding, format: .number)
+                                    .textFieldStyle(.roundedBorder)
+                                    .multilineTextAlignment(.trailing)
+                                    .frame(width: 48)
+                                    .accessibilityLabel("Show when below percent")
+                                Text("%")
+                                Stepper("", value: quietThresholdBinding, in: 1...99)
+                                    .labelsHidden()
+                                    .accessibilityLabel("Adjust show-when-below percent")
+                            }
+                        }
+                    }
+                }
+                Text(menuBarCaption)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1494,15 +1534,98 @@ struct GeneralSettingsPane: View {
     /// icon-only branch): every mode names its own display behavior, and
     /// the modes that change what's shown reaffirm that notifications keep
     /// watching every account.
-    private var menuBarPercentCaption: String {
+    /// Issue #238: WHEN the menu bar shows its indicator, as stored —
+    /// values that don't apply to the selected display mode read as always,
+    /// so switching modes shows the honest effective state, not a stale
+    /// selection from the other mode.
+    private var effectiveShowWhen: MenuBarShowWhen {
+        let mode = settingsSync.settings.menuBarShowWhenMode
+        if MenuBarPinResolver.isHealth(settingsSync.settings.menuBarAccountId) {
+            switch mode {
+            case .yellowOrWorse, .redOnly: return mode
+            case .always, .belowPercent: return .always
+            }
+        }
+        if case .belowPercent = mode { return mode }
+        return .always
+    }
+
+    /// The active percentage-mode visibility threshold; nil while Always.
+    private var quietPercentThreshold: Int? {
+        effectiveShowWhen.percentThreshold
+    }
+
+    /// Health-mode "Show it" selection: stored value in, stored value out.
+    private var healthShowWhenBinding: Binding<String> {
+        binding(
+            get: { [effectiveShowWhen] _ in effectiveShowWhen.stored },
+            set: { model, value in await model.setMenuBarShowWhen(value) }
+        )
+    }
+
+    /// Percentage-mode "Show it" selection (Always / Only below a
+    /// threshold). Enabling prefills the threshold from the notification
+    /// setting ("Notify when % left drops below") — the natural "needs
+    /// attention" line the user already chose — but the value is stored
+    /// independently in `menuBarShowWhen`, so editing one never moves the
+    /// other.
+    private var percentQuietEnabledBinding: Binding<Bool> {
+        binding(
+            get: { [quietPercentThreshold] _ in quietPercentThreshold != nil },
+            set: { model, enabled in
+                await model.setMenuBarShowWhen(
+                    enabled
+                        ? MenuBarShowWhen.belowPercent(
+                            Self.clampPercent(model.settings.notificationThresholdPercent)
+                        ).stored
+                        : MenuBarShowWhen.alwaysStored
+                )
+            }
+        )
+    }
+
+    /// The inline editable threshold (1–99; out-of-range input clamps).
+    private var quietThresholdBinding: Binding<Int> {
+        binding(
+            get: { [quietPercentThreshold] settings in
+                quietPercentThreshold ?? Self.clampPercent(settings.notificationThresholdPercent)
+            },
+            set: { model, value in
+                await model.setMenuBarShowWhen(
+                    MenuBarShowWhen.belowPercent(Self.clampPercent(value)).stored
+                )
+            }
+        )
+    }
+
+    private static func clampPercent(_ value: Int) -> Int {
+        min(max(value, 1), 99)
+    }
+
+    private var menuBarCaption: String {
         let current = settingsSync.settings.menuBarAccountId
         if MenuBarPinResolver.isNone(current) {
             return "The menu bar shows only the ModelDeck icon — never a percentage. Notifications still watch every account."
         }
         // Issue #235: the health modes name their own display behavior,
-        // like every other branch here.
+        // like every other branch here; #238 adds the quiet variants —
+        // each states that hiding is display-only so silence never reads
+        // as "no alerts".
         if let provider = MenuBarPinResolver.healthProvider(current) {
-            return "The menu bar shows \(provider.displayName)'s availability health as a colored status dot — green circle, yellow triangle, or red octagon from the 7-day runway simulation — instead of a percentage. Notifications still watch every account."
+            switch effectiveShowWhen {
+            case .yellowOrWorse:
+                return "The \(provider.displayName) availability status dot appears only while the verdict is Yellow or Red — while it's green, just the plain icon. Display only: notifications still watch every account."
+            case .redOnly:
+                return "The \(provider.displayName) availability status dot appears only while the verdict is Red — otherwise just the plain icon. Display only: notifications still watch every account."
+            case .always, .belowPercent:
+                return "The menu bar shows \(provider.displayName)'s availability health as a colored status dot — green circle, yellow triangle, or red octagon from the 7-day runway simulation — instead of a percentage. Notifications still watch every account."
+            }
+        }
+        if let threshold = quietPercentThreshold {
+            if current.isEmpty {
+                return "The percentage appears only when the lowest account drops below \(threshold)% — otherwise just the icon. Display only: notifications still watch every account."
+            }
+            return "The pinned account's percentage appears only when it drops below \(threshold)% — otherwise just the icon. Display only: notifications still watch every account."
         }
         if current.isEmpty {
             return "The percentage appears only when any account drops below the warning threshold."

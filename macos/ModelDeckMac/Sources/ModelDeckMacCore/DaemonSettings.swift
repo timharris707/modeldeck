@@ -30,6 +30,19 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
     /// validates only string/length, so every sentinel round-trips through
     /// old and new daemons alike.
     public var menuBarAccountId: String
+    /// Issue #238 quiet mode: WHEN the menu bar shows the indicator that
+    /// `menuBarAccountId` selects. Grammar (see `MenuBarShowWhen`):
+    /// "" = always (default — existing users see zero change);
+    /// "below:<1-99>" = percentage modes show the number only while the
+    /// displayed percent is below the threshold; "yellow" = health modes
+    /// show the status dot only for YELLOW/RED verdicts; "red" = RED only.
+    /// Same free-string discipline as the #229/#235 sentinels riding
+    /// `menuBarAccountId`: the daemon validates only string/length, unknown
+    /// values parse as always (never a crash, never data hidden by
+    /// surprise), a value that doesn't apply to the selected display mode
+    /// gates nothing, and a pre-#238 build simply ignores the key.
+    /// Display-only: notifications keep watching every account.
+    public var menuBarShowWhen: String
     /// Issue #176 (Tim decision 2026-07-31): the daemon's scheduled renewal
     /// of expired-idle Claude accounts. Default ON — the whole point is zero
     /// user effort; the honest cost disclosure lives on the toggle.
@@ -54,6 +67,7 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         notificationThresholdPercent: 25,
         menuBarStyle: "icon-only",
         menuBarAccountId: "",
+        menuBarShowWhen: "",
         autoRenewEnabled: true,
         sharedUserScopeEnabled: false
     )
@@ -68,6 +82,7 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         notificationThresholdPercent: Int,
         menuBarStyle: String,
         menuBarAccountId: String = "",
+        menuBarShowWhen: String = "",
         autoRenewEnabled: Bool = true,
         sharedUserScopeEnabled: Bool = false
     ) {
@@ -80,6 +95,7 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         self.notificationThresholdPercent = notificationThresholdPercent
         self.menuBarStyle = menuBarStyle
         self.menuBarAccountId = menuBarAccountId
+        self.menuBarShowWhen = menuBarShowWhen
         self.autoRenewEnabled = autoRenewEnabled
         self.sharedUserScopeEnabled = sharedUserScopeEnabled
     }
@@ -102,6 +118,9 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         menuBarStyle = try container.decodeIfPresent(String.self, forKey: .menuBarStyle) ?? defaults.menuBarStyle
         menuBarAccountId = try container.decodeIfPresent(String.self, forKey: .menuBarAccountId)
             ?? defaults.menuBarAccountId
+        // Issue #238: absent on pre-#238 daemons → always shown (default).
+        menuBarShowWhen = try container.decodeIfPresent(String.self, forKey: .menuBarShowWhen)
+            ?? defaults.menuBarShowWhen
         autoRenewEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoRenewEnabled)
             ?? defaults.autoRenewEnabled
         // Issue #204: absent on pre-#204 daemons → the opt-in default (off).
@@ -139,6 +158,12 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
     public var menuBarPinnedAccountId: String? {
         menuBarAccountId.isEmpty ? nil : menuBarAccountId
     }
+
+    /// Issue #238: typed view of `menuBarShowWhen`; every unrecognized
+    /// stored value falls back to always shown.
+    public var menuBarShowWhenMode: MenuBarShowWhen {
+        MenuBarShowWhen.parse(menuBarShowWhen)
+    }
 }
 
 /// A partial update for `PUT /api/settings`. Only non-nil fields are encoded,
@@ -159,6 +184,11 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
     public var notificationThresholdPercent: Int?
     public var menuBarStyle: String?
     public var menuBarAccountId: String?
+    /// Issue #238: the quiet-mode "when" value (`MenuBarShowWhen` grammar).
+    /// Pre-#238 daemons reject unknown keys — SettingsSyncModel strips this
+    /// field and retries when that happens (the #90/#123/#176 tolerance
+    /// path).
+    public var menuBarShowWhen: String?
     /// Issue #176: the auto-renew toggle. Pre-#176 daemons reject unknown
     /// keys — SettingsSyncModel strips this field and retries when that
     /// happens (the #90/#123 tolerance path).
@@ -174,6 +204,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         notificationThresholdPercent: Int? = nil,
         menuBarStyle: String? = nil,
         menuBarAccountId: String? = nil,
+        menuBarShowWhen: String? = nil,
         autoRenewEnabled: Bool? = nil
     ) {
         self.autoRefreshEnabled = autoRefreshEnabled
@@ -185,6 +216,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         self.notificationThresholdPercent = notificationThresholdPercent
         self.menuBarStyle = menuBarStyle
         self.menuBarAccountId = menuBarAccountId
+        self.menuBarShowWhen = menuBarShowWhen
         self.autoRenewEnabled = autoRenewEnabled
     }
 
@@ -201,6 +233,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
             notificationThresholdPercent: other.notificationThresholdPercent ?? notificationThresholdPercent,
             menuBarStyle: other.menuBarStyle ?? menuBarStyle,
             menuBarAccountId: other.menuBarAccountId ?? menuBarAccountId,
+            menuBarShowWhen: other.menuBarShowWhen ?? menuBarShowWhen,
             autoRenewEnabled: other.autoRenewEnabled ?? autoRenewEnabled
         )
     }
@@ -216,13 +249,14 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         try container.encodeIfPresent(notificationThresholdPercent, forKey: .notificationThresholdPercent)
         try container.encodeIfPresent(menuBarStyle, forKey: .menuBarStyle)
         try container.encodeIfPresent(menuBarAccountId, forKey: .menuBarAccountId)
+        try container.encodeIfPresent(menuBarShowWhen, forKey: .menuBarShowWhen)
         try container.encodeIfPresent(autoRenewEnabled, forKey: .autoRenewEnabled)
     }
 
     enum CodingKeys: String, CodingKey {
         case autoRefreshEnabled, autoRefreshIntervalSeconds, autoRefreshIntervalCustomized, pauseWhileActive
         case layout, defaultSort, notificationThresholdPercent, menuBarStyle, menuBarAccountId
-        case autoRenewEnabled
+        case menuBarShowWhen, autoRenewEnabled
     }
 
     public var isEmpty: Bool {
@@ -230,6 +264,6 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
             && autoRefreshIntervalCustomized == nil && pauseWhileActive == nil
             && layout == nil && defaultSort == nil && notificationThresholdPercent == nil
             && menuBarStyle == nil && menuBarAccountId == nil
-            && autoRenewEnabled == nil
+            && menuBarShowWhen == nil && autoRenewEnabled == nil
     }
 }

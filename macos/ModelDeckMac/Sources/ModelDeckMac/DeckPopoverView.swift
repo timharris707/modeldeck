@@ -54,6 +54,12 @@ struct DeckPopoverView: View {
         // meter rows carry "Weekly · all models" left and
         // "Resets Wed 5:59 PM" right on every card (zone-free per #137).
         .frame(width: deckModel.layout == .twoColumn ? 640 : 420)
+        // Issue #230 (reopened): capture the popover's own NSWindow into
+        // DeckWindowRegistry the moment SwiftUI hosts the deck, so the
+        // dismissal choke point closes THE window instead of guessing
+        // private class names (the guess broke on macOS 26). Background:
+        // zero-size, hit-test-inert, renders nothing.
+        .background(DeckWindowCaptureView())
         .onAppear {
             // Tim directive 2026-08-02: one diff per open, against the
             // snapshot stored at the PREVIOUS open — the changed cards glow

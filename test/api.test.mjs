@@ -431,6 +431,7 @@ test('settings API validates partial updates and drives worst-capacity threshold
     notificationThresholdPercent: 25,
     menuBarStyle: 'icon-only',
     menuBarAccountId: '',
+    menuBarShowWhen: '',
   });
   result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ layout: 'single-column', notificationThresholdPercent: 30 }) });
   assert.equal(result.body.layout, 'single-column');
@@ -462,6 +463,16 @@ test('settings API validates partial updates and drives worst-capacity threshold
   assert.match(result.body.error, /menuBarAccountId/);
   result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ menuBarAccountId: '' }) });
   assert.equal(result.body.menuBarAccountId, '');
+
+  // Issue #238 quiet mode: menuBarShowWhen is a free short string like the
+  // pin ('' = always; the app owns the grammar); non-strings are rejected.
+  result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ menuBarShowWhen: 'below:25' }) });
+  assert.equal(result.body.menuBarShowWhen, 'below:25');
+  result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ menuBarShowWhen: 9 }) });
+  assert.equal(result.response.status, 400);
+  assert.match(result.body.error, /menuBarShowWhen/);
+  result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ menuBarShowWhen: '' }) });
+  assert.equal(result.body.menuBarShowWhen, '');
 
   const first = fixture.store.saveAccount({ provider: 'claude', label: 'First', profileRef: 'first' });
   const second = fixture.store.saveAccount({ provider: 'claude', label: 'Second', profileRef: 'second' });

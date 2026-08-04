@@ -167,6 +167,9 @@ struct ModelDeckMacApp: App {
                 // The deck model mirrors the raw setting for the cards'
                 // right-click pin menus.
                 statusModel?.pinnedAccountId = settings.menuBarPinnedAccountId
+                // Issue #238 quiet mode: WHEN the indicator shows — also
+                // display-only; notifications keep watching every account.
+                statusModel?.showWhen = settings.menuBarShowWhen
                 deckModel?.menuBarPinnedSetting = settings.menuBarAccountId
                 notifications?.thresholds = settings.usageThresholds
             }

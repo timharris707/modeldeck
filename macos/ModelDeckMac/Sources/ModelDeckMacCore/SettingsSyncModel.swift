@@ -105,6 +105,12 @@ public final class SettingsSyncModel: ObservableObject {
             { $0.autoRenewEnabled != nil },
             { $0.autoRenewEnabled = nil }
         ),
+        // Issue #238: pre-quiet-mode daemons don't know the show-when key.
+        (
+            "menuBarShowWhen",
+            { $0.menuBarShowWhen != nil },
+            { $0.menuBarShowWhen = nil }
+        ),
     ]
 
     private func push(_ patch: DaemonSettingsPatch) async {
@@ -200,6 +206,14 @@ public final class SettingsSyncModel: ObservableObject {
     public func setMenuBarAccount(id: String) async {
         guard id != settings.menuBarAccountId else { return }
         await update(DaemonSettingsPatch(menuBarAccountId: id))
+    }
+
+    /// Issue #238: WHEN the menu bar shows its indicator ("Show it" —
+    /// `MenuBarShowWhen` grammar; "" = always). Display-only: notifications
+    /// keep watching every account.
+    public func setMenuBarShowWhen(_ stored: String) async {
+        guard stored != settings.menuBarShowWhen else { return }
+        await update(DaemonSettingsPatch(menuBarShowWhen: stored))
     }
 
     static func message(for error: Error) -> String {

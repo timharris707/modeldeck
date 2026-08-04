@@ -192,6 +192,15 @@ enum AppUpdateDialogPanel {
         // until the user dismisses it, exactly like the pre-#163 NSAlert.
         panel.hidesOnDeactivate = false
         panel.level = .floating
+        // Issue #230 (reopened, Tim's 2026-08-04 report): the deck popover
+        // is a STATUS-level panel, one tier above this .floating panel, so
+        // a dialog presented while the deck is up came up occluded behind
+        // it — the original #230 fix only covered the Settings path. Every
+        // deck-launched window now routes through the same close-the-deck
+        // choke point before presenting. Presented from the status-item
+        // context menu instead (no deck open), the close is a harmless
+        // no-op.
+        SettingsWindowFronting.closeDeckPopover()
         // Accessory-activation pitfall (#45): activate so the panel comes
         // up in front of whatever app was frontmost.
         SettingsWindowFronting.activateForDialog()

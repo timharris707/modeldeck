@@ -194,6 +194,88 @@ public enum MenuBarPinResolver {
     }
 }
 
+/// Issue #238: the stored `menuBarShowWhen` setting's grammar — WHEN the menu
+/// bar shows its indicator, layered on top of WHAT `menuBarAccountId` selects.
+/// Mode-specific by design (Tim's refinement): the percentage option carries
+/// its own threshold, the health options name verdicts. A value that doesn't
+/// apply to the currently selected display mode (e.g. "yellow" while a
+/// percentage mode is active) simply doesn't gate anything — the mode shows
+/// always, exactly like the default. Unknown future values parse as `.always`
+/// so a downgrade can never crash or hide data it wasn't asked to hide.
+/// Display-only throughout: notifications keep watching every account
+/// regardless of what the menu bar hides.
+public enum MenuBarShowWhen: Equatable, Sendable {
+    /// "" — the indicator is always shown (the pre-#238 behavior and the
+    /// stored default; also what every unrecognized value degrades to).
+    case always
+    /// "below:<1-99>" — percentage modes show the number only while the
+    /// displayed percent is strictly below this threshold.
+    case belowPercent(Int)
+    /// "yellow" — health modes show the status dot only for a YELLOW or RED
+    /// verdict; a green deck renders the plain glyph.
+    case yellowOrWorse
+    /// "red" — health modes show the status dot only for a RED verdict.
+    case redOnly
+
+    /// The stored default: always shown.
+    public static let alwaysStored = ""
+
+    /// The stored string for this case (round-trips through `parse`).
+    public var stored: String {
+        switch self {
+        case .always: return Self.alwaysStored
+        case .belowPercent(let percent): return "below:\(percent)"
+        case .yellowOrWorse: return "yellow"
+        case .redOnly: return "red"
+        }
+    }
+
+    /// Lenient parse: "" and every unrecognized value — including a
+    /// "below:" threshold outside 1–99 — mean `.always`, the graceful
+    /// degradation contract for values written by newer builds.
+    public static func parse(_ stored: String) -> MenuBarShowWhen {
+        switch stored {
+        case alwaysStored: return .always
+        case "yellow": return .yellowOrWorse
+        case "red": return .redOnly
+        default:
+            guard stored.hasPrefix("below:"),
+                  let percent = Int(stored.dropFirst("below:".count)),
+                  (1...99).contains(percent)
+            else { return .always }
+            return .belowPercent(percent)
+        }
+    }
+
+    /// The percentage-mode visibility threshold; nil when this value doesn't
+    /// gate percentage display (always / health-only values).
+    public var percentThreshold: Int? {
+        if case .belowPercent(let percent) = self { return percent }
+        return nil
+    }
+
+    /// Whether a health verdict passes this gate. Health-mode callers only:
+    /// `.always` and the percentage value never hide the dot. A nil verdict
+    /// (no data yet, empty provider pool) always shows — the muted no-data
+    /// ring is honest "unknown", and quiet mode must never dress unknown up
+    /// as all-clear.
+    public func showsHealth(verdict: AvailabilityVerdict?) -> Bool {
+        guard let verdict else { return true }
+        switch self {
+        case .always, .belowPercent: return true
+        case .yellowOrWorse: return verdict != .green
+        case .redOnly: return verdict == .red
+        }
+    }
+
+    /// Whether a displayed percent passes this gate. Percentage-mode callers
+    /// only: `.always` and the health values never hide the number.
+    public func showsPercent(_ percent: Double) -> Bool {
+        guard case .belowPercent(let threshold) = self else { return true }
+        return percent < Double(threshold)
+    }
+}
+
 /// Issue #131 (Tim directive 2026-07-22): the deck checkmark means "shown in
 /// the menu bar" — it marks exactly ONE account across the whole deck, the
 /// one whose window currently feeds the menu bar percentage. This resolver is

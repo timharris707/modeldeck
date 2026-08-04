@@ -58,6 +58,14 @@ export const DEFAULT_SETTINGS = Object.freeze({
   // being pinned, and the app falls back to lowest-across when the id no
   // longer resolves.
   menuBarAccountId: '',
+  // Issue #238 quiet mode: WHEN the menu bar shows its indicator. '' =
+  // always (the pre-#238 behavior); 'below:<1-99>' = percentage modes show
+  // the number only under that percent; 'yellow' / 'red' = health modes
+  // show the dot only from that verdict up. Free string like
+  // menuBarAccountId — the app owns the grammar and treats anything it
+  // doesn't recognize as '' (always), so old and new builds round-trip
+  // each other's values safely. Display-only: notifications are unaffected.
+  menuBarShowWhen: '',
 });
 
 function validateSetting(key, value) {
@@ -82,6 +90,9 @@ function validateSetting(key, value) {
   }
   if (key === 'menuBarAccountId' && (typeof value !== 'string' || value.length > 128)) {
     throw new Error('menuBarAccountId must be a string of at most 128 characters');
+  }
+  if (key === 'menuBarShowWhen' && (typeof value !== 'string' || value.length > 64)) {
+    throw new Error('menuBarShowWhen must be a string of at most 64 characters');
   }
 }
 

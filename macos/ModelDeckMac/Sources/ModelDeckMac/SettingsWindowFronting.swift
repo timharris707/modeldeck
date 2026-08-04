@@ -82,17 +82,43 @@ enum SettingsWindowFronting {
         }
     }
 
-    /// Issue #230: close the `.window`-style MenuBarExtra panel (the deck).
-    /// `close()` (not a bare `orderOut`) so SwiftUI's presentation state
-    /// resets and the next status-item click reopens the deck first try.
-    /// Identification lives in Core (`DeckPopoverWindowMatcher`) where it is
-    /// tested; no match — popover already closed, or the private class name
-    /// churned — is a harmless no-op.
-    private static func closeDeckPopover() {
-        for window in NSApp.windows
-        where DeckPopoverWindowMatcher.matches(className: window.className) {
-            window.close()
+    /// Issue #230 (reopened): THE deck-dismissal choke point for every
+    /// deck-launched window — Settings (gear menu, deck-card sign-in,
+    /// add-account) fronts through `activateAndFront()` above, and the
+    /// update dialog panel calls this directly before presenting. Primary
+    /// path: close the popover's own `NSWindow`, captured directly from
+    /// inside the deck hierarchy (`DeckWindowCaptureView` →
+    /// `DeckWindowRegistry`) — correct on every macOS, no private-API
+    /// assumptions. The class-name matcher survives ONLY as the fallback for
+    /// the never-registered case: `MenuBarExtraWindow` was observed on
+    /// macOS 13–15 but did NOT match on Tim's macOS 26 (v0.3.17 shipped
+    /// broken on exactly that guess), so the scan is best-effort, never the
+    /// mechanism. Ordering lives in Core (`DeckWindowRegistry`) where it is
+    /// tested; nothing registered and no scan match — popover already
+    /// closed, or it never opened — is a harmless no-op.
+    static func closeDeckPopover() {
+        IconDebugLog.log("closeDeckPopover: windows before = \(windowSummary())")
+        var fellBack = false
+        DeckWindowRegistry.shared.closeDeckPopover {
+            fellBack = true
+            for window in NSApp.windows
+            where DeckPopoverWindowMatcher.matches(className: window.className) {
+                IconDebugLog.log("closeDeckPopover: fallback scan closing \(window.className)")
+                window.close()
+            }
         }
+        IconDebugLog.log(
+            "closeDeckPopover: path=\(fellBack ? "class-name fallback" : "registry")"
+                + " windows after = \(windowSummary())"
+        )
+    }
+
+    /// Env-gated (#230 reopen) field diagnostics: front-to-back window
+    /// classes + visibility, so occlusion reports carry the actual order.
+    private static func windowSummary() -> String {
+        NSApp.orderedWindows
+            .map { "\($0.className)(visible=\($0.isVisible), key=\($0.isKeyWindow))" }
+            .joined(separator: ", ")
     }
 
     private static func settingsWindow() -> NSWindow? {
