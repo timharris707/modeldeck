@@ -65,6 +65,17 @@ const CLAUDE_AUTH_OVERRIDE_KEYS = [
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_BASE_URL',
 ];
+// Issue #224: only the credential keys make renewal meaningless — a profile
+// whose settings env sets ANTHROPIC_BASE_URL alone (the CLIProxyAPI route)
+// still authenticates with the stored OAuth ModelDeck manages, so renewal
+// proceeds with the base URL pinned back to Anthropic for the renewal child.
+const CLAUDE_AUTH_CREDENTIAL_KEYS = [
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+];
+const CLAUDE_RENEWAL_SETTINGS_OVERRIDE = JSON.stringify({
+  env: { ANTHROPIC_BASE_URL: 'https://api.anthropic.com' },
+});
 
 const CLAUDE_RENEWAL_EMAIL_PATTERN = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
 const CLAUDE_RENEWAL_EMAIL_KEYS = new Set([
@@ -1555,21 +1566,23 @@ export class ModelDeckService {
     try {
       raw = await fs.promises.readFile(path.join(profileRef, 'settings.json'), 'utf8');
     } catch (error) {
-      if (error.code === 'ENOENT') return { authOverride: false, readable: true };
-      return { authOverride: false, readable: false };
+      if (error.code === 'ENOENT') return { authOverride: false, proxyRouted: false, readable: true };
+      return { authOverride: false, proxyRouted: false, readable: false };
     }
     let settings;
     try {
       settings = JSON.parse(raw);
     } catch {
-      return { authOverride: false, readable: false };
+      return { authOverride: false, proxyRouted: false, readable: false };
     }
     const env = settings && typeof settings === 'object' && !Array.isArray(settings)
       && settings.env && typeof settings.env === 'object' && !Array.isArray(settings.env)
       ? settings.env
       : null;
+    const present = (key) => Boolean(env && Object.hasOwn(env, key));
     return {
-      authOverride: Boolean(env && CLAUDE_AUTH_OVERRIDE_KEYS.some((key) => Object.hasOwn(env, key))),
+      authOverride: CLAUDE_AUTH_CREDENTIAL_KEYS.some(present),
+      proxyRouted: present('ANTHROPIC_BASE_URL'),
       readable: true,
     };
   }
@@ -1633,6 +1646,16 @@ export class ModelDeckService {
 
   async runClaudeRenewalCli(args, profileRef) {
     await fs.promises.mkdir(this.claudeRenewalScratchDir, { recursive: true, mode: 0o700 });
+    // Issue #224: claudeRenewalEnv strips ANTHROPIC_BASE_URL from the child
+    // process env, but the profile's own settings.json re-applies it inside
+    // the CLI. Command-line settings outrank the profile file, so pin the
+    // invocation rung back to Anthropic for proxy-routed profiles. `claude
+    // auth status` neither accepts --settings nor routes its token refresh
+    // through ANTHROPIC_BASE_URL, so the auth-status rung is left alone.
+    if (args[0] === '-p') {
+      const override = await this.claudeAuthOverrideState(profileRef);
+      if (override.proxyRouted) args = [...args, '--settings', CLAUDE_RENEWAL_SETTINGS_OVERRIDE];
+    }
     return this.exec(this.claudePath, args, {
       cwd: this.claudeRenewalScratchDir,
       env: this.claudeRenewalEnv(profileRef),

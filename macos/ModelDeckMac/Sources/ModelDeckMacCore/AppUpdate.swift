@@ -266,13 +266,14 @@ public struct AppUpdateNotification: Equatable, Sendable {
 
 /// Issue #60 — the Settings → General "Check for updates automatically"
 /// toggle. Periodic check against the same public GitHub releases feed as
-/// the manual check (never any other endpoint), daily cadence per the app's
-/// restraint bar — never a tight loop. The preference is app-local
-/// (UserDefaults), like Launch at Login: the daemon never stores it.
+/// the manual check (never any other endpoint), a few hours between checks
+/// per the app's restraint bar (#241 tightened it from daily) — never a
+/// tight loop. The preference is app-local (UserDefaults), like Launch at
+/// Login: the daemon never stores it.
 ///
 /// Issue #121 (Tim directive 2026-07-22): this checker stays the scheduling
 /// brain. Sparkle's own timer is disabled (`SUEnableAutomaticChecks` NO);
-/// when a newer version is found AND a Sparkle driver is attached, the daily
+/// when a newer version is found AND a Sparkle driver is attached, the due
 /// tick hands off to `AppUpdateInstallModel.backgroundCheck()` — quiet
 /// download + stage when "Install updates automatically" is on, availability
 /// notice otherwise. Without a driver (dev builds, pre-Sparkle releases) the
@@ -282,9 +283,14 @@ public final class AppUpdateAutoChecker: ObservableObject {
     nonisolated public static let enabledDefaultsKey = "modeldeck.appupdate.autoCheckEnabled"
     nonisolated public static let lastCheckDefaultsKey = "modeldeck.appupdate.lastAutoCheckAt"
     nonisolated public static let lastNotifiedDefaultsKey = "modeldeck.appupdate.lastNotifiedVersion"
-    /// Daily — infrequent on purpose.
-    nonisolated public static let checkInterval: TimeInterval = 24 * 60 * 60
-    /// The scheduler wakes hourly to ask "is the daily check due yet?" —
+    /// Every ~4 hours (issue #241; was daily). ModelDeck is an always-on
+    /// menu-bar app, so a once-daily check lost every race against a
+    /// same-day release — Tim's install checked at ~07:30 and never saw a
+    /// version shipped that afternoon before he updated by hand. Still
+    /// restrained: at most six feed GETs a day against the public releases
+    /// endpoint, and only while the auto-check toggle is on.
+    nonisolated public static let checkInterval: TimeInterval = 4 * 60 * 60
+    /// The scheduler wakes hourly to ask "is the check due yet?" —
     /// cheap clock math only; the feed is hit at most once per interval.
     nonisolated static let wakeInterval: TimeInterval = 60 * 60
 
@@ -351,7 +357,7 @@ public final class AppUpdateAutoChecker: ObservableObject {
     }
 
     /// Pure due-ness rule: never checked → due; otherwise due once the
-    /// daily interval has elapsed since the last automatic check.
+    /// check interval has elapsed since the last automatic check.
     nonisolated public static func isDue(now: Date, lastCheck: Date?) -> Bool {
         guard let lastCheck else { return true }
         return now.timeIntervalSince(lastCheck) >= checkInterval
@@ -428,7 +434,11 @@ public final class AppUpdateAutoChecker: ObservableObject {
         case .updateNow:
             body = running + "Use Update Now in ModelDeck to install it — nothing installs until you do."
         case .automaticInstall:
-            body = running + "It's downloading in the background and installs the next time ModelDeck relaunches."
+            // Issue #241: the old "installs the next time ModelDeck
+            // relaunches" promised an event that never happens on an
+            // always-running menu-bar app. The staged-restart prompt
+            // (AppUpdateStagedPromptModel) is the follow-through; say so.
+            body = running + "It's downloading in the background — ModelDeck will offer a restart when it's ready."
         }
         return AppUpdateNotification(
             title: "ModelDeck \(release.version) is available",

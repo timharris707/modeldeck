@@ -967,9 +967,10 @@ struct GeneralSettingsPane: View {
     /// Issue #33: app-update check state (GitHub releases feed of the public
     /// repo). Deliberately separate from every CLI update control.
     @ObservedObject var appUpdateModel: AppUpdateModel
-    /// Issue #60: the "Check for updates automatically" toggle — daily check
-    /// of the SAME releases feed; issue #121 made it the scheduling brain
-    /// for Sparkle's quiet install as well.
+    /// Issue #60: the "Check for updates automatically" toggle — periodic
+    /// check (every few hours since #241; was daily) of the SAME releases
+    /// feed; issue #121 made it the scheduling brain for Sparkle's quiet
+    /// install as well.
     @ObservedObject var appUpdateAutoChecker: AppUpdateAutoChecker
     /// Issue #121: "Update Now" + "Install updates automatically" state.
     @ObservedObject var appUpdateInstallModel: AppUpdateInstallModel
@@ -1170,6 +1171,22 @@ struct GeneralSettingsPane: View {
                     .foregroundStyle(.secondary)
             }
 
+            // Issue #242 (Tim's suggestion): an Accessibility home for
+            // presentation aids that are OFF by default because the
+            // defaults already don't rely on color alone.
+            Section("Accessibility") {
+                Toggle("Show health verdict labels", isOn: binding(
+                    get: { $0.deckHealthLabelsMode.showsVerdictWord },
+                    set: { model, on in
+                        await model.setDeckHealthLabels(
+                            on ? DeckHealthLabels.showStored
+                               : DeckHealthLabels.dotOnlyStored
+                        )
+                    }
+                ))
+                .help("Shows the verdict word (Green / Yellow / Red) beside each provider's availability dot on the deck. Off, the dot alone carries the verdict — its shape changes with the verdict (green circle, yellow triangle, red octagon, hollow ring while there is no data), so color is never the only signal, and the word stays one click away in the chip's detail popover. VoiceOver always speaks the full verdict either way.")
+            }
+
             // Issue #204 (Tim approved direction): shared user scope —
             // user-scope MCP registrations + user memory as one set across
             // every managed Claude account, opt-in, enable runs a disclosed
@@ -1289,9 +1306,12 @@ struct GeneralSettingsPane: View {
                     get: { appUpdateAutoChecker.isEnabled },
                     set: { appUpdateAutoChecker.setEnabled($0) }
                 ))
+                // Issue #241: cadence copy tracks AppUpdateAutoChecker's
+                // interval (now every few hours, was daily) — the toggle's
+                // behavior is otherwise untouched.
                 .help(appUpdateInstallModel.canInstall
-                    ? "Once a day, check the update feed for a newer version."
-                    : "Once a day, check the releases feed and show a notification when a newer version is out. Nothing installs automatically.")
+                    ? "Every few hours, check the update feed for a newer version."
+                    : "Every few hours, check the releases feed and show a notification when a newer version is out. Nothing installs automatically.")
                 if appUpdateInstallModel.canInstall {
                     // Issue #121 (Tim directive 2026-07-22, default ON):
                     // quiet install on relaunch. App-local preference; the
@@ -1300,16 +1320,20 @@ struct GeneralSettingsPane: View {
                         get: { appUpdateInstallModel.isAutoInstallEnabled },
                         set: { appUpdateInstallModel.setAutoInstall($0) }
                     ))
-                    .help("Downloads a found update in the background and installs it the next time ModelDeck relaunches. Off: updates wait for Update Now.")
+                    // Issue #241: "installs the next time ModelDeck
+                    // relaunches" promised an event that never happens on
+                    // an always-running menu-bar app — the staged prompt's
+                    // restart offer is the honest follow-through.
+                    .help("Downloads a found update in the background; ModelDeck then offers a one-click restart to finish. Off: updates wait for Update Now.")
                     Text(appUpdateAutoChecker.isEnabled
                         ? (appUpdateInstallModel.isAutoInstallEnabled
-                            ? "Daily check; new versions download quietly and install when ModelDeck relaunches."
-                            : "Daily check with a notification when a new version exists — installs only when you choose Update Now.")
+                            ? "Checks every few hours; new versions download quietly and ModelDeck offers a restart when they're ready."
+                            : "Checks every few hours, with a notification when a new version exists — installs only when you choose Update Now.")
                         : "Automatic checks are off — updates are found only when you check manually.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
-                    Text("Daily check with a notification when a new version exists — nothing installs automatically in this build.")
+                    Text("Checks every few hours, with a notification when a new version exists — nothing installs automatically in this build.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

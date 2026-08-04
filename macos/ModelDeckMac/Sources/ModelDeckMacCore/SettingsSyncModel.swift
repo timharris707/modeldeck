@@ -111,6 +111,12 @@ public final class SettingsSyncModel: ObservableObject {
             { $0.menuBarShowWhen != nil },
             { $0.menuBarShowWhen = nil }
         ),
+        // Issue #242: pre-chip-labels daemons don't know the labels key.
+        (
+            "deckHealthLabels",
+            { $0.deckHealthLabels != nil },
+            { $0.deckHealthLabels = nil }
+        ),
     ]
 
     private func push(_ patch: DaemonSettingsPatch) async {
@@ -214,6 +220,14 @@ public final class SettingsSyncModel: ObservableObject {
     public func setMenuBarShowWhen(_ stored: String) async {
         guard stored != settings.menuBarShowWhen else { return }
         await update(DaemonSettingsPatch(menuBarShowWhen: stored))
+    }
+
+    /// Issue #242: the deck chip labels value ("Show health verdict labels"
+    /// — `DeckHealthLabels` grammar; "" = dot only). Display-only: the
+    /// chip's tooltip, detail popover, and VoiceOver summary are unaffected.
+    public func setDeckHealthLabels(_ stored: String) async {
+        guard stored != settings.deckHealthLabels else { return }
+        await update(DaemonSettingsPatch(deckHealthLabels: stored))
     }
 
     static func message(for error: Error) -> String {

@@ -124,6 +124,27 @@ public struct AvailabilityHealthReport: Equatable, Sendable {
     /// Largest one-time spend (points) addable TODAY at the measured pace
     /// with no drought.
     public var burstHeadroomPoints: Double?
+    // Issue #244 — the burst-aware pace scenario. All nil/false while the
+    // burn-rate window is inactive (cold start, under 30 min of samples):
+    // the report is then byte-for-byte the pre-#244 evaluation.
+    /// The short-window burn rate ("today's rate", pts/day) the scenario
+    /// was evaluated with; nil while the window is inactive.
+    public var burstPointsPerDay: Double?
+    /// First drought hour of the burst-scenario sim, set only when the
+    /// burst scenario is RELEVANT: burst > 2× the trailing pace AND the
+    /// burst sim droughts where the measured-pace sim does not.
+    public var burstFirstDroughtHours: Int?
+    /// Straight-line hours until the pool hits the safety floor at
+    /// today's rate, ignoring resets (Tim's "bottoms out in ~Xh" number —
+    /// the adjacent soonest-reset line supplies the rescue context).
+    public var burstBottomsOutHours: Double?
+    /// Hours until the SOONEST pool reset (not the biggest) — the other
+    /// number Tim needed live: "next reset lands in Yh".
+    public var soonestResetHours: Double?
+    /// True when the burst scenario lowered a steady-state GREEN to
+    /// YELLOW. The verdict, displayScore, and readout all already reflect
+    /// the degradation — this flag only drives the "why" copy.
+    public var burstDegraded: Bool
     public var nextBigReset: AvailabilityNextReset?
     public var pool: [AvailabilityPoolAccount]
     public var excluded: [AvailabilityExclusion]
@@ -142,6 +163,11 @@ public struct AvailabilityHealthReport: Equatable, Sendable {
         minPoolPoints: Double? = nil,
         firstDroughtHours: Int? = nil,
         burstHeadroomPoints: Double? = nil,
+        burstPointsPerDay: Double? = nil,
+        burstFirstDroughtHours: Int? = nil,
+        burstBottomsOutHours: Double? = nil,
+        soonestResetHours: Double? = nil,
+        burstDegraded: Bool = false,
         nextBigReset: AvailabilityNextReset? = nil,
         pool: [AvailabilityPoolAccount] = [],
         excluded: [AvailabilityExclusion] = [],
@@ -157,6 +183,11 @@ public struct AvailabilityHealthReport: Equatable, Sendable {
         self.minPoolPoints = minPoolPoints
         self.firstDroughtHours = firstDroughtHours
         self.burstHeadroomPoints = burstHeadroomPoints
+        self.burstPointsPerDay = burstPointsPerDay
+        self.burstFirstDroughtHours = burstFirstDroughtHours
+        self.burstBottomsOutHours = burstBottomsOutHours
+        self.soonestResetHours = soonestResetHours
+        self.burstDegraded = burstDegraded
         self.nextBigReset = nextBigReset
         self.pool = pool
         self.excluded = excluded
@@ -278,6 +309,20 @@ public enum AvailabilityHealthEngine {
         return ["week", "7d", "weekly"].contains(lower) ? "weekly" : lower
     }
 
+    /// The driver-scope snapshot for one account's usage rows — primary
+    /// scope first, generic fallback second. Shared by the pool builder
+    /// and the #244 burn-rate window so both always read the SAME scope.
+    static func driverSnapshot(
+        for provider: DeckProvider,
+        in rows: [UsageSnapshot]
+    ) -> UsageSnapshot? {
+        let scopes = driverScopes(for: provider)
+        return rows.first { normalizedScope($0.scope) == scopes.primary }
+            ?? scopes.fallback.flatMap { fallback in
+                rows.first { normalizedScope($0.scope) == fallback }
+            }
+    }
+
     /// Builds the provider's pool from a deck state: enabled accounts with a
     /// fresh driver-scope snapshot, tier-weighted; everything else is
     /// excluded WITH its reason. Disabled accounts are omitted silently
@@ -290,7 +335,6 @@ public enum AvailabilityHealthEngine {
         staleAfter: TimeInterval = defaultStaleAfter
     ) -> (accounts: [AvailabilityPoolAccount], excluded: [AvailabilityExclusion], unknownTierLabels: [String]) {
         let snapshotsByAccount = Dictionary(grouping: state.usage, by: \.accountId)
-        let scopes = driverScopes(for: provider)
         var accounts: [AvailabilityPoolAccount] = []
         var excluded: [AvailabilityExclusion] = []
         var unknownTiers: [String] = []
@@ -303,10 +347,7 @@ public enum AvailabilityHealthEngine {
                 continue
             }
             let rows = snapshotsByAccount[account.id] ?? []
-            let snapshot = rows.first { normalizedScope($0.scope) == scopes.primary }
-                ?? scopes.fallback.flatMap { fallback in
-                    rows.first { normalizedScope($0.scope) == fallback }
-                }
+            let snapshot = driverSnapshot(for: provider, in: rows)
             guard let snapshot else {
                 excluded.append(AvailabilityExclusion(
                     label: account.label, reason: "no weekly usage data"
@@ -555,11 +596,39 @@ public enum AvailabilityHealthEngine {
 
     /// One provider's complete evaluation over a deck state at `now` — the
     /// single entry point the chip, popover, and menu bar all read.
+    ///
+    /// Issue #244: `burstPointsPerDay` is the short-window burn rate from
+    /// `BurnRateWindow` ("today's rate"); nil (inactive window) reproduces
+    /// the pre-#244 evaluation exactly. When today's rate exceeds the 2×
+    /// stress test the GREEN band already implies (M ≥ 2 means the pool
+    /// survives 2× the trailing average), the burst becomes a first-class
+    /// scenario: the pool is simulated at max(2× average, 1× burst) —
+    /// which is then simply the burst rate — and if THAT droughts where
+    /// the measured pace does not, a steady-state GREEN degrades to
+    /// YELLOW. This is an ADDITIONAL scenario on top of Tim's signed-off
+    /// M-band semantics, never a redefinition: `sustainableMultiple`, the
+    /// bands, and every steady-state number are untouched.
+    ///
+    /// Degrade rules (adversarial notes, optimistic direction):
+    /// - Burst ≤ 2× average never touches the VERDICT: GREEN already
+    ///   proved 2× survives, and re-testing a weaker rate could only ever
+    ///   flatter it. Pinned as a verdict no-op. (The burst FACT fields
+    ///   populate on the looser burst > pace gate — display only.)
+    /// - Burst can only ever LOWER a verdict (green → yellow), never
+    ///   raise one, and never below yellow: RED is unreachable from here
+    ///   because red means the measured pace itself droughts — and then
+    ///   `base.firstDroughtHour != nil` skips the degrade branch (the
+    ///   verdict is already worse than anything burst could say).
+    /// - When the verdict degrades, `displayScore` is re-clamped into the
+    ///   yellow segment (positioned by how deep into the week the burst
+    ///   drought lands), so the bar, the color, and the readout can never
+    ///   contradict each other.
     public static func report(
         for provider: DeckProvider,
         state: DeckState,
         now: Date,
-        staleAfter: TimeInterval = defaultStaleAfter
+        staleAfter: TimeInterval = defaultStaleAfter,
+        burstPointsPerDay: Double? = nil
     ) -> AvailabilityHealthReport {
         let (accounts, excluded, unknownTiers) = pool(
             for: provider, state: state, now: now, staleAfter: staleAfter
@@ -574,17 +643,59 @@ public enum AvailabilityHealthEngine {
         let pace = measuredPace(accounts)
         let multiple = sustainableMultiple(accounts, pacePerDay: pace)
         let base = simulate(accounts, pacePerDay: pace)
+        var verdict = AvailabilityVerdict.band(forMultiple: multiple)
+        var score = displayScore(forMultiple: multiple)
+        var burstDrought: Int?
+        var bottomsOut: Double?
+        var soonestReset: Double?
+        var degraded = false
+        // Information display runs whenever today's rate outpaces the
+        // average at all (orchestrator decision on #244's closing
+        // requirement: the bench-out vs next-reset numbers show on GREEN,
+        // YELLOW, or RED decks alike whenever the burst sim touches the
+        // floor inside the horizon). The VERDICT gate below is stricter
+        // and unchanged.
+        if let burst = burstPointsPerDay, burst > pace {
+            let burstSim = simulate(accounts, pacePerDay: burst)
+            if let dry = burstSim.firstDroughtHour {
+                burstDrought = dry
+                let poolNow = accounts.reduce(0) { $0 + $1.remainingPoints }
+                bottomsOut = max(poolNow - floorPoints(for: accounts), 0) / (burst / 24)
+                // A clamped-0 reset already snapped: its next lands a full
+                // cycle out, matching measuredPace/resetLands exactly.
+                soonestReset = accounts
+                    .map { $0.hoursToReset > 0 ? $0.hoursToReset : cycleHours }
+                    .min()
+                // The degrade gate, exactly as reviewed: burst above the
+                // 2× stress test GREEN already implies, droughting where
+                // the measured pace does not, lowers GREEN → YELLOW.
+                // Never anything else.
+                if burst > 2 * pace, base.firstDroughtHour == nil, verdict == .green {
+                    degraded = true
+                    verdict = .yellow
+                    // Needle inside the yellow segment, later drought →
+                    // closer to green: hour 1 → 33, hour 168 → ~65.8
+                    // (never 66 — that pixel is green's).
+                    score = min(score, 33 + 33 * Double(max(dry - 1, 0)) / cycleHours)
+                }
+            }
+        }
         return AvailabilityHealthReport(
             provider: provider,
-            verdict: AvailabilityVerdict.band(forMultiple: multiple),
+            verdict: verdict,
             sustainableMultiple: multiple,
-            displayScore: displayScore(forMultiple: multiple),
+            displayScore: score,
             poolPoints: accounts.reduce(0) { $0 + $1.remainingPoints },
             capacityPoints: accounts.reduce(0) { $0 + $1.capacityPoints },
             pacePointsPerDay: pace,
             minPoolPoints: base.minPoolPoints,
             firstDroughtHours: base.firstDroughtHour,
             burstHeadroomPoints: burstHeadroom(accounts, pacePerDay: pace),
+            burstPointsPerDay: burstPointsPerDay,
+            burstFirstDroughtHours: burstDrought,
+            burstBottomsOutHours: bottomsOut,
+            soonestResetHours: soonestReset,
+            burstDegraded: degraded,
             nextBigReset: nextBigReset(accounts, now: now),
             pool: accounts,
             excluded: excluded,
@@ -655,13 +766,53 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
                 accessibilitySummary: "\(providerName) availability: no data. \(readout)"
             )
         }
-        let readout = Self.readout(
-            multiple: multiple, pacePerDay: report.pacePointsPerDay
-        )
+        // Issue #244: a burst-degraded verdict must SAY why — the chip
+        // color and the sentence may never contradict each other. The
+        // burst readout replaces the steady-state one (which would
+        // otherwise claim green words under a yellow chip).
+        let readout: String
+        if report.burstDegraded, let dry = report.burstFirstDroughtHours {
+            readout = Self.burstReadout(
+                multiple: multiple,
+                burstPointsPerDay: report.burstPointsPerDay,
+                pacePerDay: report.pacePointsPerDay,
+                droughtHours: dry
+            )
+        } else if verdict == .yellow, let dry = report.burstFirstDroughtHours {
+            // Review finding 4 (partial): a base-YELLOW deck with an
+            // active burst drought gets the burst clause too, so the
+            // sentence and the fact lines below never disagree.
+            readout = Self.readout(
+                multiple: multiple, pacePerDay: report.pacePointsPerDay
+            ) + " Today's burn runs ahead of that pace and would dry the pool in \(hoursText(dry))."
+        } else {
+            readout = Self.readout(
+                multiple: multiple, pacePerDay: report.pacePointsPerDay
+            )
+        }
         var facts: [String] = [
             "Pool now: \(points(report.poolPoints)) of \(points(report.capacityPoints)) pts",
             "Measured pace: \(points(report.pacePointsPerDay)) pts/day",
         ]
+        // Issue #244, Tim's two live numbers. "Current burn" shows
+        // whenever the window is active (unless the rate rounds to zero —
+        // "~0 pts/day (0.0×)" is noise, review finding 7); the
+        // bottoms-out pair shows whenever the burst sim touches the floor
+        // inside the horizon, on any verdict (orchestrator decision).
+        if let burn = report.burstPointsPerDay, burn.rounded() >= 1 {
+            var line = "Current burn: ~\(points(burn)) pts/day"
+            if report.pacePointsPerDay > 0 {
+                line += " (\(multiplierText(burn / report.pacePointsPerDay))× your weekly pace)"
+            }
+            facts.append(line)
+        }
+        if let bottomsOut = report.burstBottomsOutHours,
+           let soonestReset = report.soonestResetHours {
+            facts.append(
+                "At today's rate: pool bottoms out in ~\(hoursText(Int(bottomsOut.rounded())));"
+                + " next reset lands in \(hoursText(Int(soonestReset.rounded())))"
+            )
+        }
         if let minPool = report.minPoolPoints {
             facts.append("Lowest point over 7 days: \(points(minPool)) pts")
         }
@@ -724,6 +875,44 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
         }
         let amount = String(format: "%.1f", multiple)
         return "You could sustain about \(amount)× your current pace — \(verdict.rawValue)\(qualifier)."
+    }
+
+    /// Issue #244: the burst-degraded readout — same plain-language
+    /// register as the steady-state sentence, but it owns the yellow and
+    /// names the reason. Pinned by tests.
+    public static func burstReadout(
+        multiple: Double,
+        burstPointsPerDay: Double?,
+        pacePerDay: Double,
+        droughtHours: Int
+    ) -> String {
+        guard pacePerDay > 0 else {
+            // Fresh cycle, no trailing average yet — but the burn window
+            // is live and its rate droughts. Still yellow, still named.
+            return "No weekly usage measured yet, but today's burn would run "
+                + "the pool dry in \(hoursText(droughtHours)). "
+                + "Yellow while this burst lasts."
+        }
+        let burnPhrase: String
+        if let burst = burstPointsPerDay {
+            burnPhrase = "today's burn (\(multiplierText(burst / pacePerDay))× that pace)"
+        } else {
+            burnPhrase = "today's burn"
+        }
+        let steady = multiple >= AvailabilityHealthEngine.maxMultiple
+            ? "over \(Int(AvailabilityHealthEngine.maxMultiple))×"
+            : "about \(String(format: "%.1f", multiple))×"
+        return "Your weekly average could sustain \(steady) — but \(burnPhrase) "
+            + "would run the pool dry in \(hoursText(droughtHours)). "
+            + "Yellow while this burst lasts."
+    }
+
+    /// "6.9" under 10×, whole numbers above ("28×", not "27.9×") — burn
+    /// multiples get less precise as they get less believable.
+    static func multiplierText(_ multiple: Double) -> String {
+        multiple < 9.95
+            ? String(format: "%.1f", multiple)
+            : "\(Int(multiple.rounded()))"
     }
 
     static func excludedLine(_ excluded: [AvailabilityExclusion]) -> String? {

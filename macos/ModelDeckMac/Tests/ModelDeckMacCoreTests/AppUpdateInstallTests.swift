@@ -508,7 +508,10 @@ struct AppUpdateAutoCheckerInstallTests {
         await rig.auto.checkIfDue()
         #expect(rig.driver.backgroundCheckCount == 1)
         #expect(rig.log.posted.count == 1)
-        #expect(rig.log.posted.first?.body.contains("installs the next time ModelDeck relaunches") == true)
+        // Issue #241: the availability banner no longer promises a
+        // relaunch that never happens on an always-on install — it points
+        // at the staged prompt's restart offer instead.
+        #expect(rig.log.posted.first?.body.contains("will offer a restart when it's ready") == true)
     }
 
     @Test func autoInstallOffNotifiesAboutUpdateNow() async {
@@ -534,7 +537,9 @@ struct AppUpdateAutoCheckerInstallTests {
         let updateNow = AppUpdateAutoChecker.notification(for: release, currentVersion: "0.3.1", mode: .updateNow)
         #expect(updateNow.body.contains("Update Now"))
         let autoBody = AppUpdateAutoChecker.notification(for: release, currentVersion: "0.3.1", mode: .automaticInstall)
-        #expect(autoBody.body.contains("relaunches"))
+        // Issue #241: honest follow-through — a restart offer, never a
+        // "next relaunch" that an always-on menu-bar app doesn't have.
+        #expect(autoBody.body.contains("offer a restart"))
         // The 2-arg legacy signature (issue #60 tests, pre-Sparkle callers)
         // must keep the notify-only copy.
         let legacy = AppUpdateAutoChecker.notification(for: release, currentVersion: "0.3.1")

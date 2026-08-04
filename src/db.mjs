@@ -66,6 +66,15 @@ export const DEFAULT_SETTINGS = Object.freeze({
   // doesn't recognize as '' (always), so old and new builds round-trip
   // each other's values safely. Display-only: notifications are unaffected.
   menuBarShowWhen: '',
+  // Issue #242 deck chip labels: '' = dot only (the default — the dot is
+  // shape-coded green circle / yellow triangle / red octagon / hollow
+  // no-data ring, so color is never the only signal); 'show' = dot +
+  // verdict word (the Settings → General → Accessibility toggle). Free
+  // string like menuBarShowWhen — the app owns the grammar and treats
+  // anything it doesn't recognize as '' (dot only), so old and new builds
+  // round-trip each other's values safely. Display-only: the chip's
+  // tooltip, detail popover, and VoiceOver strings are unaffected.
+  deckHealthLabels: '',
 });
 
 function validateSetting(key, value) {
@@ -93,6 +102,9 @@ function validateSetting(key, value) {
   }
   if (key === 'menuBarShowWhen' && (typeof value !== 'string' || value.length > 64)) {
     throw new Error('menuBarShowWhen must be a string of at most 64 characters');
+  }
+  if (key === 'deckHealthLabels' && (typeof value !== 'string' || value.length > 64)) {
+    throw new Error('deckHealthLabels must be a string of at most 64 characters');
   }
 }
 

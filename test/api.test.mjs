@@ -432,6 +432,8 @@ test('settings API validates partial updates and drives worst-capacity threshold
     menuBarStyle: 'icon-only',
     menuBarAccountId: '',
     menuBarShowWhen: '',
+    // Issue #242: deck chip labels — '' = dot only (default).
+    deckHealthLabels: '',
   });
   result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ layout: 'single-column', notificationThresholdPercent: 30 }) });
   assert.equal(result.body.layout, 'single-column');
@@ -473,6 +475,16 @@ test('settings API validates partial updates and drives worst-capacity threshold
   assert.match(result.body.error, /menuBarShowWhen/);
   result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ menuBarShowWhen: '' }) });
   assert.equal(result.body.menuBarShowWhen, '');
+
+  // Issue #242 deck chip labels: same free-short-string contract ('' = dot
+  // only; the app owns the grammar); non-strings are rejected.
+  result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ deckHealthLabels: 'show' }) });
+  assert.equal(result.body.deckHealthLabels, 'show');
+  result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ deckHealthLabels: 9 }) });
+  assert.equal(result.response.status, 400);
+  assert.match(result.body.error, /deckHealthLabels/);
+  result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ deckHealthLabels: '' }) });
+  assert.equal(result.body.deckHealthLabels, '');
 
   const first = fixture.store.saveAccount({ provider: 'claude', label: 'First', profileRef: 'first' });
   const second = fixture.store.saveAccount({ provider: 'claude', label: 'Second', profileRef: 'second' });

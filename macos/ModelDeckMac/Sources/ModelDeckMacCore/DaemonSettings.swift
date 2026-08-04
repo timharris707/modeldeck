@@ -43,6 +43,18 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
     /// gates nothing, and a pre-#238 build simply ignores the key.
     /// Display-only: notifications keep watching every account.
     public var menuBarShowWhen: String
+    /// Issue #242 deck chip labels: whether the deck's Availability Health
+    /// chips render the verdict word beside the shape-coded dot. Grammar
+    /// (see `DeckHealthLabels`): "" = dot only (default — the dot's shape
+    /// already codes the verdict: green circle / yellow triangle / red
+    /// octagon / hollow no-data ring, the #235 menu-bar coding shared via
+    /// `AvailabilityVerdictShape`); "show" = dot + verdict word (the
+    /// Settings → General → Accessibility toggle). Same free-string
+    /// discipline as `menuBarShowWhen` above: the daemon validates only
+    /// string/length, unknown values parse as dot-only (never a crash), a
+    /// pre-#242 build simply ignores the key. Display-only: the tooltip,
+    /// detail popover, and VoiceOver summary are unaffected in both modes.
+    public var deckHealthLabels: String
     /// Issue #176 (Tim decision 2026-07-31): the daemon's scheduled renewal
     /// of expired-idle Claude accounts. Default ON — the whole point is zero
     /// user effort; the honest cost disclosure lives on the toggle.
@@ -68,6 +80,7 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         menuBarStyle: "icon-only",
         menuBarAccountId: "",
         menuBarShowWhen: "",
+        deckHealthLabels: "",
         autoRenewEnabled: true,
         sharedUserScopeEnabled: false
     )
@@ -83,6 +96,7 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         menuBarStyle: String,
         menuBarAccountId: String = "",
         menuBarShowWhen: String = "",
+        deckHealthLabels: String = "",
         autoRenewEnabled: Bool = true,
         sharedUserScopeEnabled: Bool = false
     ) {
@@ -96,6 +110,7 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         self.menuBarStyle = menuBarStyle
         self.menuBarAccountId = menuBarAccountId
         self.menuBarShowWhen = menuBarShowWhen
+        self.deckHealthLabels = deckHealthLabels
         self.autoRenewEnabled = autoRenewEnabled
         self.sharedUserScopeEnabled = sharedUserScopeEnabled
     }
@@ -121,6 +136,9 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         // Issue #238: absent on pre-#238 daemons → always shown (default).
         menuBarShowWhen = try container.decodeIfPresent(String.self, forKey: .menuBarShowWhen)
             ?? defaults.menuBarShowWhen
+        // Issue #242: absent on pre-#242 daemons → dot only (default).
+        deckHealthLabels = try container.decodeIfPresent(String.self, forKey: .deckHealthLabels)
+            ?? defaults.deckHealthLabels
         autoRenewEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoRenewEnabled)
             ?? defaults.autoRenewEnabled
         // Issue #204: absent on pre-#204 daemons → the opt-in default (off).
@@ -164,6 +182,45 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
     public var menuBarShowWhenMode: MenuBarShowWhen {
         MenuBarShowWhen.parse(menuBarShowWhen)
     }
+
+    /// Issue #242: typed view of `deckHealthLabels`; every unrecognized
+    /// stored value falls back to dot-only (the default).
+    public var deckHealthLabelsMode: DeckHealthLabels {
+        DeckHealthLabels.parse(deckHealthLabels)
+    }
+}
+
+/// Issue #242: the stored `deckHealthLabels` setting's grammar — whether the
+/// deck's Availability Health chips show the verdict word beside the
+/// shape-coded dot. Two values today; a free string (not a Bool) so the key
+/// keeps the same forward-compatible discipline as `menuBarShowWhen`:
+/// unknown future values parse as the dot-only default, never a crash, and
+/// a newer build's value round-trips through this build unclobbered.
+public enum DeckHealthLabels: Equatable, Sendable {
+    /// "" — dot only (the default, and what every unrecognized value
+    /// degrades to). Accessible without the word: the dot's shape codes the
+    /// verdict (`AvailabilityVerdictShape`), and the word stays one click
+    /// away in the chip's detail popover.
+    case dotOnly
+    /// "show" — dot + verdict word, today's pre-#242 chip. The Settings →
+    /// General → Accessibility "Show health verdict labels" toggle.
+    case show
+
+    public static let dotOnlyStored = ""
+    public static let showStored = "show"
+
+    /// The stored string for this case (round-trips through `parse`).
+    public var stored: String {
+        self == .show ? Self.showStored : Self.dotOnlyStored
+    }
+
+    /// Lenient parse: "" and every unrecognized value mean dot-only.
+    public static func parse(_ stored: String) -> DeckHealthLabels {
+        stored == showStored ? .show : .dotOnly
+    }
+
+    /// Whether the deck chip renders the verdict word beside the dot.
+    public var showsVerdictWord: Bool { self == .show }
 }
 
 /// A partial update for `PUT /api/settings`. Only non-nil fields are encoded,
@@ -189,6 +246,11 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
     /// field and retries when that happens (the #90/#123/#176 tolerance
     /// path).
     public var menuBarShowWhen: String?
+    /// Issue #242: the deck chip labels value (`DeckHealthLabels` grammar).
+    /// Pre-#242 daemons reject unknown keys — SettingsSyncModel strips this
+    /// field and retries when that happens (the #90/#123/#176/#238
+    /// tolerance path).
+    public var deckHealthLabels: String?
     /// Issue #176: the auto-renew toggle. Pre-#176 daemons reject unknown
     /// keys — SettingsSyncModel strips this field and retries when that
     /// happens (the #90/#123 tolerance path).
@@ -205,6 +267,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         menuBarStyle: String? = nil,
         menuBarAccountId: String? = nil,
         menuBarShowWhen: String? = nil,
+        deckHealthLabels: String? = nil,
         autoRenewEnabled: Bool? = nil
     ) {
         self.autoRefreshEnabled = autoRefreshEnabled
@@ -217,6 +280,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         self.menuBarStyle = menuBarStyle
         self.menuBarAccountId = menuBarAccountId
         self.menuBarShowWhen = menuBarShowWhen
+        self.deckHealthLabels = deckHealthLabels
         self.autoRenewEnabled = autoRenewEnabled
     }
 
@@ -234,6 +298,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
             menuBarStyle: other.menuBarStyle ?? menuBarStyle,
             menuBarAccountId: other.menuBarAccountId ?? menuBarAccountId,
             menuBarShowWhen: other.menuBarShowWhen ?? menuBarShowWhen,
+            deckHealthLabels: other.deckHealthLabels ?? deckHealthLabels,
             autoRenewEnabled: other.autoRenewEnabled ?? autoRenewEnabled
         )
     }
@@ -250,13 +315,14 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         try container.encodeIfPresent(menuBarStyle, forKey: .menuBarStyle)
         try container.encodeIfPresent(menuBarAccountId, forKey: .menuBarAccountId)
         try container.encodeIfPresent(menuBarShowWhen, forKey: .menuBarShowWhen)
+        try container.encodeIfPresent(deckHealthLabels, forKey: .deckHealthLabels)
         try container.encodeIfPresent(autoRenewEnabled, forKey: .autoRenewEnabled)
     }
 
     enum CodingKeys: String, CodingKey {
         case autoRefreshEnabled, autoRefreshIntervalSeconds, autoRefreshIntervalCustomized, pauseWhileActive
         case layout, defaultSort, notificationThresholdPercent, menuBarStyle, menuBarAccountId
-        case menuBarShowWhen, autoRenewEnabled
+        case menuBarShowWhen, deckHealthLabels, autoRenewEnabled
     }
 
     public var isEmpty: Bool {
@@ -264,6 +330,6 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
             && autoRefreshIntervalCustomized == nil && pauseWhileActive == nil
             && layout == nil && defaultSort == nil && notificationThresholdPercent == nil
             && menuBarStyle == nil && menuBarAccountId == nil
-            && menuBarShowWhen == nil && autoRenewEnabled == nil
+            && menuBarShowWhen == nil && deckHealthLabels == nil && autoRenewEnabled == nil
     }
 }

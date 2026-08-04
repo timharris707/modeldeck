@@ -42,7 +42,7 @@ public enum AppUpdateRelaunchPolicy {
     public enum SessionMode: Equatable, Sendable {
         /// The user pressed Update Now.
         case userInitiated
-        /// The daily scheduled check.
+        /// The periodic scheduled check (AppUpdateAutoChecker's cadence).
         case background
     }
 
@@ -135,7 +135,7 @@ public protocol AppUpdateInstalling: AnyObject {
     /// One-click "Update Now": check the feed, download, verify, install,
     /// relaunch. User-initiated — errors surface, progress reports.
     func beginInstall()
-    /// Scheduled background check (driven by AppUpdateAutoChecker's daily
+    /// Scheduled background check (driven by AppUpdateAutoChecker's
     /// cadence, never by Sparkle's own timer). With automatic install ON the
     /// update downloads and stages quietly; OFF it only reports availability.
     func checkInBackground()

@@ -34,6 +34,22 @@ struct AppUpdateNotificationPoster {
     }
 }
 
+/// Issue #241: banner for a background update that finished staging —
+/// "ModelDeck <version> is ready, restart to finish". Its own identifier so
+/// it replaces itself per version but never clobbers the availability
+/// banner above (availability and readiness are different events; both may
+/// be pending in Notification Center at once).
+struct AppUpdateStagedNotificationPoster {
+    func post(_ notification: AppUpdateNotification) async {
+        await deliverBanner(
+            identifier: "modeldeck.appupdate.staged",
+            title: notification.title,
+            body: notification.body,
+            sound: nil
+        )
+    }
+}
+
 /// Shared delivery: lazy authorization on the first banner, silent no-op
 /// when declined or when running unbundled.
 private func deliverBanner(

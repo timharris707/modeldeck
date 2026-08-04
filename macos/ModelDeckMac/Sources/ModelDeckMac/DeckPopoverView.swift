@@ -26,6 +26,12 @@ struct DeckPopoverView: View {
     /// drives this; progress/failure render in the dialog re-summon and the
     /// Settings row (both read the same shared model).
     @ObservedObject var appUpdateInstallModel: AppUpdateInstallModel
+    /// Issue #241: the staged-update restart prompt. Prompting renders the
+    /// dismissible "restart to finish updating" banner under the header;
+    /// dismissed renders the passive header badge whose popover (via the
+    /// #113 one-at-a-time slot) re-offers the Restart. Both drive the
+    /// existing #163 explicit install path — never a forced restart.
+    @ObservedObject var stagedPromptModel: AppUpdateStagedPromptModel
     /// Issue #96: bundled background-service lifecycle. The popover hosts
     /// the calm one-screen first-run consent and its follow-on states.
     @ObservedObject var setupModel: DaemonSetupModel
@@ -42,6 +48,7 @@ struct DeckPopoverView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
+            stagedUpdateBanner
             connectionBanner
             installProgressLine
             content
@@ -99,6 +106,13 @@ struct DeckPopoverView: View {
             .accessibilityAddTraits(.isHeader)
 
             Spacer()
+
+            // Issue #241 amendment to the "update chrome stays out of the
+            // header" line below: the PASSIVE staged-update badge is the one
+            // exception — a dismissed restart prompt must leave something
+            // visible (staged-invisible is the #241 bug), and the header
+            // corner is the deck's only always-rendered chrome.
+            updateReadyBadge
 
             sortControl
 
@@ -214,12 +228,92 @@ struct DeckPopoverView: View {
         .accessibilityAddTraits(isActive ? .isSelected : [])
     }
 
+    // MARK: - Staged-update restart prompt (issue #241)
+
+    /// The proactive banner: a background update finished staging, offer
+    /// the restart. Dismissible (→ the passive header badge), fires from
+    /// the prompt model at most once per staged version, and Restart hands
+    /// off to the existing #163 explicit quit→install→relaunch path.
+    @ViewBuilder
+    private var stagedUpdateBanner: some View {
+        if case .prompting(let version) = stagedPromptModel.state {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Text(AppUpdateStagedPromptModel.bannerText(version: version))
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+                Button("Restart") {
+                    stagedPromptModel.restartNow()
+                }
+                .controlSize(.small)
+                .help("Quit, install v\(version), and reopen ModelDeck — the same one-click path as Update Now")
+                .accessibilityLabel("Restart ModelDeck to finish updating")
+                Button {
+                    stagedPromptModel.dismissPrompt()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Dismiss — a small badge stays in the header until you restart")
+                .accessibilityLabel("Dismiss update prompt")
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color(nsColor: .quaternarySystemFill))
+            )
+        }
+    }
+
+    /// The passive badge after a dismissal (#241): a quiet header glyph;
+    /// clicking opens the explanation popover (via the #113 slot) that
+    /// re-offers the one-click Restart.
+    @ViewBuilder
+    private var updateReadyBadge: some View {
+        if case .badged(let version) = stagedPromptModel.state {
+            let id = DeckWarningID(topic: .updateReady)
+            Button {
+                deckModel.toggleWarning(id)
+            } label: {
+                Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.tint)
+            }
+            .buttonStyle(.plain)
+            .help("ModelDeck \(version) is ready — click for the restart offer")
+            .accessibilityLabel("Update ready: ModelDeck \(version)")
+            .popover(isPresented: deckModel.warningBinding(id), arrowEdge: .bottom) {
+                SignInExplanationView(
+                    explanation: AppUpdateStagedPromptModel.badgeExplanation(version: version),
+                    actionTitle: "Restart ModelDeck",
+                    actionHelp: "Quit, install v\(version), and reopen ModelDeck — the same one-click path as Update Now",
+                    actionAccessibilityLabel: "Restart ModelDeck to finish updating",
+                    onSignInAgain: {
+                        deckModel.setWarningPresented(id, false)
+                        stagedPromptModel.restartNow()
+                    }
+                )
+            }
+        }
+    }
+
     /// Issue #121: once "Update Now" starts (the dialog closes on press),
     /// the install's progress/failure lives HERE so it never disappears —
     /// the same honest status line the Settings row renders.
+    /// Issue #241: while the staged restart prompt (banner or badge) owns
+    /// the pending-relaunch story, the caption would say the same thing
+    /// twice — it yields for exactly that phase and no other.
     @ViewBuilder
     private var installProgressLine: some View {
-        if let status = AppUpdateInstallModel.statusText(for: appUpdateInstallModel.phase) {
+        if stagedPromptOwnsStatus {
+            EmptyView()
+        } else if let status = AppUpdateInstallModel.statusText(for: appUpdateInstallModel.phase) {
             HStack(spacing: 6) {
                 if appUpdateInstallModel.isBusy {
                     ProgressView().controlSize(.small)
@@ -234,6 +328,16 @@ struct DeckPopoverView: View {
 
     private var installStatusIsFailure: Bool {
         if case .failed = appUpdateInstallModel.phase { return true }
+        return false
+    }
+
+    /// Issue #241: true exactly when the phase is pending-relaunch AND the
+    /// prompt model is presenting it (banner or badge) — the one case the
+    /// #121 caption would duplicate.
+    private var stagedPromptOwnsStatus: Bool {
+        if case .installedPendingRelaunch = appUpdateInstallModel.phase {
+            return stagedPromptModel.state != .hidden
+        }
         return false
     }
 
@@ -420,7 +524,13 @@ struct DeckPopoverView: View {
     ) -> AvailabilityHealthPresentation {
         let now = Date()
         return AvailabilityHealthPresentation.make(
-            report: AvailabilityHealthEngine.report(for: provider, state: state, now: now),
+            report: AvailabilityHealthEngine.report(
+                for: provider, state: state, now: now,
+                // Issue #244: the short-window burn rate makes an active
+                // burst a first-class scenario; nil (cold window) keeps
+                // the pre-#244 evaluation exactly.
+                burstPointsPerDay: statusModel.burstRate(for: provider)
+            ),
             now: now
         )
     }
@@ -1522,26 +1632,40 @@ func availabilityColor(_ verdict: AvailabilityVerdict?) -> Color {
 }
 
 /// Issue #235: the per-provider Availability Health chip beside the column
-/// title — colored dot + verdict word, deliberately in the deck's quiet
-/// caption voice. Clicking opens the detail popover through the model's
-/// one-at-a-time presentation slot (the #113 click-to-explain idiom;
-/// tooltips are unreliable inside MenuBarExtra windows).
+/// title — a shape-coded dot, deliberately in the deck's quiet caption
+/// voice. Issue #242: the verdict word is OFF by default (noise for most
+/// users, per Tim) and returns behind Settings → General → Accessibility's
+/// "Show health verdict labels" toggle; the dot carries the menu bar's #235
+/// shape coding (shared `AvailabilityVerdictShape`) so color is never the
+/// only signal even without the word. Clicking opens the detail popover
+/// through the model's one-at-a-time presentation slot (the #113
+/// click-to-explain idiom; tooltips are unreliable inside MenuBarExtra
+/// windows) — tooltip, popover, and the VoiceOver summary are identical in
+/// both label modes.
 struct AvailabilityHealthChip: View {
     let presentation: AvailabilityHealthPresentation
     @ObservedObject var deckModel: DeckPopoverModel
     let warningID: DeckWarningID
 
     var body: some View {
+        let display = AvailabilityHealthChipDisplay.make(
+            verdict: presentation.verdict,
+            chipWord: presentation.chipWord,
+            showsVerdictLabels: deckModel.showsHealthVerdictLabels
+        )
         Button {
             deckModel.toggleWarning(warningID)
         } label: {
             HStack(spacing: 4) {
-                Circle()
-                    .fill(availabilityColor(presentation.verdict))
-                    .frame(width: 7, height: 7)
-                Text(presentation.chipWord)
-                    .font(DeckType.caption)
-                    .foregroundStyle(.secondary)
+                VerdictDotView(
+                    shape: display.shape,
+                    color: availabilityColor(presentation.verdict)
+                )
+                if let word = display.word {
+                    Text(word)
+                        .font(DeckType.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .padding(.horizontal, 2)
             .contentShape(Rectangle())
@@ -1554,6 +1678,45 @@ struct AvailabilityHealthChip: View {
         .popover(isPresented: deckModel.warningBinding(warningID), arrowEdge: .bottom) {
             AvailabilityHealthPopoverView(presentation: presentation)
         }
+    }
+}
+
+/// Issue #242: the chip's verdict dot — the same shape coding as the menu
+/// bar's status dot (green circle / yellow triangle / red octagon / hollow
+/// no-data ring), drawn from the shared Core geometry so the two surfaces
+/// can never drift apart.
+struct VerdictDotView: View {
+    let shape: AvailabilityVerdictShape
+    let color: Color
+    var size: CGFloat = 7
+
+    var body: some View {
+        let dotShape = VerdictDotShape(shape: shape)
+        Group {
+            if shape.isStroked {
+                dotShape.stroke(
+                    color,
+                    lineWidth: AvailabilityVerdictShape.ringLineWidth
+                )
+            } else {
+                dotShape.fill(color)
+            }
+        }
+        .frame(width: size, height: size)
+    }
+}
+
+/// SwiftUI wrapper over the shared Core path geometry. The Core paths are
+/// authored in AppKit's unflipped coordinates (triangle apex at maxY = top);
+/// SwiftUI's space is flipped, so the path is mirrored about the rect's
+/// vertical midline to keep the triangle pointing up.
+struct VerdictDotShape: Shape {
+    let shape: AvailabilityVerdictShape
+
+    func path(in rect: CGRect) -> Path {
+        let flip = CGAffineTransform(translationX: 0, y: 2 * rect.midY)
+            .scaledBy(x: 1, y: -1)
+        return Path(shape.path(in: rect)).applying(flip)
     }
 }
 

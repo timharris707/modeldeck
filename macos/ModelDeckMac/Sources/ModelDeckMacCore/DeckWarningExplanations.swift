@@ -33,6 +33,11 @@ public enum DeckWarningTopic: Hashable, Sendable {
     /// presentation slot so the detail popover behaves exactly like every
     /// other click-to-explain affordance.
     case availabilityHealth
+    /// The header's passive staged-update badge (issue #241) — shown after
+    /// the "restart to finish updating" banner is dismissed, so a staged
+    /// background update can be ignored but never invisible. Its popover
+    /// (explanation + the Restart offer) rides the same one-at-a-time slot.
+    case updateReady
 }
 
 /// Identity of ONE clickable warning affordance: the topic plus the element

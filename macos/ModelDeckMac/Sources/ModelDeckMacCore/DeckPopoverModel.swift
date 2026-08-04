@@ -1130,14 +1130,16 @@ public final class DeckPopoverModel: ObservableObject {
         rows: [DeckAccountRow],
         staleness: (DeckAccountRow) -> DeckFreshness.CardStaleness?,
         cadenceNoticeVisible: Bool,
-        healthChipProviders: [DeckProvider] = []
+        healthChipProviders: [DeckProvider] = [],
+        updateBadgeVisible: Bool = false
     ) {
         guard let presented = presentedWarning,
               !Self.liveWarningIDs(
                   rows: rows,
                   staleness: staleness,
                   cadenceNoticeVisible: cadenceNoticeVisible,
-                  healthChipProviders: healthChipProviders
+                  healthChipProviders: healthChipProviders,
+                  updateBadgeVisible: updateBadgeVisible
               ).contains(presented)
         else { return }
         presentedWarning = nil
@@ -1157,15 +1159,23 @@ public final class DeckPopoverModel: ObservableObject {
     /// opening Settings closes the deck popover (#231's fronting), taking
     /// any anchored popover with it. This reconcile is the model-side
     /// safety net for the presented-warning slot.
+    /// Issue #241: `updateBadgeVisible` mirrors the header's passive
+    /// staged-update badge (the dismissed restart prompt), so its Restart
+    /// popover is released when the badge goes — restart clicked, or the
+    /// staged phase cleared.
     public static func liveWarningIDs(
         rows: [DeckAccountRow],
         staleness: (DeckAccountRow) -> DeckFreshness.CardStaleness?,
         cadenceNoticeVisible: Bool,
-        healthChipProviders: [DeckProvider] = []
+        healthChipProviders: [DeckProvider] = [],
+        updateBadgeVisible: Bool = false
     ) -> Set<DeckWarningID> {
         var live: Set<DeckWarningID> = [DeckWarningID(topic: .footerFreshness)]
         if cadenceNoticeVisible {
             live.insert(DeckWarningID(topic: .refreshCadence))
+        }
+        if updateBadgeVisible {
+            live.insert(DeckWarningID(topic: .updateReady))
         }
         for provider in healthChipProviders {
             live.insert(DeckWarningID(topic: .availabilityHealth, elementID: provider.rawValue))
@@ -1301,6 +1311,16 @@ public final class DeckPopoverModel: ObservableObject {
     /// changes go through `onPinMenuBarAccount`, never through this
     /// property's setter.
     @Published public var menuBarPinnedSetting: String = ""
+
+    /// Issue #242: whether the Availability Health chips render the verdict
+    /// word beside the shape-coded dot. Default false — dot only; the dot's
+    /// shape (shared `AvailabilityVerdictShape` coding) keeps the verdict
+    /// non-color-reliant, and the word stays one click away in the detail
+    /// popover. Mirrored from the daemon-confirmed `deckHealthLabels`
+    /// setting by the app's settings apply (plain assignment, same
+    /// no-echo contract as `menuBarPinnedSetting`); toggled in Settings →
+    /// General → Accessibility.
+    @Published public var showsHealthVerdictLabels = false
 
     /// Fired when a card's context menu picks a new pin value ("" = unpin,
     /// account id, or a follow-active sentinel). The app wires it to

@@ -143,9 +143,14 @@ public final class MenuBarStatusModel: ObservableObject {
         // direction.
         if let pinnedAccountId,
            let healthProvider = MenuBarPinResolver.healthProvider(pinnedAccountId) {
+            // Issue #244: the dot reads the burst-aware verdict — the same
+            // report source as the popover chip, so a burst-degraded
+            // YELLOW shows in the menu bar with no extra wiring.
+            let now = clock()
             let verdict = deckState.flatMap {
                 AvailabilityHealthEngine.report(
-                    for: healthProvider, state: $0, now: clock()
+                    for: healthProvider, state: $0, now: now,
+                    burstPointsPerDay: burnWindow.burstRate(for: healthProvider, now: now)
                 ).verdict
             }
             // Issue #238 quiet mode: "When yellow or worse" / "Only when
@@ -212,6 +217,28 @@ public final class MenuBarStatusModel: ObservableObject {
     /// `apply(deckState:)`) with the new worst-remaining + deck state. The
     /// app wires the notification coordinator here (issue #7).
     public var onStateUpdate: ((WorstRemaining?, DeckState?) -> Void)?
+
+    /// Issue #244: the rolling short-window burn-rate store ("today's
+    /// rate"). Fed by `recordBurnSample` from the app's fresh-state hook —
+    /// the same flow that runs reconcileActivation/reconcileWarnings — so
+    /// it sees exactly the states the deck already fetches. No
+    /// persistence: a cold start refills within minutes, and the window
+    /// reports nil (burst logic inactive) until it spans ~30 min.
+    public private(set) var burnWindow = BurnRateWindow()
+
+    /// Records one fresh deck state into the burn window, then recomputes
+    /// the icon so a health-mode dot reflects the burst-aware verdict
+    /// immediately (the hook fires after the refresh's own recompute).
+    public func recordBurnSample(state: DeckState) {
+        burnWindow.record(state: state, now: clock())
+        recomputeIconState()
+    }
+
+    /// The provider's current short-window burn rate (pts/day); nil while
+    /// the window is inactive. The popover feeds this into the engine.
+    public func burstRate(for provider: DeckProvider) -> Double? {
+        burnWindow.burstRate(for: provider, now: clock())
+    }
 
     private let evaluator: any UsageEvaluating
     private let stateProvider: (any DeckStateProviding)?

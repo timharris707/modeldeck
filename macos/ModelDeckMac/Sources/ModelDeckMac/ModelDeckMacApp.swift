@@ -22,6 +22,10 @@ struct ModelDeckMacApp: App {
     /// Issue #121: in-app install state ("Update Now" + the automatic-install
     /// toggle). The Sparkle driver only exists in fully configured bundles.
     @StateObject private var appUpdateInstallModel: AppUpdateInstallModel
+    /// Issue #241: the staged-update restart prompt (banner → badge) over
+    /// the shared install model — always-on installs must never hold a
+    /// silently staged update.
+    @StateObject private var appUpdateStagedPrompt: AppUpdateStagedPromptModel
     /// Keeps the SPUUpdater alive for the app's lifetime (the install model
     /// holds it weakly on purpose — the seam must never own Sparkle).
     private let sparkleDriver: SparkleUpdateDriver?
@@ -122,6 +126,18 @@ struct ModelDeckMacApp: App {
         ) { notification in
             await AppUpdateNotificationPoster().post(notification)
         }
+        // Issue #241: a background update that finishes staging must OFFER a
+        // restart instead of waiting silently for a relaunch that never
+        // happens on an always-running menu-bar app. Observes the shared
+        // install model's phase; prompts once per staged version (deck
+        // banner + user notification), degrades to the passive header badge
+        // on dismissal, and its Restart drives the existing #163 explicit
+        // quit→install→relaunch path.
+        let appUpdateStagedPrompt = AppUpdateStagedPromptModel(
+            installModel: appUpdateInstallModel
+        ) { notification in
+            Task { await AppUpdateStagedNotificationPoster().post(notification) }
+        }
         let notifications = UsageNotificationCoordinator(poster: UserNotificationCenterPoster())
         // Issue #96: all seams live (SMAppService agent, Keychain, launchctl,
         // /api/health probe); in dev builds without a bundled daemon manifest
@@ -171,6 +187,10 @@ struct ModelDeckMacApp: App {
                 // display-only; notifications keep watching every account.
                 statusModel?.showWhen = settings.menuBarShowWhen
                 deckModel?.menuBarPinnedSetting = settings.menuBarAccountId
+                // Issue #242: deck chip verdict labels (Accessibility
+                // toggle) — display-only; unknown stored values read as
+                // the dot-only default.
+                deckModel?.showsHealthVerdictLabels = settings.deckHealthLabelsMode.showsVerdictWord
                 notifications?.thresholds = settings.usageThresholds
             }
             statusModel?.startAutoRefresh(interval: settings.effectiveAutoRefreshInterval)
@@ -192,7 +212,7 @@ struct ModelDeckMacApp: App {
             }
         }
         // Every fresh daemon state feeds the notification transition check.
-        statusModel.onStateUpdate = { [weak notifications, weak statusModel, weak deckModel, weak daemonSetupModel] worst, state in
+        statusModel.onStateUpdate = { [weak notifications, weak statusModel, weak deckModel, weak daemonSetupModel, weak appUpdateStagedPrompt] worst, state in
             Task { @MainActor [weak notifications] in
                 await notifications?.evaluate(worst: worst, state: state)
             }
@@ -203,6 +223,12 @@ struct ModelDeckMacApp: App {
             // refreshed, keychain granted, cadence cap lifted) is dismissed
             // at the model, and the one-at-a-time slot can never desync.
             if let statusModel, let deckModel, let state {
+                // Issue #244: every fresh state feeds the burn-rate window
+                // ("today's rate") — same hook as the reconciles below, no
+                // new polling. The record call also recomputes the icon so
+                // a health-mode dot picks up a burst-degraded verdict from
+                // THIS sample, not the next refresh's.
+                statusModel.recordBurnSample(state: state)
                 // Issue #228: a fresh daemon state that contradicts a
                 // leftover optimistic activation override clears it — the
                 // deck must never keep a ✓ the daemon disowns once no
@@ -220,7 +246,11 @@ struct ModelDeckMacApp: App {
                     // chip.
                     healthChipProviders: deckModel.layout == .twoColumn
                         && !deckModel.isDeckEmpty(state: state)
-                        ? [.claude, .codex] : []
+                        ? [.claude, .codex] : [],
+                    // Issue #241: the staged-update badge's Restart popover
+                    // is released once the badge itself is gone (restart
+                    // clicked, or the staged phase cleared).
+                    updateBadgeVisible: appUpdateStagedPrompt?.isBadgeVisible ?? false
                 )
             }
             // Issue #185: a daemon running from a since-deleted bundle keeps
@@ -346,6 +376,7 @@ struct ModelDeckMacApp: App {
         _appUpdateModel = StateObject(wrappedValue: appUpdateModel)
         _appUpdateAutoChecker = StateObject(wrappedValue: appUpdateAutoChecker)
         _appUpdateInstallModel = StateObject(wrappedValue: appUpdateInstallModel)
+        _appUpdateStagedPrompt = StateObject(wrappedValue: appUpdateStagedPrompt)
         self.sparkleDriver = sparkleDriver
         _notifications = StateObject(wrappedValue: notifications)
         _daemonSetupModel = StateObject(wrappedValue: daemonSetupModel)
@@ -387,6 +418,7 @@ struct ModelDeckMacApp: App {
                 signInModel: signInModel,
                 appUpdateModel: appUpdateModel,
                 appUpdateInstallModel: appUpdateInstallModel,
+                stagedPromptModel: appUpdateStagedPrompt,
                 setupModel: daemonSetupModel,
                 launchAtLoginModel: launchAtLoginModel
             )

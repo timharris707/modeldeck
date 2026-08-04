@@ -402,3 +402,19 @@ test('menuBarShowWhen accepts short strings and rejects everything else', () => 
     assert.throws(() => store.saveSettings({ menuBarShowWhen: 'x'.repeat(65) }), /menuBarShowWhen/);
   } finally { store.close(); }
 });
+
+// Issue #242 deck chip labels: same free-string discipline again — the app
+// owns the grammar ('' = dot only, 'show' = dot + verdict word), the store
+// validates only string/length so old and new builds round-trip each
+// other's values.
+test('deckHealthLabels accepts short strings and rejects everything else', () => {
+  const store = new Store(':memory:');
+  try {
+    assert.equal(store.getSettings().deckHealthLabels, '');
+    assert.equal(store.saveSettings({ deckHealthLabels: 'show' }).deckHealthLabels, 'show');
+    assert.equal(store.saveSettings({ deckHealthLabels: '' }).deckHealthLabels, '');
+    assert.throws(() => store.saveSettings({ deckHealthLabels: 42 }), /deckHealthLabels/);
+    assert.throws(() => store.saveSettings({ deckHealthLabels: null }), /deckHealthLabels/);
+    assert.throws(() => store.saveSettings({ deckHealthLabels: 'x'.repeat(65) }), /deckHealthLabels/);
+  } finally { store.close(); }
+});

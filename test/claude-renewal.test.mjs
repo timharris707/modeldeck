@@ -148,6 +148,52 @@ test('renewal preconditions return distinct decided outcomes without invoking Cl
     } finally { data.close(); }
   });
 
+  await t.test('a base URL alongside a credential override still declines renewal', async () => {
+    const data = fixture();
+    try {
+      data.expire();
+      fs.writeFileSync(path.join(data.targetHome, 'settings.json'), JSON.stringify({
+        env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8317', ANTHROPIC_API_KEY: 'placeholder-never-read-back' },
+      }));
+      const renew = await data.service.renewClaudeAccount(data.target.id);
+      assert.equal(renew.outcome, 'auth-overridden');
+      assert.equal(renew.mechanism, null);
+      assert.equal(data.calls.length, 0);
+    } finally { data.close(); }
+  });
+
+});
+
+test('a base-URL-only proxy route renews with the invocation pinned back to Anthropic', async () => {
+  let probes = 0;
+  const data = fixture({
+    serviceOptions: {
+      listProviderProcesses: async () => ['claude'],
+      fetchClaude: async () => {
+        probes += 1;
+        if (probes === 1) throw new Error(EXPIRED);
+        return SNAPSHOTS;
+      },
+    },
+  });
+  try {
+    data.expire();
+    fs.writeFileSync(path.join(data.targetHome, 'settings.json'), JSON.stringify({
+      env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8317' },
+    }));
+    const renew = await data.service.renewClaudeAccount(data.target.id);
+    assert.equal(renew.outcome, 'renewed');
+    assert.equal(renew.mechanism, 'invoke');
+    assert.equal(renew.path, 'no-flip');
+    assert.deepEqual(data.calls.map((call) => call.args), [
+      ['auth', 'status', '--json'],
+      ['-p', 'ok', '--model', 'claude-haiku-4-5-20251001',
+        '--settings', '{"env":{"ANTHROPIC_BASE_URL":"https://api.anthropic.com"}}'],
+    ]);
+    assertPinnedRenewalCalls(data);
+    const account = (await data.service.state()).accounts.find((item) => item.id === data.target.id);
+    assert.equal(account.renew.authOverride, false);
+  } finally { data.close(); }
 });
 
 test('the no-flip identity gate accepts matching email or account UUID and rejects missing or contradictory identity', async (t) => {

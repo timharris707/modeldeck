@@ -125,52 +125,24 @@ public enum MenuBarIconRenderer {
     }
 
     /// The shape-coded status dot: circle / triangle / octagon so the
-    /// verdict never relies on color alone.
+    /// verdict never relies on color alone. The mapping and geometry live in
+    /// `AvailabilityVerdictShape` (#242) — shared with the deck chip's dot,
+    /// so the two surfaces can never drift apart.
     private static func drawVerdictDot(_ verdict: AvailabilityVerdict?, in rect: NSRect) {
+        let shape = AvailabilityVerdictShape.shape(for: verdict)
+        let path = NSBezierPath(cgPath: shape.path(in: rect))
         switch verdict {
-        case .green:
-            NSColor.systemGreen.setFill()
-            NSBezierPath(ovalIn: rect).fill()
-        case .yellow:
-            warningColor.setFill()
-            trianglePath(in: rect).fill()
-        case .red:
-            criticalColor.setFill()
-            octagonPath(in: rect).fill()
-        case nil:
-            NSColor.secondaryLabelColor.setStroke()
-            let ring = NSBezierPath(ovalIn: rect.insetBy(dx: 0.75, dy: 0.75))
-            ring.lineWidth = 1.5
-            ring.stroke()
+        case .green: NSColor.systemGreen.setFill()
+        case .yellow: warningColor.setFill()
+        case .red: criticalColor.setFill()
+        case nil: NSColor.secondaryLabelColor.setStroke()
         }
-    }
-
-    private static func trianglePath(in rect: NSRect) -> NSBezierPath {
-        let path = NSBezierPath()
-        path.move(to: NSPoint(x: rect.midX, y: rect.maxY))
-        path.line(to: NSPoint(x: rect.maxX, y: rect.minY))
-        path.line(to: NSPoint(x: rect.minX, y: rect.minY))
-        path.close()
-        return path
-    }
-
-    private static func octagonPath(in rect: NSRect) -> NSBezierPath {
-        let inset = rect.width * 0.29
-        let points = [
-            NSPoint(x: rect.minX + inset, y: rect.minY),
-            NSPoint(x: rect.maxX - inset, y: rect.minY),
-            NSPoint(x: rect.maxX, y: rect.minY + inset),
-            NSPoint(x: rect.maxX, y: rect.maxY - inset),
-            NSPoint(x: rect.maxX - inset, y: rect.maxY),
-            NSPoint(x: rect.minX + inset, y: rect.maxY),
-            NSPoint(x: rect.minX, y: rect.maxY - inset),
-            NSPoint(x: rect.minX, y: rect.minY + inset),
-        ]
-        let path = NSBezierPath()
-        path.move(to: points[0])
-        for point in points.dropFirst() { path.line(to: point) }
-        path.close()
-        return path
+        if shape.isStroked {
+            path.lineWidth = AvailabilityVerdictShape.ringLineWidth
+            path.stroke()
+        } else {
+            path.fill()
+        }
     }
 
     /// The single composite the status bar shows: glyph + colored text.
