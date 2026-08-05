@@ -334,24 +334,111 @@ public enum MenuBarSourceResolver {
     /// `resolvedPinnedAccountID` is `resolve(pinnedSetting, in: state)` —
     /// passed in (rather than recomputed) so the copy is keyed on the same
     /// resolution the marked row was chosen by.
+    /// Issue #249: `windowTitle`, when the menu bar is currently showing a
+    /// percent from this account, names the WINDOW feeding that number —
+    /// the checkmark named the account but not the window, which is exactly
+    /// the half that read as a mix-up when the cards were toggled to a
+    /// different headline window.
     public static func checkmarkTooltip(
         pinnedSetting: String?,
         resolvedPinnedAccountID: String?,
-        accountID: String
+        accountID: String,
+        windowTitle: String? = nil
     ) -> String {
-        guard let pinnedSetting, !pinnedSetting.isEmpty else {
-            return "Shown in the menu bar — currently the lowest % left across accounts"
-        }
-        guard resolvedPinnedAccountID == accountID else {
+        let base: String
+        if pinnedSetting == nil || pinnedSetting?.isEmpty == true {
+            base = "Shown in the menu bar — currently the lowest % left across accounts"
+        } else if resolvedPinnedAccountID != accountID {
             // The stored pin didn't resolve; this row won the lowest-across
             // fallback (#123).
-            return "Shown in the menu bar — the pinned selection isn't available, "
+            base = "Shown in the menu bar — the pinned selection isn't available, "
                 + "so the lowest % left across accounts is shown"
+        } else if pinnedSetting?.hasPrefix("active:") == true {
+            base = "Shown in the menu bar — following the active account"
+        } else {
+            base = "Shown in the menu bar — pinned (right-click to unpin)"
         }
-        if pinnedSetting.hasPrefix("active:") {
-            return "Shown in the menu bar — following the active account"
+        guard let windowTitle else { return base }
+        return base + ". Its \(windowTitle) is the number in the menu bar."
+    }
+
+    // MARK: - Menu bar number traceability (issue #249)
+
+    /// How a scope is NAMED in traceability copy. Normally the card's own
+    /// window title, so the line always matches a row the user can find.
+    /// Spend is the exception (CodeRabbit, PR #250): `WorstRemainingCalculator`
+    /// falls back to a spend scope when an account has no measurable
+    /// rate-limit window, and calling a budget a "limit window" would be a
+    /// lie in exactly the state the traceability copy exists to clarify.
+    public static func windowDescriptor(for scope: String) -> String {
+        let title = DeckBuilder.windowTitle(for: scope)
+        return UsageScope.isSpend(scope) ? "\(title) budget" : title
+    }
+
+    /// Issue #249 (Tim's 2026-08-04 field report): the menu bar read "36%"
+    /// while no visible card showed 36 — the cards were toggled to the
+    /// model-window headline, so the same account headlined "Weekly · Fable
+    /// 81%" and the number looked like a tracking bug. The data was right;
+    /// nothing said which account/window the number refers to. This is the
+    /// popover's one-line answer, rendered under the header whenever the
+    /// menu bar is showing a percent.
+    public struct NumberSourceLine: Equatable, Sendable {
+        /// The compact caption: "Menu bar 36% — Studio · 5-hour limit".
+        public var text: String
+        /// Hover copy stating the selection RULE for the current mode, in
+        /// the state-honest style of the Settings menu-bar caption.
+        public var tooltip: String
+
+        public init(text: String, tooltip: String) {
+            self.text = text
+            self.tooltip = tooltip
         }
-        return "Shown in the menu bar — pinned (right-click to unpin)"
+    }
+
+    /// Builds the caption for the window currently feeding the menu bar
+    /// percent. `source` is the exact `WorstRemaining` the icon displays
+    /// (`MenuBarStatusModel.menuBarPercentSource`); the pin arguments key
+    /// the tooltip on the same resolution the icon used, like
+    /// `checkmarkTooltip`.
+    public static func numberSourceLine(
+        source: WorstRemaining,
+        accountLabel: String?,
+        pinnedSetting: String?,
+        resolvedPinnedAccountID: String?
+    ) -> NumberSourceLine {
+        let window = windowDescriptor(for: source.scope)
+        let text: String
+        if let accountLabel, !accountLabel.isEmpty {
+            text = "Menu bar \(source.displayPercent)% — \(accountLabel) · \(window)"
+        } else {
+            text = "Menu bar \(source.displayPercent)% — \(window)"
+        }
+        // "Studio's 5-hour limit" / "the 5-hour limit" for tooltip prose.
+        let possessiveWindow: String
+        if let accountLabel, !accountLabel.isEmpty {
+            possessiveWindow = "\(accountLabel)'s \(window)"
+        } else {
+            possessiveWindow = "the \(window)"
+        }
+        // "usage window" rather than "limit window": the same copy has to
+        // stay true when the source is a spend budget (CodeRabbit, PR #250).
+        let tooltip: String
+        if pinnedSetting == nil || pinnedSetting?.isEmpty == true {
+            tooltip = "The menu bar shows the lowest % left across every account and "
+                + "usage window — right now \(possessiveWindow). "
+                + "Right-click a card to pin one account instead."
+        } else if resolvedPinnedAccountID != source.accountId {
+            tooltip = "The pinned selection isn't available, so the menu bar shows the "
+                + "lowest % left across every account — right now \(possessiveWindow)."
+        } else if pinnedSetting?.hasPrefix("active:") == true {
+            tooltip = "The menu bar follows the active account and shows its lowest "
+                + "usage window — right now \(possessiveWindow)."
+        } else {
+            tooltip = "The menu bar is pinned to this account and shows its lowest "
+                + "usage window — right now \(possessiveWindow). "
+                + "Right-click its card to unpin."
+        }
+        return NumberSourceLine(text: text, tooltip: tooltip)
     }
 }
 

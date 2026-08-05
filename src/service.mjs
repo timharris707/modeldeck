@@ -58,7 +58,12 @@ const CLAUDE_RENEWAL_BACKOFF_MS = 30 * 60_000;
 const CLAUDE_RENEWAL_DAY_MS = 24 * 60 * 60_000;
 const CLAUDE_RENEWAL_DAILY_LIMIT = 6;
 const CLAUDE_RENEWAL_MODEL = 'claude-haiku-4-5-20251001';
-const CLAUDE_RENEWAL_BUSY_DETAIL = 'A Claude session is running; ModelDeck will renew at the next quiet moment.';
+// Issue #251 (Tim field report): the busy deferral must READ as what it is —
+// queued automation, nothing for the user to do. The promise leads so the
+// deck card's one-line truncation can never cut it ("Will renew
+// automatically…" survives; the old order truncated to "…ModelDeck will
+// renew…", which read as a failed to-do).
+const CLAUDE_RENEWAL_BUSY_DETAIL = 'Will renew automatically at the next quiet moment — a Claude session is running right now.';
 const CLAUDE_RENEWAL_BUDGET_OUTCOMES = new Set(['renewed', 'failed']);
 const CLAUDE_AUTH_OVERRIDE_KEYS = [
   'ANTHROPIC_API_KEY',

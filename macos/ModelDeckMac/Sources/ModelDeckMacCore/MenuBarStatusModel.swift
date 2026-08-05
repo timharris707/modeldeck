@@ -116,6 +116,39 @@ public final class MenuBarStatusModel: ObservableObject {
         )
     }
 
+    /// Issue #249: the exact window feeding the percent the menu bar is
+    /// CURRENTLY displaying — the traceability anchor for the popover's
+    /// source line and the icon's accessibility label. Mirrors
+    /// `recomputeIconState`'s source order (resolved pin's lowest non-spend
+    /// window, global worst otherwise); nil whenever no percent is shown
+    /// (loading, plain — including quiet-mode hiding — and the icon-only /
+    /// health display modes), because a hidden number needs no explaining.
+    public var menuBarPercentSource: WorstRemaining? {
+        switch iconState {
+        case .pinned, .warning, .critical:
+            break
+        case .loading, .plain, .health:
+            return nil
+        }
+        if let state = deckState, let resolved = resolvedPinnedAccountId {
+            return WorstRemainingCalculator.worstRemaining(in: state, accountId: resolved)
+        }
+        return worstRemaining
+    }
+
+    /// Issue #249: the popover's rendered source caption ("Menu bar 36% —
+    /// Studio · 5-hour limit" plus the mode's rule as hover copy); nil
+    /// whenever the menu bar shows no percent.
+    public var menuBarNumberSourceLine: MenuBarSourceResolver.NumberSourceLine? {
+        guard let source = menuBarPercentSource else { return nil }
+        return MenuBarSourceResolver.numberSourceLine(
+            source: source,
+            accountLabel: deckState?.accounts.first { $0.id == source.accountId }?.label,
+            pinnedSetting: pinnedAccountId,
+            resolvedPinnedAccountID: resolvedPinnedAccountId
+        )
+    }
+
     /// True once any state has landed (refresh success or `apply`); gates
     /// the `.loading` placeholder (issue #58).
     private var hasLoadedOnce = false

@@ -33,6 +33,22 @@ struct MenuBarIconView: View {
             .accessibilityLabel(accessibilityText)
     }
 
+    /// Issue #249: "Studio's 5-hour limit" — the account AND window feeding
+    /// the displayed percent, so the spoken label is as traceable as the
+    /// popover's source line. Nil while no percent is shown (the fallback
+    /// branches below then keep their pre-#249 copy).
+    private var percentSourceText: String? {
+        guard let source = statusModel.menuBarPercentSource else { return nil }
+        let window = MenuBarSourceResolver.windowDescriptor(for: source.scope)
+        // An EMPTY label counts as unavailable, matching numberSourceLine —
+        // otherwise VoiceOver hears "'s 5-hour limit" (CodeRabbit, PR #250).
+        guard let label = statusModel.deckState?.accounts
+            .first(where: { $0.id == source.accountId })?.label,
+              !label.isEmpty
+        else { return "the \(window)" }
+        return "\(label)'s \(window)"
+    }
+
     private var accessibilityText: String {
         switch state {
         case .loading:
@@ -40,13 +56,22 @@ struct MenuBarIconView: View {
         case .plain:
             return "ModelDeck"
         case .pinned(let percent):
+            if let source = percentSourceText {
+                return "ModelDeck: \(percent) percent left on \(source)"
+            }
             if let label = statusModel.pinnedAccountLabel {
                 return "ModelDeck: \(percent) percent left on \(label)"
             }
             return "ModelDeck: \(percent) percent left on the pinned account"
         case .warning(let percent):
+            if let source = percentSourceText {
+                return "ModelDeck: \(percent) percent left on \(source)"
+            }
             return "ModelDeck: \(percent) percent left on the lowest window"
         case .critical(let percent):
+            if let source = percentSourceText {
+                return "ModelDeck: critical, \(percent) percent left on \(source)"
+            }
             return "ModelDeck: critical, \(percent) percent left on the lowest window"
         case .health(let provider, let verdict):
             // Issue #235: speak the provider and verdict, not a percent.

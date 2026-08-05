@@ -169,7 +169,9 @@ struct WindowAnchorDetectionTests {
         ) == .anchored)
     }
 
-    // No duration, no reset, or no percent → never second-guess: anchored.
+    // No duration or no percent → never second-guess: anchored. (The
+    // no-reset case moved to the #247 suite below, where full remaining +
+    // null resetsAt now classifies as a fresh window.)
     @Test func missingInputsStayAnchored() {
         #expect(WindowPresentation.anchor(
             remainingPercent: 100,
@@ -179,19 +181,89 @@ struct WindowAnchorDetectionTests {
             now: now
         ) == .anchored)
         #expect(WindowPresentation.anchor(
-            remainingPercent: 100,
-            resetsAt: nil,
-            observedAt: now,
-            windowDuration: week,
-            now: now
-        ) == .anchored)
-        #expect(WindowPresentation.anchor(
             remainingPercent: nil,
             resetsAt: now.addingTimeInterval(week),
             observedAt: now,
             windowDuration: week,
             now: now
         ) == .anchored)
+    }
+}
+
+// Issue #247 (Tim, 2026-08-04) — after a weekly rollover and before any
+// new usage, Anthropic reports 100% remaining with resetsAt=null on every
+// scope. Under #145 that rendered "100% left" with an EMPTY reset slot,
+// which Tim read as the account not being picked up by the proxy/daemon.
+// The null form is the same fresh-window state #101 named for Codex.
+@Suite("WindowPresentation — null-reset fresh window (issue #247)")
+struct NullResetFreshWindowTests {
+    @Test func fullRemainingWithNullResetIsUnanchored() {
+        #expect(WindowPresentation.anchor(
+            remainingPercent: 100,
+            resetsAt: nil,
+            observedAt: now,
+            windowDuration: week,
+            now: now
+        ) == .unanchored(windowDuration: week))
+        // Same for the 5-hour scope family.
+        #expect(WindowPresentation.anchor(
+            remainingPercent: 100,
+            resetsAt: nil,
+            observedAt: now,
+            windowDuration: fiveHours,
+            now: now
+        ) == .unanchored(windowDuration: fiveHours))
+    }
+
+    // The narrowing that keeps this honest: usage HAS landed but the
+    // provider stated no reset — that is missing data, not a fresh
+    // window, and keeps #145's empty slot.
+    @Test func partialUsageWithNullResetStaysAnchored() {
+        #expect(WindowPresentation.anchor(
+            remainingPercent: 40,
+            resetsAt: nil,
+            observedAt: now,
+            windowDuration: week,
+            now: now
+        ) == .anchored)
+        // The 0.05%-used ceiling is shared with #101's placeholder form.
+        #expect(WindowPresentation.anchor(
+            remainingPercent: 99.5,
+            resetsAt: nil,
+            observedAt: now,
+            windowDuration: week,
+            now: now
+        ) == .anchored)
+    }
+
+    // Unknown percent or unknown duration → no claim either way.
+    @Test func unknownInputsWithNullResetStayAnchored() {
+        #expect(WindowPresentation.anchor(
+            remainingPercent: nil,
+            resetsAt: nil,
+            observedAt: now,
+            windowDuration: week,
+            now: now
+        ) == .anchored)
+        #expect(WindowPresentation.anchor(
+            remainingPercent: 100,
+            resetsAt: nil,
+            observedAt: now,
+            windowDuration: nil,
+            now: now
+        ) == .anchored)
+    }
+
+    // A null-reset fresh window never depends on observedAt — there is no
+    // timestamp to compare it against, so old daemons classify too.
+    @Test func nullResetClassifiesWithoutObservedAt() {
+        #expect(WindowPresentation.anchor(
+            remainingPercent: 100,
+            resetsAt: nil,
+            observedAt: nil,
+            windowDuration: week,
+            now: now
+        ) == .unanchored(windowDuration: week))
     }
 }
 
@@ -229,6 +301,26 @@ struct WindowPresentationCopyTests {
             == "Resets 5 hours after first use")
         #expect(WindowPresentation.unanchoredResetText(windowDuration: 90 * 60)
             == "Resets 90 minutes after first use")
+    }
+
+    // Issue #247: the tooltip must not claim a placeholder timestamp
+    // exists when the provider reported none.
+    @Test func unanchoredTooltipMatchesWhatTheProviderReported() {
+        let placeholder = WindowPresentation.unanchoredTooltip(
+            windowDuration: week,
+            reportsPlaceholder: true
+        )
+        #expect(placeholder.contains("Fresh window"))
+        #expect(placeholder.hasSuffix("a placeholder reset time that shifts on every refresh."))
+
+        let none = WindowPresentation.unanchoredTooltip(
+            windowDuration: week,
+            reportsPlaceholder: false
+        )
+        #expect(none.contains("Fresh window"))
+        #expect(none.contains("7 days"))
+        #expect(none.hasSuffix("no reset time."))
+        #expect(!none.contains("placeholder"))
     }
 
     @Test func rolloverTextJustNowThenClockTime() {
@@ -333,5 +425,32 @@ struct DeckBuilderWindowPresentationTests {
         ))
         #expect(window.anchor == .anchored)
         #expect(window.rolloverText == nil)
+    }
+
+    // Issue #247, the field shape: Anthropic's post-rollover payload —
+    // 100% left, resetsAt absent — must SAY it is a fresh window rather
+    // than leave the slot blank.
+    @Test func nullResetFreshWindowShowsFreshWindowCopy() {
+        let window = build(snapshot(scope: "week", remaining: 100, resetsAt: nil))
+        #expect(window.anchor == .unanchored(windowDuration: week))
+        #expect(window.displayedResetText == "Resets 7 days after first use")
+        #expect(window.resetTooltip.contains("Fresh window"))
+        // No placeholder was reported, so the tooltip must not claim one.
+        #expect(!window.resetTooltip.contains("placeholder"))
+    }
+
+    // The other side of the same payload: every scope reports the state,
+    // so the 5-hour row must not stay blank either.
+    @Test func nullResetFiveHourShowsFreshWindowCopy() {
+        let window = build(snapshot(scope: "5h", remaining: 100, resetsAt: nil))
+        #expect(window.displayedResetText == "Resets 5 hours after first use")
+    }
+
+    // Spend rows keep their empty slot — 100% with no reset there is the
+    // meaningless-spend shape (#28/#139), not a fresh rate-limit window.
+    @Test func nullResetSpendRowStaysEmpty() {
+        let window = build(snapshot(scope: "spend", remaining: 100, resetsAt: nil))
+        #expect(window.anchor == .anchored)
+        #expect(window.displayedResetText == nil)
     }
 }

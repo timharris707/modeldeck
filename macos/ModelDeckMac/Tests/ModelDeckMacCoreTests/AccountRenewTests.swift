@@ -339,10 +339,12 @@ final class AccountRenewTests: XCTestCase {
     func testBusyFallbackMatchesEnginePinnedDetail() {
         // The engine (#199 daemon half) pins busy's detail sentence; a
         // daemon that omits it must read identically — busy is a promise
-        // to renew at the next quiet moment, never a shrug.
+        // to renew at the next quiet moment, never a shrug. Issue #251:
+        // promise-first wording, so the card's one-line truncation can
+        // never cut the automatic part.
         XCTAssertEqual(
             AccountRenew.busyFallback,
-            "A Claude session is running; ModelDeck will renew at the next quiet moment."
+            "Will renew automatically at the next quiet moment — a Claude session is running right now."
         )
         XCTAssertEqual(
             AccountRenew.outcomeText(for: AccountRenewal(outcome: "busy")),

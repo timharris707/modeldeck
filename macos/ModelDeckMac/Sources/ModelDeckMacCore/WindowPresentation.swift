@@ -23,6 +23,15 @@ import Foundation
 //    it needs cross-refresh state for something a single snapshot already
 //    proves, and it cannot classify the FIRST snapshot after launch.
 //
+//    Issue #247 adds the NULL form of the same state: after a rollover and
+//    before the first request, Anthropic's usage API reports 100%
+//    remaining with `resetsAt=null` on every scope — no placeholder at
+//    all. #145 rendered that as an empty reset slot, which Tim read in
+//    the field (2026-08-04) as the account "not getting picked up" by the
+//    proxy/daemon. Detection: zero recorded usage (same ceiling) AND no
+//    `resetsAt`. Partial usage with a null reset is NOT reclassified —
+//    that is genuinely missing data, and keeps the #145 empty slot.
+//
 // 2. RECENTLY ROLLED. A window that expired moments ago shows ~100% left
 //    right after heavy use — factually right, cognitively wrong (Tim's
 //    weekly rolled at 10:19 AM mid-hand-test after a heavy morning).
@@ -43,9 +52,11 @@ import Foundation
 public enum WindowAnchor: Equatable, Sendable {
     /// Normal window: show the provider's reset time as-is.
     case anchored
-    /// No usage this period — the provider's `resetsAt` is a floating
-    /// placeholder (probe time + duration) that drifts on every refresh.
-    /// Show "resets N after first use" copy instead of the fake timestamp.
+    /// No usage this period — the provider's `resetsAt` is either a
+    /// floating placeholder (probe time + duration) that drifts on every
+    /// refresh, or null outright (#247: Anthropic after a rollover).
+    /// Show "resets N after first use" copy instead of the fake timestamp
+    /// (or the confusing blank).
     case unanchored(windowDuration: TimeInterval)
     /// The window rolled at `at` (its inferred start), recently enough
     /// that "100% left" needs the rollover annotation for context.
@@ -105,12 +116,21 @@ public enum WindowPresentation {
         windowDuration: TimeInterval?,
         now: Date
     ) -> WindowAnchor {
-        guard let resetsAt, let windowDuration, windowDuration > 0 else { return .anchored }
-        guard let remainingPercent else { return .anchored }
+        guard let windowDuration, windowDuration > 0, let remainingPercent else { return .anchored }
         let usedPercent = 100 - remainingPercent
 
-        // Unanchored: zero usage + resetsAt sits exactly one window length
-        // after the probe that produced it.
+        // Unanchored, null form (#247): full remaining and no resetsAt at
+        // all — an untouched window whose provider omits even the
+        // placeholder. Partial usage with a null reset stays .anchored
+        // (missing data, not a fresh window; the slot renders empty per #145).
+        guard let resetsAt else {
+            return usedPercent <= unanchoredMaxUsedPercent
+                ? .unanchored(windowDuration: windowDuration)
+                : .anchored
+        }
+
+        // Unanchored, placeholder form: zero usage + resetsAt sits exactly
+        // one window length after the probe that produced it.
         let reference = observedAt ?? now
         if usedPercent <= unanchoredMaxUsedPercent,
            abs(resetsAt.timeIntervalSince(reference) - windowDuration) <= unanchoredTolerance {
@@ -154,10 +174,18 @@ public enum WindowPresentation {
 
     /// Hover tooltip for an unanchored window — explains WHY there is no
     /// timestamp (the backstop tooltip normally carries the absolute time).
-    public static func unanchoredTooltip(windowDuration: TimeInterval) -> String {
-        "Fresh window — no usage in this period yet. The \(durationPhrase(windowDuration)) "
+    /// `reportsPlaceholder` picks the honest trailing clause: the #101 form
+    /// reports a drifting placeholder, the #247 null form reports nothing.
+    public static func unanchoredTooltip(
+        windowDuration: TimeInterval,
+        reportsPlaceholder: Bool
+    ) -> String {
+        let tail = reportsPlaceholder
+            ? "a placeholder reset time that shifts on every refresh."
+            : "no reset time."
+        return "Fresh window — no usage in this period yet. The \(durationPhrase(windowDuration)) "
             + "countdown starts with the first request; until then the provider reports "
-            + "a placeholder reset time that shifts on every refresh."
+            + tail
     }
 
     /// The rollover annotation: "Week reset just now" within five minutes,

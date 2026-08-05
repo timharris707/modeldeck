@@ -48,6 +48,7 @@ struct DeckPopoverView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
+            menuBarSourceLine
             stagedUpdateBanner
             connectionBanner
             installProgressLine
@@ -114,6 +115,8 @@ struct DeckPopoverView: View {
             // corner is the deck's only always-rendered chrome.
             updateReadyBadge
 
+            weeklyFocusControl
+
             sortControl
 
             Menu {
@@ -164,6 +167,67 @@ struct DeckPopoverView: View {
             .menuStyle(.borderlessButton)
             .fixedSize()
         }
+    }
+
+    /// Issue #249 (Tim's 2026-08-04 field report): the menu bar read "36%"
+    /// while the cards, toggled to the model-window headline, showed 81%
+    /// for the same account — the number looked like a tracking bug. This
+    /// muted caption is the answer to "what is that number?": it names the
+    /// account and WINDOW feeding the menu bar percent, and its tooltip
+    /// states the mode's selection rule. Rendered only while the menu bar
+    /// is actually showing a percent — a hidden number needs no explaining,
+    /// and the icon-only / health modes keep their clean chrome.
+    @ViewBuilder
+    private var menuBarSourceLine: some View {
+        if let line = statusModel.menuBarNumberSourceLine {
+            Text(line.text)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .help(line.tooltip)
+        }
+    }
+
+    /// Issue #254 (Tim, 2026-08-05): the window-focus toggle. ON makes every
+    /// Claude card headline "Weekly · all models"; OFF restores whatever the
+    /// card showed before (the model window when the Settings preference is
+    /// on — so for that setup the button reads as the plain Fable ↔ Weekly
+    /// switch it was asked for). Same visual language as the #30/#178 sort
+    /// segments — one 16pt icon segment, selected background when active,
+    /// tooltip and accessibility carrying the words — so the header gains a
+    /// control, not a new idiom. Claude-only by construction (see
+    /// `DeckAccountRow.worstWindow`); the glyph is a calendar because the
+    /// thing it selects is the weekly window.
+    private var weeklyFocusControl: some View {
+        let isOn = deckModel.focusGeneralWeeklyHeadline
+        return Button {
+            deckModel.toggleGeneralWeeklyFocus()
+        } label: {
+            Image(systemName: "calendar")
+                .font(.system(size: 10, weight: .medium))
+                .frame(height: 16)
+                .padding(.horizontal, 6)
+                .contentShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(isOn ? Color(nsColor: .controlBackgroundColor) : .clear)
+                        .shadow(color: .black.opacity(isOn ? 0.15 : 0), radius: 0.75, y: 0.5)
+                )
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(isOn ? Color.primary : Color.secondary)
+        .padding(1)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color(nsColor: .quaternarySystemFill))
+        )
+        .fixedSize()
+        .help(isOn
+            ? "Claude cards are showing the weekly (all models) window. Click to go back."
+            : "Show the weekly (all models) window on Claude cards instead of the model window.")
+        .accessibilityLabel("Weekly window on Claude cards")
+        .accessibilityValue(isOn ? "on" : "off")
+        .accessibilityAddTraits(isOn ? [.isButton, .isSelected] : .isButton)
     }
 
     /// Issue #178 (Tim): the compact icon-segment sort control, hand-rolled
@@ -396,11 +460,19 @@ struct DeckPopoverView: View {
             // mark from the same value and can never disagree. The tooltip
             // is likewise single-valued: only the source row renders it.
             let sourceID = statusModel.menuBarSourceAccountId
-            let sourceTooltip = sourceID.map {
+            // Issue #249: when the menu bar is showing this account's
+            // percent, the tooltip also names the WINDOW feeding it.
+            let numberSource = statusModel.menuBarPercentSource
+            let sourceTooltip = sourceID.map { id in
                 MenuBarSourceResolver.checkmarkTooltip(
                     pinnedSetting: statusModel.pinnedAccountId,
                     resolvedPinnedAccountID: statusModel.resolvedPinnedAccountId,
-                    accountID: $0
+                    accountID: id,
+                    windowTitle: numberSource.flatMap {
+                        $0.accountId == id
+                            ? MenuBarSourceResolver.windowDescriptor(for: $0.scope)
+                            : nil
+                    }
                 )
             } ?? ""
             switch deckModel.layout {

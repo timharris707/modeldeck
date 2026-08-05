@@ -123,7 +123,11 @@ public enum AccountRenew {
     /// sentence for the deferred case, so a daemon that omits `detail`
     /// reads identically to one that sends it — busy is a promise to renew
     /// at the next quiet moment, never a shrug.
-    public static let busyFallback = "A Claude session is running; ModelDeck will renew at the next quiet moment."
+    /// Issue #251 (Tim field report): promise-first wording — the automatic
+    /// part must lead so the card's one-line truncation can never cut it;
+    /// the old order truncated to "…ModelDeck will renew…", which read as a
+    /// failed to-do instead of queued automation.
+    public static let busyFallback = "Will renew automatically at the next quiet moment — a Claude session is running right now."
 
     /// Issue #199: the outcome families the click site styles differently
     /// (busy prominent-and-calm, renewed a quiet confirmation, failures

@@ -208,7 +208,10 @@ struct DeckBuilderTests {
         #expect(row?.worstWindow?.resetText == "no reset data")
     }
 
-    @Test func noResetAnywhereStillSaysNoResetData() {
+    @Test func noResetAnywhereFallsBackToDisplayOrder() {
+        // No tied window carries a real reset, so the pick is display order.
+        // Issue #247: both windows are full with no resetsAt — a fresh
+        // window — so the headline says so instead of going blank.
         let state = DeckState(
             accounts: [account("m1", provider: "claude", label: "Studio")],
             usage: [
@@ -218,7 +221,7 @@ struct DeckBuilderTests {
         )
         let row = DeckBuilder.rows(state: state, now: now).first
         #expect(row?.worstWindow?.scope == "5h") // display-order fallback
-        #expect(row?.worstWindow?.resetText == "no reset data")
+        #expect(row?.worstWindow?.resetText == "Resets 5 hours after first use")
     }
 
     @Test func spendStaysExcludedFromTieBreak() {
@@ -852,6 +855,41 @@ struct DeckPopoverModelTests {
         #expect(DeckPopoverModel(defaults: defaults).showAccountEmails == true)
         model.showAccountEmails = false
         #expect(DeckPopoverModel(defaults: defaults).showAccountEmails == false)
+    }
+
+    // Issue #254: the header's weekly-window toggle is a view preference
+    // like the rest — default off (so no install's headline changes on
+    // upgrade), flipped by the header button, persisted app-locally so the
+    // choice survives closing the popover.
+    @Test func weeklyFocusDefaultsOffAndTogglesBothWays() {
+        let model = DeckPopoverModel(defaults: freshDefaults())
+        #expect(model.focusGeneralWeeklyHeadline == false)
+        model.toggleGeneralWeeklyFocus()
+        #expect(model.focusGeneralWeeklyHeadline == true)
+        model.toggleGeneralWeeklyFocus()
+        #expect(model.focusGeneralWeeklyHeadline == false)
+    }
+
+    @Test func weeklyFocusPersistsAcrossInstances() {
+        let defaults = freshDefaults()
+        let model = DeckPopoverModel(defaults: defaults)
+        model.toggleGeneralWeeklyFocus()
+        #expect(DeckPopoverModel(defaults: defaults).focusGeneralWeeklyHeadline == true)
+        model.toggleGeneralWeeklyFocus()
+        #expect(DeckPopoverModel(defaults: defaults).focusGeneralWeeklyHeadline == false)
+    }
+
+    @Test func weeklyFocusIsIndependentOfTheSettingsModelWindowPreference() {
+        // The two are layered, not exclusive: the header toggle overrides
+        // the Settings preference while it's on and hands it back when off.
+        let defaults = freshDefaults()
+        let model = DeckPopoverModel(defaults: defaults)
+        model.preferModelWindowHeadline = true
+        model.toggleGeneralWeeklyFocus()
+        #expect(model.preferModelWindowHeadline == true)
+        #expect(model.focusGeneralWeeklyHeadline == true)
+        model.toggleGeneralWeeklyFocus()
+        #expect(model.preferModelWindowHeadline == true)
     }
 
     // Issue #226: the deck's "Add Account…" entry points (empty-state CTA
@@ -1780,10 +1818,32 @@ struct DeckMenuBarPinTests {
 // rollover annotations, and provider-stated timestamps are preserved.
 @Suite("No reset placeholder on any row (issue #145)")
 struct NoResetPlaceholderTests {
-    @Test func unusedFiveHourAndModelWeeklyWithoutResetShowEmptySlot() {
-        // The live screenshot's shape: 100%-left windows the provider gave
-        // no resetsAt for (no active session) — the exact rows that showed
-        // "no reset data" and where the absence is self-explanatory.
+    // Issue #247 narrowed this case: 100%-left windows with no resetsAt are
+    // a FRESH WINDOW, and now say so (see NullResetFreshWindowTests). The
+    // #145 rule still governs every window that isn't provably fresh — a
+    // scope whose duration is unknowable can't be classified, so it keeps
+    // the empty slot and the never-rendered internal fallback string.
+    @Test func unknownScopeWithoutResetShowsEmptySlot() {
+        let state = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio")],
+            usage: [snapshot("c1", scope: "mystery", remaining: 100, resetsIn: nil)]
+        )
+        let row = DeckBuilder.rows(state: state, now: now)[0]
+        let window = row.windows[0]
+        #expect(window.displayedResetText == nil, "\(window.scope) must render an empty slot")
+        // The stored fallback string survives internally; it just never
+        // reaches a row anymore.
+        #expect(window.resetText == "no reset data")
+        // Collapsed summary is the bare title — no "· no reset data" tail.
+        #expect(row.worstSummary == row.worstWindow?.title)
+        #expect(row.worstSummary?.contains("no reset data") == false)
+    }
+
+    // Issue #247, Tim's field case: a Claude account whose weekly window
+    // has reset with no usage since reports 100% + null resetsAt on EVERY
+    // scope. Blank slots read as "the account isn't being picked up"; the
+    // card must state the fresh window instead.
+    @Test func freshWindowAfterResetIsNamedOnEveryScope() {
         let state = DeckState(
             accounts: [account("c1", provider: "claude", label: "Studio")],
             usage: [
@@ -1793,14 +1853,11 @@ struct NoResetPlaceholderTests {
         )
         let row = DeckBuilder.rows(state: state, now: now)[0]
         for window in row.windows {
-            #expect(window.displayedResetText == nil, "\(window.scope) must render an empty slot")
-            // The stored fallback string survives internally; it just never
-            // reaches a row anymore.
-            #expect(window.resetText == "no reset data")
+            #expect(window.displayedResetText?.hasSuffix("after first use") == true,
+                    "\(window.scope) must name the fresh window, not render blank")
         }
-        // Collapsed summary is the bare title — no "· no reset data" tail.
-        #expect(row.worstSummary == row.worstWindow?.title)
-        #expect(row.worstSummary?.contains("no reset data") == false)
+        // The collapsed card carries it too — that is the surface Tim read.
+        #expect(row.worstSummary?.contains("after first use") == true)
     }
 
     @Test func partiallyUsedWindowWithoutResetShowsLabelAndPercentCleanly() {
@@ -1987,6 +2044,114 @@ struct ModelWindowHeadlineTests {
             ]
         )
         let row = DeckBuilder.rows(state: state, now: now, preferModelWindowHeadline: true).first
+        #expect(row?.worstWindow?.scope == "5h")
+    }
+}
+
+// MARK: - Weekly-window header toggle (issue #254, Tim 2026-08-05)
+
+/// The deck header's window toggle: ON binds Claude cards to the GENERAL
+/// weekly window ("Weekly · all models"); OFF restores whatever the card
+/// showed before, so with the model-window preference on the button is the
+/// plain Fable ↔ Weekly switch Tim asked for. Claude only, never hides a
+/// card's only data, and every derived value follows the binding window
+/// (the #43 "visible order matches visible text" invariant).
+@Suite("Weekly-window header toggle (issue #254)")
+struct WeeklyWindowToggleTests {
+    /// Tim's live deck shape: a Claude account whose Fable weekly is spent
+    /// while its general weekly still has room — exactly the capacity the
+    /// proxy's split routing reclaimed and the all-Fable deck hid.
+    private func splitRoutingState() -> DeckState {
+        DeckState(
+            accounts: [
+                account("c1", provider: "claude", label: "Insight", isDefault: true),
+                account("x1", provider: "codex", label: "Codex One"),
+            ],
+            usage: [
+                snapshot("c1", scope: "5h", remaining: 100, resetsIn: 3 * 3600),
+                snapshot("c1", scope: "week", remaining: 43, resetsIn: 4 * 86_400),
+                snapshot("c1", scope: "Fable weekly", remaining: 3, resetsIn: 2 * 86_400),
+                // Codex reports a model-scoped weekly too (the 0.3.15 report):
+                // the toggle must never touch it.
+                snapshot("x1", scope: "week", remaining: 26, resetsIn: 3 * 86_400),
+                snapshot("x1", scope: "GPT-Codex weekly", remaining: 90, resetsIn: 3 * 86_400),
+            ]
+        )
+    }
+
+    @Test func toggleOffLeavesTheModelWindowHeadline() {
+        // The state Tim clicks FROM: model-window preference on, Fable shown.
+        let row = DeckBuilder.rows(
+            state: splitRoutingState(), now: now, preferModelWindowHeadline: true
+        ).first { $0.account.id == "c1" }
+        #expect(row?.prefersGeneralWeeklyHeadline == false)
+        #expect(row?.worstWindow?.scope == "Fable weekly")
+    }
+
+    @Test func toggleOnHeadlinesTheGeneralWeeklyAndSortKeysFollow() {
+        let row = DeckBuilder.rows(
+            state: splitRoutingState(), now: now,
+            preferModelWindowHeadline: true, preferGeneralWeeklyHeadline: true
+        ).first { $0.account.id == "c1" }
+        #expect(row?.worstWindow?.scope == "week")
+        #expect(row?.worstSummary?.hasPrefix("Weekly · all models") == true)
+        // Issue #43 invariant: sort keys are the DISPLAYED window's, so the
+        // deck's order still matches the text on the cards.
+        #expect(row?.lowestRemaining == 43)
+        #expect(row?.displayedReset == DeckDateParsing.date(from: iso(4 * 86_400)))
+    }
+
+    @Test func toggleOnWinsOverAMuchLowerBurstWindow() {
+        // The point of the toggle: it names a window, it is not a "worst"
+        // search — a 2% five-hour window must not steal the headline back.
+        let state = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio")],
+            usage: [
+                snapshot("c1", scope: "5h", remaining: 2, resetsIn: 30 * 60),
+                snapshot("c1", scope: "week", remaining: 66, resetsIn: 5 * 86_400),
+                snapshot("c1", scope: "Fable weekly", remaining: 34, resetsIn: 5 * 86_400),
+            ]
+        )
+        let row = DeckBuilder.rows(state: state, now: now, preferGeneralWeeklyHeadline: true).first
+        #expect(row?.worstWindow?.scope == "week")
+    }
+
+    @Test func codexCardsAreUntouched() {
+        let row = DeckBuilder.rows(
+            state: splitRoutingState(), now: now,
+            preferModelWindowHeadline: true, preferGeneralWeeklyHeadline: true
+        ).first { $0.account.id == "x1" }
+        // Codex keeps its lowest-window headline regardless of either
+        // preference — its "week" here is lowest, and it got there by the
+        // ordinary rule, not by the Claude-only filter.
+        #expect(row?.worstWindow?.scope == "week")
+        #expect(row?.provider == .codex)
+    }
+
+    @Test func aCardWithNoGeneralWeeklyKeepsItsOnlyData() {
+        // No view preference may hide the only data a card has.
+        let state = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio")],
+            usage: [
+                snapshot("c1", scope: "5h", remaining: 44, resetsIn: 3600),
+                snapshot("c1", scope: "Fable weekly", remaining: 12, resetsIn: 86_400),
+            ]
+        )
+        let row = DeckBuilder.rows(state: state, now: now, preferGeneralWeeklyHeadline: true).first
+        #expect(row?.worstWindow?.scope == "Fable weekly")
+    }
+
+    @Test func anUnmeasurableGeneralWeeklyFallsBackRatherThanBlanking() {
+        // A percentless "week" row is not a headline: the toggle must fall
+        // through to today's pick instead of binding to a blank window.
+        let state = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio")],
+            usage: [
+                snapshot("c1", scope: "5h", remaining: 51, resetsIn: 3600),
+                snapshot("c1", scope: "week", remaining: nil),
+            ]
+        )
+        let row = DeckBuilder.rows(state: state, now: now, preferGeneralWeeklyHeadline: true).first
         #expect(row?.worstWindow?.scope == "5h")
     }
 }

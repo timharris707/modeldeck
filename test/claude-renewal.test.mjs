@@ -13,7 +13,8 @@ const SNAPSHOTS = [{ scope: 'weekly', usedPercent: 10, source: 'fixture' }];
 const TARGET_EMAIL = 'target@example.invalid';
 const TARGET_UUID = 'uuid-target';
 const MATCHING_STATUS = JSON.stringify({ email: TARGET_EMAIL, accountUuid: TARGET_UUID });
-const BUSY_DETAIL = 'A Claude session is running; ModelDeck will renew at the next quiet moment.';
+// Issue #251: promise-first busy copy, pinned verbatim.
+const BUSY_DETAIL = 'Will renew automatically at the next quiet moment — a Claude session is running right now.';
 
 function fixture(options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-renewal-'));

@@ -166,7 +166,12 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
         // it were still the upcoming reset.
         if let idleRollforward { return idleRollforward.tooltip }
         if case .unanchored(let duration) = anchor {
-            return WindowPresentation.unanchoredTooltip(windowDuration: duration)
+            // #247: the null form (no resetsAt reported) gets its own
+            // trailing clause — "reports a placeholder" would be false.
+            return WindowPresentation.unanchoredTooltip(
+                windowDuration: duration,
+                reportsPlaceholder: resetsAt != nil
+            )
         }
         return DeckBuilder.absoluteResetText(for: resetsAt)
             ?? "The provider didn't report a reset time for this window"
@@ -206,6 +211,9 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
     /// 7 days after first use") — keyed on the anchor, not the date,
     /// because an unanchored window deliberately IGNORES its drifting
     /// `resetsAt` — and any real reset timestamp, which renders as always.
+    /// Issue #247 narrows #145's empty slot: a FULL window with a null
+    /// `resetsAt` now classifies unanchored (fresh window) and shows the
+    /// #101 copy; only partial-usage/unknown windows still render empty.
     public var displayedResetText: String? {
         // Issue #175: the rollforward fact replaces the reset text — the
         // stored `resetsAt` is in the past, so "resetting now" (or a past
@@ -282,6 +290,21 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     /// sort keys, summary, meter — follows the binding window, preserving
     /// the #43 "visible order matches visible text" invariant.
     public var prefersModelWindowHeadline: Bool
+    /// Issue #254 (Tim, 2026-08-05): the deck header's window toggle — when
+    /// ON, Claude cards bind to the GENERAL weekly window ("Weekly · all
+    /// models") instead of whatever they would otherwise headline. It
+    /// OVERRIDES `prefersModelWindowHeadline` rather than competing with it,
+    /// so the header button reads as the plain two-position switch Tim asked
+    /// for (Fable ↔ Weekly) while a fresh install's default headline is
+    /// untouched.
+    ///
+    /// Motivation: the proxy's Fable/non-Fable split routing keeps accounts
+    /// serving Sonnet/Opus on their general weekly quota after their Fable
+    /// weekly is spent — capacity the all-Fable deck rendered invisible.
+    /// Same guard rails as the model-window preference: Claude only, and a
+    /// row with no measurable general weekly keeps today's pick, because no
+    /// view preference may hide the only data a card has.
+    public var prefersGeneralWeeklyHeadline: Bool
 
     public var id: String { account.id }
 
@@ -361,7 +384,13 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
         // grabbing it replaced the real weekly headline with a fresh-window
         // 100%. The directive was always about the Claude/Fable quota;
         // Codex keeps its lowest-window headline regardless of the setting.
-        if prefersModelWindowHeadline, provider == .claude {
+        // Issue #254: the header toggle wins when it's on — it is the more
+        // immediate, explicitly-clicked control, and the two preferences
+        // name mutually exclusive windows (general weekly vs model weekly).
+        if prefersGeneralWeeklyHeadline, provider == .claude {
+            let generalWeekly = eligible.filter { DeckBuilder.windowRank(scope: $0.scope) == 1 }
+            if !generalWeekly.isEmpty { eligible = generalWeekly }
+        } else if prefersModelWindowHeadline, provider == .claude {
             let modelScoped = eligible.filter { DeckBuilder.windowRank(scope: $0.scope) == 2 }
             if !modelScoped.isEmpty { eligible = modelScoped }
         }
@@ -446,7 +475,8 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
         isActive: Bool,
         activationState: ProviderActivationState = .unknown,
         newestObservedAt: Date? = nil,
-        prefersModelWindowHeadline: Bool = false
+        prefersModelWindowHeadline: Bool = false,
+        prefersGeneralWeeklyHeadline: Bool = false
     ) {
         self.account = account
         self.provider = provider
@@ -455,6 +485,7 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
         self.activationState = activationState
         self.newestObservedAt = newestObservedAt
         self.prefersModelWindowHeadline = prefersModelWindowHeadline
+        self.prefersGeneralWeeklyHeadline = prefersGeneralWeeklyHeadline
     }
 }
 
@@ -555,7 +586,8 @@ public enum DeckBuilder {
         state: DeckState,
         thresholds: UsageThresholds = .default,
         now: Date = Date(),
-        preferModelWindowHeadline: Bool = false
+        preferModelWindowHeadline: Bool = false,
+        preferGeneralWeeklyHeadline: Bool = false
     ) -> [DeckAccountRow] {
         let usageByAccount = Dictionary(grouping: state.usage, by: \.accountId)
         return state.accounts
@@ -583,7 +615,8 @@ public enum DeckBuilder {
                     newestObservedAt: snapshots
                         .compactMap { DeckDateParsing.date(from: $0.observedAt) }
                         .max(),
-                    prefersModelWindowHeadline: preferModelWindowHeadline
+                    prefersModelWindowHeadline: preferModelWindowHeadline,
+                    prefersGeneralWeeklyHeadline: preferGeneralWeeklyHeadline
                 )
             }
     }
@@ -673,9 +706,14 @@ public enum DeckBuilder {
         direction: DeckSortDirection = .ascending,
         thresholds: UsageThresholds = .default,
         now: Date = Date(),
-        preferModelWindowHeadline: Bool = false
+        preferModelWindowHeadline: Bool = false,
+        preferGeneralWeeklyHeadline: Bool = false
     ) -> [DeckColumn] {
-        let allRows = rows(state: state, thresholds: thresholds, now: now, preferModelWindowHeadline: preferModelWindowHeadline)
+        let allRows = rows(
+            state: state, thresholds: thresholds, now: now,
+            preferModelWindowHeadline: preferModelWindowHeadline,
+            preferGeneralWeeklyHeadline: preferGeneralWeeklyHeadline
+        )
         return [DeckProvider.claude, .codex].map { provider in
             DeckColumn(
                 provider: provider,
@@ -691,10 +729,15 @@ public enum DeckBuilder {
         direction: DeckSortDirection = .ascending,
         thresholds: UsageThresholds = .default,
         now: Date = Date(),
-        preferModelWindowHeadline: Bool = false
+        preferModelWindowHeadline: Bool = false,
+        preferGeneralWeeklyHeadline: Bool = false
     ) -> [DeckAccountRow] {
         sorted(
-            rows(state: state, thresholds: thresholds, now: now, preferModelWindowHeadline: preferModelWindowHeadline),
+            rows(
+                state: state, thresholds: thresholds, now: now,
+                preferModelWindowHeadline: preferModelWindowHeadline,
+                preferGeneralWeeklyHeadline: preferGeneralWeeklyHeadline
+            ),
             by: sortOrder, direction: direction
         )
     }
@@ -735,7 +778,9 @@ public enum DeckBuilder {
         switch anchor {
         case .unanchored(let duration):
             // The provider's resetsAt is a placeholder that drifts on every
-            // refresh — never show it as a timestamp.
+            // refresh — never show it as a timestamp — or null outright
+            // (#247), where this copy replaces a blank slot that read as
+            // "account not getting picked up".
             text = WindowPresentation.unanchoredResetText(windowDuration: duration)
         case .recentlyRolled(let rolledAt, let duration):
             text = resetText(for: resetDate, now: now)
@@ -1006,6 +1051,7 @@ public final class DeckPopoverModel: ObservableObject {
     static let sortDefaultsKey = "modeldeck.popover.sort"
     static let showEmailsDefaultsKey = "modeldeck.popover.showEmails"
     static let preferModelWindowDefaultsKey = "modeldeck.popover.preferModelWindow"
+    static let focusGeneralWeeklyDefaultsKey = "modeldeck.popover.focusGeneralWeekly"
 
     @Published public var layout: DeckLayout {
         didSet {
@@ -1442,6 +1488,22 @@ public final class DeckPopoverModel: ObservableObject {
         didSet { defaults.set(preferModelWindowHeadline, forKey: Self.preferModelWindowDefaultsKey) }
     }
 
+    /// Issue #254 (Tim, 2026-08-05): the deck header's window toggle. ON =
+    /// Claude cards headline "Weekly · all models"; OFF = whatever they
+    /// would otherwise show, so with `preferModelWindowHeadline` on (Tim's
+    /// state) the button is exactly the Fable ↔ Weekly switch he asked for,
+    /// and a default install's headline is unchanged either way. App-local
+    /// (UserDefaults, the #73 pattern), never synced to the daemon; it
+    /// persists across popover opens like every other view preference.
+    @Published public var focusGeneralWeeklyHeadline: Bool {
+        didSet { defaults.set(focusGeneralWeeklyHeadline, forKey: Self.focusGeneralWeeklyDefaultsKey) }
+    }
+
+    /// The header toggle's action: flip the general-weekly focus.
+    public func toggleGeneralWeeklyFocus() {
+        focusGeneralWeeklyHeadline.toggle()
+    }
+
     /// Tim directive 2026-08-02: on each popover open, the cards whose
     /// headline moved since the PREVIOUS open glow briefly and roll their
     /// percent old → new — "what changed since I last looked" at a glance.
@@ -1519,6 +1581,9 @@ public final class DeckPopoverModel: ObservableObject {
         self.showAccountEmails = defaults.bool(forKey: Self.showEmailsDefaultsKey)
         // Absent key reads false — today's lowest-remaining default.
         self.preferModelWindowHeadline = defaults.bool(forKey: Self.preferModelWindowDefaultsKey)
+        // Absent key reads false — the header toggle starts off, so a fresh
+        // install's headline is whatever it was before issue #254.
+        self.focusGeneralWeeklyHeadline = defaults.bool(forKey: Self.focusGeneralWeeklyDefaultsKey)
     }
 
     public func isExpanded(_ accountID: String) -> Bool {
@@ -1538,7 +1603,8 @@ public final class DeckPopoverModel: ObservableObject {
         usageChangesByAccount = changeTracker.capture(
             rows: DeckBuilder.rows(
                 state: state, thresholds: thresholds, now: now,
-                preferModelWindowHeadline: preferModelWindowHeadline
+                preferModelWindowHeadline: preferModelWindowHeadline,
+                preferGeneralWeeklyHeadline: focusGeneralWeeklyHeadline
             )
         )
         usageCaptureGeneration += 1
@@ -1560,7 +1626,8 @@ public final class DeckPopoverModel: ObservableObject {
     public func columns(for state: DeckState, now: Date = Date()) -> [DeckColumn] {
         DeckBuilder.columns(
             state: state, sortOrder: sortOrder, direction: sortDirection, thresholds: thresholds, now: now,
-            preferModelWindowHeadline: preferModelWindowHeadline
+            preferModelWindowHeadline: preferModelWindowHeadline,
+            preferGeneralWeeklyHeadline: focusGeneralWeeklyHeadline
         )
         .map { DeckColumn(provider: $0.provider, rows: applyingActivation($0.rows)) }
     }
@@ -1570,7 +1637,8 @@ public final class DeckPopoverModel: ObservableObject {
         applyingActivation(
             DeckBuilder.interleavedRows(
                 state: state, sortOrder: sortOrder, direction: sortDirection, thresholds: thresholds, now: now,
-                preferModelWindowHeadline: preferModelWindowHeadline
+                preferModelWindowHeadline: preferModelWindowHeadline,
+                preferGeneralWeeklyHeadline: focusGeneralWeeklyHeadline
             )
         )
     }
