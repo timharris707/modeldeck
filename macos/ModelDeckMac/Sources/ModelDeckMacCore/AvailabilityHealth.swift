@@ -43,6 +43,21 @@ public enum AvailabilityVerdict: String, Equatable, Sendable, CaseIterable {
     public var displayWord: String {
         rawValue.prefix(1).uppercased() + rawValue.dropFirst()
     }
+
+    /// Severity rank for capping (issue #257): red worst, green best.
+    var severityRank: Int {
+        switch self {
+        case .red: return 0
+        case .yellow: return 1
+        case .green: return 2
+        }
+    }
+
+    /// The worse of two verdicts — how a cap is applied without ever
+    /// IMPROVING a verdict the runway already lowered.
+    func worse(than other: AvailabilityVerdict) -> AvailabilityVerdict {
+        severityRank <= other.severityRank ? self : other
+    }
 }
 
 /// One account admitted to the provider pool, in tier-weighted points.
@@ -145,6 +160,15 @@ public struct AvailabilityHealthReport: Equatable, Sendable {
     /// YELLOW. The verdict, displayScore, and readout all already reflect
     /// the degradation — this flag only drives the "why" copy.
     public var burstDegraded: Bool
+    // Issue #257 — present availability, alongside the forward runway.
+    /// Points held in accounts with enough left to host work. Always ≤
+    /// `poolPoints`; the difference is stranded in near-empty accounts.
+    public var usablePoints: Double
+    /// How many admitted accounts can host work right now.
+    public var usableAccountCount: Int
+    /// True when present scarcity lowered the runway verdict. Drives the
+    /// "why" copy, exactly like `burstDegraded`.
+    public var scarcityCapped: Bool
     public var nextBigReset: AvailabilityNextReset?
     public var pool: [AvailabilityPoolAccount]
     public var excluded: [AvailabilityExclusion]
@@ -168,6 +192,9 @@ public struct AvailabilityHealthReport: Equatable, Sendable {
         burstBottomsOutHours: Double? = nil,
         soonestResetHours: Double? = nil,
         burstDegraded: Bool = false,
+        usablePoints: Double = 0,
+        usableAccountCount: Int = 0,
+        scarcityCapped: Bool = false,
         nextBigReset: AvailabilityNextReset? = nil,
         pool: [AvailabilityPoolAccount] = [],
         excluded: [AvailabilityExclusion] = [],
@@ -188,6 +215,9 @@ public struct AvailabilityHealthReport: Equatable, Sendable {
         self.burstBottomsOutHours = burstBottomsOutHours
         self.soonestResetHours = soonestResetHours
         self.burstDegraded = burstDegraded
+        self.usablePoints = usablePoints
+        self.usableAccountCount = usableAccountCount
+        self.scarcityCapped = scarcityCapped
         self.nextBigReset = nextBigReset
         self.pool = pool
         self.excluded = excluded
@@ -222,6 +252,80 @@ public enum AvailabilityHealthEngine {
     public static func floorPoints(for accounts: [AvailabilityPoolAccount]) -> Double {
         floorFraction * (accounts.map(\.capacityPoints).max() ?? 100)
     }
+    // MARK: - Present availability (issue #257)
+    //
+    // Tim's field report 2026-08-05: the chip read GREEN 96 on a Claude pool
+    // holding 1,600 of 12,000 points with FOUR of six accounts at 1–3%. The
+    // verdict was defensible as pure 7-day sustainability — every account
+    // resets inside the horizon, so the sim never approached the floor — but
+    // it answered the wrong question. Availability Health exists to answer
+    // "can I start the heavy work NOW?", and nothing in the score reacted to
+    // how little was reachable at that moment: a pool at 13% scored the same
+    // as a pool at 90%. Worse, the ONE mechanism that watched recent rate
+    // (#244's burst scenario) is asymmetric and transient, so the verdict
+    // IMPROVED when he stopped working while capacity was still falling.
+    //
+    // So the runway verdict is now CAPPED by what is presently usable.
+
+    /// An account below this fraction of its own capacity cannot host real
+    /// work, so its remaining points are not counted as usable. Same 5%
+    /// shape as `floorFraction`, applied per account rather than pool-wide.
+    public static let usableAccountFraction = 0.05
+    /// Usable fraction at or below which the verdict cannot be GREEN.
+    public static let scarceUsableFraction = 0.15
+    /// Usable fraction at or below which the verdict goes RED — unless
+    /// relief is imminent (see `imminentReliefHours`). Design defaults,
+    /// flagged in the PR for Tim to veto like `floorFraction` was.
+    public static let criticalUsableFraction = 0.07
+    /// A reset landing within this many hours downgrades the RED cap to
+    /// YELLOW: being nearly dry matters less when a refill is minutes out.
+    /// Deliberately does NOT lift the YELLOW cap — "almost empty, but more
+    /// is coming" is exactly the caution state, not an all-clear.
+    public static let imminentReliefHours = 6.0
+
+    /// Points sitting in accounts too empty to host work — counted in the
+    /// pool total, but not reachable for a session.
+    public static func usablePoints(_ accounts: [AvailabilityPoolAccount]) -> Double {
+        accounts
+            .filter { $0.remainingPoints >= usableAccountFraction * $0.capacityPoints }
+            .reduce(0) { $0 + $1.remainingPoints }
+    }
+
+    /// How many admitted accounts can actually host work right now.
+    public static func usableAccountCount(_ accounts: [AvailabilityPoolAccount]) -> Int {
+        accounts.filter { $0.remainingPoints >= usableAccountFraction * $0.capacityPoints }.count
+    }
+
+    /// The ceiling present scarcity puts on the runway verdict; nil when
+    /// there is enough usable capacity to impose none.
+    ///
+    /// TWO conditions, both required — calibrated against the #244 field
+    /// deck Tim confirmed as GREEN (five Max 20x accounts: one at 4%, four
+    /// at 14.5%; pool 11.6% of capacity). A low pool ALONE must not cap, or
+    /// that deck would have been wrongly downgraded: four live accounts at
+    /// 14.5% is a working deck. What made 2026-08-05 different is that most
+    /// of the deck was SPENT — 2 of 6 accounts usable. So the cap needs
+    /// both a scarce pool and a majority of accounts unusable:
+    ///
+    ///   #244 deck  → 11.6% pool, 4 of 5 usable → no cap (GREEN preserved)
+    ///   2026-08-05 → 12.0% pool, 2 of 6 usable → YELLOW
+    static func scarcityCap(_ accounts: [AvailabilityPoolAccount]) -> AvailabilityVerdict? {
+        let capacity = accounts.reduce(0) { $0 + $1.capacityPoints }
+        guard capacity > 0 else { return nil }
+        let fraction = usablePoints(accounts) / capacity
+        guard fraction <= scarceUsableFraction else { return nil }
+        // Half or fewer of the admitted accounts can host work.
+        guard usableAccountCount(accounts) * 2 <= accounts.count else { return nil }
+        guard fraction <= criticalUsableFraction else { return .yellow }
+        // Imminent relief softens RED to YELLOW, never to GREEN. A clamped-0
+        // reset already snapped, so its next lands a full cycle out — the
+        // same reading measuredPace and resetLands use.
+        let soonest = accounts
+            .map { $0.hoursToReset > 0 ? $0.hoursToReset : cycleHours }
+            .min() ?? cycleHours
+        return soonest <= imminentReliefHours ? .yellow : .red
+    }
+
     /// Weekly cycle length; the simulation horizon.
     public static let cycleHours = 168.0
     /// Observations older than this exclude the account (prototype value).
@@ -298,8 +402,22 @@ public enum AvailabilityHealthEngine {
     /// ("week"/"7d"); model-scoped weeklies like "GPT-5-Codex weekly" never
     /// match the generic scope.
     static func driverScopes(for provider: DeckProvider) -> (primary: String, fallback: String?) {
+        driverScopes(for: provider, generalWeekly: false)
+    }
+
+    /// Issue #258 (Tim, 2026-08-05): the chip answers the question the deck
+    /// is currently SHOWING. With the #254 header toggle on, Claude cards
+    /// headline "Weekly · all models", so the chip evaluates the general
+    /// weekly pool rather than Fable's — otherwise the cards and the dot
+    /// answer two different questions side by side with nothing saying so.
+    /// Claude only: Codex's driver scope is already the general weekly, and
+    /// the toggle never touches Codex cards.
+    static func driverScopes(
+        for provider: DeckProvider,
+        generalWeekly: Bool
+    ) -> (primary: String, fallback: String?) {
         switch provider {
-        case .claude: return ("fable weekly", "weekly")
+        case .claude: return generalWeekly ? ("weekly", nil) : ("fable weekly", "weekly")
         case .codex: return ("weekly", nil)
         }
     }
@@ -314,9 +432,10 @@ public enum AvailabilityHealthEngine {
     /// and the #244 burn-rate window so both always read the SAME scope.
     static func driverSnapshot(
         for provider: DeckProvider,
-        in rows: [UsageSnapshot]
+        in rows: [UsageSnapshot],
+        generalWeekly: Bool = false
     ) -> UsageSnapshot? {
-        let scopes = driverScopes(for: provider)
+        let scopes = driverScopes(for: provider, generalWeekly: generalWeekly)
         return rows.first { normalizedScope($0.scope) == scopes.primary }
             ?? scopes.fallback.flatMap { fallback in
                 rows.first { normalizedScope($0.scope) == fallback }
@@ -332,7 +451,8 @@ public enum AvailabilityHealthEngine {
         for provider: DeckProvider,
         state: DeckState,
         now: Date,
-        staleAfter: TimeInterval = defaultStaleAfter
+        staleAfter: TimeInterval = defaultStaleAfter,
+        generalWeekly: Bool = false
     ) -> (accounts: [AvailabilityPoolAccount], excluded: [AvailabilityExclusion], unknownTierLabels: [String]) {
         let snapshotsByAccount = Dictionary(grouping: state.usage, by: \.accountId)
         var accounts: [AvailabilityPoolAccount] = []
@@ -347,7 +467,7 @@ public enum AvailabilityHealthEngine {
                 continue
             }
             let rows = snapshotsByAccount[account.id] ?? []
-            let snapshot = driverSnapshot(for: provider, in: rows)
+            let snapshot = driverSnapshot(for: provider, in: rows, generalWeekly: generalWeekly)
             guard let snapshot else {
                 excluded.append(AvailabilityExclusion(
                     label: account.label, reason: "no weekly usage data"
@@ -628,10 +748,12 @@ public enum AvailabilityHealthEngine {
         state: DeckState,
         now: Date,
         staleAfter: TimeInterval = defaultStaleAfter,
-        burstPointsPerDay: Double? = nil
+        burstPointsPerDay: Double? = nil,
+        generalWeekly: Bool = false
     ) -> AvailabilityHealthReport {
         let (accounts, excluded, unknownTiers) = pool(
-            for: provider, state: state, now: now, staleAfter: staleAfter
+            for: provider, state: state, now: now, staleAfter: staleAfter,
+            generalWeekly: generalWeekly
         )
         guard !accounts.isEmpty else {
             return AvailabilityHealthReport(
@@ -680,6 +802,29 @@ public enum AvailabilityHealthEngine {
                 }
             }
         }
+        // Issue #257: present scarcity caps the runway verdict. Applied
+        // LAST so it composes with #244's burst degrade and can only ever
+        // lower — `worse(than:)` never improves a verdict the runway or the
+        // burst scenario already brought down. The score follows the cap so
+        // the bar and the dot can never disagree (the #235 invariant).
+        var scarcityCapped = false
+        if let cap = scarcityCap(accounts) {
+            let capped = verdict.worse(than: cap)
+            // CodeRabbit (PR #259): clamp the bar ONLY when the cap actually
+            // lowered the verdict. A runway that was already YELLOW/RED owns
+            // its own needle — moving it here would change the bar with no
+            // scarcity readout to explain it, breaking the lower-only
+            // contract and the #235 "bar and dot never disagree" invariant.
+            if capped != verdict {
+                scarcityCapped = true
+                verdict = capped
+                switch verdict {
+                case .yellow: score = min(score, 50)
+                case .red: score = min(score, 20)
+                case .green: break
+                }
+            }
+        }
         return AvailabilityHealthReport(
             provider: provider,
             verdict: verdict,
@@ -696,6 +841,9 @@ public enum AvailabilityHealthEngine {
             burstBottomsOutHours: bottomsOut,
             soonestResetHours: soonestReset,
             burstDegraded: degraded,
+            usablePoints: usablePoints(accounts),
+            usableAccountCount: usableAccountCount(accounts),
+            scarcityCapped: scarcityCapped,
             nextBigReset: nextBigReset(accounts, now: now),
             pool: accounts,
             excluded: excluded,
@@ -771,7 +919,23 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
         // burst readout replaces the steady-state one (which would
         // otherwise claim green words under a yellow chip).
         let readout: String
-        if report.burstDegraded, let dry = report.burstFirstDroughtHours {
+        if report.scarcityCapped {
+            // Issue #257: when present scarcity lowered the verdict, the
+            // sentence must say THAT — the runway sentence ("you could
+            // sustain 2.9× this pace") is true but reads as an all-clear
+            // beside four near-empty cards, which is the whole complaint.
+            let usable = report.usableAccountCount
+            let total = report.pool.count
+            var line = "Only \(points(report.usablePoints)) pts are usable right now, "
+                + "across \(usable) of \(total) account\(total == 1 ? "" : "s")."
+            if let soonest = report.soonestResetHours ?? report.pool
+                .map({ $0.hoursToReset > 0 ? $0.hoursToReset : AvailabilityHealthEngine.cycleHours })
+                .min() {
+                line += " The next reset lands in \(hoursText(Int(soonest.rounded())))."
+            }
+            line += " Your weekly pace itself is fine — this is about what you can start today."
+            readout = line
+        } else if report.burstDegraded, let dry = report.burstFirstDroughtHours {
             readout = Self.burstReadout(
                 multiple: multiple,
                 burstPointsPerDay: report.burstPointsPerDay,
@@ -794,11 +958,30 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
             "Pool now: \(points(report.poolPoints)) of \(points(report.capacityPoints)) pts",
             "Measured pace: \(points(report.pacePointsPerDay)) pts/day",
         ]
+        // Issue #257: what is reachable RIGHT NOW, stated whenever it
+        // differs from the raw pool — points stranded in near-empty
+        // accounts are counted in the pool but cannot host a session, and
+        // that gap is exactly what made a 13%-full deck read GREEN.
+        if report.usableAccountCount < report.pool.count
+            || report.usablePoints < report.poolPoints {
+            facts.append(
+                "Usable now: \(points(report.usablePoints)) pts across "
+                + "\(report.usableAccountCount) of \(report.pool.count) accounts"
+            )
+        }
         // Issue #244, Tim's two live numbers. "Current burn" shows
         // whenever the window is active (unless the rate rounds to zero —
         // "~0 pts/day (0.0×)" is noise, review finding 7); the
         // bottoms-out pair shows whenever the burst sim touches the floor
         // inside the horizon, on any verdict (orchestrator decision).
+        // Issue #260: a nil burn rate means the window has not gathered
+        // enough evidence yet (fresh install, or the app was closed a
+        // while) — say so, because the verdict beside it is a steady-state
+        // reading with no burst opinion in it, and an unexplained GREEN in
+        // that gap is exactly what read as broken after v0.3.20 relaunched.
+        if report.burstPointsPerDay == nil {
+            facts.append("Today's burn: still measuring")
+        }
         if let burn = report.burstPointsPerDay, burn.rounded() >= 1 {
             var line = "Current burn: ~\(points(burn)) pts/day"
             if report.pacePointsPerDay > 0 {

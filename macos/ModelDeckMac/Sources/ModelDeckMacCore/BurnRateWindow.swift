@@ -14,11 +14,20 @@ import Foundation
 //   newer than the last sample for that account — a refresh that returns
 //   the same provider observation twice records nothing.
 // - The window holds the last `windowSpan` (~3 h) of samples, pruned by
-//   age on every record. Persistence across relaunches is deliberately NOT
-//   provided: on a cold start the window refills within a few refreshes,
-//   and until it spans `minimumActiveSpan` (~30 min) the burst logic is
-//   INACTIVE (`burstRate` returns nil) — the engine then behaves exactly
-//   as before #244. Honest degradation, pinned by tests.
+//   age on every record.
+//
+//   Issue #260 REVERSES the original "persistence across relaunches is
+//   deliberately NOT provided" decision. Tim, 2026-08-05: the chip sat
+//   YELLOW all day on a measured ~13,500 pts/day Fable burn (≈7× this
+//   deck's degrade threshold), he installed v0.3.20, and the verdict
+//   snapped to GREEN the moment the app relaunched — not because anything
+//   improved, but because the window was destroyed and `burstRate` went
+//   nil. "Refills within a few refreshes" is not honest degradation when
+//   the gap displays an ALL-CLEAR, and #241's self-announcing updates
+//   made the app relaunch itself on every release, so the blind window
+//   now lands on every upgrade. Samples are therefore persisted and
+//   restored, pruned by the same age rule so a long-closed app resumes
+//   cold rather than resurrecting stale evidence.
 // - Reset handling: an interval where an account's remaining INCREASED
 //   means a weekly reset crossed it. That interval is dropped entirely —
 //   neither its points nor its time count — so a reset can never read as
@@ -55,6 +64,27 @@ public struct BurnRateWindow: Equatable, Sendable {
     private struct Key: Hashable, Sendable {
         var provider: DeckProvider
         var accountId: String
+
+        /// Flat string form for the persisted dictionary (issue #260).
+        /// Account ids are store-generated UUIDs, so "<provider>|<id>"
+        /// round-trips unambiguously; anything unparseable is dropped on
+        /// restore rather than guessed.
+        var storageKey: String { "\(provider.rawValue)|\(accountId)" }
+
+        init(provider: DeckProvider, accountId: String) {
+            self.provider = provider
+            self.accountId = accountId
+        }
+
+        init?(storageKey: String) {
+            guard let separator = storageKey.firstIndex(of: "|") else { return nil }
+            guard let provider = DeckProvider(rawValue: String(storageKey[..<separator])) else {
+                return nil
+            }
+            let id = String(storageKey[storageKey.index(after: separator)...])
+            guard !id.isEmpty else { return nil }
+            self.init(provider: provider, accountId: id)
+        }
     }
 
     /// How much history the window keeps (issue's 2–4 h sketch, midpoint).
@@ -87,8 +117,17 @@ public struct BurnRateWindow: Equatable, Sendable {
     /// pool builder stays the sole authority on who is scored.
     public mutating func record(state: DeckState, now: Date) {
         let snapshotsByAccount = Dictionary(grouping: state.usage, by: \.accountId)
+        // CodeRabbit (PR #259), a bug PERSISTENCE created: before #260 a
+        // relaunch cleared everything, so a removed or disabled account's
+        // samples died with the process. Now they are restored, and
+        // `burstRate` sums every retained series for the provider — so a
+        // deleted high-burn account could keep the verdict degraded for up
+        // to the full 3h window. Live keys are collected from the state
+        // itself and anything else is dropped.
+        var live: Set<Key> = []
         for account in state.accounts where account.enabled {
             guard let provider = DeckProvider.from(account.provider) else { continue }
+            live.insert(Key(provider: provider, accountId: account.id))
             let rows = snapshotsByAccount[account.id] ?? []
             guard let snapshot = AvailabilityHealthEngine.driverSnapshot(
                 for: provider, in: rows
@@ -114,6 +153,12 @@ public struct BurnRateWindow: Equatable, Sendable {
                 observedAt: observed,
                 resetsAt: DeckDateParsing.date(from: snapshot.resetsAt)
             ))
+        }
+        // Guarded on a non-empty roster: a degenerate state (daemon briefly
+        // reporting no accounts) must not wipe a healthy window — that
+        // would recreate the very blindness #260 exists to prevent.
+        if !live.isEmpty {
+            for key in series.keys where !live.contains(key) { series[key] = nil }
         }
         prune(now: now)
     }
@@ -189,5 +234,52 @@ public struct BurnRateWindow: Equatable, Sendable {
     /// The number of retained samples for a provider (test/debug surface).
     public func sampleCount(for provider: DeckProvider) -> Int {
         series.reduce(0) { $0 + ($1.key.provider == provider ? $1.value.count : 0) }
+    }
+
+    // MARK: - Persistence (issue #260)
+
+    /// Wire form: `["claude|acct-1": [sample, …]]`. A dictionary keyed by
+    /// the flat storage key so a future provider or a removed account
+    /// decodes as "unknown key, drop it" instead of failing the whole
+    /// restore — the same tolerate-unknowns contract as the daemon mirrors.
+    private struct StoredSample: Codable {
+        var remainingPoints: Double
+        var observedAt: Date
+        var resetsAt: Date?
+    }
+
+    /// The window's samples encoded for storage; nil when there is nothing
+    /// worth writing.
+    public func encoded() -> Data? {
+        guard !series.isEmpty else { return nil }
+        let wire = series.reduce(into: [String: [StoredSample]]()) { out, entry in
+            out[entry.key.storageKey] = entry.value.map {
+                StoredSample(
+                    remainingPoints: $0.remainingPoints,
+                    observedAt: $0.observedAt,
+                    resetsAt: $0.resetsAt
+                )
+            }
+        }
+        return try? JSONEncoder().encode(wire)
+    }
+
+    /// Restores a persisted window, dropping anything older than
+    /// `windowSpan` (and any unparseable key). A window restored from a
+    /// long-closed app therefore comes back EMPTY — cold, honest, and
+    /// identical to a fresh install — rather than resurrecting stale
+    /// samples that would fabricate a rate across the downtime gap.
+    public init(restoring data: Data?, now: Date) {
+        guard let data,
+              let wire = try? JSONDecoder().decode([String: [StoredSample]].self, from: data)
+        else { return }
+        for (rawKey, samples) in wire {
+            guard let key = Key(storageKey: rawKey) else { continue }
+            let restored = samples
+                .map { Sample(remainingPoints: $0.remainingPoints, observedAt: $0.observedAt, resetsAt: $0.resetsAt) }
+                .sorted { $0.observedAt < $1.observedAt }
+            if !restored.isEmpty { series[key] = restored }
+        }
+        prune(now: now)
     }
 }

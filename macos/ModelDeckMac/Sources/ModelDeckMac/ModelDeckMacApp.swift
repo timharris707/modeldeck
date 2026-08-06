@@ -56,7 +56,11 @@ struct ModelDeckMacApp: App {
             stateProvider: client,
             // Issue #72: the popover's manual Refresh asks the daemon for a
             // real provider poll so the footer's data age visibly restarts.
-            usageRefresher: client
+            usageRefresher: client,
+            // Issue #260: the burn window survives relaunch, so a
+            // self-announcing update (#241) can no longer blank the burst
+            // signal mid-run and snap the verdict back to GREEN.
+            burnWindowStore: .standard
         )
         // Phase 5: the same loopback client powers Activate (POST) and the
         // post-switch verification read; a verified state is pushed straight

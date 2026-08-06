@@ -254,17 +254,33 @@ public final class MenuBarStatusModel: ObservableObject {
     /// Issue #244: the rolling short-window burn-rate store ("today's
     /// rate"). Fed by `recordBurnSample` from the app's fresh-state hook —
     /// the same flow that runs reconcileActivation/reconcileWarnings — so
-    /// it sees exactly the states the deck already fetches. No
-    /// persistence: a cold start refills within minutes, and the window
-    /// reports nil (burst logic inactive) until it spans ~30 min.
-    public private(set) var burnWindow = BurnRateWindow()
+    /// it sees exactly the states the deck already fetches.
+    /// Issue #260: PERSISTED across relaunches. Losing it silently reverts
+    /// the verdict to its steady-state GREEN, which is what Tim watched
+    /// happen the instant v0.3.20 relaunched itself mid-burn.
+    public private(set) var burnWindow: BurnRateWindow
+
+    /// Where the burn window is persisted; nil disables persistence (tests
+    /// and any caller that wants the pre-#260 in-memory behavior).
+    private let burnWindowStore: UserDefaults?
+    static let burnWindowDefaultsKey = "modeldeck.burnWindow.samples"
 
     /// Records one fresh deck state into the burn window, then recomputes
     /// the icon so a health-mode dot reflects the burst-aware verdict
     /// immediately (the hook fires after the refresh's own recompute).
     public func recordBurnSample(state: DeckState) {
         burnWindow.record(state: state, now: clock())
+        persistBurnWindow()
         recomputeIconState()
+    }
+
+    private func persistBurnWindow() {
+        guard let burnWindowStore else { return }
+        if let data = burnWindow.encoded() {
+            burnWindowStore.set(data, forKey: Self.burnWindowDefaultsKey)
+        } else {
+            burnWindowStore.removeObject(forKey: Self.burnWindowDefaultsKey)
+        }
     }
 
     /// The provider's current short-window burn rate (pts/day); nil while
@@ -286,13 +302,23 @@ public final class MenuBarStatusModel: ObservableObject {
         stateProvider: (any DeckStateProviding)? = nil,
         usageRefresher: (any UsageRefreshing)? = nil,
         thresholds: UsageThresholds = .default,
-        clock: @escaping @Sendable () -> Date = { Date() }
+        clock: @escaping @Sendable () -> Date = { Date() },
+        // Issue #260: nil keeps the pre-#260 in-memory window (tests).
+        burnWindowStore: UserDefaults? = nil
     ) {
         self.evaluator = evaluator
         self.stateProvider = stateProvider
         self.usageRefresher = usageRefresher
         self.thresholds = thresholds
         self.clock = clock
+        self.burnWindowStore = burnWindowStore
+        // Restored samples are pruned to the same 3h span, so an app that
+        // was closed for hours comes back cold rather than fabricating a
+        // rate across the downtime gap.
+        self.burnWindow = BurnRateWindow(
+            restoring: burnWindowStore?.data(forKey: Self.burnWindowDefaultsKey),
+            now: clock()
+        )
     }
 
     deinit {

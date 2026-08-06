@@ -601,7 +601,12 @@ struct DeckPopoverView: View {
                 // Issue #244: the short-window burn rate makes an active
                 // burst a first-class scenario; nil (cold window) keeps
                 // the pre-#244 evaluation exactly.
-                burstPointsPerDay: statusModel.burstRate(for: provider)
+                burstPointsPerDay: statusModel.burstRate(for: provider),
+                // Issue #258 (Tim): the chip answers the question the deck
+                // is SHOWING — with the #254 toggle on, the cards headline
+                // "Weekly · all models", so the verdict evaluates that pool
+                // instead of Fable's. Claude-only inside the engine.
+                generalWeekly: deckModel.focusGeneralWeeklyHeadline
             ),
             now: now
         )
