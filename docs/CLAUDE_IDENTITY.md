@@ -99,6 +99,31 @@ What is NOT protected:
   use time (issue #99), so no environment pinning can keep a running
   session's credential scope on its launch profile across a flip. Native
   multi-account rearchitecture is tracked separately.
+
+  **Measured qualification (2026-08-05, CLI 2.1.223, issue #263.)** The
+  sentence above is about a session that did not set the variables itself. It
+  does NOT mean a freshly spawned child cannot be scoped. Hand-run in a
+  launchd-like empty environment, `claude auth status --json`:
+
+  | invocation | result |
+  |---|---|
+  | no pin at all (`~/.claude` → an authenticated profile) | `loggedIn: false` |
+  | `CLAUDE_SECURESTORAGE_CONFIG_DIR` → a NON-ACTIVE profile, empty `CLAUDE_CONFIG_DIR` | `loggedIn: true`, `authMethod: "claude.ai"`, `subscriptionType: "max"`, identity fields null |
+  | both pinned to that profile | full identity for that profile |
+
+  So for a NEW child process the credential READ follows
+  `CLAUDE_SECURESTORAGE_CONFIG_DIR`, and the identity fields come from
+  `.claude.json` in `CLAUDE_CONFIG_DIR` — the two are separable, which is what
+  #263's renewal fix depends on. Whether the token WRITE (a refresh) follows
+  the same variable is not directly measured here; the supporting evidence is
+  the field record — non-active profiles renew via the no-flip rung and are
+  verified afterward by re-probing that profile's OWN credential
+  (`probeClaudeRenewal`), which is the authoritative check and reports
+  `failed` if a refresh ever landed elsewhere.
+
+  This qualification exists because issue #252's stated premise leans on the
+  unqualified sentence. Re-derive #252's hazard model against the table above
+  rather than against the sentence alone.
 - Pinned sessions read `<configDir>/.claude.json` instead of the shared
   `~/.claude.json`, so project trust, MCP approvals, and history no longer
   cross profiles — intended isolation, but expect one-time re-prompts.

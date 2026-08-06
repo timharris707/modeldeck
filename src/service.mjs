@@ -81,6 +81,11 @@ const CLAUDE_AUTH_CREDENTIAL_KEYS = [
 const CLAUDE_RENEWAL_SETTINGS_OVERRIDE = JSON.stringify({
   env: { ANTHROPIC_BASE_URL: 'https://api.anthropic.com' },
 });
+const CLAUDE_AUTH_OVERRIDE_ABSENT = Object.freeze({
+  authOverride: false,
+  proxyRouted: false,
+  helperRouted: false,
+});
 
 const CLAUDE_RENEWAL_EMAIL_PATTERN = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
 const CLAUDE_RENEWAL_EMAIL_KEYS = new Set([
@@ -1571,23 +1576,33 @@ export class ModelDeckService {
     try {
       raw = await fs.promises.readFile(path.join(profileRef, 'settings.json'), 'utf8');
     } catch (error) {
-      if (error.code === 'ENOENT') return { authOverride: false, proxyRouted: false, readable: true };
-      return { authOverride: false, proxyRouted: false, readable: false };
+      if (error.code === 'ENOENT') return { ...CLAUDE_AUTH_OVERRIDE_ABSENT, readable: true };
+      return { ...CLAUDE_AUTH_OVERRIDE_ABSENT, readable: false };
     }
     let settings;
     try {
       settings = JSON.parse(raw);
     } catch {
-      return { authOverride: false, proxyRouted: false, readable: false };
+      return { ...CLAUDE_AUTH_OVERRIDE_ABSENT, readable: false };
     }
-    const env = settings && typeof settings === 'object' && !Array.isArray(settings)
-      && settings.env && typeof settings.env === 'object' && !Array.isArray(settings.env)
-      ? settings.env
+    const object = settings && typeof settings === 'object' && !Array.isArray(settings) ? settings : null;
+    const env = object && object.env && typeof object.env === 'object' && !Array.isArray(object.env)
+      ? object.env
       : null;
     const present = (key) => Boolean(env && Object.hasOwn(env, key));
     return {
       authOverride: CLAUDE_AUTH_CREDENTIAL_KEYS.some(present),
       proxyRouted: present('ANTHROPIC_BASE_URL'),
+      // Issue #263: reported, deliberately NOT treated as an auth override.
+      // An apiKeyHelper is what BLINDED renewal (it outranks the stored OAuth
+      // in `claude auth status`, so the CLI named nobody) — but the renewal
+      // child no longer reads this file at all, so these accounts stay
+      // renewable. Marking them overridden here would take away the very
+      // capability this issue restores. DaemonModels.swift has documented
+      // renew.authOverride as covering "an apiKeyHelper/env override" since
+      // #225 while nothing in the daemon read the key; this closes that gap
+      // on the reporting side only.
+      helperRouted: Boolean(object && typeof object.apiKeyHelper === 'string' && object.apiKeyHelper.trim()),
       readable: true,
     };
   }
@@ -1637,10 +1652,92 @@ export class ModelDeckService {
     return timestamp - lastAt >= CLAUDE_RENEWAL_BACKOFF_MS;
   }
 
-  claudeRenewalEnv(profileRef) {
+  // Issue #263. A CLIProxyAPI-routed profile's settings.json carries a
+  // top-level `apiKeyHelper`, and the CLI resolves that helper BEFORE the
+  // stored OAuth credential — so `claude auth status --json` answers
+  // `{"loggedIn":true,"authMethod":"api_key_helper"}` with NO email and NO
+  // orgId. claudeRenewalIdentityMatches is fail-closed, so it declines, every
+  // attempt falls through to the flip rung, and an always-on user's sessions
+  // defer that rung forever. Four of Tim's six accounts had ZERO completed
+  // renewals in 24h while the two profiles without an apiKeyHelper renewed
+  // themselves on the no-flip rung with the same sessions running.
+  //
+  // The fix rests on a hand-test — the one #176 specified and closed
+  // "by construction" without ever running — against CLI 2.1.223 on
+  // 2026-08-05: CLAUDE_CONFIG_DIR (which supplies settings.json) and
+  // CLAUDE_SECURESTORAGE_CONFIG_DIR (which selects the Keychain item) are
+  // INDEPENDENT knobs. Pointing the config dir at a scratch directory that
+  // holds only a link to the profile's .claude.json — no settings.json,
+  // therefore no apiKeyHelper and no proxy base URL — while the securestorage
+  // dir stays on the real profile turned all four accounts from
+  // `authMethod:"api_key_helper"` with no identity into `authMethod:"claude.ai"`
+  // reporting their own email, org and Max tier.
+  //
+  // .claude.json is LINKED rather than copied so the CLI's writes still reach
+  // the profile exactly as they do today. The link is re-asserted on every
+  // call: if the CLI ever replaces it with a regular file (an atomic
+  // write-then-rename would), the next renewal restores the link, so the
+  // profile's own file can go one run stale but can never be clobbered.
+  async claudeRenewalConfigDir(profileRef) {
+    try {
+      const suffix = crypto.createHash('sha256').update(String(profileRef).normalize('NFC'))
+        .digest('hex').slice(0, 12);
+      const dir = path.join(this.claudeRenewalScratchDir, `cfg-${suffix}`);
+      await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
+      // The whole point of the scratch dir is that NO settings reach the
+      // child. Nothing ModelDeck runs writes these, but assert the invariant
+      // rather than trust it: a stray file here silently restores the exact
+      // blindness this issue exists to remove. Failures are NOT swallowed —
+      // a settings file we could not clear must abort the renewal, not run
+      // the CLI against it.
+      for (const name of ['settings.json', 'settings.local.json']) {
+        await fs.promises.rm(path.join(dir, name), { recursive: true, force: true });
+      }
+
+      const target = path.resolve(profileRef, '.claude.json');
+      const link = path.join(dir, '.claude.json');
+      let targetExists = true;
+      try {
+        await fs.promises.access(target, fs.constants.F_OK);
+      } catch {
+        targetExists = false;
+      }
+      let current = null;
+      try {
+        current = await fs.promises.readlink(link);
+      } catch {
+        // Absent, or present as a regular file — either way it is replaced below.
+      }
+      if (!targetExists) {
+        // No identity to carry. The matcher stays fail-closed, exactly as
+        // before this change; leaving a dangling link would only confuse it.
+        await fs.promises.rm(link, { recursive: true, force: true });
+        return dir;
+      }
+      if (current !== target) {
+        await fs.promises.rm(link, { recursive: true, force: true });
+        await fs.promises.symlink(target, link);
+      }
+      return dir;
+    } catch (error) {
+      // Adversarial review of #263: without this marker a failure of
+      // ModelDeck's OWN setup reaches performClaudeRenewal as "the CLI named
+      // nobody" — indistinguishable from the bug being fixed, which is the
+      // one confusion this issue must not reintroduce.
+      error.modeldeckRenewalStage = 'config-dir';
+      throw error;
+    }
+  }
+
+  claudeRenewalEnv(profileRef, configDir) {
+    // Required, deliberately: a default of `profileRef` would let a future
+    // caller silently hand the profile's settings.json — and its
+    // apiKeyHelper — back to the renewal child, reinstating #263.
+    if (!configDir) throw new Error('claudeRenewalEnv requires an explicit renewal config dir');
     const env = { ...this.childEnv };
     for (const key of CLAUDE_AUTH_OVERRIDE_KEYS) delete env[key];
-    env.CLAUDE_CONFIG_DIR = profileRef;
+    // #263: settings come from the scratch dir, credentials from the profile.
+    env.CLAUDE_CONFIG_DIR = configDir;
     env.CLAUDE_SECURESTORAGE_CONFIG_DIR = profileRef;
     // Native Claude resolves its Keychain item from USER. launchd does not
     // reliably supply it, so restore only the OS username just as the normal
@@ -1651,19 +1748,26 @@ export class ModelDeckService {
 
   async runClaudeRenewalCli(args, profileRef) {
     await fs.promises.mkdir(this.claudeRenewalScratchDir, { recursive: true, mode: 0o700 });
-    // Issue #224: claudeRenewalEnv strips ANTHROPIC_BASE_URL from the child
-    // process env, but the profile's own settings.json re-applies it inside
-    // the CLI. Command-line settings outrank the profile file, so pin the
-    // invocation rung back to Anthropic for proxy-routed profiles. `claude
-    // auth status` neither accepts --settings nor routes its token refresh
-    // through ANTHROPIC_BASE_URL, so the auth-status rung is left alone.
+    const configDir = await this.claudeRenewalConfigDir(profileRef);
+    // Issue #224 pinned the base URL back to Anthropic for proxy-routed
+    // profiles, but only on the `-p` rung, because `claude auth status`
+    // rejects the flag outright (`error: unknown option '--settings'` — now
+    // hand-verified, #263). The scratch config dir above already withholds
+    // the profile's settings.json from BOTH rungs, so this pin is no longer
+    // load-bearing; it is kept as an explicit belt-and-braces assertion that
+    // the renewal request goes to Anthropic and not through the pool.
     if (args[0] === '-p') {
       const override = await this.claudeAuthOverrideState(profileRef);
       if (override.proxyRouted) args = [...args, '--settings', CLAUDE_RENEWAL_SETTINGS_OVERRIDE];
     }
     return this.exec(this.claudePath, args, {
+      // cwd stays the shared scratch ROOT, unchanged from before #263. Only
+      // the env moves. Pointing cwd at the per-account config dir would have
+      // made it a project path for the CLI (a second settings search location)
+      // and scattered the CLI's transcript spill across one directory per
+      // account, for no benefit — CLAUDE_CONFIG_DIR is explicit.
       cwd: this.claudeRenewalScratchDir,
-      env: this.claudeRenewalEnv(profileRef),
+      env: this.claudeRenewalEnv(profileRef, configDir),
       timeout: CLAUDE_RENEWAL_TIMEOUT_MS,
       maxBuffer: 1_000_000,
     });
@@ -1880,16 +1984,32 @@ export class ModelDeckService {
       return this.recordClaudeRenewalAttempt(accountId, result);
     }
 
+    // Issue #263: WHY the cheap rung was declined is the single fact that
+    // would have exposed this defect four releases ago. Every stuck account
+    // recorded a bare `busy`, which read as "a session is in the way" when the
+    // truth was "the CLI named nobody, so we never even tried the cheap path".
+    // Carry the reason onto whatever the flip rung decides.
+    //
+    // The four cases are kept distinct because collapsing them is the very
+    // mistake being corrected. Note an exec failure can still carry usable
+    // stdout (the CLI exits non-zero having printed its status), so a reported
+    // identity always wins over the error.
+    let identityDecline;
+    if (reportedIdentity) identityDecline = 'mismatched';
+    else if (authStatus?.modeldeckRenewalStage === 'config-dir') identityDecline = 'setup-failed';
+    else if (authStatus instanceof Error) identityDecline = 'error';
+    else identityDecline = 'absent';
+
     try {
       if (await this.runningClaudeProcessCount()) {
-        return decided('busy', null, CLAUDE_RENEWAL_BUSY_DETAIL, { path: 'flip' });
+        return decided('busy', null, CLAUDE_RENEWAL_BUSY_DETAIL, { path: 'flip', identityDecline });
       }
     } catch {
-      return decided('failed', null, 'ModelDeck could not confirm that Claude was idle, so renewal was not attempted.', { path: 'flip' });
+      return decided('failed', null, 'ModelDeck could not confirm that Claude was idle, so renewal was not attempted.', { path: 'flip', identityDecline });
     }
 
     const result = await this.performClaudeFlipRenewal(account, at);
-    return this.recordClaudeRenewalAttempt(accountId, result);
+    return this.recordClaudeRenewalAttempt(accountId, { ...result, identityDecline });
   }
 
   async renewClaudeAccount(accountId) {
@@ -2280,6 +2400,12 @@ export class ModelDeckService {
             at: storedAttempt.at,
             outcome: storedAttempt.outcome,
             mechanism: storedAttempt.mechanism ?? null,
+            // Issue #263, additive: why the cheap no-flip rung was declined.
+            // A bare `busy` hid this defect for four releases — it read as
+            // "a session is in the way" when the truth was "the CLI named
+            // nobody, so the cheap path was never tried".
+            ...(storedAttempt.identityDecline ? { identityDecline: storedAttempt.identityDecline } : {}),
+            ...(storedAttempt.path ? { path: storedAttempt.path } : {}),
           }
           : null;
         renew = {
@@ -2289,6 +2415,11 @@ export class ModelDeckService {
           available: account.enabled && signinReason === 'expired'
             && !override.authOverride && override.readable,
           authOverride: override.authOverride,
+          // Issue #263, additive: this profile authenticates its normal
+          // traffic through an apiKeyHelper (the CLIProxyAPI route). It is
+          // NOT an auth override — renewal still works, because the renewal
+          // child reads a scratch settings context that has no helper.
+          ...(override.helperRouted ? { helperRouted: true } : {}),
           lastAttempt,
           ...(storedAttempt?.restoreFailed ? { error: storedAttempt.detail } : {}),
         };

@@ -86,12 +86,26 @@ function fixture(options = {}) {
 }
 
 function assertPinnedRenewalCalls(data, calls = data.calls) {
+  const scratchRoot = path.join(data.root, 'data', 'claude-renewal');
   for (const call of calls) {
     assert.equal(call.options.timeout, 60_000);
-    assert.equal(call.options.cwd, path.join(data.root, 'data', 'claude-renewal'));
-    assert.equal(call.options.env.CLAUDE_CONFIG_DIR, data.targetHome);
+    // Issue #263: the renewal child no longer reads the PROFILE's settings.
+    // Its config dir is a per-account scratch directory under the renewal
+    // scratch root, so `apiKeyHelper` (and the proxy base URL) cannot reach
+    // the CLI and blank out the identity the no-flip rung depends on.
+    // Credential scoping still points at the real profile — that is the
+    // separation the whole fix rests on.
+    // cwd is unchanged from before #263: only the env moved.
+    assert.equal(call.options.cwd, scratchRoot);
+    const configDir = call.options.env.CLAUDE_CONFIG_DIR;
+    assert.equal(path.dirname(configDir), scratchRoot);
+    assert.match(path.basename(configDir), /^cfg-[0-9a-f]{12}$/);
+    assert.notEqual(configDir, data.targetHome);
     assert.equal(call.options.env.CLAUDE_SECURESTORAGE_CONFIG_DIR, data.targetHome);
     assert.equal(call.options.env.USER, 'fixture-user');
+    for (const name of ['settings.json', 'settings.local.json']) {
+      assert.equal(fs.existsSync(path.join(configDir, name)), false);
+    }
     for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL']) {
       assert.equal(Object.hasOwn(call.options.env, key), false);
     }
@@ -318,10 +332,14 @@ test('matching auth-status renews without a flip while Claude is running and san
     assert.equal(data.store.getAccount(data.target.id).isDefault, false);
     assert.equal(data.store.getAccount(data.target.id).metadata.claudeRenewal.lastAttempt.path, 'no-flip');
     const account = (await data.service.state()).accounts.find((item) => item.id === data.target.id);
+    // #263 made `path` additive on the wire: which rung ran is the fact that
+    // distinguishes "a session was in the way" from "the cheap rung was never
+    // tried", and the latter is what hid this defect for four releases.
     assert.deepEqual(account.renew.lastAttempt, {
       at: renew.at,
       outcome: 'renewed',
       mechanism: 'auth-status',
+      path: 'no-flip',
     });
   } finally { data.close(); }
 });
@@ -722,6 +740,7 @@ test('renewal attempt metadata survives a daemon restart', async () => {
         at: renew.at,
         outcome: renew.outcome,
         mechanism: renew.mechanism,
+        path: renew.path,
       });
     } finally { reopened.close(); }
   } finally {

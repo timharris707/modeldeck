@@ -236,30 +236,47 @@ public struct ClaudeStatuslineOptIn: Codable, Equatable, Sendable {
 }
 
 /// Issue #176: the daemon's per-account renewal capability from
-/// `GET /api/state` (`renew: {available, authOverride, lastAttempt}`).
+/// `GET /api/state`
+/// (`renew: {available, authOverride, helperRouted?, lastAttempt}`).
 /// `available` — the guarded renew op can run for this profile;
-/// `authOverride` — the profile routes authentication elsewhere (e.g. an
-/// apiKeyHelper/env override), so ModelDeck's renewal honestly can't apply.
+/// `authOverride` — the profile's settings env supplies an Anthropic
+/// credential (`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`), so ModelDeck's
+/// renewal honestly can't apply.
+///
+/// `helperRouted` (issue #263) — the profile authenticates its ordinary
+/// traffic through an `apiKeyHelper`, the CLIProxyAPI route. This doc comment
+/// claimed since #225 that `authOverride` already covered apiKeyHelper; it did
+/// not, and the daemon read the key nowhere at all. That gap was the defect:
+/// the helper outranks the stored OAuth credential inside the CLI, so
+/// `claude auth status --json` named nobody, renewal's fail-closed identity
+/// gate declined the cheap rung, and four of Tim's six accounts deferred as
+/// "busy" every five minutes for four releases. It is reported, NOT treated as
+/// an override — the renewal child now reads a scratch settings context with
+/// no helper in it, so these accounts stay renewable.
+///
 /// Decoding is deliberately shape-tolerant (the `activation`/`scheduler`
 /// policy): an unexpected shape reads as the inert empty capability rather
 /// than failing the whole account decode.
 public struct AccountRenewCapability: Codable, Equatable, Sendable {
     public var available: Bool
     public var authOverride: Bool
+    public var helperRouted: Bool
     public var lastAttempt: AccountRenewAttempt?
 
     public init(
         available: Bool = false,
         authOverride: Bool = false,
+        helperRouted: Bool = false,
         lastAttempt: AccountRenewAttempt? = nil
     ) {
         self.available = available
         self.authOverride = authOverride
+        self.helperRouted = helperRouted
         self.lastAttempt = lastAttempt
     }
 
     private enum CodingKeys: String, CodingKey {
-        case available, authOverride, lastAttempt
+        case available, authOverride, helperRouted, lastAttempt
     }
 
     public init(from decoder: Decoder) throws {
@@ -270,6 +287,7 @@ public struct AccountRenewCapability: Codable, Equatable, Sendable {
         self.init(
             available: (try? container.decodeIfPresent(Bool.self, forKey: .available)) ?? false,
             authOverride: (try? container.decodeIfPresent(Bool.self, forKey: .authOverride)) ?? false,
+            helperRouted: (try? container.decodeIfPresent(Bool.self, forKey: .helperRouted)) ?? false,
             lastAttempt: (try? container.decodeIfPresent(AccountRenewAttempt.self, forKey: .lastAttempt)) ?? nil
         )
     }
@@ -282,11 +300,54 @@ public struct AccountRenewAttempt: Codable, Equatable, Sendable {
     public var at: String?
     public var outcome: String?
     public var mechanism: String?
+    /// Issue #263, additive: which rung the daemon selected — "no-flip" or
+    /// "flip".
+    public var path: String?
+    /// Issue #263, additive: why the cheap no-flip rung was declined —
+    /// "absent" (the CLI named nobody), "mismatched" (it named someone else),
+    /// "error" (the invocation failed), "setup-failed" (ModelDeck's own
+    /// renewal config dir could not be prepared).
+    ///
+    /// These exist because a bare `busy` hid the #263 defect for four
+    /// releases: it read as "a session is in the way" when the truth was "the
+    /// cheap rung was never tried". They are decoded here so the daemon's
+    /// explanation survives the wire even before a view renders it — an
+    /// explanation that stops at the JSON boundary is the same blind spot
+    /// wearing a different hat.
+    public var identityDecline: String?
 
-    public init(at: String? = nil, outcome: String? = nil, mechanism: String? = nil) {
+    public init(
+        at: String? = nil,
+        outcome: String? = nil,
+        mechanism: String? = nil,
+        path: String? = nil,
+        identityDecline: String? = nil
+    ) {
         self.at = at
         self.outcome = outcome
         self.mechanism = mechanism
+        self.path = path
+        self.identityDecline = identityDecline
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case at, outcome, mechanism, path, identityDecline
+    }
+
+    /// Shape-tolerant, matching `AccountRenewCapability`: an unexpected type on
+    /// any one field must never fail the whole account decode.
+    public init(from decoder: Decoder) throws {
+        guard let container = try? decoder.container(keyedBy: CodingKeys.self) else {
+            self.init()
+            return
+        }
+        self.init(
+            at: (try? container.decodeIfPresent(String.self, forKey: .at)) ?? nil,
+            outcome: (try? container.decodeIfPresent(String.self, forKey: .outcome)) ?? nil,
+            mechanism: (try? container.decodeIfPresent(String.self, forKey: .mechanism)) ?? nil,
+            path: (try? container.decodeIfPresent(String.self, forKey: .path)) ?? nil,
+            identityDecline: (try? container.decodeIfPresent(String.self, forKey: .identityDecline)) ?? nil
+        )
     }
 }
 
