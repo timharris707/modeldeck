@@ -84,8 +84,23 @@ const CLAUDE_RENEWAL_SETTINGS_OVERRIDE = JSON.stringify({
 const CLAUDE_AUTH_OVERRIDE_ABSENT = Object.freeze({
   authOverride: false,
   proxyRouted: false,
+  cliproxyRouted: false,
   helperRouted: false,
 });
+
+// A CLIProxyAPI instance is local by definition; anything else (corporate
+// gateway, an explicit api.anthropic.com) must never receive the client key.
+function isLoopbackUrl(value) {
+  if (typeof value !== 'string' || !value.trim()) return false;
+  let parsed;
+  try {
+    parsed = new URL(value.trim());
+  } catch {
+    return false;
+  }
+  const host = parsed.hostname.replace(/^\[|\]$/g, '');
+  return host === '127.0.0.1' || host === 'localhost' || host === '::1';
+}
 
 const CLAUDE_RENEWAL_EMAIL_PATTERN = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
 const CLAUDE_RENEWAL_EMAIL_KEYS = new Set([
@@ -1593,6 +1608,11 @@ export class ModelDeckService {
     return {
       authOverride: CLAUDE_AUTH_CREDENTIAL_KEYS.some(present),
       proxyRouted: present('ANTHROPIC_BASE_URL'),
+      // Issue #277 adversarial review: injecting the CLIProxy client key must
+      // not key off base-URL PRESENCE — a corporate gateway or an explicit
+      // api.anthropic.com URL is not CLIProxy, and handing it ModelDeck's
+      // client key would be wrong. Only a loopback base URL qualifies.
+      cliproxyRouted: isLoopbackUrl(env ? env.ANTHROPIC_BASE_URL : null),
       // Issue #263: reported, deliberately NOT treated as an auth override.
       // An apiKeyHelper is what BLINDED renewal (it outranks the stored OAuth
       // in `claude auth status`, so the CLI named nobody) — but the renewal
@@ -2138,7 +2158,10 @@ export class ModelDeckService {
     // never blocks the home switch.
     let shellPinError = null;
     try {
-      await this.writeClaudeShellEnvFile(value);
+      // cliproxyRouted, not proxyRouted: the Keychain client key goes only to
+      // profiles whose base URL is actually a local CLIProxy (#277 review).
+      const { cliproxyRouted } = await this.claudeAuthOverrideState(value);
+      await this.writeClaudeShellEnvFile(value, cliproxyRouted);
     } catch (error) {
       shellPinError = errorMessage(error);
     }
@@ -2186,12 +2209,12 @@ export class ModelDeckService {
 
   // Atomic write (temp + rename) so a shell sourcing the snippet mid-switch
   // never sees a half-written file.
-  async writeClaudeShellEnvFile(profileRealPath) {
+  async writeClaudeShellEnvFile(profileRealPath, proxyRouted = false) {
     const file = this.claudeShellEnvFile;
     await fs.promises.mkdir(path.dirname(file), { recursive: true });
     const temporary = `${file}.modeldeck-${process.pid}-${crypto.randomUUID()}`;
     try {
-      await fs.promises.writeFile(temporary, claudePinnedEnvFileContent(profileRealPath), { mode: 0o600 });
+      await fs.promises.writeFile(temporary, claudePinnedEnvFileContent(profileRealPath, proxyRouted), { mode: 0o600 });
       await fs.promises.rename(temporary, file);
     } catch (error) {
       await fs.promises.unlink(temporary).catch(() => {});

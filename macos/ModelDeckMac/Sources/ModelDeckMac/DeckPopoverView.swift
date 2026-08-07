@@ -1507,9 +1507,11 @@ struct DeckAccountRowView: View {
                     // on the row — tier-scale, secondary, grouped with the
                     // title cluster so it never competes with the headline
                     // percent. Absent field (no proxy) renders nothing.
-                    // Issue #272: the value follows the #254 toggle — the
-                    // Fable view shows 0 for a Fable-benched account, whose
-                    // live weight routes only other models.
+                    // Issue #272 (rekeyed by #287): the value follows the
+                    // window the row displays — a Fable-benched account
+                    // shows 0 whenever anything but its general weekly is
+                    // on screen (including the Weekly-focus fallback path);
+                    // its live weight routes only other models.
                     ProxyWeightBadge(presentation: weight)
                 }
                 Spacer(minLength: 8)

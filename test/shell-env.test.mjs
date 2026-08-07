@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { claudePinnedEnvFileContent } from '../src/adapters/claude.mjs';
 
 // Issue #66: the ~/.zshenv block must source the daemon-written pinned env
 // snippet (both CLAUDE_CONFIG_DIR and CLAUDE_SECURESTORAGE_CONFIG_DIR) and
@@ -58,6 +59,61 @@ test('sourcing the block exports the pinned pair when the env file exists', (t) 
     env: { HOME: home, PATH: process.env.PATH },
   }).toString();
   assert.deepEqual(output.split('\n'), [profile, profile]);
+});
+
+test('a failed proxy Keychain lookup exports an empty key without breaking shell startup', (t) => {
+  const home = fixtureHome(t);
+  runInstaller(home);
+  const dataDir = path.join(home, 'Library', 'Application Support', 'ModelDeck');
+  const binDir = path.join(home, 'bin');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.mkdirSync(binDir);
+  fs.writeFileSync(path.join(dataDir, 'claude-env.sh'), claudePinnedEnvFileContent('/profiles/proxied', true));
+  // Never touch the test runner's real Keychain. This stand-in models a
+  // missing item by failing noisily; the generated pointer must suppress the
+  // error, export an empty value, and let even a `set -e` shell continue.
+  fs.writeFileSync(path.join(binDir, 'security'), [
+    '#!/bin/sh',
+    'echo "fixture Keychain item missing" >&2',
+    'exit 44',
+    '',
+  ].join('\n'), { mode: 0o700 });
+  const output = execFileSync('/bin/sh', ['-c', 'set -eu; . "$HOME/.zshenv"; printf "<%s>\\ncontinued" "$ANTHROPIC_API_KEY"'], {
+    env: { HOME: home, PATH: `${binDir}:/usr/bin:/bin` },
+  }).toString();
+  assert.equal(output, '<>\ncontinued');
+});
+
+test('an unproxied profile clears an inherited key, but never the user\'s own (CodeRabbit, PR #278)', (t) => {
+  // The nested-shell case: a shell started while a PROXIED profile was
+  // active exports the key; switching to an unproxied profile rewrites
+  // claude-env.sh, and a subshell sourcing it must come up WITHOUT the key
+  // — an unproxied profile authenticates with its stored OAuth, and an API
+  // key would override and break it. Omitting the export is not enough,
+  // because the child inherits it.
+  const home = fixtureHome(t);
+  runInstaller(home);
+  const dataDir = path.join(home, 'Library', 'Application Support', 'ModelDeck');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, 'claude-env.sh'), claudePinnedEnvFileContent('/profiles/plain', false));
+
+  // Inherited from a proxied-profile parent: OUR marker is set, so ours goes.
+  const cleared = execFileSync('/bin/sh', ['-c', 'set -eu; . "$HOME/.zshenv"; printf "<%s>" "${ANTHROPIC_API_KEY:-}"'], {
+    env: {
+      HOME: home,
+      PATH: process.env.PATH,
+      ANTHROPIC_API_KEY: 'inherited-proxy-key-placeholder',
+      MODELDECK_MANAGED_ANTHROPIC_API_KEY: '1',
+    },
+  }).toString();
+  assert.equal(cleared, '<>', 'a key ModelDeck exported is cleared');
+
+  // The user's OWN key (no marker) must survive untouched — ModelDeck does
+  // not own this variable when it did not set it.
+  const preserved = execFileSync('/bin/sh', ['-c', 'set -eu; . "$HOME/.zshenv"; printf "<%s>" "${ANTHROPIC_API_KEY:-}"'], {
+    env: { HOME: home, PATH: process.env.PATH, ANTHROPIC_API_KEY: 'user-own-key-placeholder' },
+  }).toString();
+  assert.equal(preserved, '<user-own-key-placeholder>', "a user's own key is never touched");
 });
 
 test('override path agrees end-to-end: daemon write path and generated block source the same file', async (t) => {

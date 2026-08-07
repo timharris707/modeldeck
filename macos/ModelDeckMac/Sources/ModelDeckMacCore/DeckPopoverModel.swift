@@ -363,9 +363,18 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     /// live weight preserved for the tooltip's fuller truth; the Weekly
     /// view (and Codex, which has no Fable concept) shows the weight as-is.
     ///
-    /// "Fable view" follows the same rule as the #258 health basis: the
-    /// #254 toggle OFF is the Fable side, ON is the general-weekly side —
-    /// the chrome tells one consistent story per toggle position.
+    /// Issue #287 (supersedes #272's toggle keying): "Fable view" is
+    /// decided by the window the row actually DISPLAYS, not the #254
+    /// toggle position. The toggle stood in for the displayed window until
+    /// the fallback path bit: Weekly focus with no measurable general
+    /// weekly keeps the Fable window on screen (`worstWindow`'s
+    /// no-preference-may-hide-data guard), and the toggle-keyed badge then
+    /// rendered the live weight beside a Fable number — overstating
+    /// routing for a benched account, exactly what #272's accuracy
+    /// invariant forbids. The general-weekly window is the only window a
+    /// benched account's live weight truthfully describes; any other
+    /// displayed window (Fable weekly, 5-hour burst, spend fallback, or no
+    /// window at all) tells the Fable-side story: effective weight 0.
     public struct ProxyWeightPresentation: Equatable, Sendable {
         /// The number the badge renders.
         public var weight: Int
@@ -378,8 +387,17 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
 
     public var proxyWeightPresentation: ProxyWeightPresentation? {
         guard let live = account.proxyWeight else { return nil }
+        // Issue #287: key on the binding window, so the badge and the
+        // number beside it can never tell different stories — including
+        // when the #254 toggle is ON but the row fell back to the Fable
+        // window. A row with no binding window at all is NOT displaying
+        // general weekly, so a benched account stays benched there too
+        // (understatement is recoverable via the tooltip; overstatement
+        // is the #287 bug).
+        let displaysGeneralWeekly = worstWindow
+            .map { DeckBuilder.windowRank(scope: $0.scope) == 1 } ?? false
         let benched = provider == .claude
-            && !prefersGeneralWeeklyHeadline
+            && !displaysGeneralWeekly
             && account.proxyFableExcluded == true
         return ProxyWeightPresentation(
             weight: benched ? 0 : live,

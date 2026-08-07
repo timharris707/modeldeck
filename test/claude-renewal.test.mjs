@@ -112,6 +112,15 @@ function assertPinnedRenewalCalls(data, calls = data.calls) {
   }
 }
 
+test('renewal child scrubs an ANTHROPIC_API_KEY inherited from a pinned-shell daemon', () => {
+  const data = fixture();
+  try {
+    const env = data.service.claudeRenewalEnv(data.targetHome, path.join(data.root, 'renewal-config'));
+    assert.equal(Object.hasOwn(env, 'ANTHROPIC_API_KEY'), false);
+    assert.equal(env.PATH, '/fixture/bin');
+  } finally { data.close(); }
+});
+
 test('renewal preconditions return distinct decided outcomes without invoking Claude', async (t) => {
   await t.test('non-Claude accounts fail with provider mismatch and no renewal metadata', async () => {
     const data = fixture();

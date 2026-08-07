@@ -277,7 +277,7 @@ const assertOwnerOnlyDirectory = claudeProfile.assertOwnerOnlyDirectory;
 // pinned session store its transcript under one profile while authenticating
 // as another. Verified on Claude Code 2.1.216; the keychain-scope derivation
 // is an undocumented internal — revalidate on CLI upgrades.
-export function claudePinnedEnvFileContent(profileRealPath) {
+export function claudePinnedEnvFileContent(profileRealPath, proxyRouted = false) {
   if (!profileRealPath || typeof profileRealPath !== 'string') {
     throw new Error('Claude profile real path is required');
   }
@@ -289,6 +289,28 @@ export function claudePinnedEnvFileContent(profileRealPath) {
     '# variables must always carry the same value (issue #66).',
     `export CLAUDE_CONFIG_DIR=${quoted}`,
     `export CLAUDE_SECURESTORAGE_CONFIG_DIR=${quoted}`,
+    ...(proxyRouted ? [
+      '',
+      '# Proxy-routed profile: headless children need a key the apiKeyHelper',
+      '# cannot supply without an interactive approval (issue #277). Pointer',
+      '# only — the value is fetched from the Keychain at shell startup and',
+      '# never written to disk. The marker records that WE set it, so the',
+      '# unproxied branch below can clear ours without touching a key the',
+      '# user set for their own tooling.',
+      'export ANTHROPIC_API_KEY="$(security find-generic-password -s cli-proxy-api-client -w 2>/dev/null)"',
+      'export MODELDECK_MANAGED_ANTHROPIC_API_KEY=1',
+    ] : [
+      '',
+      '# Not proxy-routed: this profile authenticates with its stored OAuth,',
+      '# and an API key would OVERRIDE that and break it. Omitting the export',
+      '# is not enough — a nested shell inherits the key from a parent that',
+      '# was started while a proxied profile was active (CodeRabbit, PR #278).',
+      '# Guarded on our own marker so a key the user exported for their own',
+      '# tooling is never touched.',
+      'if [ "${MODELDECK_MANAGED_ANTHROPIC_API_KEY:-}" = "1" ]; then',
+      '  unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY',
+      'fi',
+    ]),
     '',
   ].join('\n');
 }

@@ -2225,7 +2225,7 @@ struct DeckChangeTrackerTests {
     }
 }
 
-@Suite("Proxy weight badge follows the window toggle (issue #272)")
+@Suite("Proxy weight badge follows the displayed window (issues #272/#287)")
 struct ProxyWeightPresentationTests {
     // Tim, 2026-08-06 (two screenshots): LoanMeld read "⑂8 at 0% Fable left"
     // in the Fable view. Not a display regression — the 2026-08-05 two-tier
@@ -2233,12 +2233,31 @@ struct ProxyWeightPresentationTests {
     // Fable-benched account), and the badge kept showing the raw number in
     // both views. Before the split a Fable-drained account's weight WAS 0,
     // so the Fable view looked right by coincidence.
+    //
+    // Issue #287 rekeyed "view" from the #254 toggle to the window the row
+    // actually displays: with Weekly focus ON but no measurable general
+    // weekly, `worstWindow` keeps the Fable window on screen, and the
+    // toggle-keyed badge overstated routing (live weight beside a Fable
+    // number for a benched account).
+
+    private func window(_ scope: String, remaining: Double? = 50) -> DeckWindow {
+        DeckWindow(
+            scope: scope,
+            title: DeckBuilder.windowTitle(for: scope),
+            remainingPercent: remaining,
+            resetsAt: nil,
+            resetText: "no reset data",
+            severity: .healthy,
+            stale: false
+        )
+    }
 
     private func row(
         provider: String = "claude",
         weight: Int? = nil,
         fableExcluded: Bool? = nil,
-        generalWeekly: Bool = false
+        generalWeekly: Bool = false,
+        windows: [DeckWindow] = []
     ) -> DeckAccountRow {
         DeckAccountRow(
             account: DeckAccount(
@@ -2246,7 +2265,7 @@ struct ProxyWeightPresentationTests {
                 proxyWeight: weight, proxyFableExcluded: fableExcluded
             ),
             provider: DeckProvider.from(provider),
-            windows: [],
+            windows: windows,
             isActive: false,
             activationState: .unknown,
             prefersGeneralWeeklyHeadline: generalWeekly
@@ -2263,8 +2282,40 @@ struct ProxyWeightPresentationTests {
     }
 
     @Test func weeklyViewShowsTheLiveWeightForTheSameAccount() {
-        let presentation = row(weight: 8, fableExcluded: true, generalWeekly: true)
-            .proxyWeightPresentation
+        // #287: the weekly side needs the general weekly actually displayed
+        // — with the datum present the toggle binds the row to it.
+        let presentation = row(
+            weight: 8, fableExcluded: true, generalWeekly: true,
+            windows: [window("week"), window("week:fable", remaining: 0)]
+        ).proxyWeightPresentation
+        #expect(presentation?.weight == 8)
+        #expect(presentation?.benchedForFable == false)
+    }
+
+    @Test func weeklyFocusFallingBackToTheFableWindowStaysBenched() {
+        // THE #287 regression: Weekly focus ON, no general-weekly datum —
+        // the row displays the Fable window (worstWindow's fallback), so
+        // the badge must tell the Fable story: benched, effective 0. The
+        // toggle-keyed badge showed 8 here, overstating Fable routing for
+        // six of seven pooled accounts.
+        let presentation = row(
+            weight: 8, fableExcluded: true, generalWeekly: true,
+            windows: [window("week:fable", remaining: 12)]
+        ).proxyWeightPresentation
+        #expect(presentation?.weight == 0)
+        #expect(presentation?.benchedForFable == true)
+        #expect(presentation?.liveWeight == 8, "the tooltip keeps the whole truth")
+    }
+
+    @Test func aDisplayedGeneralWeeklyTellsTheLiveWeightEvenWithTheToggleOff() {
+        // The same displayed-window rule in the other direction: toggle OFF
+        // but the general weekly IS the binding (worst) window — the number
+        // on screen is general-pool quota, which the live weight truthfully
+        // routes, so no benched 0 beside it.
+        let presentation = row(
+            weight: 8, fableExcluded: true,
+            windows: [window("week", remaining: 10), window("week:fable", remaining: 40)]
+        ).proxyWeightPresentation
         #expect(presentation?.weight == 8)
         #expect(presentation?.benchedForFable == false)
     }
@@ -2306,10 +2357,21 @@ struct ProxyWeightPresentationTests {
             .accessibilityLabel(showsIdentity: false)
         #expect(benched.contains("benched for Fable routing, weight 8 for other models"))
 
-        let weekly = row(weight: 8, fableExcluded: true, generalWeekly: true)
-            .accessibilityLabel(showsIdentity: false)
+        let weekly = row(
+            weight: 8, fableExcluded: true, generalWeekly: true,
+            windows: [window("week")]
+        ).accessibilityLabel(showsIdentity: false)
         #expect(weekly.contains("proxy routing weight 8"))
         #expect(!weekly.contains("benched"))
+
+        // #287 lockstep: the fallback-to-Fable row SPEAKS benched too —
+        // VoiceOver must never hear a weight the badge doesn't show.
+        let fallback = row(
+            weight: 8, fableExcluded: true, generalWeekly: true,
+            windows: [window("week:fable", remaining: 12)]
+        ).accessibilityLabel(showsIdentity: false)
+        #expect(fallback.contains("benched for Fable routing, weight 8 for other models"))
+        #expect(!fallback.contains("proxy routing weight"))
 
         let unrouted = row().accessibilityLabel(showsIdentity: false)
         #expect(!unrouted.contains("weight"))

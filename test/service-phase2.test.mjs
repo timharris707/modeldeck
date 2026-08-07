@@ -318,11 +318,16 @@ test('Claude secure-storage activation handles darwin success, failure, non-darw
   });
 });
 
-test('Claude activation pins the shell env file with both variables and refreshes it per switch', async (t) => {
+test('Claude activation pins proxy credentials by Keychain pointer and removes the export per unproxied switch', async (t) => {
   const data = fixture();
   t.after(() => data.close());
-  const first = data.store.saveAccount({ provider: 'claude', label: 'First', profileRef: data.firstHome, isDefault: true });
-  const second = data.store.saveAccount({ provider: 'claude', label: 'Second', profileRef: data.secondHome });
+  const proxiedSettings = `${JSON.stringify({
+    apiKeyHelper: 'printf sk-placeholder',
+    env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8317' },
+  }, null, 2)}\n`;
+  fs.writeFileSync(path.join(data.firstHome, 'settings.json'), proxiedSettings, { mode: 0o600 });
+  const first = data.store.saveAccount({ provider: 'claude', label: 'Proxied', profileRef: data.firstHome, isDefault: true });
+  const second = data.store.saveAccount({ provider: 'claude', label: 'Unproxied', profileRef: data.secondHome });
   const envFile = path.join(data.root, 'claude-env.sh');
   assert.equal(data.service.claudeShellEnvFile, envFile);
 
@@ -331,21 +336,55 @@ test('Claude activation pins the shell env file with both variables and refreshe
   const firstReal = fs.realpathSync(data.firstHome);
   assert.ok(content.includes(`export CLAUDE_CONFIG_DIR='${firstReal}'`));
   assert.ok(content.includes(`export CLAUDE_SECURESTORAGE_CONFIG_DIR='${firstReal}'`));
+  assert.ok(content.includes('export ANTHROPIC_API_KEY="$(security find-generic-password -s cli-proxy-api-client -w 2>/dev/null)"'));
   assert.equal((fs.statSync(envFile).mode & 0o777), 0o600);
+  // The activation path only reads routing from settings. The credential
+  // remains a shell-time Keychain pointer and never enters settings.json,
+  // where it would disable managed renewal (#199/#224/#263).
+  const settingsAfterActivation = fs.readFileSync(path.join(data.firstHome, 'settings.json'), 'utf8');
+  assert.equal(settingsAfterActivation, proxiedSettings);
+  assert.equal(Object.hasOwn(JSON.parse(settingsAfterActivation).env, 'ANTHROPIC_API_KEY'), false);
 
   // Activation must refresh the exported path so new shells pick up the
-  // newly active profile while already-pinned sessions stay insulated.
+  // newly active profile while already-pinned sessions stay insulated. A
+  // complete rewrite also removes the proxy key export for an unproxied
+  // profile, where that key would take precedence over stored OAuth.
   await data.service.activateAccount(second.id);
   content = fs.readFileSync(envFile, 'utf8');
   const secondReal = fs.realpathSync(data.secondHome);
   assert.ok(content.includes(`export CLAUDE_CONFIG_DIR='${secondReal}'`));
   assert.ok(content.includes(`export CLAUDE_SECURESTORAGE_CONFIG_DIR='${secondReal}'`));
   assert.ok(!content.includes(firstReal));
+  // No EXPORT for an unproxied profile — but the guarded clear must be
+  // present, or a nested shell keeps the key it inherited from the proxied
+  // profile that was active a moment ago (CodeRabbit, PR #278).
+  assert.ok(!/^export ANTHROPIC_API_KEY=/m.test(content));
+  assert.ok(content.includes('unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY'));
+  assert.equal(fs.readFileSync(path.join(data.firstHome, 'settings.json'), 'utf8'), proxiedSettings);
+  assert.equal(fs.existsSync(path.join(data.secondHome, 'settings.json')), false);
 
   // Codex activation must not touch the Claude pin.
   const codex = data.store.saveAccount({ provider: 'codex', label: 'Codex', profileRef: data.firstHome, isDefault: true });
   await data.service.activateAccount(codex.id);
   assert.ok(fs.readFileSync(envFile, 'utf8').includes(secondReal));
+});
+
+test('a non-loopback base URL never receives the CLIProxy client key', async (t) => {
+  // Adversarial review of #277: base-URL PRESENCE is not CLIProxy routing.
+  // A corporate gateway (or an explicit api.anthropic.com) must not be
+  // handed ModelDeck's Keychain client key.
+  const data = fixture();
+  t.after(() => data.close());
+  const gatewaySettings = `${JSON.stringify({
+    env: { ANTHROPIC_BASE_URL: 'https://llm-gateway.corp.example' },
+  }, null, 2)}\n`;
+  fs.writeFileSync(path.join(data.firstHome, 'settings.json'), gatewaySettings, { mode: 0o600 });
+  const account = data.store.saveAccount({ provider: 'claude', label: 'Gateway', profileRef: data.firstHome, isDefault: true });
+  await data.service.activateAccount(account.id);
+  const content = fs.readFileSync(path.join(data.root, 'claude-env.sh'), 'utf8');
+  assert.ok(!/^export ANTHROPIC_API_KEY=/m.test(content));
+  // The guarded clear still applies, exactly as for an unrouted profile.
+  assert.ok(content.includes('unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY'));
 });
 
 test('Claude activation reports running unpinned sessions and never blocks on detection', async (t) => {

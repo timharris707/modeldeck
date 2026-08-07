@@ -713,8 +713,31 @@ test('pinned env file exports both variables with one identical quoted path', ()
   const values = lines.filter((line) => line.startsWith('export ')).map((line) => line.split('=').slice(1).join('='));
   assert.equal(values.length, 2);
   assert.equal(values[0], values[1]);
+  // CodeRabbit (PR #278): an unproxied profile must EXPORT no key, but it
+  // must still CLEAR one ModelDeck previously exported — a nested shell
+  // inherits it otherwise. The clear is guarded on our own marker so a key
+  // the user set for their own tooling is never touched.
+  assert.ok(!/^export ANTHROPIC_API_KEY=/m.test(content), 'no export on an unproxied profile');
+  assert.ok(content.includes('unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY'));
+  assert.ok(content.includes('"${MODELDECK_MANAGED_ANTHROPIC_API_KEY:-}" = "1"'), 'guarded on our marker');
   assert.ok(content.endsWith('\n'));
   assert.throws(() => claudePinnedEnvFileContent(), /real path is required/);
+});
+
+test('proxy-routed pinned env file adds the fixed Keychain pointer without changing the quoted pins', () => {
+  const content = claudePinnedEnvFileContent("/profiles/o'brien", true);
+  const expected = `'/profiles/o'\\''brien'`;
+  assert.ok(content.includes(`export CLAUDE_CONFIG_DIR=${expected}`));
+  assert.ok(content.includes(`export CLAUDE_SECURESTORAGE_CONFIG_DIR=${expected}`));
+  assert.ok(content.includes(
+    'export ANTHROPIC_API_KEY="$(security find-generic-password -s cli-proxy-api-client -w 2>/dev/null)"',
+  ));
+  assert.equal(content.match(/^export ANTHROPIC_API_KEY=/gm)?.length, 1);
+  // The marker (CodeRabbit, PR #278) records that WE set the key, so the
+  // unproxied branch can clear ours without touching the user's own.
+  assert.ok(content.includes('export MODELDECK_MANAGED_ANTHROPIC_API_KEY=1'));
+  assert.ok(!content.includes('unset ANTHROPIC_API_KEY'), 'a proxied profile never clears it');
+  assert.ok(content.endsWith('\n'));
 });
 
 test('shared profile helpers preserve provider-specific required and invalid-name errors', async (t) => {
