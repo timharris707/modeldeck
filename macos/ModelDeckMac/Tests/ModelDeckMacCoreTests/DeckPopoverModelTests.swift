@@ -2224,3 +2224,106 @@ struct DeckChangeTrackerTests {
         #expect(tracker.capture(rows: rows(remaining: 20)).isEmpty)
     }
 }
+
+@Suite("Proxy weight badge follows the window toggle (issue #272)")
+struct ProxyWeightPresentationTests {
+    // Tim, 2026-08-06 (two screenshots): LoanMeld read "⑂8 at 0% Fable left"
+    // in the Fable view. Not a display regression — the 2026-08-05 two-tier
+    // rebalance made one weight mean two things (general-pace duty for a
+    // Fable-benched account), and the badge kept showing the raw number in
+    // both views. Before the split a Fable-drained account's weight WAS 0,
+    // so the Fable view looked right by coincidence.
+
+    private func row(
+        provider: String = "claude",
+        weight: Int? = nil,
+        fableExcluded: Bool? = nil,
+        generalWeekly: Bool = false
+    ) -> DeckAccountRow {
+        DeckAccountRow(
+            account: DeckAccount(
+                id: "a1", provider: provider, label: "Studio",
+                proxyWeight: weight, proxyFableExcluded: fableExcluded
+            ),
+            provider: DeckProvider.from(provider),
+            windows: [],
+            isActive: false,
+            activationState: .unknown,
+            prefersGeneralWeeklyHeadline: generalWeekly
+        )
+    }
+
+    @Test func fableViewShowsZeroForABenchedAccount() {
+        // THE field case: live weight 8 is general-pace duty; for Fable
+        // routing this account is parked, and the Fable view must say so.
+        let presentation = row(weight: 8, fableExcluded: true).proxyWeightPresentation
+        #expect(presentation?.weight == 0)
+        #expect(presentation?.benchedForFable == true)
+        #expect(presentation?.liveWeight == 8, "the tooltip keeps the whole truth")
+    }
+
+    @Test func weeklyViewShowsTheLiveWeightForTheSameAccount() {
+        let presentation = row(weight: 8, fableExcluded: true, generalWeekly: true)
+            .proxyWeightPresentation
+        #expect(presentation?.weight == 8)
+        #expect(presentation?.benchedForFable == false)
+    }
+
+    @Test func anUnbenchedAccountShowsItsWeightInBothViews() {
+        for generalWeekly in [false, true] {
+            let presentation = row(weight: 3, generalWeekly: generalWeekly)
+                .proxyWeightPresentation
+            #expect(presentation?.weight == 3)
+            #expect(presentation?.benchedForFable == false)
+        }
+    }
+
+    @Test func aTrueZeroWeightStillRendersAsZeroUnbenched() {
+        // Weight 0 without an exclusion means "the proxy parked the whole
+        // account" — a real value since #220, distinct from Fable-benched.
+        let presentation = row(weight: 0).proxyWeightPresentation
+        #expect(presentation?.weight == 0)
+        #expect(presentation?.benchedForFable == false)
+    }
+
+    @Test func codexNeverBenches() {
+        // Codex has no Fable concept; a stray flag must not invent one.
+        let presentation = row(provider: "codex", weight: 5, fableExcluded: true)
+            .proxyWeightPresentation
+        #expect(presentation?.weight == 5)
+        #expect(presentation?.benchedForFable == false)
+    }
+
+    @Test func noWeightRendersNothingRegardlessOfTheFlag() {
+        #expect(row(fableExcluded: true).proxyWeightPresentation == nil)
+    }
+
+    @Test func theRowLabelSpeaksTheWeightBecauseItSuppressesTheBadge() {
+        // CodeRabbit (PR #273): the row's explicit parent label suppresses
+        // the badge's own element (#65/#113 pattern) — folding the weight in
+        // here is the only way VoiceOver ever hears it.
+        let benched = row(weight: 8, fableExcluded: true)
+            .accessibilityLabel(showsIdentity: false)
+        #expect(benched.contains("benched for Fable routing, weight 8 for other models"))
+
+        let weekly = row(weight: 8, fableExcluded: true, generalWeekly: true)
+            .accessibilityLabel(showsIdentity: false)
+        #expect(weekly.contains("proxy routing weight 8"))
+        #expect(!weekly.contains("benched"))
+
+        let unrouted = row().accessibilityLabel(showsIdentity: false)
+        #expect(!unrouted.contains("weight"))
+    }
+
+    @Test func theDaemonFieldDecodesAndItsAbsenceReadsAsNil() throws {
+        let benched = try JSONDecoder().decode(DeckAccount.self, from: Data("""
+        {"id":"a1","provider":"claude","label":"Studio","enabled":true,"isDefault":false,"proxyWeight":8,"proxyFableExcluded":true}
+        """.utf8))
+        #expect(benched.proxyFableExcluded == true)
+
+        let plain = try JSONDecoder().decode(DeckAccount.self, from: Data("""
+        {"id":"a1","provider":"claude","label":"Studio","enabled":true,"isDefault":false,"proxyWeight":3}
+        """.utf8))
+        #expect(plain.proxyFableExcluded == nil)
+    }
+}

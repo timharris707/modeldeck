@@ -37,6 +37,53 @@ public enum DeckLayout: String, Equatable, Sendable {
     case singleColumn = "single-column"
 }
 
+/// Issue #270 — how much desktop shows through the deck.
+///
+/// There was no transparency control before this: the deck inherited
+/// SwiftUI's default `MenuBarExtra(.window)` material and nothing else, so
+/// "turn it down" had nothing to turn. Each case is the opacity of a
+/// window-background fill composited BEHIND the content and IN FRONT of that
+/// system material — `clear` is therefore byte-identical to the pre-#270
+/// look, and `solid` is a genuinely opaque panel.
+///
+/// Tim, 2026-08-06: *"a little too transparent … cut down some, maybe half of
+/// what it's currently at."* `frosted` is that half, and is the default.
+/// Discrete steps rather than a slider because this lives in the gear menu,
+/// where a continuous control is unusable.
+/// `Hashable` is stated explicitly rather than left to synthesis: the gear
+/// menu's `ForEach(DeckGlass.allCases, id: \.self)` depends on it, and a case
+/// gaining an associated value later would otherwise break that at a distance
+/// (CodeRabbit, PR #271).
+public enum DeckGlass: String, Equatable, Hashable, Sendable, CaseIterable {
+    case clear
+    case light
+    case frosted
+    case solid
+
+    /// The default: half the desktop show-through of the pre-#270 deck.
+    public static let `default` = DeckGlass.frosted
+
+    /// Opacity of the fill drawn behind the deck's content.
+    public var fillOpacity: Double {
+        switch self {
+        case .clear: return 0
+        case .light: return 0.25
+        case .frosted: return 0.5
+        case .solid: return 1
+        }
+    }
+
+    /// Menu title. Deliberately describes the RESULT, not the number.
+    public var title: String {
+        switch self {
+        case .clear: return "Clear"
+        case .light: return "Light"
+        case .frosted: return "Frosted"
+        case .solid: return "Solid"
+        }
+    }
+}
+
 /// Sort order applied per column in two-column mode and to the interleaved
 /// list in single-column mode. Next reset is the locked default.
 ///
@@ -308,6 +355,39 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
 
     public var id: String { account.id }
 
+    /// Issue #272: the ⑂ badge's per-view value. The proxy holds ONE weight
+    /// per account, but since the two-tier split policy that number can be
+    /// general-pace duty for an account benched from Fable via
+    /// `excluded-models` — true for Sonnet/Opus routing, false for Fable.
+    /// The Fable view therefore shows the EFFECTIVE weight, 0, with the
+    /// live weight preserved for the tooltip's fuller truth; the Weekly
+    /// view (and Codex, which has no Fable concept) shows the weight as-is.
+    ///
+    /// "Fable view" follows the same rule as the #258 health basis: the
+    /// #254 toggle OFF is the Fable side, ON is the general-weekly side —
+    /// the chrome tells one consistent story per toggle position.
+    public struct ProxyWeightPresentation: Equatable, Sendable {
+        /// The number the badge renders.
+        public var weight: Int
+        /// True when this is a Fable-view rendering of a benched account —
+        /// the badge shows 0 and the tooltip explains the split.
+        public var benchedForFable: Bool
+        /// The live routing weight (what `weight` hides while benched).
+        public var liveWeight: Int
+    }
+
+    public var proxyWeightPresentation: ProxyWeightPresentation? {
+        guard let live = account.proxyWeight else { return nil }
+        let benched = provider == .claude
+            && !prefersGeneralWeeklyHeadline
+            && account.proxyFableExcluded == true
+        return ProxyWeightPresentation(
+            weight: benched ? 0 : live,
+            benchedForFable: benched,
+            liveWeight: live
+        )
+    }
+
     /// Issue #89: this card's staleness marker, or nil while its data is
     /// fresh. Pure derivation so the threshold math is unit-testable; the
     /// view calls this with the app's effective auto-refresh interval.
@@ -464,6 +544,15 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
         }
         if account.hasDuplicateToken {
             label += ", \(DuplicateTokenMarker.accessibilityLabel)"
+        }
+        // Issue #272 (CodeRabbit, PR #273): this explicit parent label
+        // suppresses the badge's own element (the #65/#113 pattern), so the
+        // weight must be folded in here or VoiceOver never hears it — and
+        // the benched wording must stay distinct from plain routing weight.
+        if let weight = proxyWeightPresentation {
+            label += weight.benchedForFable
+                ? ", benched for Fable routing, weight \(weight.liveWeight) for other models"
+                : ", proxy routing weight \(weight.weight)"
         }
         return label
     }
@@ -1052,6 +1141,7 @@ public final class DeckPopoverModel: ObservableObject {
     static let showEmailsDefaultsKey = "modeldeck.popover.showEmails"
     static let preferModelWindowDefaultsKey = "modeldeck.popover.preferModelWindow"
     static let focusGeneralWeeklyDefaultsKey = "modeldeck.popover.focusGeneralWeekly"
+    static let glassDefaultsKey = "modeldeck.popover.glass"
 
     @Published public var layout: DeckLayout {
         didSet {
@@ -1499,6 +1589,13 @@ public final class DeckPopoverModel: ObservableObject {
         didSet { defaults.set(focusGeneralWeeklyHeadline, forKey: Self.focusGeneralWeeklyDefaultsKey) }
     }
 
+    /// Issue #270: how opaque the deck's backing fill is. App-local
+    /// (UserDefaults, the #73 pattern), never synced to the daemon — it is a
+    /// display preference with no daemon-side meaning.
+    @Published public var glass: DeckGlass {
+        didSet { defaults.set(glass.rawValue, forKey: Self.glassDefaultsKey) }
+    }
+
     /// The header toggle's action: flip the general-weekly focus.
     public func toggleGeneralWeeklyFocus() {
         focusGeneralWeeklyHeadline.toggle()
@@ -1584,6 +1681,12 @@ public final class DeckPopoverModel: ObservableObject {
         // Absent key reads false — the header toggle starts off, so a fresh
         // install's headline is whatever it was before issue #254.
         self.focusGeneralWeeklyHeadline = defaults.bool(forKey: Self.focusGeneralWeeklyDefaultsKey)
+        // Issue #270: an ABSENT key reads `.frosted`, not `.clear` — existing
+        // installs are meant to get the reduced transparency without touching
+        // anything. An unrecognized value (a downgrade, a hand-edited plist)
+        // also falls back to the default rather than to a blank window.
+        self.glass = defaults.string(forKey: Self.glassDefaultsKey)
+            .flatMap(DeckGlass.init(rawValue:)) ?? .default
     }
 
     public func isExpanded(_ accountID: String) -> Bool {

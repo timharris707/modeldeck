@@ -71,11 +71,16 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
     /// Codex account) omits the object entirely and no renew affordance
     /// renders anywhere.
     public var renew: AccountRenewCapability?
-    /// CLIProxyAPI routing weight (0–10 band the hourly rebalance job
-    /// maintains from live quota). Optional by design — a machine without
-    /// the proxy, an account the proxy doesn't route, or an old daemon
-    /// omits it and nothing renders.
+    /// CLIProxyAPI routing weight (0–10 band the rebalance job maintains
+    /// from live quota). Optional by design — a machine without the proxy,
+    /// an account the proxy doesn't route, or an old daemon omits it and
+    /// nothing renders.
     public var proxyWeight: Int?
+    /// Issue #272: true when the proxy benches this account for the Fable
+    /// family (`excluded-models` on its auth file) — `proxyWeight` then
+    /// routes only OTHER models, and the deck's Fable view must not present
+    /// it as Fable routing. Absent everywhere the exclusion doesn't apply.
+    public var proxyFableExcluded: Bool?
 
     public init(
         id: String,
@@ -93,7 +98,8 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         signinReason: String? = nil,
         claudeStatusline: ClaudeStatuslineOptIn? = nil,
         renew: AccountRenewCapability? = nil,
-        proxyWeight: Int? = nil
+        proxyWeight: Int? = nil,
+        proxyFableExcluded: Bool? = nil
     ) {
         self.id = id
         self.provider = provider
@@ -111,6 +117,7 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         self.claudeStatusline = claudeStatusline
         self.renew = renew
         self.proxyWeight = proxyWeight
+        self.proxyFableExcluded = proxyFableExcluded
     }
 
     /// Per-account health chip (issue #32): each roster row reads its OWN

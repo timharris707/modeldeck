@@ -2349,9 +2349,19 @@ export class ModelDeckService {
         const weight = data?.weight;
         if (!Number.isInteger(weight) || weight < 0) continue;
         if (data.type === 'claude' && typeof data.email === 'string' && data.email.trim()) {
-          byClaudeEmail.set(data.email.trim().toLowerCase(), weight);
+          // Issue #272: the two-tier rebalance policy benches a Fable-drained
+          // account via per-credential `excluded-models` while its `weight`
+          // switches to general-pace duty. One number, two meanings — so the
+          // exclusion travels with the weight, letting the deck show the
+          // EFFECTIVE weight for whichever window a card is describing.
+          // Prefix match: the policy writes the exact model id, which is
+          // versioned; the meaning is "the premium Fable family".
+          const excluded = data['excluded-models'];
+          const fableExcluded = Array.isArray(excluded)
+            && excluded.some((m) => typeof m === 'string' && m.startsWith('claude-fable'));
+          byClaudeEmail.set(data.email.trim().toLowerCase(), { weight, fableExcluded });
         } else if (data.type === 'codex' && typeof data.account_id === 'string' && data.account_id.trim()) {
-          byCodexAccountId.set(data.account_id.trim(), weight);
+          byCodexAccountId.set(data.account_id.trim(), { weight, fableExcluded: false });
         }
       } catch { /* malformed or unreadable auth file: no weight for it */ }
     }
@@ -2360,6 +2370,7 @@ export class ModelDeckService {
 
   // Weight 0 is a real value (the proxy stops routing there) — every lookup
   // distinguishes "mapped to 0" from "not mapped" via has(), never truthiness.
+  // Returns { weight, fableExcluded } or null.
   proxyWeightFor(account, weights) {
     if (!weights) return null;
     if (account.provider === 'claude') {
@@ -2426,7 +2437,7 @@ export class ModelDeckService {
       }
       // Additive (the #149/#174 discipline): accounts the proxy doesn't
       // know — or a machine without the proxy at all — omit the key.
-      const proxyWeight = this.proxyWeightFor(account, proxyWeights);
+      const proxyRouting = this.proxyWeightFor(account, proxyWeights);
       // Additive Codex identity evidence: the #108 remembered
       // `tokens.account_id` IDENTIFIER (never a token value). Codex daemon
       // identities are empty, so external tools joining accounts to their
@@ -2443,7 +2454,11 @@ export class ModelDeckService {
         ...(lastRefreshError ? { lastRefreshError } : {}),
         ...(claudeStatusline ? { claudeStatusline } : {}),
         ...(renew ? { renew } : {}),
-        ...(proxyWeight != null ? { proxyWeight } : {}),
+        ...(proxyRouting != null ? { proxyWeight: proxyRouting.weight } : {}),
+        // Issue #272, additive and Claude-only in practice: true when the
+        // proxy's auth file benches this account for the Fable family via
+        // `excluded-models` — its weight then routes only OTHER models.
+        ...(proxyRouting?.fableExcluded ? { proxyFableExcluded: true } : {}),
         ...(codexAccountId ? { codexAccountId } : {}),
       };
     }));

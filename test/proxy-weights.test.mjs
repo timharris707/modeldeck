@@ -142,6 +142,70 @@ test('absence in every direction omits the key entirely', async (t) => {
   assert.ok(accounts.every((a) => !('proxyWeight' in a)));
 });
 
+test('a Fable exclusion travels with the weight; its absence omits the key (#272)', async (t) => {
+  // The two-tier rebalance benches a Fable-drained account via
+  // `excluded-models` while its weight switches to general-pace duty. The
+  // deck needs the exclusion to show the EFFECTIVE weight per view.
+  const fixture = makeFixture({
+    authFiles: {
+      'claude-tim@example.com.json': JSON.stringify({
+        type: 'claude', email: 'tim@example.com', weight: 8,
+        'excluded-models': ['claude-fable-5'],
+      }),
+    },
+  });
+  t.after(() => cleanup(fixture));
+  const claude = (await fixture.service.accountsWithAuthState())
+    .find((a) => a.provider === 'claude');
+  assert.equal(claude.proxyWeight, 8);
+  assert.equal(claude.proxyFableExcluded, true);
+
+  // No exclusion → key absent entirely, per the additive discipline.
+  const plain = makeFixture({
+    authFiles: {
+      'claude-tim@example.com.json': JSON.stringify({
+        type: 'claude', email: 'tim@example.com', weight: 3,
+      }),
+    },
+  });
+  t.after(() => cleanup(plain));
+  const unbenched = (await plain.service.accountsWithAuthState())
+    .find((a) => a.provider === 'claude');
+  assert.equal(unbenched.proxyWeight, 3);
+  assert.ok(!('proxyFableExcluded' in unbenched));
+});
+
+test('non-Fable exclusions and malformed excluded-models do not read as benched (#272)', async (t) => {
+  const fixture = makeFixture({
+    authFiles: {
+      'claude-tim@example.com.json': JSON.stringify({
+        type: 'claude', email: 'tim@example.com', weight: 5,
+        'excluded-models': ['claude-haiku-4-5-20251001'],
+      }),
+    },
+  });
+  t.after(() => cleanup(fixture));
+  const claude = (await fixture.service.accountsWithAuthState())
+    .find((a) => a.provider === 'claude');
+  assert.equal(claude.proxyWeight, 5);
+  assert.ok(!('proxyFableExcluded' in claude));
+
+  // Malformed shapes read as "not benched", never as an error.
+  const malformed = makeFixture({
+    authFiles: {
+      'claude-tim@example.com.json': JSON.stringify({
+        type: 'claude', email: 'tim@example.com', weight: 5,
+        'excluded-models': 'claude-fable-5',
+      }),
+    },
+  });
+  t.after(() => cleanup(malformed));
+  const survived = (await malformed.service.accountsWithAuthState())
+    .find((a) => a.provider === 'claude');
+  assert.equal(survived.proxyWeight, 5);
+  assert.ok(!('proxyFableExcluded' in survived));
+});
+
 test('negative and non-integer weights are ignored; a valid sibling still joins', async (t) => {
   const fixture = makeFixture({
     authFiles: {

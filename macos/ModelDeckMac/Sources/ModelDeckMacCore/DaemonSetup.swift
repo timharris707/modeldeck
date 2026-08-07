@@ -361,6 +361,18 @@ public final class DaemonSetupModel: ObservableObject {
     /// Set when a drift re-register happened this launch; the UI notes it
     /// subtly ("Background service updated to match this app version").
     @Published public private(set) var didReregisterForUpdate = false
+
+    /// Issue #269: the user has read the re-register notice and dismissed it.
+    ///
+    /// Scoped to this launch DELIBERATELY, matching `didReregisterForUpdate`
+    /// itself: the notice only appears when a drift re-register actually
+    /// happened, so persisting the dismissal would suppress the NEXT update's
+    /// notice too — silencing a message the user has never seen. A later
+    /// re-register in the same launch re-raises it, which is correct: that is
+    /// a new event, not the one that was dismissed.
+    public func dismissReregisterNotice() {
+        didReregisterForUpdate = false
+    }
     /// Issue #98: true from the moment the user consents to an install (or
     /// legacy takeover) this session — the fresh registration means the
     /// daemon is NOT yet in the Claude credential items' ACLs, so its first

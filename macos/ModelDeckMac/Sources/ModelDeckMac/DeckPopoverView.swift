@@ -62,6 +62,21 @@ struct DeckPopoverView: View {
         // meter rows carry "Weekly · all models" left and
         // "Resets Wed 5:59 PM" right on every card (zone-free per #137).
         .frame(width: deckModel.layout == .twoColumn ? 640 : 420)
+        // Issue #270 (Tim, 2026-08-06: "a little too transparent"): the deck
+        // had NO background of its own — it inherited SwiftUI's default
+        // MenuBarExtra window material and nothing else. This composites a
+        // window-background fill behind the content, in front of that
+        // material, so less desktop reads through. `.clear` reproduces the
+        // pre-#270 look exactly; the default is half.
+        //
+        // Applied AFTER .frame so it covers the padding too, and BEFORE the
+        // capture view below so it never sits over the content. The window
+        // clips it to its own rounded shape, so no corner treatment here.
+        .background(
+            Color(nsColor: .windowBackgroundColor)
+                .opacity(deckModel.glass.fillOpacity)
+                .ignoresSafeArea()
+        )
         // Issue #230 (reopened): capture the popover's own NSWindow into
         // DeckWindowRegistry the moment SwiftUI hosts the deck, so the
         // dismissal choke point closes THE window instead of guessing
@@ -132,6 +147,14 @@ struct DeckPopoverView: View {
                 Picker("Layout", selection: $deckModel.layout) {
                     Text("Two columns").tag(DeckLayout.twoColumn)
                     Text("Single column").tag(DeckLayout.singleColumn)
+                }
+                // Issue #270: how much desktop reads through the deck.
+                // Discrete steps, not a slider — a continuous control is
+                // unusable inside a menu.
+                Picker("Background", selection: $deckModel.glass) {
+                    ForEach(DeckGlass.allCases, id: \.self) { glass in
+                        Text(glass.title).tag(glass)
+                    }
                 }
                 Divider()
                 // Issue #33 final placement (Tim, 2026-07-20): the canonical
@@ -419,9 +442,33 @@ struct DeckPopoverView: View {
         }
         if setupModel.didReregisterForUpdate {
             // Drift re-register happened this launch — note it subtly.
-            Text("Background service updated to match this app version.")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+            // Issue #269 (Tim, 2026-08-06): informational, not actionable, so
+            // it must be acknowledgeable — it used to sit at the top of the
+            // deck for the whole session after being read once.
+            HStack(spacing: 4) {
+                Text("Background service updated to match this app version.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                Button {
+                    setupModel.dismissReregisterNotice()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        // Small glyph, comfortable target. `.frame` then a
+                        // plain Rectangle centres the region on the glyph.
+                        // `Rectangle().size(16, 16)` looks equivalent and is
+                        // not: it re-anchors at the incoming rect's ORIGIN,
+                        // so the target ran ~7pt right and ~8pt DOWN of the
+                        // glyph with zero margin above or left, and spilled
+                        // outside the button's layout bounds (measured in
+                        // review, PR #271).
+                        .frame(width: 16, height: 16)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss background service notice")
+            }
         }
         if let launchAtLoginError = launchAtLoginModel.lastError {
             Text(launchAtLoginError)
@@ -1455,12 +1502,15 @@ struct DeckAccountRowView: View {
                         onRelogin: { beginDuplicateRelogin() }
                     )
                 }
-                if let weight = row.account.proxyWeight {
+                if let weight = row.proxyWeightPresentation {
                     // Proxy routing weight: deliberately the quietest element
                     // on the row — tier-scale, secondary, grouped with the
                     // title cluster so it never competes with the headline
                     // percent. Absent field (no proxy) renders nothing.
-                    ProxyWeightBadge(weight: weight)
+                    // Issue #272: the value follows the #254 toggle — the
+                    // Fable view shows 0 for a Fable-benched account, whose
+                    // live weight routes only other models.
+                    ProxyWeightBadge(presentation: weight)
                 }
                 Spacer(minLength: 8)
                 // Issue #33 amendment: the headline percent only exists
@@ -1929,19 +1979,35 @@ struct MenuBarSourceCheckmark: View {
 /// never uses severity color. Weight 0 renders too: "the proxy has parked
 /// this account" is exactly the fact worth seeing.
 struct ProxyWeightBadge: View {
-    let weight: Int
+    let presentation: DeckAccountRow.ProxyWeightPresentation
+
+    /// Issue #272: while benched for Fable, the badge's 0 is the effective
+    /// Fable weight — the tooltip carries the rest of the story so the live
+    /// weight is one hover away, not hidden.
+    private var tooltip: String {
+        if presentation.benchedForFable {
+            return "Benched for Fable routing — weight \(presentation.liveWeight) "
+                + "still routes this account's other-model traffic"
+        }
+        return "Proxy routing weight \(presentation.weight) — "
+            + "rebalanced every few minutes from remaining quota"
+    }
 
     var body: some View {
         HStack(spacing: 2) {
             Image(systemName: "arrow.triangle.branch")
                 .font(.system(size: 8.5))
-            Text("\(weight)")
+            Text("\(presentation.weight)")
                 .font(DeckType.tier)
                 .monospacedDigit()
         }
         .foregroundStyle(.secondary)
-        .help("Proxy routing weight \(weight) — rebalanced hourly from remaining quota")
-        .accessibilityLabel("Proxy routing weight \(weight)")
+        .help(tooltip)
+        .accessibilityLabel(
+            presentation.benchedForFable
+                ? "Benched for Fable routing, weight \(presentation.liveWeight) for other models"
+                : "Proxy routing weight \(presentation.weight)"
+        )
     }
 }
 

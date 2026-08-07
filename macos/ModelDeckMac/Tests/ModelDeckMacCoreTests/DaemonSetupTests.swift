@@ -510,6 +510,57 @@ final class DaemonSetupModelTests: XCTestCase {
         XCTAssertEqual(model.phase, .quiet)
     }
 
+    // Issue #269 (Tim, 2026-08-06): "there should be a dismiss option next to
+    // it so that it doesn't sit there and remain when it's no longer
+    // applicable once we've seen it." The notice is informational, so it must
+    // be acknowledgeable — it used to hold the top of the deck for the whole
+    // session after being read once.
+
+    func testDismissingClearsTheReregisterNotice() async {
+        registrar.statusValue = .enabled
+        marker.registeredCommit = "old"
+        probe = FakeProbe([true])
+        let model = makeModel()
+        await model.evaluateOnLaunch()
+        XCTAssertTrue(model.didReregisterForUpdate)
+        model.dismissReregisterNotice()
+        XCTAssertFalse(model.didReregisterForUpdate)
+    }
+
+    func testDismissingTheNoticeIsIdempotentAndSafeWhenAbsent() async {
+        // No drift this launch: dismiss must not invent state or trap.
+        let quiet = makeModel()
+        XCTAssertFalse(quiet.didReregisterForUpdate)
+        quiet.dismissReregisterNotice()
+        quiet.dismissReregisterNotice()
+        XCTAssertFalse(quiet.didReregisterForUpdate)
+    }
+
+    func testALaterReregisterRaisesTheNoticeAgain() async {
+        // The dismissal acknowledges ONE event, not the category. This is why
+        // it is per-launch and not persisted: persisting would silence the
+        // NEXT update's notice, which the user has never seen.
+        registrar.statusValue = .enabled
+        marker.registeredCommit = "old"
+        probe = FakeProbe([true])
+        let model = makeModel()
+        await model.evaluateOnLaunch()
+        model.dismissReregisterNotice()
+        XCTAssertFalse(model.didReregisterForUpdate)
+
+        // No probe rebind here: `makeModel()` captured the instance above by
+        // reference, so assigning a NEW FakeProbe could never reach the model
+        // — it would read as controlling this second evaluation while doing
+        // nothing. The captured [true] repeats forever, which is what this
+        // test wants. To vary reachability, mutate the captured instance.
+        marker.registeredCommit = "older-still"
+        await model.evaluateOnLaunch()
+        XCTAssertTrue(
+            model.didReregisterForUpdate,
+            "a NEW re-register is a new event, not the one that was dismissed"
+        )
+    }
+
     func testNoDriftNoReregister() async {
         registrar.statusValue = .enabled
         marker.registeredCommit = "new"
