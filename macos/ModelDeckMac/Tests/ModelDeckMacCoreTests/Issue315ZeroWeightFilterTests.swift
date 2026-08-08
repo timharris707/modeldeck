@@ -133,57 +133,64 @@ struct Issue315ZeroWeightFilterTests {
         #expect(!DeckPopoverModel.isHiddenByZeroWeightFilter(c5))
     }
 
-    // MARK: Default + persistence
+    // MARK: Default + persistence (reshaped by #319: the zero-weight filter
+    // is now the By-zero-weightings MODE of the Hide/Show system)
 
-    @Test func filterDefaultsOff() {
+    @Test func zeroWeightModeIsNotTheDefault() {
+        // #319's armed-but-empty default: master ON, mode By account,
+        // nothing manually hidden — so zero-weight rows do NOT hide until
+        // this mode is chosen (the #315-era default-off promise, kept).
         let model = DeckPopoverModel(defaults: freshDefaults())
-        #expect(model.hideZeroWeightAccounts == false)
+        #expect(model.hideMode == .byAccount)
+        #expect(!model.isRowHidden(
+            DeckBuilder.rows(state: fixtureState(), now: now).first { $0.id == "c2" }!,
+            now: now))
     }
 
-    @Test func filterPersistsAcrossInstances() {
+    @Test func modePersistsAcrossInstances() {
         let defaults = freshDefaults()
         let model = DeckPopoverModel(defaults: defaults)
-        model.toggleZeroWeightFilter()
-        #expect(model.hideZeroWeightAccounts == true)
-        #expect(DeckPopoverModel(defaults: defaults).hideZeroWeightAccounts == true,
-                "a relaunch (fresh model, same defaults) keeps the filter on")
-        model.toggleZeroWeightFilter()
-        #expect(DeckPopoverModel(defaults: defaults).hideZeroWeightAccounts == false)
+        model.hideMode = .byZeroWeightings
+        #expect(DeckPopoverModel(defaults: defaults).hideMode == .byZeroWeightings,
+                "a relaunch (fresh model, same defaults) keeps the mode")
+        model.hideMode = .byAccount
+        #expect(DeckPopoverModel(defaults: defaults).hideMode == .byAccount)
     }
 
     // MARK: Visual filtering
 
     @Test func columnsHideOnlyZeroWeightRowsWhenOn() {
         let model = DeckPopoverModel(defaults: freshDefaults())
-        model.hideZeroWeightAccounts = true
+        model.hideMode = .byZeroWeightings
         let columns = model.columns(for: fixtureState(), now: now)
         let claude = columns.first { $0.provider == .claude }!
         let codex = columns.first { $0.provider == .codex }!
         #expect(Set(claude.rows.map(\.id)) == ["c1", "c3", "c5"])
-        #expect(claude.hiddenZeroWeightCount == 2)
+        #expect(claude.hiddenAccountCount == 2)
         #expect(codex.rows.isEmpty)
-        #expect(codex.hiddenZeroWeightCount == 1)
+        #expect(codex.hiddenAccountCount == 1)
     }
 
     @Test func columnCountStillDescribesTheWholeRoster() {
         // Tim's minimal hint: the count NOT shrinking is how the deck says
         // rows are filtered, not gone.
         let model = DeckPopoverModel(defaults: freshDefaults())
-        model.hideZeroWeightAccounts = true
+        model.hideMode = .byZeroWeightings
         let claude = model.columns(for: fixtureState(), now: now)
             .first { $0.provider == .claude }!
         #expect(claude.rows.count == 3)
         #expect(claude.accountCountText == "5 accounts")
         // Singular form survives the arithmetic.
-        #expect(DeckColumn(provider: .codex, rows: [], hiddenZeroWeightCount: 1)
+        #expect(DeckColumn(provider: .codex, rows: [], hiddenAccountCount: 1)
             .accountCountText == "1 account")
     }
 
     @Test func filterOffIsByteIdenticalToPreFilterDerivation() {
+        // #319's default (By account, empty manual list) must render the
+        // pre-#315 deck byte-identically — the armed-but-empty contract.
         let model = DeckPopoverModel(defaults: freshDefaults())
-        #expect(model.hideZeroWeightAccounts == false)
         let columns = model.columns(for: fixtureState(), now: now)
-        #expect(columns.allSatisfy { $0.hiddenZeroWeightCount == 0 })
+        #expect(columns.allSatisfy { $0.hiddenAccountCount == 0 })
         let claude = columns.first { $0.provider == .claude }!
         #expect(Set(claude.rows.map(\.id)) == ["c1", "c2", "c3", "c4", "c5"])
         #expect(claude.accountCountText == "5 accounts")
@@ -192,7 +199,7 @@ struct Issue315ZeroWeightFilterTests {
     @Test func interleavedRowsRespectTheFilter() {
         let model = DeckPopoverModel(defaults: freshDefaults())
         model.layout = .singleColumn
-        model.hideZeroWeightAccounts = true
+        model.hideMode = .byZeroWeightings
         let ids = Set(model.interleavedRows(for: fixtureState(), now: now).map(\.id))
         #expect(ids == ["c1", "c3", "c5"])
     }
@@ -201,7 +208,7 @@ struct Issue315ZeroWeightFilterTests {
 
     @Test func hiddenAccountStillDrivesWorstRemainingAndMenuBarSource() {
         let model = DeckPopoverModel(defaults: freshDefaults())
-        model.hideZeroWeightAccounts = true
+        model.hideMode = .byZeroWeightings
         let state = fixtureState()
         // c2 (hidden, weight 0) holds the deck's lowest %: the menu-bar
         // number and its source checkmark derivation must still pick it —
@@ -222,7 +229,7 @@ struct Issue315ZeroWeightFilterTests {
         let state = fixtureState()
         let report = AvailabilityHealthEngine.report(for: .claude, state: state, now: now)
         let model = DeckPopoverModel(defaults: freshDefaults())
-        model.hideZeroWeightAccounts = true
+        model.hideMode = .byZeroWeightings
         _ = model.columns(for: state, now: now)
         #expect(AvailabilityHealthEngine.report(for: .claude, state: state, now: now) == report)
     }
@@ -238,7 +245,7 @@ struct Issue315ZeroWeightFilterTests {
 
     @Test func changeTrackingStillCoversHiddenAccounts() {
         let model = DeckPopoverModel(defaults: freshDefaults())
-        model.hideZeroWeightAccounts = true
+        model.hideMode = .byZeroWeightings
         var state = fixtureState()
         model.captureUsageChanges(state: state, now: now)
         // c2's headline moves between opens; the tracker must report it
@@ -250,21 +257,19 @@ struct Issue315ZeroWeightFilterTests {
         #expect(model.usageChange(for: "c2") != nil)
     }
 
-    // MARK: Footer affordance gating
+    // MARK: Footer glyph derivation (the #319 master eye replaces the
+    // #315 weights-only gating — By account works on every machine, so the
+    // eye now renders on any populated deck; `isHidingAnyRow` drives its
+    // glyph instead)
 
-    @Test func toggleOffersOnlyWhereWeightsExist() {
-        #expect(DeckPopoverModel.offersZeroWeightToggle(state: fixtureState()))
-        let noPool = DeckState(
-            accounts: [account("c9", label: "Solo")],
-            usage: [snapshot("c9", remaining: 50)]
-        )
-        #expect(!DeckPopoverModel.offersZeroWeightToggle(state: noPool),
-                "no weights anywhere — the toggle would be a dead switch")
-        let disabledOnly = DeckState(
-            accounts: [account("c8", label: "Retired", enabled: false, proxyWeight: 0)],
-            usage: []
-        )
-        #expect(!DeckPopoverModel.offersZeroWeightToggle(state: disabledOnly),
-                "disabled accounts never reach the deck, so they don't earn the toggle")
+    @Test func isHidingAnyRowTracksActualHiding() {
+        let model = DeckPopoverModel(defaults: freshDefaults())
+        #expect(!model.isHidingAnyRow(state: fixtureState(), now: now),
+                "armed-but-empty default hides nothing, so the glyph stays the plain eye")
+        model.hideMode = .byZeroWeightings
+        #expect(model.isHidingAnyRow(state: fixtureState(), now: now))
+        model.hideShowEnabled = false
+        #expect(!model.isHidingAnyRow(state: fixtureState(), now: now),
+                "master OFF shows everything regardless of mode")
     }
 }

@@ -113,35 +113,50 @@ struct Issue317ZeroWeightFilterFieldTests {
         // Tim's click, replayed: filter ON hides the six ⑂ 0 rows and keeps
         // the one row showing a positive weight; the count line still says 7.
         let model = DeckPopoverModel(defaults: freshDefaults())
-        model.hideZeroWeightAccounts = true
+        model.hideMode = .byZeroWeightings
         let claude = model.columns(for: capturedFieldState(), now: now)
             .first { $0.provider == .claude }!
         #expect(claude.rows.map(\.id) == ["p5"])
-        #expect(claude.hiddenZeroWeightCount == 6)
+        #expect(claude.hiddenAccountCount == 6)
         #expect(claude.accountCountText == "7 accounts")
     }
 
-    @Test func fullClickPathTogglePersistsAndRederives() {
-        // The footer button's whole path: toggle → UserDefaults → row
-        // re-derivation, including a relaunch (fresh model, same defaults).
+    @Test func fullClickPathModePersistsAndRederives() {
+        // The #319 shape of the original click path: choose the mode →
+        // UserDefaults → row re-derivation, including a relaunch (fresh
+        // model, same defaults); the footer eye (master switch) brings
+        // everything back without losing the mode.
         let defaults = freshDefaults()
         let state = capturedFieldState()
         let model = DeckPopoverModel(defaults: defaults)
         #expect(model.columns(for: state, now: now)
-            .first { $0.provider == .claude }!.rows.count == 7)
-        model.toggleZeroWeightFilter()
-        #expect(defaults.bool(forKey: DeckPopoverModel.hideZeroWeightDefaultsKey))
+            .first { $0.provider == .claude }!.rows.count == 7,
+            "the By-account default hides nothing on this deck")
+        model.hideMode = .byZeroWeightings
+        #expect(defaults.string(forKey: DeckPopoverModel.hideShowModeDefaultsKey)
+            == DeckPopoverModel.DeckHideMode.byZeroWeightings.rawValue)
         #expect(model.columns(for: state, now: now)
             .first { $0.provider == .claude }!.rows.count == 1)
         let relaunched = DeckPopoverModel(defaults: defaults)
         #expect(relaunched.columns(for: state, now: now)
             .first { $0.provider == .claude }!.rows.count == 1)
-        relaunched.toggleZeroWeightFilter()
+        relaunched.toggleHideShowSystem()
         #expect(relaunched.columns(for: state, now: now)
             .first { $0.provider == .claude }!.rows.count == 7)
+        #expect(relaunched.hideMode == .byZeroWeightings,
+                "the footer eye flips visibility, never the chosen mode")
     }
 
-    @Test func toggleIsOfferedOnThisDeck() {
-        #expect(DeckPopoverModel.offersZeroWeightToggle(state: capturedFieldState()))
+    @Test func legacyEyeUserKeepsHidingOnThisDeck() {
+        // Issue #319 migration replayed on the captured field deck: a 0.4.1
+        // user who had the eye toggle ON must still see the six ⑂ 0 rows
+        // hidden after upgrading — mapped to mode By zero weightings.
+        let defaults = freshDefaults()
+        defaults.set(true, forKey: DeckPopoverModel.hideZeroWeightDefaultsKey)
+        let model = DeckPopoverModel(defaults: defaults)
+        #expect(model.hideShowEnabled)
+        #expect(model.hideMode == .byZeroWeightings)
+        #expect(model.columns(for: capturedFieldState(), now: now)
+            .first { $0.provider == .claude }!.rows.map(\.id) == ["p5"])
     }
 }

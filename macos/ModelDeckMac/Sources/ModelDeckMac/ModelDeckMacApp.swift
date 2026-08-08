@@ -306,9 +306,12 @@ struct ModelDeckMacApp: App {
             }
         }
         // Account edits/removals verified against a fresh /api/state land in
-        // the status model immediately.
-        accountsModel.onStateChanged = { [weak statusModel] state in
+        // the status model immediately. Issue #319: a removal also prunes
+        // the hide/show manual overrides, so a future account reusing the
+        // id never arrives pre-hidden or pre-pinned.
+        accountsModel.onStateChanged = { [weak statusModel, weak deckModel] state in
             statusModel?.apply(deckState: state)
+            deckModel?.pruneManualOverrides(matching: state)
         }
         // A finished (or cancelled-with-remove) add-account flow lands in the
         // deck immediately, same as edits.

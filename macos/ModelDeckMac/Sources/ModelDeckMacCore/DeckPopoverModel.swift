@@ -656,12 +656,13 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
 public struct DeckColumn: Equatable, Identifiable, Sendable {
     public var provider: DeckProvider
     public var rows: [DeckAccountRow]
-    /// Issue #315: how many of this column's accounts the zero-weight
-    /// filter is currently hiding. Purely presentational bookkeeping so the
-    /// header count can keep telling the truth about the ROSTER ("7
-    /// accounts" over 4 visible rows is the deliberate, minimal hint that
-    /// the filter is on — Tim's suggestion on the issue; no banner).
-    public var hiddenZeroWeightCount: Int
+    /// Issue #315 (generalized by #319): how many of this column's accounts
+    /// the hide/show system is currently hiding, whatever the mode. Purely
+    /// presentational bookkeeping so the header count can keep telling the
+    /// truth about the ROSTER ("7 accounts" over 4 visible rows is the
+    /// deliberate, minimal hint that the filter is on — Tim's suggestion on
+    /// the issue; no banner).
+    public var hiddenAccountCount: Int
 
     public var id: String { provider.rawValue }
     public var title: String { provider.displayName }
@@ -669,14 +670,14 @@ public struct DeckColumn: Equatable, Identifiable, Sendable {
         // Issue #315: counts ALL of the provider's deck accounts, hidden
         // ones included — hiding is visual, and the count not shrinking is
         // the quiet cue that rows are filtered, not gone.
-        let total = rows.count + hiddenZeroWeightCount
+        let total = rows.count + hiddenAccountCount
         return total == 1 ? "1 account" : "\(total) accounts"
     }
 
-    public init(provider: DeckProvider, rows: [DeckAccountRow], hiddenZeroWeightCount: Int = 0) {
+    public init(provider: DeckProvider, rows: [DeckAccountRow], hiddenAccountCount: Int = 0) {
         self.provider = provider
         self.rows = rows
-        self.hiddenZeroWeightCount = hiddenZeroWeightCount
+        self.hiddenAccountCount = hiddenAccountCount
     }
 }
 
@@ -1712,25 +1713,256 @@ public final class DeckPopoverModel: ObservableObject {
         focusGeneralWeeklyHeadline.toggle()
     }
 
-    // MARK: Zero-weight account filter (issue #315)
+    // MARK: Hide/Show Accounts (issue #319, generalizing #315/#317)
 
-    /// Issue #315 (Tim, 2026-08-08): "a toggle that includes or hides
-    /// accounts with a weighting of zero … It wouldn't change how anything
-    /// functions. It would simply just hide or show." A PURE presentation
-    /// filter applied only in `columns(for:)` / `interleavedRows(for:)` —
-    /// the deck's render path. Every functional consumer (menu-bar %,
-    /// Availability Health, notifications, /api/capacity, refresh, renewal)
-    /// reads `DeckState`/snapshots directly and never consults this flag,
-    /// so a hidden account still counts everywhere non-visual (pinned by
-    /// Issue315ZeroWeightFilterTests). App-local (UserDefaults, the #73
-    /// pattern), never synced to the daemon; DEFAULT OFF.
-    @Published public var hideZeroWeightAccounts: Bool {
-        didSet { defaults.set(hideZeroWeightAccounts, forKey: Self.hideZeroWeightDefaultsKey) }
+    /// Issue #319 (Tim, 2026-08-08): the zero-weight filter grows into a
+    /// general Hide/Show system — a master switch (DEFAULT ON) plus three
+    /// mutually exclusive modes. Everything here keeps the #315/#316/#317
+    /// contract: a PURE presentation filter applied only in `columns(for:)`
+    /// / `interleavedRows(for:)` — the deck's render path. Every functional
+    /// consumer (menu-bar %, Availability Health, notifications,
+    /// /api/capacity, refresh, renewal) reads `DeckState`/snapshots directly
+    /// and never consults any of this, so a hidden account still counts
+    /// everywhere non-visual (pinned by the #315/#317/#319 suites).
+    /// App-local (UserDefaults, the #73 pattern), never synced to the
+    /// daemon.
+    ///
+    /// "Default ON" means ARMED, not hiding: the default mode is By account
+    /// with an empty manual hide list, so a fresh install (and every
+    /// upgrader who never touched the 0.4.1 eye) sees zero change until
+    /// they hide a row or switch modes.
+    public enum DeckHideMode: String, CaseIterable, Sendable {
+        /// Manual list: only rows the user right-clicked Hide on are hidden.
+        case byAccount = "by-account"
+        /// Rows whose DISPLAYED window resets within N days stay visible;
+        /// the rest hide. Manual hides still apply on top (spec: the
+        /// right-click line stays enabled in this mode).
+        case byResets = "by-resets"
+        /// Exactly the shipped #317 behavior: rows displaying ⑂ 0 hide.
+        case byZeroWeightings = "by-zero-weightings"
+
+        public var displayName: String {
+            switch self {
+            case .byAccount: return "By account"
+            case .byResets: return "By resets"
+            case .byZeroWeightings: return "By zero weightings"
+            }
+        }
     }
 
-    /// The footer toggle's action.
-    public func toggleZeroWeightFilter() {
-        hideZeroWeightAccounts.toggle()
+    /// Issue #319 (grilled design, Tim-confirmed): the By-resets horizon —
+    /// a fixed dropdown, not a free stepper. Rolling windows from NOW
+    /// ("12 hours" = displayed reset lands within the next 12 hours).
+    /// Raw values are the persistence format — never rename a case's raw
+    /// value. "7 days (All)" effectively includes everything: no displayed
+    /// window resets further out than a week.
+    public enum DeckResetsHorizon: String, CaseIterable, Sendable {
+        case twelveHours = "12h"
+        case oneDay = "24h"
+        case twoDays = "2d"
+        case threeDays = "3d"
+        case fourDays = "4d"
+        case fiveDays = "5d"
+        case sixDays = "6d"
+        case sevenDays = "7d"
+
+        /// The rolling window's length.
+        public var interval: TimeInterval {
+            switch self {
+            case .twelveHours: return 12 * 3_600
+            case .oneDay: return 86_400
+            case .twoDays: return 2 * 86_400
+            case .threeDays: return 3 * 86_400
+            case .fourDays: return 4 * 86_400
+            case .fiveDays: return 5 * 86_400
+            case .sixDays: return 6 * 86_400
+            case .sevenDays: return 7 * 86_400
+            }
+        }
+
+        public var displayName: String {
+            switch self {
+            case .twelveHours: return "12 hours"
+            case .oneDay: return "24 hours"
+            case .twoDays: return "2 days"
+            case .threeDays: return "3 days"
+            case .fourDays: return "4 days"
+            case .fiveDays: return "5 days"
+            case .sixDays: return "6 days"
+            case .sevenDays: return "7 days (All)"
+            }
+        }
+
+        /// Migration from the short-lived 1...7 days stepper this dropdown
+        /// replaced (same PR line, but a stored count is migrated rather
+        /// than dropped): N days maps to the N-days case, out-of-range
+        /// clamps into 1...7 first. The old default (1 day) lands on the
+        /// new default (24 hours) — identical behavior.
+        static func fromLegacyDays(_ days: Int) -> DeckResetsHorizon {
+            switch min(7, max(1, days)) {
+            case 1: return .oneDay
+            case 2: return .twoDays
+            case 3: return .threeDays
+            case 4: return .fourDays
+            case 5: return .fiveDays
+            case 6: return .sixDays
+            default: return .sevenDays
+            }
+        }
+    }
+
+    /// A row's manual override — ONE shared list with two effects (the
+    /// "manual wins both ways" decision): `.hidden` hides the account even
+    /// when the mode's automatic rule would show it; `.shown` pins it
+    /// visible even when the rule would hide it (By resets: an account
+    /// resetting outside the window). Absent means the automatic rule
+    /// decides. Ignored entirely in By zero weightings.
+    public enum ManualVisibility: Sendable, Equatable {
+        case hidden
+        case shown
+    }
+
+    static let hideShowEnabledDefaultsKey = "modeldeck.popover.hideShow.enabled"
+    static let hideShowModeDefaultsKey = "modeldeck.popover.hideShow.mode"
+    static let hideShowResetsDaysDefaultsKey = "modeldeck.popover.hideShow.resetsDays"
+    static let hideShowResetsHorizonDefaultsKey = "modeldeck.popover.hideShow.resetsHorizon"
+    static let hideShowManualHiddenDefaultsKey = "modeldeck.popover.hideShow.manualHidden"
+    static let hideShowManualShownDefaultsKey = "modeldeck.popover.hideShow.manualShown"
+
+    /// The master switch — Settings section and footer eye are TWO surfaces
+    /// over this ONE flag. OFF shows every account while keeping the mode,
+    /// days, and manual list intact for when it comes back on.
+    @Published public var hideShowEnabled: Bool {
+        didSet { defaults.set(hideShowEnabled, forKey: Self.hideShowEnabledDefaultsKey) }
+    }
+
+    /// The selected mode — a single enum value, so mutual exclusivity is
+    /// structural, not policed.
+    @Published public var hideMode: DeckHideMode {
+        didSet { defaults.set(hideMode.rawValue, forKey: Self.hideShowModeDefaultsKey) }
+    }
+
+    /// The By-resets horizon (dropdown selection). Default 24 hours.
+    @Published public var hideResetsHorizon: DeckResetsHorizon {
+        didSet {
+            defaults.set(hideResetsHorizon.rawValue, forKey: Self.hideShowResetsHorizonDefaultsKey)
+        }
+    }
+
+    /// The manual overrides, keyed to the daemon's stable account id (never
+    /// a row index or sort position — rows reorder constantly). Two
+    /// disjoint sets are the storage shape of the one conceptual list:
+    /// explicit hides and explicit show-pins.
+    @Published public private(set) var manuallyHiddenAccountIDs: Set<String>
+    @Published public private(set) var manuallyShownAccountIDs: Set<String>
+
+    public func manualVisibility(for accountID: String) -> ManualVisibility? {
+        if manuallyHiddenAccountIDs.contains(accountID) { return .hidden }
+        if manuallyShownAccountIDs.contains(accountID) { return .shown }
+        return nil
+    }
+
+    public func isManuallyHidden(_ accountID: String) -> Bool {
+        manuallyHiddenAccountIDs.contains(accountID)
+    }
+
+    /// Set (or clear, with nil) an account's manual override and persist.
+    /// The two sets stay disjoint by construction.
+    public func setManualVisibility(_ visibility: ManualVisibility?, for accountID: String) {
+        manuallyHiddenAccountIDs.remove(accountID)
+        manuallyShownAccountIDs.remove(accountID)
+        switch visibility {
+        case .hidden: manuallyHiddenAccountIDs.insert(accountID)
+        case .shown: manuallyShownAccountIDs.insert(accountID)
+        case nil: break
+        }
+        defaults.set(manuallyHiddenAccountIDs.sorted(), forKey: Self.hideShowManualHiddenDefaultsKey)
+        defaults.set(manuallyShownAccountIDs.sorted(), forKey: Self.hideShowManualShownDefaultsKey)
+    }
+
+    /// Whether the context-menu line reads "Show on Deck" for this row:
+    /// exactly when the CURRENT mode's rules (manual overrides included,
+    /// master switch ignored — you may be peeking with the eye off) would
+    /// hide it. Otherwise it reads "Hide from Deck".
+    public func manualToggleOffersShow(_ row: DeckAccountRow, now: Date = Date()) -> Bool {
+        hiddenUnderCurrentMode(row, now: now)
+    }
+
+    /// The context-menu Hide/Show line's action. Hide always sets
+    /// `.hidden`. Show is mode-shaped (Tim's ruling: "Pin only in By
+    /// resets"):
+    /// - By resets: Show creates a `.shown` PIN — the row stays visible
+    ///   even when it resets outside the window.
+    /// - By account: Show returns the row to NEUTRAL — it leaves the
+    ///   hidden set AND sheds any `.shown` pin, which is the user-visible
+    ///   escape hatch for a stale pin picked up in By resets.
+    public func toggleManualVisibility(_ row: DeckAccountRow, now: Date = Date()) {
+        if hiddenUnderCurrentMode(row, now: now) {
+            setManualVisibility(hideMode == .byResets ? .shown : nil, for: row.id)
+        } else {
+            setManualVisibility(.hidden, for: row.id)
+        }
+    }
+
+    /// Issue #319 peek (design record item 7): with the master switch OFF,
+    /// every row renders — but the ones the current mode WOULD hide render
+    /// dimmed, so a peek shows what the eye is protecting you from instead
+    /// of silently flattening the two populations. False whenever the
+    /// switch is on (hidden rows are simply absent then).
+    public func isRowDimmedForPeek(_ row: DeckAccountRow, now: Date = Date()) -> Bool {
+        !hideShowEnabled && hiddenUnderCurrentMode(row, now: now)
+    }
+
+    /// The peek dimming's opacity — quiet, per the deck's visual register.
+    public static let peekDimmedOpacity: Double = 0.5
+
+    /// Issue #319 (review F4): drop manual overrides whose account id has
+    /// left the roster — called with the fresh state after a roster
+    /// mutation (account deletion), so a later account that happens to
+    /// reuse the id never arrives pre-hidden or pre-pinned. Disabled
+    /// accounts keep their overrides: they are still ON the roster, just
+    /// not on the deck.
+    public func pruneManualOverrides(matching state: DeckState) {
+        let roster = Set(state.accounts.map(\.id))
+        let hidden = manuallyHiddenAccountIDs.intersection(roster)
+        let shown = manuallyShownAccountIDs.intersection(roster)
+        guard hidden != manuallyHiddenAccountIDs || shown != manuallyShownAccountIDs else {
+            return
+        }
+        manuallyHiddenAccountIDs = hidden
+        manuallyShownAccountIDs = shown
+        defaults.set(hidden.sorted(), forKey: Self.hideShowManualHiddenDefaultsKey)
+        defaults.set(shown.sorted(), forKey: Self.hideShowManualShownDefaultsKey)
+    }
+
+    /// The footer eye's action: flip the master switch. Mode, days, and the
+    /// manual list all survive an off/on round trip.
+    public func toggleHideShowSystem() {
+        hideShowEnabled.toggle()
+    }
+
+    /// Issue #319: the deck row context menu's Hide/Show line is enabled in
+    /// By-account and By-resets modes and DISABLED (visible, grayed) in
+    /// By-zero-weightings — that mode's hiding is automatic, and a manual
+    /// line there would suggest an override that doesn't exist. Keyed on
+    /// the MODE, not the master switch: with the switch off, toggling
+    /// membership while everything is visible is exactly how a stranded
+    /// manual hide gets undone.
+    public var contextMenuHideShowEnabled: Bool {
+        hideMode != .byZeroWeightings
+    }
+
+    /// Issue #319 "By resets": whether this row's DISPLAYED (binding)
+    /// window resets within the rolling horizon from NOW — the same reset
+    /// timestamp the collapsed card shows (#43: visible behavior keys on
+    /// visible text, never a number the user can't see). A row with no
+    /// displayed reset at all stays visible: the filter can't judge it,
+    /// and no view preference may hide the only data a card has.
+    nonisolated public static func renewsWithinResetHorizon(
+        _ row: DeckAccountRow, horizon: DeckResetsHorizon, now: Date
+    ) -> Bool {
+        guard let reset = row.displayedReset else { return true }
+        return reset.timeIntervalSince(now) <= horizon.interval
     }
 
     /// Issue #315, repredicated by #317: which rows the filter hides —
@@ -1754,19 +1986,61 @@ public final class DeckPopoverModel: ObservableObject {
         return !presentation.absentFromPool && presentation.weight == 0
     }
 
-    /// Issue #315: whether the footer offers the toggle at all. Only pool
-    /// machines have weights, so on a machine with no routed account the
-    /// control would be a dead switch — minimal register says omit it.
-    /// A persisted ON survives as an escape hatch via the view's
-    /// `|| hideZeroWeightAccounts` so the filter can always be turned off.
-    nonisolated public static func offersZeroWeightToggle(state: DeckState) -> Bool {
-        state.accounts.contains { $0.enabled && $0.proxyWeight != nil }
+    /// Issue #319: whether the CURRENT mode's rules would hide this row,
+    /// master switch aside (the context menu needs the mode's verdict even
+    /// while the eye has everything visible):
+    /// - By account: exactly the manual hides.
+    /// - By resets: manual wins both ways — an explicit `.hidden` hides an
+    ///   account even inside the window, an explicit `.shown` pins it
+    ///   visible even outside; only override-free rows fall to the
+    ///   automatic horizon rule.
+    /// - By zero weightings: exactly `isHiddenByZeroWeightFilter` (#317's
+    ///   predicate, not a fork); manual overrides are ignored, matching
+    ///   the disabled context-menu line.
+    public func hiddenUnderCurrentMode(_ row: DeckAccountRow, now: Date) -> Bool {
+        switch hideMode {
+        case .byAccount:
+            return manuallyHiddenAccountIDs.contains(row.id)
+        case .byResets:
+            switch manualVisibility(for: row.id) {
+            case .hidden: return true
+            case .shown: return false
+            case nil:
+                return !Self.renewsWithinResetHorizon(
+                    row, horizon: hideResetsHorizon, now: now)
+            }
+        case .byZeroWeightings:
+            return Self.isHiddenByZeroWeightFilter(row)
+        }
     }
 
-    /// Applies the filter to already-derived rows; identity when OFF.
-    func applyingZeroWeightFilter(_ rows: [DeckAccountRow]) -> [DeckAccountRow] {
-        guard hideZeroWeightAccounts else { return rows }
-        return rows.filter { !Self.isHiddenByZeroWeightFilter($0) }
+    /// Whether the hide/show system actually hides this row right now —
+    /// the render path's predicate: master switch, then the mode.
+    public func isRowHidden(_ row: DeckAccountRow, now: Date) -> Bool {
+        hideShowEnabled && hiddenUnderCurrentMode(row, now: now)
+    }
+
+    /// Issue #319: whether the current settings are actually hiding at
+    /// least one row of this state — drives the footer eye's glyph
+    /// (eye.slash only while something is really hidden; the armed-but-
+    /// empty default keeps the plain eye). Derived from the FULL row set
+    /// (review F3): `columns(for:)` drops unknown-provider rows, so a
+    /// hidden unknown-provider row in single-column layout would leave
+    /// the glyph dishonest if this read the columns.
+    public func isHidingAnyRow(state: DeckState, now: Date = Date()) -> Bool {
+        guard hideShowEnabled else { return false }
+        return DeckBuilder.rows(
+            state: state, thresholds: thresholds, now: now,
+            preferModelWindowHeadline: preferModelWindowHeadline,
+            preferGeneralWeeklyHeadline: focusGeneralWeeklyHeadline
+        ).contains { isRowHidden($0, now: now) }
+    }
+
+    /// Applies the hide/show system to already-derived rows; identity when
+    /// the master switch is OFF.
+    func applyingHideShowFilter(_ rows: [DeckAccountRow], now: Date) -> [DeckAccountRow] {
+        guard hideShowEnabled else { return rows }
+        return rows.filter { !isRowHidden($0, now: now) }
     }
 
     // MARK: Header notice dismissals (issue #302)
@@ -1894,8 +2168,43 @@ public final class DeckPopoverModel: ObservableObject {
         // also falls back to the default rather than to a blank window.
         self.glass = defaults.string(forKey: Self.glassDefaultsKey)
             .flatMap(DeckGlass.init(rawValue:)) ?? .default
-        // Issue #315: absent key reads false — nothing starts hidden.
-        self.hideZeroWeightAccounts = defaults.bool(forKey: Self.hideZeroWeightDefaultsKey)
+        // Issue #319: the master switch defaults ON (absent key reads true —
+        // the armed-but-empty default; nothing hides until a mode or manual
+        // hide says so).
+        self.hideShowEnabled = defaults.object(forKey: Self.hideShowEnabledDefaultsKey) == nil
+            ? true
+            : defaults.bool(forKey: Self.hideShowEnabledDefaultsKey)
+        // Issue #319 migration: a 0.4.1 user who turned the eye toggle ON
+        // was hiding zero-weight rows — the new system reproduces exactly
+        // that as mode "By zero weightings" (master ON is the new default
+        // anyway). The legacy key is read once here and never written
+        // again; everyone else lands on the By-account default.
+        self.hideMode = defaults.string(forKey: Self.hideShowModeDefaultsKey)
+            .flatMap(DeckHideMode.init(rawValue:))
+            ?? (defaults.bool(forKey: Self.hideZeroWeightDefaultsKey)
+                ? .byZeroWeightings
+                : .byAccount)
+        // Absent key reads 24 hours (the grilled-design default). A stored
+        // day count from the short-lived stepper migrates to its matching
+        // dropdown case (1 day → 24 hours; out-of-range clamps first); an
+        // unrecognized raw value falls back to the default.
+        self.hideResetsHorizon = defaults.string(forKey: Self.hideShowResetsHorizonDefaultsKey)
+            .flatMap(DeckResetsHorizon.init(rawValue:))
+            ?? (defaults.object(forKey: Self.hideShowResetsDaysDefaultsKey) == nil
+                ? .oneDay
+                : DeckResetsHorizon.fromLegacyDays(
+                    defaults.integer(forKey: Self.hideShowResetsDaysDefaultsKey)))
+        // Absent keys read empty — nothing starts manually hidden or
+        // pinned. Keyed to stable account ids, so an id no longer on the
+        // roster is inert (and harmless) rather than shifting onto some
+        // other row. Hidden wins if a hand-edited plist lists an id in
+        // both sets (`manualVisibility` checks hidden first).
+        self.manuallyHiddenAccountIDs = Set(
+            defaults.stringArray(forKey: Self.hideShowManualHiddenDefaultsKey) ?? []
+        )
+        self.manuallyShownAccountIDs = Set(
+            defaults.stringArray(forKey: Self.hideShowManualShownDefaultsKey) ?? []
+        )
         // Issue #302: absent key reads empty — nothing starts dismissed.
         // Unrecognized raw values (a downgrade, a removed kind) are dropped
         // rather than crashing or resurrecting as some other notice.
@@ -1949,29 +2258,30 @@ public final class DeckPopoverModel: ObservableObject {
             preferGeneralWeeklyHeadline: focusGeneralWeeklyHeadline
         )
         .map { column in
-            // Issue #315: filter LAST, after the activation override, and
-            // remember how many rows it removed so the header count can
+            // Issue #315/#319: filter LAST, after the activation override,
+            // and remember how many rows it removed so the header count can
             // keep describing the whole roster.
             let rows = applyingActivation(column.rows)
-            let visible = applyingZeroWeightFilter(rows)
+            let visible = applyingHideShowFilter(rows, now: now)
             return DeckColumn(
                 provider: column.provider,
                 rows: visible,
-                hiddenZeroWeightCount: rows.count - visible.count
+                hiddenAccountCount: rows.count - visible.count
             )
         }
     }
 
     /// Single-column mode content (both providers interleaved by sort).
     public func interleavedRows(for state: DeckState, now: Date = Date()) -> [DeckAccountRow] {
-        applyingZeroWeightFilter(
+        applyingHideShowFilter(
             applyingActivation(
                 DeckBuilder.interleavedRows(
                     state: state, sortOrder: sortOrder, direction: sortDirection, thresholds: thresholds, now: now,
                     preferModelWindowHeadline: preferModelWindowHeadline,
                     preferGeneralWeeklyHeadline: focusGeneralWeeklyHeadline
                 )
-            )
+            ),
+            now: now
         )
     }
 

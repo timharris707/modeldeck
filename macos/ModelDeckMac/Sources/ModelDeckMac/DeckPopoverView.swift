@@ -624,6 +624,11 @@ struct DeckPopoverView: View {
                                 deckModel.toggleExpansion(of: row.id)
                             }
                         }
+                        // Issue #319 peek: with the eye off, rows the mode
+                        // WOULD hide render dimmed (same rule as the
+                        // two-column layout).
+                        .opacity(deckModel.isRowDimmedForPeek(row)
+                            ? DeckPopoverModel.peekDimmedOpacity : 1)
                     }
                 }
             }
@@ -671,16 +676,24 @@ struct DeckPopoverView: View {
         return !deckModel.isDeckEmpty(state: state)
     }
 
-    /// Issue #315: the zero-weight filter toggle renders only where it can
-    /// do something — a populated deck on a machine whose accounts carry
-    /// proxy weights — OR whenever the persisted filter is ON, so the
-    /// control that hid rows can always bring them back.
-    private var showsZeroWeightToggle: Bool {
-        guard let state = statusModel.deckState, !deckModel.isDeckEmpty(state: state) else {
-            return false
-        }
-        return DeckPopoverModel.offersZeroWeightToggle(state: state)
-            || deckModel.hideZeroWeightAccounts
+    /// Issue #319: the footer eye is the master switch's quick toggle — one
+    /// state, two surfaces (this and Settings → Hide/Show Accounts). It
+    /// renders on any populated deck: unlike #315's zero-weight-only
+    /// filter, By-account works on every machine, and the always-reachable
+    /// footer is half of the "everything hidden must never strand the
+    /// user" guarantee (Settings is the other half).
+    private var showsHideShowToggle: Bool {
+        guard let state = statusModel.deckState else { return false }
+        return !deckModel.isDeckEmpty(state: state)
+    }
+
+    /// Whether the system is hiding at least one row RIGHT NOW — drives the
+    /// eye glyph (unchanged semantics: eye = everything visible, eye.slash
+    /// = rows hidden), so the armed-but-empty default still shows the
+    /// plain eye.
+    private var isHidingRows: Bool {
+        guard let state = statusModel.deckState else { return false }
+        return deckModel.isHidingAnyRow(state: state)
     }
 
     /// Issue #235: one Availability Health evaluation per provider column,
@@ -833,30 +846,33 @@ struct DeckPopoverView: View {
                     action: onDetach
                 )
             }
-            // Issue #315: hide/show zero-weight accounts. Purely visual —
-            // routing, health, refresh, renewal, and the menu bar never
-            // consult it (pinned by tests). Bare glyph per #283; the glyph
-            // shows the CURRENT mode (eye = everything visible, eye.slash =
-            // zero-weight rows hidden), and the unchanged column count
-            // ("7 accounts" over fewer rows) is the quiet hint while
-            // filtering. Offered only where weights exist (pool machines),
-            // with a persisted ON as the escape hatch.
-            if showsZeroWeightToggle {
+            // Issue #315, generalized by #319: the Hide/Show master switch's
+            // quick toggle — the SAME flag Settings → Hide/Show Accounts
+            // controls (one state, two surfaces). Purely visual — routing,
+            // health, refresh, renewal, and the menu bar never consult it
+            // (pinned by tests). Bare glyph per #283 with unchanged
+            // semantics: eye = everything visible (including the armed-but-
+            // empty default), eye.slash = rows currently hidden; the
+            // unchanged column count ("7 accounts" over fewer rows) is the
+            // quiet hint while filtering.
+            if showsHideShowToggle {
                 DeckFooterIconButton(
-                    systemImage: deckModel.hideZeroWeightAccounts ? "eye.slash" : "eye",
-                    name: deckModel.hideZeroWeightAccounts
-                        ? "Show zero-weight accounts"
-                        : "Hide zero-weight accounts",
-                    help: deckModel.hideZeroWeightAccounts
-                        ? "Accounts showing routing weight 0 are hidden from the deck. "
-                            + "They still count for routing, health, and the menu bar."
-                        : "Hide accounts showing routing weight 0 from the deck. "
-                            + "Display only — nothing about routing or refresh changes.",
-                    accessibilityLabel: deckModel.hideZeroWeightAccounts
-                        ? "Show zero-weight accounts"
-                        : "Hide zero-weight accounts",
+                    systemImage: isHidingRows ? "eye.slash" : "eye",
+                    name: deckModel.hideShowEnabled
+                        ? "Show all accounts"
+                        : "Resume hiding accounts",
+                    help: deckModel.hideShowEnabled
+                        ? "Hide/Show Accounts is on (\(deckModel.hideMode.displayName)). "
+                            + "Click to show every account; your hide settings are kept. "
+                            + "Display only — hidden accounts still count for routing, health, and the menu bar."
+                        : "Hide/Show Accounts is off — every account is shown. "
+                            + "Click to resume hiding (\(deckModel.hideMode.displayName)). "
+                            + "Configure in Settings → General.",
+                    accessibilityLabel: deckModel.hideShowEnabled
+                        ? "Turn off account hiding"
+                        : "Turn on account hiding",
                     accessibilityHint: "Visual filter only; hidden accounts keep working",
-                    action: { deckModel.toggleZeroWeightFilter() }
+                    action: { deckModel.toggleHideShowSystem() }
                 )
             }
             if showsFooterAddAccount {
@@ -1020,7 +1036,11 @@ struct DeckColumnView: View {
             .padding(.bottom, 2)
 
             if column.rows.isEmpty {
-                Text("No accounts")
+                // Issue #319: an all-hidden column says so instead of the
+                // misleading "No accounts" (the count above still states the
+                // roster total). The footer eye and Settings stay reachable,
+                // so this state never strands anyone.
+                Text(column.hiddenAccountCount > 0 ? "All accounts hidden" : "No accounts")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 40)
@@ -1050,6 +1070,14 @@ struct DeckColumnView: View {
                             deckModel.toggleExpansion(of: row.id)
                         }
                     }
+                    // Issue #319 peek (design record item 7): with the
+                    // master switch OFF every row renders, but the ones
+                    // the current mode WOULD hide render dimmed — the
+                    // peek shows both populations honestly. No opacity
+                    // change while the switch is on (hidden rows are
+                    // simply absent).
+                    .opacity(deckModel.isRowDimmedForPeek(row)
+                        ? DeckPopoverModel.peekDimmedOpacity : 1)
                 }
             }
         }
@@ -1565,6 +1593,21 @@ struct DeckAccountRowView: View {
                     )
                 )
             }
+            // Issue #319: the manual Hide/Show line (third line). Enabled in
+            // By-account and By-resets modes; DISABLED — visible and grayed,
+            // never hidden — in By-zero-weightings, whose hiding is
+            // automatic. Keyed to the stable account id. Manual wins both
+            // ways: the label follows the MODE's verdict for this row
+            // (master switch aside), so while peeking with the eye off a
+            // window-hidden row reads "Show on Deck" — and that Show
+            // persists as a pin that keeps the account visible even when
+            // it resets outside the By-resets window.
+            Button(deckModel.manualToggleOffersShow(row)
+                ? "Show on Deck"
+                : "Hide from Deck") {
+                deckModel.toggleManualVisibility(row)
+            }
+            .disabled(!deckModel.contextMenuHideShowEnabled)
         }
     }
 

@@ -1339,6 +1339,23 @@ struct GeneralSettingsPane: View {
     /// Interval choices inside the daemon's validated 60–3600 s range.
     private static let intervalChoices: [Int] = [60, 120, 300, 600, 900, 1800, 3600]
 
+    /// Issue #319: the Hide/Show section's one-line explanation of what the
+    /// current selection does — state-honest, including the off state.
+    private var hideShowCaption: String {
+        guard deckModel.hideShowEnabled else {
+            return "Hiding is off — every account is shown. Your mode and hidden accounts are kept for when it's back on."
+        }
+        switch deckModel.hideMode {
+        case .byAccount:
+            return "Right-click an account on the deck and choose Hide from Deck. Nothing hides until you do."
+        case .byResets:
+            return "Accounts renewing within the next \(deckModel.hideResetsHorizon.displayName.lowercased()) stay visible; the rest hide. "
+                + "Right-click overrides win both ways: Hide always hides, Show keeps an account visible."
+        case .byZeroWeightings:
+            return "Accounts whose row shows routing weight 0 hide automatically. The right-click Hide line is off in this mode."
+        }
+    }
+
     var body: some View {
         Form {
             Section("Refresh") {
@@ -1437,6 +1454,39 @@ struct GeneralSettingsPane: View {
                 // today's lowest-window behavior stays until chosen.
                 Toggle("Lead with the model window (e.g. Fable)", isOn: $deckModel.preferModelWindowHeadline)
                     .help("Claude cards headline the model-specific weekly window (like Fable) instead of whichever window is lowest. The 5-hour and all-model windows stay visible when a card is expanded, and sorting follows the displayed window. Cards without a model window are unaffected.")
+            }
+
+            // Issue #319 (Tim, 2026-08-08): the Hide/Show system — a master
+            // switch (default ON) over three mutually exclusive modes. Same
+            // state as the deck footer's eye toggle (one flag, two
+            // surfaces). Everything here is display-only: hidden accounts
+            // keep routing, refreshing, and feeding the menu bar, and the
+            // deck's counts keep stating roster totals.
+            Section("Hide/Show Accounts") {
+                Toggle("Hide accounts from the deck", isOn: $deckModel.hideShowEnabled)
+                    .help("The master switch for hiding — the deck footer's eye toggles the same thing. Display only: hidden accounts still count for routing, health, and the menu bar.")
+                Picker("Mode", selection: $deckModel.hideMode) {
+                    Text("By account").tag(DeckPopoverModel.DeckHideMode.byAccount)
+                    Text("By resets").tag(DeckPopoverModel.DeckHideMode.byResets)
+                    Text("By zero weightings").tag(DeckPopoverModel.DeckHideMode.byZeroWeightings)
+                }
+                .pickerStyle(.radioGroup)
+                .disabled(!deckModel.hideShowEnabled)
+                if deckModel.hideMode == .byResets {
+                    // Grilled design (Tim-confirmed): a fixed dropdown of
+                    // rolling windows from now, not a free stepper.
+                    Picker("Renewing within", selection: $deckModel.hideResetsHorizon) {
+                        ForEach(DeckPopoverModel.DeckResetsHorizon.allCases, id: \.self) { horizon in
+                            Text(horizon.displayName).tag(horizon)
+                        }
+                    }
+                    .disabled(!deckModel.hideShowEnabled)
+                }
+                // State-honest caption (the PR #196 precedent): describe
+                // what the CURRENT selection actually does.
+                Text(hideShowCaption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             // Menu bar percent source (Tim, 2026-07-22): "lowest across
