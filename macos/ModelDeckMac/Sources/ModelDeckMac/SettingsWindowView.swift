@@ -1347,7 +1347,11 @@ struct GeneralSettingsPane: View {
         }
         switch deckModel.hideMode {
         case .byAccount:
-            return "Right-click an account on the deck and choose Hide from Deck. Nothing hides until you do."
+            // Issue #321: the right-click gesture line moved to the STATIC
+            // caption under the mode picker (Settings parity, decision 4),
+            // so this state-honest line keeps only what that caption
+            // doesn't say.
+            return "Nothing hides until you hide an account."
         case .byResets:
             return "Accounts renewing within the next \(deckModel.hideResetsHorizon.displayName.lowercased()) stay visible; the rest hide. "
                 + "Right-click overrides win both ways: Hide always hides, Show keeps an account visible."
@@ -1472,6 +1476,21 @@ struct GeneralSettingsPane: View {
                 }
                 .pickerStyle(.radioGroup)
                 .disabled(!deckModel.hideShowEnabled)
+                // Issue #321 decision 4 (Settings parity): a static caption
+                // for the By-account gesture, copy verbatim per the grilling
+                // record. Rendered exactly while the right-click Hide line
+                // is enabled (By account and By resets) — the SAME
+                // `contextMenuHideShowEnabled` condition the deck's context
+                // menu keys on, referenced not duplicated. In By zero
+                // weightings the gesture is off, and an instruction sitting
+                // beside the dynamic caption's "the right-click Hide line
+                // is off in this mode" would contradict it (PR #322
+                // adversarial review, minor finding).
+                if deckModel.contextMenuHideShowEnabled {
+                    Text("Right-click an account on the deck to hide it.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 if deckModel.hideMode == .byResets {
                     // Grilled design (Tim-confirmed): a fixed dropdown of
                     // rolling windows from now, not a free stepper.

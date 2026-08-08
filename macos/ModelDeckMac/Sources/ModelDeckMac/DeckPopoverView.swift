@@ -872,8 +872,48 @@ struct DeckPopoverView: View {
                         ? "Turn off account hiding"
                         : "Turn on account hiding",
                     accessibilityHint: "Visual filter only; hidden accounts keep working",
-                    action: { deckModel.toggleHideShowSystem() }
+                    // Issue #321 decision 5: a single subtle bounce whenever
+                    // hiding transitions none→some (the glyph flips
+                    // plain→slash at the same moment). Generation-keyed in
+                    // the model; every occurrence, no persisted flag.
+                    pulseValue: deckModel.eyePulseGeneration,
+                    // Issue #321: route the click through the model's eye
+                    // path so a click that changes nothing visible presents
+                    // the mode-honest callout. Same master-switch flip as
+                    // before either way.
+                    action: { deckModel.toggleHideShowSystemFromEye(state: statusModel.deckState) }
                 )
+                // Issue #321 decisions 1–3: the anchored transient callout —
+                // a small popover on the eye in the deck's quiet register,
+                // NOT a floating window. Auto-fades after ~4 s; any outside
+                // interaction dismisses it instantly (transient popover);
+                // no dismiss button. The footer is shared by both column
+                // layouts and the floating deck, so every surface gets it.
+                .popover(
+                    isPresented: Binding(
+                        get: { deckModel.eyeCalloutText != nil },
+                        set: { deckModel.setEyeCalloutPresented($0) }
+                    ),
+                    arrowEdge: .bottom
+                ) {
+                    EyeNoOpCalloutView(
+                        text: deckModel.eyeCalloutText ?? "",
+                        generation: deckModel.eyeCalloutGeneration,
+                        // Generation-guarded: an expired timer from an older
+                        // presentation can race the render pass that cancels
+                        // it (CodeRabbit on PR #322) — the model ignores a
+                        // timeout whose generation is no longer presented.
+                        onTimeout: { deckModel.dismissEyeCallout(ifGeneration: $0) }
+                    )
+                }
+                // Issue #321: feed every rendered hiding state to the pulse
+                // tracker — the first report is a baseline (no pulse for a
+                // deck that opens with rows already hidden), later false→true
+                // transitions bump the generation the glyph animates on.
+                .onAppear { deckModel.noteHidingAnyRow(isHidingRows) }
+                .onChange(of: isHidingRows) { _, newValue in
+                    deckModel.noteHidingAnyRow(newValue)
+                }
             }
             if showsFooterAddAccount {
                 // Issue #226: growing the pool never requires the Settings
@@ -927,6 +967,10 @@ struct DeckFooterIconButton: View {
     /// Renders the in-flight spinner in the glyph's place and disables the
     /// button (the pre-#283 Refresh affordance, preserved).
     var isBusy: Bool = false
+    /// Issue #321: generation value the glyph bounces on — each change
+    /// plays ONE subtle symbol bounce (the eye's none→some pulse). The
+    /// default never changes, so every other footer icon is untouched.
+    var pulseValue: Int = 0
     let action: () -> Void
 
     @State private var isHovered = false
@@ -948,6 +992,10 @@ struct DeckFooterIconButton: View {
                     Image(systemName: systemImage)
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(isHovered ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                        // Issue #321: one subtle bounce per pulse-value
+                        // change — inert for every button that keeps the
+                        // constant default.
+                        .symbolEffect(.bounce, options: .nonRepeating, value: pulseValue)
                 }
             }
             // Issue #271's lesson, stated: size FIRST, then take a plain
@@ -962,6 +1010,50 @@ struct DeckFooterIconButton: View {
         .onHover { isHovered = $0 }
         .help("\(name) — \(help)")
         .accessibilityLabel(accessibilityLabel)
+    }
+}
+
+/// Issue #321: the eye's no-op callout — one small caption line in the
+/// deck's quiet register, no chrome beyond the popover itself, no dismiss
+/// button. It auto-fades after ~4 seconds (generation-keyed so a second
+/// no-op click restarts the clock) and, being a transient popover, any
+/// outside interaction dismisses it instantly. The text is announced to
+/// VoiceOver on presentation: a sighted user gets the anchored explanation,
+/// a VoiceOver user hears the same sentence.
+struct EyeNoOpCalloutView: View {
+    let text: String
+    /// The model's presentation generation — restarts the auto-dismiss
+    /// timer (and re-announces) when a new no-op click lands while the
+    /// callout is already up.
+    let generation: Int
+    /// Called with the generation this timer was armed for; the model
+    /// dismisses only if that generation is still the presented one.
+    let onTimeout: (Int) -> Void
+
+    var body: some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.leading)
+            .frame(maxWidth: 220, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .accessibilityLabel(text)
+            .task(id: generation) { [generation] in
+                AccessibilityNotification.Announcement(text).post()
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                // A cancelled sleep (popover already dismissed, or a newer
+                // generation restarted the task) must not dismiss the
+                // successor presentation…
+                guard !Task.isCancelled else { return }
+                // …and neither may a continuation that resumed in the gap
+                // between a new presentation and the render pass that
+                // cancels this task (cancellation only propagates on view
+                // update — CodeRabbit on PR #322). The captured generation
+                // lets the model drop a stale timeout on the floor.
+                onTimeout(generation)
+            }
     }
 }
 

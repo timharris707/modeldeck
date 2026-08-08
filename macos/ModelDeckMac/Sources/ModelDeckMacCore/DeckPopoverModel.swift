@@ -2043,6 +2043,130 @@ public final class DeckPopoverModel: ObservableObject {
         return rows.filter { !isRowHidden($0, now: now) }
     }
 
+    // MARK: No-op eye clicks explain themselves (issue #321)
+
+    /// Issue #321 (Tim's field finding on 0.4.2 at fresh defaults): clicking
+    /// the footer eye in the armed-but-empty default changes nothing on
+    /// screen — to a new user the feature looks broken. The settled design
+    /// (grilling record on the issue): every eye click that changes nothing
+    /// visible gets a small anchored callout on the eye explaining WHY, in
+    /// mode-honest copy — forever, no seen-it state. The rejected
+    /// alternative (dimming/disabling the eye on a would-be no-op) must not
+    /// come back: it hurts discoverability.
+    ///
+    /// The callout copy, verbatim per the grilling record (approved as
+    /// drafted; ships unedited).
+    nonisolated public static func eyeNoOpCalloutCopy(for mode: DeckHideMode) -> String {
+        switch mode {
+        case .byAccount:
+            return "Right-click any account to hide it."
+        case .byResets:
+            return "All accounts renew within your window — tighten it in Settings."
+        case .byZeroWeightings:
+            return "No accounts are at zero weight right now."
+        }
+    }
+
+    /// Whether flipping the master switch would change nothing visible:
+    /// true exactly when NO row of the full row set is hidden under the
+    /// current mode's rules. Computed from the SAME derivations the views
+    /// render from (`DeckBuilder.rows` + `hiddenUnderCurrentMode`) — never a
+    /// parallel predicate (#317's field failure was exactly a forked
+    /// derivation disagreeing with the glyph). When no row is
+    /// mode-hidden, both switch positions render the identical row set, no
+    /// row dims for the peek, and even the eye glyph stays the plain eye —
+    /// a genuinely invisible click. Conversely, ANY mode-hidden row makes
+    /// the toggle visible somewhere: rows appear/disappear (or dim in the
+    /// peek), and the glyph flips eye ↔ eye.slash. Keyed on the FULL row
+    /// set (the #319 review-F3 discipline): a hidden unknown-provider row
+    /// never renders in two-column layout, but it still flips the glyph
+    /// via `isHidingAnyRow`, so that click is NOT a no-op and gets no
+    /// callout. Symmetric by construction — the mode verdict ignores
+    /// `hideShowEnabled` — so it reads the same before and after the flip.
+    public func eyeToggleChangesNothingVisible(state: DeckState, now: Date = Date()) -> Bool {
+        !DeckBuilder.rows(
+            state: state, thresholds: thresholds, now: now,
+            preferModelWindowHeadline: preferModelWindowHeadline,
+            preferGeneralWeeklyHeadline: focusGeneralWeeklyHeadline
+        ).contains { hiddenUnderCurrentMode($0, now: now) }
+    }
+
+    /// The presented callout's text, or nil while none is up. Transient,
+    /// in-memory only — never persisted (the callout fires on EVERY no-op
+    /// click by design; there is no seen-it state to store).
+    @Published public private(set) var eyeCalloutText: String?
+
+    /// Bumped on every presentation so the view's ~4-second auto-dismiss
+    /// timer restarts when a second no-op click lands while the callout is
+    /// already up (same generation-keying idea as `usageCaptureGeneration`).
+    @Published public private(set) var eyeCalloutGeneration = 0
+
+    /// The footer eye's click path (issue #321): decide no-op-ness BEFORE
+    /// the flip (the predicate is symmetric, but deciding first keeps the
+    /// contract obvious), flip the master switch exactly as before, then
+    /// present the mode-honest callout only when the click changed nothing
+    /// visible. A click that DOES change rows never shows the callout — and
+    /// clears any stale one, since the rows moving is the feedback.
+    public func toggleHideShowSystemFromEye(state: DeckState?, now: Date = Date()) {
+        let isNoOp = state.map { eyeToggleChangesNothingVisible(state: $0, now: now) } ?? false
+        toggleHideShowSystem()
+        if isNoOp {
+            eyeCalloutText = Self.eyeNoOpCalloutCopy(for: hideMode)
+            eyeCalloutGeneration += 1
+        } else {
+            eyeCalloutText = nil
+        }
+    }
+
+    /// Dismiss the callout unconditionally (an explicit interaction).
+    public func dismissEyeCallout() {
+        eyeCalloutText = nil
+    }
+
+    /// The auto-fade timeout's dismiss path: clears the callout only while
+    /// the given generation is still the presented one. An expired timer
+    /// from an OLDER presentation must never dismiss a newer callout
+    /// (CodeRabbit on PR #322): the view's `.task(id:)` does cancel the old
+    /// timer on a generation bump, but cancellation only propagates at the
+    /// next view update — a continuation already enqueued on the main actor
+    /// can run between the click that presented generation N+1 and the
+    /// render pass that cancels generation N's task, with `Task.isCancelled`
+    /// still false. The generation compare closes that window.
+    public func dismissEyeCallout(ifGeneration generation: Int) {
+        guard generation == eyeCalloutGeneration else { return }
+        eyeCalloutText = nil
+    }
+
+    /// Binding-shaped setter for the view's `.popover(isPresented:)` — a
+    /// dismissal (outside click, Escape: the "any interaction" rule) clears
+    /// the callout; the popover machinery never presents through here.
+    public func setEyeCalloutPresented(_ presented: Bool) {
+        if !presented { eyeCalloutText = nil }
+    }
+
+    /// Issue #321 decision 5: the eye pulses subtly whenever hiding
+    /// transitions none→some (the glyph flips plain→slash at the same
+    /// moment) — every occurrence, no persisted flag. Bumped by
+    /// `noteHidingAnyRow` on exactly that transition; the view animates the
+    /// glyph once per bump.
+    @Published public private(set) var eyePulseGeneration = 0
+
+    /// The last hiding state the view reported, in-memory only. Nil until
+    /// the first report: the very first observation is a BASELINE, never a
+    /// transition — an app launching with rows already hidden must not
+    /// pulse on its first render.
+    private var lastNotedHidingAnyRow: Bool?
+
+    /// The view feeds every rendered hiding state here (on appear and on
+    /// change); a false→true transition bumps the pulse generation.
+    public func noteHidingAnyRow(_ isHiding: Bool) {
+        let previous = lastNotedHidingAnyRow
+        lastNotedHidingAnyRow = isHiding
+        if previous == false, isHiding {
+            eyePulseGeneration += 1
+        }
+    }
+
     // MARK: Header notice dismissals (issue #302)
 
     /// Issue #302 (Tim, 2026-08-08): "anything that gets put into that
