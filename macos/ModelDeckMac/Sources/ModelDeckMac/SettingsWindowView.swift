@@ -20,6 +20,10 @@ struct SettingsWindowView: View {
     /// Issue #176: per-account "Renew now" flow for expired-idle Claude
     /// accounts (same shared instance the deck popover observes).
     @ObservedObject var renewModel: AccountRenewModel
+    /// Issue #279: per-account proxy pool membership + session routing.
+    @ObservedObject var proxyPoolModel: ProxyPoolModel
+    /// Issue #280: the seeded pill's on-demand Verify.
+    @ObservedObject var identityVerifyModel: IdentityVerifyModel
     @ObservedObject var updateModel: ToolUpdateModel
     /// Issue #33: the app's own update check — a strictly separate surface
     /// from CLI updates (never a shared control or wording).
@@ -48,7 +52,9 @@ struct SettingsWindowView: View {
                 addAccountModel: addAccountModel,
                 deckModel: deckModel,
                 signInModel: signInModel,
-                renewModel: renewModel
+                renewModel: renewModel,
+                proxyPoolModel: proxyPoolModel,
+                identityVerifyModel: identityVerifyModel
             )
             .tabItem { Label("Accounts", systemImage: "person.2") }
             .tag(SettingsPane.accounts)
@@ -96,10 +102,19 @@ struct AccountsSettingsPane: View {
     @ObservedObject var signInModel: AccountSignInModel
     /// Issue #176: "Renew now" for expired-idle Claude rows.
     @ObservedObject var renewModel: AccountRenewModel
+    /// Issue #279: the quiet per-row proxy line (pool membership + session
+    /// routing). Renders nothing at all on a machine without the proxy.
+    @ObservedObject var proxyPoolModel: ProxyPoolModel
+    /// Issue #280: Verify beside the seeded pill.
+    @ObservedObject var identityVerifyModel: IdentityVerifyModel
 
     @State private var editingAccount: DeckAccount?
     @State private var removalCandidate: DeckAccount?
     @State private var isAddingAccount = false
+    /// Issue #279 (Tim: "ask each time rather than make it automatic"):
+    /// every proxy action passes through a confirmation naming exactly what
+    /// will happen. Nil = no dialog up.
+    @State private var proxyConfirmation: ProxyPoolConfirmation?
 
     private var sections: [AccountsRosterSection] {
         guard let state = statusModel.deckState else { return [] }
@@ -212,7 +227,41 @@ struct AccountsSettingsPane: View {
         } message: {
             Text("Removes only ModelDeck's reference to this account. Provider credentials and sign-ins are never touched.")
         }
+        // Issue #279: EVERY proxy action confirms first (Tim: "ask each
+        // time rather than make it automatic"), in one plain sentence. The
+        // join's sentence names the browser sign-in explicitly, because a
+        // browser window opening is the surprising part.
+        .confirmationDialog(
+            proxyConfirmation?.title ?? "",
+            isPresented: Binding(
+                get: { proxyConfirmation != nil },
+                set: { if !$0 { proxyConfirmation = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let confirmation = proxyConfirmation {
+                Button(confirmation.confirmTitle) {
+                    run(confirmation)
+                    proxyConfirmation = nil
+                }
+                Button("Cancel", role: .cancel) { proxyConfirmation = nil }
+            }
+        } message: {
+            Text(proxyConfirmation?.message ?? "")
+        }
         .task { await statusModel.refresh() }
+    }
+
+    /// Issue #279: the confirmed action, dispatched to the shared model.
+    private func run(_ confirmation: ProxyPoolConfirmation) {
+        switch confirmation.action {
+        case .join:
+            proxyPoolModel.beginJoin(account: confirmation.account)
+        case .route:
+            Task { await proxyPoolModel.setRouting(account: confirmation.account, enabled: true) }
+        case .unroute:
+            Task { await proxyPoolModel.setRouting(account: confirmation.account, enabled: false) }
+        }
     }
 
     @ViewBuilder
@@ -253,7 +302,21 @@ struct AccountsSettingsPane: View {
             statuslineInstalled: account.claudeStatusline?.installed,
             onSetStatusline: { enabled in
                 Task { await accountsModel.setStatuslineCapture(account: account, enabled: enabled) }
-            }
+            },
+            // Issue #279: nil on a machine without the proxy — no line, no
+            // menu item, nothing (the #149/#174 discipline). Every action
+            // routes through the confirmation, never straight to the daemon.
+            proxy: proxyPoolModel.presentation(for: account),
+            onProxyJoin: { proxyConfirmation = ProxyPoolConfirmation(account: account, action: .join) },
+            onProxyRoute: { proxyConfirmation = ProxyPoolConfirmation(account: account, action: .route) },
+            onProxyUnroute: { proxyConfirmation = ProxyPoolConfirmation(account: account, action: .unroute) },
+            onProxyCancelJoin: { proxyPoolModel.cancelJoinWait(accountID: account.id) },
+            onDismissProxyOutcome: { proxyPoolModel.dismissOutcome(accountID: account.id) },
+            // Issue #280: nil unless the account is seeded (or an attempt
+            // is still unanswered) — the button lives and dies with the pill.
+            verify: identityVerifyModel.presentation(for: account),
+            onVerifyIdentity: { Task { await identityVerifyModel.verify(account: account) } },
+            onDismissVerifyOutcome: { identityVerifyModel.dismissOutcome(accountID: account.id) }
         )
     }
 
@@ -291,6 +354,44 @@ struct AccountsSettingsPane: View {
               let state = statusModel.deckState
         else { return .unknown }
         return state.activationState(for: provider)
+    }
+}
+
+/// Issue #279: one pending proxy confirmation — which account, which of the
+/// three actions, and the plain sentence Core wrote for it. A value type so
+/// the dialog can never drift out of sync with the row it came from.
+struct ProxyPoolConfirmation: Identifiable {
+    enum Action { case join, route, unroute }
+
+    let account: DeckAccount
+    let action: Action
+
+    var id: String { "\(account.id)-\(action)" }
+
+    var title: String {
+        switch action {
+        case .join: return "Add \(account.label) to the proxy pool?"
+        case .route: return "Route \(account.label) sessions through the proxy?"
+        case .unroute: return "Stop routing \(account.label) sessions?"
+        }
+    }
+
+    var confirmTitle: String {
+        switch action {
+        case .join: return "Add to Pool"
+        case .route: return "Route Sessions"
+        case .unroute: return "Stop Routing"
+        }
+    }
+
+    /// Product copy lives in Core, tested — these are the sentences Tim's
+    /// "ask each time" rule makes load-bearing, not view scratch.
+    var message: String {
+        switch action {
+        case .join: return ProxyPool.joinConfirmation(label: account.label)
+        case .route: return ProxyPool.routeConfirmation(label: account.label)
+        case .unroute: return ProxyPool.unrouteConfirmation(label: account.label)
+        }
     }
 }
 
@@ -493,6 +594,19 @@ struct AccountRosterRow: View {
     var statuslineInstalled: Bool?
     /// Enables (true) or disables (false) statusline capture for this profile.
     var onSetStatusline: ((Bool) -> Void)?
+    /// Issue #279: this row's proxy pool + routing state. Nil renders NOTHING
+    /// — no line, no menu item — which is exactly what a machine without the
+    /// proxy (and an old daemon) must show.
+    var proxy: ProxyPoolRowPresentation?
+    var onProxyJoin: (() -> Void)?
+    var onProxyRoute: (() -> Void)?
+    var onProxyUnroute: (() -> Void)?
+    var onProxyCancelJoin: (() -> Void)?
+    var onDismissProxyOutcome: (() -> Void)?
+    /// Issue #280: the seeded pill's Verify affordance. Nil renders nothing.
+    var verify: IdentityVerifyPresentation?
+    var onVerifyIdentity: (() -> Void)?
+    var onDismissVerifyOutcome: (() -> Void)?
 
     @State private var isHovered = false
 
@@ -529,9 +643,18 @@ struct AccountRosterRow: View {
                                 .padding(.horizontal, 5)
                                 .padding(.vertical, 1.5)
                                 .background(Capsule().fill(Color.primary.opacity(0.08)))
-                                .help("Identity was entered at setup and hasn't been verified against the provider yet")
-                                .accessibilityLabel("Identity seeded at setup, not yet verified")
+                                // Issue #280 (Tim: the pill "just makes me
+                                // question what's going on"): the tooltip
+                                // now names BOTH exits, so the "yet" it
+                                // promises finally has an arrival story.
+                                .help(IdentityVerify.pillTooltip)
+                                .accessibilityLabel(IdentityVerify.pillAccessibilityLabel)
                         }
+                        // Issue #280: the Verify affordance renders ONLY
+                        // beside the pill (its presentation is gated on
+                        // `isIdentitySeeded`), so a verified account shows
+                        // neither.
+                        identityVerifyControls
                     }
                     if let subtitle = account.rosterSubtitle {
                         Text(subtitle)
@@ -577,6 +700,10 @@ struct AccountRosterRow: View {
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            // Issue #279: the quiet proxy line, under the identity line and
+            // in the same muted voice. The DECK stays calm — this surface
+            // is Settings → Accounts, where managing an account is the job.
+            proxyLine
         }
         .padding(.vertical, 3)
         .contentShape(Rectangle())
@@ -673,8 +800,156 @@ struct AccountRosterRow: View {
                 ? "ModelDeck updates this account's usage from Claude Code's statusline data whenever the profile is in use. Turning this off restores the profile's previous statusline configuration."
                 : "Adds a small statusline step to this profile that records Claude's own rate-limit numbers whenever the account is in use — no credentials, no extra API calls. Any statusline you already use keeps working unchanged.")
         }
+        // Issue #279: leaving the pool is not ModelDeck's operation, but
+        // UNROUTING is — it's the reversible half, and the ⋯ menu is where
+        // a reversal belongs (never a second button competing with the
+        // row's one quiet action). Confirmed like every other proxy action.
+        if proxy?.offersUnroute == true, let onProxyUnroute {
+            Divider()
+            Button("Stop routing sessions…", action: onProxyUnroute)
+                .disabled(isBusy)
+                .help("New sessions for this account stop going through the local proxy. "
+                    + "Running sessions are never touched.")
+        }
         Button("Remove…", role: .destructive, action: onRemove)
             .disabled(isBusy)
+    }
+
+    /// Issue #279: "In pool · routed" and, when the account has earned one,
+    /// exactly ONE quiet action beside it. The trailing slot follows the
+    /// #199 precedence tested in Core: progress → unread outcome → action.
+    @ViewBuilder
+    private var proxyLine: some View {
+        if let proxy {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.system(size: 8.5))
+                    .foregroundStyle(.tertiary)
+                if !proxy.statusText.isEmpty {
+                    Text(proxy.statusText)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                switch proxy.display {
+                case .joinWaiting:
+                    ProgressView().controlSize(.small)
+                    Text(ProxyPool.joinWaitingText)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    if let onProxyCancelJoin {
+                        Button("Stop waiting", action: onProxyCancelJoin)
+                            .controlSize(.small)
+                            .help(ProxyPool.joinWaitStopTooltip)
+                            .accessibilityLabel("Stop waiting for \(account.label) sign-in")
+                    }
+                case .routing:
+                    ProgressView().controlSize(.small)
+                    Text(ProxyPool.routingProgressText)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                case .note(let text):
+                    proxyOutcome(text, isFailure: false)
+                case .error(let text):
+                    proxyOutcome(text, isFailure: true)
+                case .action(.join):
+                    if let onProxyJoin {
+                        Button("Add to proxy pool…", action: onProxyJoin)
+                            .controlSize(.small)
+                            .disabled(isBusy)
+                            .help("Signs this account in to the local proxy so it can serve "
+                                + "pooled traffic. A browser sign-in opens; nothing changes until "
+                                + "it completes.")
+                            .accessibilityLabel("Add \(account.label) to the proxy pool")
+                    }
+                case .action(.route):
+                    if let onProxyRoute {
+                        Button("Route sessions…", action: onProxyRoute)
+                            .controlSize(.small)
+                            .disabled(isBusy)
+                            .help("New sessions for this account go through the local proxy. "
+                                + "Running sessions are never touched, and this is reversible.")
+                            .accessibilityLabel("Route \(account.label) sessions through the proxy")
+                    }
+                case .quiet:
+                    EmptyView()
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.top, 1)
+        }
+    }
+
+    /// A settled join/routing outcome — the daemon's sentence verbatim, held
+    /// until dismissed (the #199 rule: a click's answer lands at the click
+    /// site, not only in a state refresh).
+    @ViewBuilder
+    private func proxyOutcome(_ text: String, isFailure: Bool) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: isFailure ? "exclamationmark.triangle" : "checkmark.circle")
+                .font(.system(size: 9, weight: .semibold))
+            Text(text)
+                .font(.system(size: 10))
+                .lineLimit(2)
+                .help(text)
+            if let onDismissProxyOutcome {
+                Button(action: onDismissProxyOutcome) {
+                    Image(systemName: "xmark").font(.system(size: 8))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Dismiss proxy result for \(account.label)")
+            }
+        }
+        .foregroundStyle(isFailure ? AnyShapeStyle(severityColor(.warning)) : AnyShapeStyle(.secondary))
+    }
+
+    /// Issue #280: idle → [Verify], running → calm progress, decided
+    /// non-success → the quiet inline sentence (mismatch points at the
+    /// EXISTING identity-mismatch surface rather than inventing a new one).
+    /// Success renders nothing: the pill and this button both disappear on
+    /// the refreshed state, which IS the answer.
+    @ViewBuilder
+    private var identityVerifyControls: some View {
+        if let verify {
+            switch verify.display {
+            case .verify:
+                if let onVerifyIdentity {
+                    Button("Verify", action: onVerifyIdentity)
+                        .controlSize(.small)
+                        .disabled(isBusy)
+                        .help(IdentityVerify.buttonTooltip)
+                        .accessibilityLabel("Verify \(account.label)'s identity with the provider")
+                }
+            case .running:
+                HStack(spacing: 4) {
+                    ProgressView().controlSize(.small)
+                    Text(IdentityVerify.runningText)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Verifying \(account.label)'s identity")
+            case .failure(let text):
+                HStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 9, weight: .semibold))
+                    Text(text)
+                        .font(.system(size: 10))
+                        .lineLimit(1)
+                        .help(text)
+                    if let onDismissVerifyOutcome {
+                        Button(action: onDismissVerifyOutcome) {
+                            Image(systemName: "xmark").font(.system(size: 8))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("Dismiss verification result for \(account.label)")
+                    }
+                }
+                .foregroundStyle(severityColor(.warning))
+            }
+        }
     }
 
     /// Sign-in-again flow (issue #32). Direction A: healthy rows are SILENT
@@ -1099,8 +1374,13 @@ struct GeneralSettingsPane: View {
                 // #229/#235 the picker also selects Availability Health and
                 // None, so the label names the two-level structure instead:
                 // "Menu bar shows" = WHAT, "Show it" (below) = WHEN.
+                // Issue #292: the selection runs on the pin's BASE (the
+                // account id with any "|win:" window choice stripped), so
+                // a pin carrying a window choice still highlights its
+                // account row. Picking a different row writes the plain
+                // value — a new pin starts at the Lowest-window default.
                 Picker("Menu bar shows", selection: binding(
-                    get: { $0.menuBarAccountId },
+                    get: { MenuBarPinResolver.pinBase($0.menuBarAccountId) },
                     set: { model, value in await model.setMenuBarAccount(id: value) }
                 )) {
                     // Issue #229: no number at all — just the glyph. At the
@@ -1129,7 +1409,26 @@ struct GeneralSettingsPane: View {
                         Text(option.title).tag(option.id)
                     }
                 }
-                .help("A pinned account shows its lowest non-spend usage window in the menu bar continuously when one is available — normal color while healthy, gold at warning, red at critical; without a usable window the plain glyph is shown. \"Active … account\" follows whichever account is currently active for that provider. \"Lowest across all accounts\" shows a percentage only when some account drops below the warning threshold. \"… availability health\" shows that provider's Availability Health verdict as a colored status dot beside the icon (green circle, yellow triangle, red octagon — the deck column chip's 7-day runway simulation) instead of a percentage. \"None — icon only\" never shows a percentage; notifications still watch every account.")
+                .help("A pinned account shows its lowest non-spend usage window in the menu bar continuously when one is available — normal color while healthy, gold at warning, red at critical; without a usable window the plain glyph is shown. The Pinned window control below can show a specific window (like the Fable weekly) instead of the lowest. \"Active … account\" follows whichever account is currently active for that provider. \"Lowest across all accounts\" shows a percentage only when some account drops below the warning threshold. \"… availability health\" shows that provider's Availability Health verdict as a colored status dot beside the icon (green circle, yellow triangle, red octagon — the deck column chip's 7-day runway simulation) instead of a percentage. \"None — icon only\" never shows a percentage; notifications still watch every account.")
+                // Issue #292 (Tim's field report): pinning Click AI to
+                // watch the Fable weekly showed the 5-hour window instead —
+                // the pin always displayed the account's lowest window.
+                // Account pins can now choose a window CLASS; "Lowest
+                // window" is the unchanged default, and a chosen class the
+                // account doesn't report falls back to the lowest window
+                // (the popover source line says so).
+                if let pinnedBase = pinnedAccountBase {
+                    // Only window classes the account actually reports are
+                    // offered (CodeRabbit, this PR) — plus a ghost row for
+                    // a stored choice whose class has since vanished, so
+                    // the picker always contains its current selection.
+                    Picker("Pinned window", selection: pinWindowBinding(base: pinnedBase)) {
+                        ForEach(pinWindowOptions(base: pinnedBase), id: \.key) { option in
+                            Text(option.title).tag(option.key)
+                        }
+                    }
+                    .help("Which of the pinned account's usage windows the menu bar shows. \"Lowest window\" follows whichever non-spend window has the least left — the previous behavior. A chosen window the account stops reporting falls back to the lowest window; the deck's menu-bar source line always names the window actually shown.")
+                }
                 // Issue #238 quiet mode — the mode-specific WHEN row (Tim's
                 // refinement): percentage modes gate on an editable inline
                 // threshold, health modes gate on the verdict; hidden for
@@ -1540,7 +1839,9 @@ struct GeneralSettingsPane: View {
             let provider = DeckProvider.from(account.provider)?.displayName ?? account.provider
             return (id: account.id, title: "\(provider) — \(account.label)")
         }
-        let current = settingsSync.settings.menuBarAccountId
+        // Issue #292: matched on the pin's base so a window-choice suffix
+        // never earns a spurious "Removed account" ghost row.
+        let current = MenuBarPinResolver.pinBase(settingsSync.settings.menuBarAccountId)
         // Follow-active sentinels, the #229 "none" sentinel, and the #235
         // health sentinels have their own static rows above. (An
         // unrecognized "health:<future>" value still earns the fallback
@@ -1550,6 +1851,58 @@ struct GeneralSettingsPane: View {
             && !MenuBarPinResolver.isHealth(current)
             && !options.contains(where: { $0.id == current }) {
             options.append((id: current, title: "Removed account"))
+        }
+        return options
+    }
+
+    /// Issue #292: the pinned account id when the current selection is a
+    /// plain account pin — nil for every sentinel mode, so the Pinned
+    /// window picker renders only where a window choice can apply.
+    private var pinnedAccountBase: String? {
+        let base = MenuBarPinResolver.pinBase(settingsSync.settings.menuBarAccountId)
+        guard !base.isEmpty,
+              !base.hasPrefix("active:"),
+              !MenuBarPinResolver.isNone(base),
+              !MenuBarPinResolver.isHealth(base)
+        else { return nil }
+        return base
+    }
+
+    /// Issue #292: the Pinned window selection — the stored pin's window
+    /// key ("" = lowest, the default). Writes recompose the full pin value
+    /// so the account and its window choice travel as one setting.
+    private func pinWindowBinding(base: String) -> Binding<String> {
+        binding(
+            get: { MenuBarPinResolver.pinWindow($0.menuBarAccountId)?.rawValue ?? "" },
+            set: { model, key in
+                await model.setMenuBarAccount(id: MenuBarPinResolver.pinnedValue(
+                    accountId: base,
+                    window: MenuBarPinResolver.PinWindow(rawValue: key)
+                ))
+            }
+        )
+    }
+
+    /// Issue #292: the Pinned window rows — "Lowest window" plus only the
+    /// window classes the account actually reports (CodeRabbit, this PR:
+    /// offering a class the account never has invites a dead choice), each
+    /// named from the account's own window ("Weekly · Fable"). A stored
+    /// choice whose class isn't reported right now earns a ghost row —
+    /// SwiftUI pickers must contain their current selection, and the
+    /// "(not reported)" suffix says why the number fell back to lowest.
+    private func pinWindowOptions(base: String) -> [(key: String, title: String)] {
+        var options: [(key: String, title: String)] = [(key: "", title: "Lowest window")]
+        let scopes = (statusModel.deckState?.usage ?? [])
+            .filter { $0.accountId == base }
+            .map(\.scope)
+        for choice in MenuBarPinResolver.PinWindow.allCases {
+            if let scope = scopes.first(where: { choice.matches(scope: $0) }) {
+                options.append((key: choice.rawValue, title: DeckBuilder.windowTitle(for: scope)))
+            }
+        }
+        if let current = MenuBarPinResolver.pinWindow(settingsSync.settings.menuBarAccountId),
+           !options.contains(where: { $0.key == current.rawValue }) {
+            options.append((key: current.rawValue, title: "\(current.genericTitle) (not reported)"))
         }
         return options
     }
@@ -1653,6 +2006,16 @@ struct GeneralSettingsPane: View {
         }
         if current.isEmpty {
             return "The percentage appears only when any account drops below the warning threshold."
+        }
+        // Issue #292: a pin carrying a window choice names the window it
+        // shows — and the honest fallback when that window isn't reported.
+        if let choice = MenuBarPinResolver.pinWindow(current) {
+            let window = pinnedAccountBase.flatMap { base in
+                (statusModel.deckState?.usage ?? [])
+                    .first { $0.accountId == base && choice.matches(scope: $0.scope) }
+                    .map { DeckBuilder.windowTitle(for: $0.scope) }
+            } ?? choice.genericTitle
+            return "The pinned account's \(window) percentage stays visible while that window is reported; if it isn't, the account's lowest usable window is shown instead. Notifications still watch every account."
         }
         return "The pinned account's percentage stays visible while it has a usable non-spend window; otherwise the plain glyph is shown. Notifications still watch every account."
     }

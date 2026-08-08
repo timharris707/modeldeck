@@ -182,7 +182,9 @@ struct HealthScarcityTests {
         #expect(p.readout.contains("2 of 6 accounts"))
         #expect(p.readout.contains("sustain") == false)
         // And the fact list states the reachable number beside the raw pool.
-        #expect(p.factLines.contains { $0.contains("Usable now:") && $0.contains("2 of 6") })
+        let usable = p.section(AvailabilityHealthPresentation.SectionTitle.now)?.row("Usable")
+        #expect(usable?.value.contains("2 of 6 accounts") == true)
+        #expect(usable?.value.hasSuffix(" accounts") == true)
     }
 }
 

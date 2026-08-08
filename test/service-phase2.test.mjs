@@ -336,7 +336,9 @@ test('Claude activation pins proxy credentials by Keychain pointer and removes t
   const firstReal = fs.realpathSync(data.firstHome);
   assert.ok(content.includes(`export CLAUDE_CONFIG_DIR='${firstReal}'`));
   assert.ok(content.includes(`export CLAUDE_SECURESTORAGE_CONFIG_DIR='${firstReal}'`));
-  assert.ok(content.includes('export ANTHROPIC_API_KEY="$(security find-generic-password -s cli-proxy-api-client -w 2>/dev/null)"'));
+  // #278 review, major 1: guarded pointer — only a non-empty lookup exports.
+  assert.ok(content.includes('__modeldeck_key="$("${MODELDECK_SECURITY_BIN:-/usr/bin/security}" find-generic-password -s cli-proxy-api-client -w 2>/dev/null || true)"'));
+  assert.ok(content.includes('export ANTHROPIC_API_KEY="$__modeldeck_key"'));
   assert.equal((fs.statSync(envFile).mode & 0o777), 0o600);
   // The activation path only reads routing from settings. The credential
   // remains a shell-time Keychain pointer and never enters settings.json,
@@ -358,7 +360,7 @@ test('Claude activation pins proxy credentials by Keychain pointer and removes t
   // No EXPORT for an unproxied profile — but the guarded clear must be
   // present, or a nested shell keeps the key it inherited from the proxied
   // profile that was active a moment ago (CodeRabbit, PR #278).
-  assert.ok(!/^export ANTHROPIC_API_KEY=/m.test(content));
+  assert.ok(!/^\s*export ANTHROPIC_API_KEY=/m.test(content));
   assert.ok(content.includes('unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY'));
   assert.equal(fs.readFileSync(path.join(data.firstHome, 'settings.json'), 'utf8'), proxiedSettings);
   assert.equal(fs.existsSync(path.join(data.secondHome, 'settings.json')), false);

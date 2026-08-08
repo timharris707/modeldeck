@@ -383,27 +383,57 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
         public var benchedForFable: Bool
         /// The live routing weight (what `weight` hides while benched).
         public var liveWeight: Int
+        /// Issue #279: true when a real pool exists on this machine and the
+        /// daemon says this account is NOT in it (`proxyPool: "absent"`).
+        /// The badge then renders the branch glyph with no number and the
+        /// "Not in the proxy pool" tooltip — quiet ambient context; the
+        /// join action lives in Settings → Accounts, never on the deck.
+        public var absentFromPool: Bool
+
+        public init(
+            weight: Int,
+            benchedForFable: Bool,
+            liveWeight: Int,
+            absentFromPool: Bool = false
+        ) {
+            self.weight = weight
+            self.benchedForFable = benchedForFable
+            self.liveWeight = liveWeight
+            self.absentFromPool = absentFromPool
+        }
     }
 
     public var proxyWeightPresentation: ProxyWeightPresentation? {
-        guard let live = account.proxyWeight else { return nil }
-        // Issue #287: key on the binding window, so the badge and the
-        // number beside it can never tell different stories — including
-        // when the #254 toggle is ON but the row fell back to the Fable
-        // window. A row with no binding window at all is NOT displaying
-        // general weekly, so a benched account stays benched there too
-        // (understatement is recoverable via the tooltip; overstatement
-        // is the #287 bug).
-        let displaysGeneralWeekly = worstWindow
-            .map { DeckBuilder.windowRank(scope: $0.scope) == 1 } ?? false
-        let benched = provider == .claude
-            && !displaysGeneralWeekly
-            && account.proxyFableExcluded == true
-        return ProxyWeightPresentation(
-            weight: benched ? 0 : live,
-            benchedForFable: benched,
-            liveWeight: live
-        )
+        if let live = account.proxyWeight {
+            // Issue #287: key on the binding window, so the badge and the
+            // number beside it can never tell different stories — including
+            // when the #254 toggle is ON but the row fell back to the Fable
+            // window. A row with no binding window at all is NOT displaying
+            // general weekly, so a benched account stays benched there too
+            // (understatement is recoverable via the tooltip; overstatement
+            // is the #287 bug).
+            let displaysGeneralWeekly = worstWindow
+                .map { DeckBuilder.windowRank(scope: $0.scope) == 1 } ?? false
+            let benched = provider == .claude
+                && !displaysGeneralWeekly
+                && account.proxyFableExcluded == true
+            return ProxyWeightPresentation(
+                weight: benched ? 0 : live,
+                benchedForFable: benched,
+                liveWeight: live
+            )
+        }
+        // Issue #279: a machine WITH a pool renders the absent state; a
+        // machine without one (no proxyPool key at all) renders nothing —
+        // the #149/#174 discipline, unchanged. Membership without a weight
+        // yet (fresh join, rebalance pending) also renders nothing: the
+        // number arrives within one rebalance tick.
+        if account.proxyPool?.lowercased() == "absent" {
+            return ProxyWeightPresentation(
+                weight: 0, benchedForFable: false, liveWeight: 0, absentFromPool: true
+            )
+        }
+        return nil
     }
 
     /// Issue #89: this card's staleness marker, or nil while its data is
@@ -568,9 +598,15 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
         // weight must be folded in here or VoiceOver never hears it — and
         // the benched wording must stay distinct from plain routing weight.
         if let weight = proxyWeightPresentation {
-            label += weight.benchedForFable
-                ? ", benched for Fable routing, weight \(weight.liveWeight) for other models"
-                : ", proxy routing weight \(weight.weight)"
+            // Issue #279: the absent state must be SPOKEN here too — same
+            // suppression trap as the weight itself.
+            if weight.absentFromPool {
+                label += ", not in the proxy pool"
+            } else {
+                label += weight.benchedForFable
+                    ? ", benched for Fable routing, weight \(weight.liveWeight) for other models"
+                    : ", proxy routing weight \(weight.weight)"
+            }
         }
         return label
     }
@@ -1484,9 +1520,24 @@ public final class DeckPopoverModel: ObservableObject {
 
     /// Whether this exact account id is the stored pin (follow-active
     /// sentinels deliberately don't match: the context menu shows the
-    /// follow-active checkmark on its own item instead).
+    /// follow-active checkmark on its own item instead). Issue #292:
+    /// compared on the pin's base, so a pin carrying a window choice
+    /// still reads as pinned.
     public func isMenuBarPinned(_ accountID: String) -> Bool {
-        menuBarPinnedSetting == accountID
+        MenuBarPinResolver.pinBase(menuBarPinnedSetting) == accountID
+    }
+
+    /// Issue #292: the window choice this account's pin carries; nil while
+    /// the pin is plain (lowest window) or the account isn't pinned.
+    public func menuBarPinWindow(for accountID: String) -> MenuBarPinResolver.PinWindow? {
+        guard isMenuBarPinned(accountID) else { return nil }
+        return MenuBarPinResolver.pinWindow(menuBarPinnedSetting)
+    }
+
+    /// Issue #292: pin this account showing the given window class (nil =
+    /// lowest window, the plain pre-#292 pin) from a card's context menu.
+    public func pinMenuBar(accountID: String, window: MenuBarPinResolver.PinWindow?) {
+        onPinMenuBarAccount?(MenuBarPinResolver.pinnedValue(accountId: accountID, window: window))
     }
 
     public func isMenuBarFollowingActive(provider: DeckProvider) -> Bool {
@@ -1604,8 +1655,17 @@ public final class DeckPopoverModel: ObservableObject {
     /// (UserDefaults, the #73 pattern), never synced to the daemon; it
     /// persists across popover opens like every other view preference.
     @Published public var focusGeneralWeeklyHeadline: Bool {
-        didSet { defaults.set(focusGeneralWeeklyHeadline, forKey: Self.focusGeneralWeeklyDefaultsKey) }
+        didSet {
+            defaults.set(focusGeneralWeeklyHeadline, forKey: Self.focusGeneralWeeklyDefaultsKey)
+            onGeneralWeeklyFocusChange?(focusGeneralWeeklyHeadline)
+        }
     }
+
+    /// Issue #297: fired on every toggle flip so the app can mirror the
+    /// value into `MenuBarStatusModel.focusGeneralWeekly` — the health-mode
+    /// dot evaluates the same pool as the popover chip. App-local wiring
+    /// only; nothing here goes to the daemon.
+    public var onGeneralWeeklyFocusChange: ((Bool) -> Void)?
 
     /// Issue #270: how opaque the deck's backing fill is. App-local
     /// (UserDefaults, the #73 pattern), never synced to the daemon — it is a

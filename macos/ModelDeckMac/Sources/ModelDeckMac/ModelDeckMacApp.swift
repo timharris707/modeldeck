@@ -13,6 +13,12 @@ struct ModelDeckMacApp: App {
     /// Issue #176: "Renew now" for expired-idle Claude accounts — one shared
     /// state behind the deck cards and the Settings roster rows.
     @StateObject private var renewModel: AccountRenewModel
+    /// Issue #279: per-account proxy pool membership + session routing —
+    /// one shared state machine so a join's wait and its outcome belong to
+    /// the account, not to whichever view happens to be on screen.
+    @StateObject private var proxyPoolModel: ProxyPoolModel
+    /// Issue #280: the seeded pill's on-demand identity check.
+    @StateObject private var identityVerifyModel: IdentityVerifyModel
     /// Issue #204: shared user scope (tools & memory across Claude
     /// accounts) — the confirmation-gated enable/disable state machine.
     @StateObject private var sharedScopeModel: SharedScopeModel
@@ -38,11 +44,16 @@ struct ModelDeckMacApp: App {
     /// model's load() (fired from a view .task) — NEVER in a view-struct
     /// initializer, which this App body re-runs on every evaluation (the
     /// hot stack behind the #68 re-render cost).
-    @StateObject private var launchAtLoginModel = LaunchAtLoginModel()
+    @StateObject private var launchAtLoginModel: LaunchAtLoginModel
     /// Issue #59: right-click context menu on the menu bar icon (Quit +
     /// Check for App Updates). Class ref held for the app's lifetime;
     /// installed from the label's .task.
     private let contextMenuController: MenuBarContextMenuController
+    /// Issue #295: attached-vs-detached deck mode (Core, persisted).
+    @StateObject private var floatingDeckModel: FloatingDeckModel
+    /// Issue #295: the floating deck's NSWindow lifecycle (open/front/
+    /// close, frame autosave, close-button detection).
+    private let floatingDeckController: FloatingDeckWindowController
 
     init() {
         let configuration = DaemonConfiguration.resolved()
@@ -101,6 +112,14 @@ struct ModelDeckMacApp: App {
         // verify); the model only asks, shows progress, and relays the
         // decided outcome calmly.
         let renewModel = AccountRenewModel(renewer: client, stateProvider: client)
+        // Issue #279: pool membership and session routing are the daemon's
+        // ops end to end (the proxy's own OAuth, an atomic settings write);
+        // the model asks AFTER the user confirms, shows the wait, and
+        // relays the decided outcome. Issue #280's identity check has the
+        // same shape. One shared instance each — Settings must never hold a
+        // second, divergent copy of an in-flight attempt.
+        let proxyPoolModel = ProxyPoolModel(manager: client, stateProvider: client)
+        let identityVerifyModel = IdentityVerifyModel(verifier: client, stateProvider: client)
         // Issue #204: the daemon owns the shared-scope mechanism end to end
         // (backups, section-level merge, reversibility); the model only asks
         // for the guarded op and relays the disclosed outcome calmly.
@@ -198,6 +217,15 @@ struct ModelDeckMacApp: App {
                 notifications?.thresholds = settings.usageThresholds
             }
             statusModel?.startAutoRefresh(interval: settings.effectiveAutoRefreshInterval)
+        }
+        // Issue #297: the deck's general-weekly focus toggle is app-local
+        // (UserDefaults on the popover model, never a daemon setting), so it
+        // can't ride onApply above — mirror it into the status model here,
+        // seeded now and on every flip, so the health-mode dot always
+        // evaluates the same pool as the popover chip.
+        statusModel.focusGeneralWeekly = deckModel.focusGeneralWeeklyHeadline
+        deckModel.onGeneralWeeklyFocusChange = { [weak statusModel] focused in
+            statusModel?.focusGeneralWeekly = focused
         }
         // A card's right-click pin goes through the same daemon-backed
         // setting as the Settings picker; the confirmed document then flows
@@ -299,6 +327,18 @@ struct ModelDeckMacApp: App {
         renewModel.onStateChanged = { [weak statusModel] state in
             statusModel?.apply(deckState: state)
         }
+        // Issue #279: a settled join or routing write lands its fresh state
+        // immediately — the row's status line then reads the daemon's
+        // re-read truth ("In pool · routed"), which IS the feedback.
+        proxyPoolModel.onStateChanged = { [weak statusModel] state in
+            statusModel?.apply(deckState: state)
+        }
+        // Issue #280: a verified identity is promoted daemon-side, so the
+        // fresh state simply drops the seeded pill (and this button with
+        // it) — the disappearance is the success feedback.
+        identityVerifyModel.onStateChanged = { [weak statusModel] state in
+            statusModel?.apply(deckState: state)
+        }
         // Issue #204: every finished (or refused) shared-scope op lands its
         // fresh state in the deck immediately — the Settings toggle renders
         // the daemon-reported enabled flag, so state honesty is this wire.
@@ -367,6 +407,36 @@ struct ModelDeckMacApp: App {
             }
         }
 
+        // The SMAppService.status XPC read stays in the model's load()
+        // (fired from a view .task), never here — see the property doc.
+        let launchAtLoginModel = LaunchAtLoginModel()
+        _launchAtLoginModel = StateObject(wrappedValue: launchAtLoginModel)
+
+        // Issue #295: the floating deck — same models, a second home. The
+        // controller builds the floating DeckPopoverView lazily from the
+        // SAME instances the popover observes (one deck's state, wherever
+        // it renders); `isFloating` keeps it out of the popover-dismissal
+        // registry and hides the detach control.
+        let floatingDeckModel = FloatingDeckModel()
+        let floatingDeckController = FloatingDeckWindowController(model: floatingDeckModel) {
+            AnyView(DeckPopoverView(
+                statusModel: statusModel,
+                deckModel: deckModel,
+                renewModel: renewModel,
+                signInModel: signInModel,
+                appUpdateModel: appUpdateModel,
+                appUpdateInstallModel: appUpdateInstallModel,
+                stagedPromptModel: appUpdateStagedPrompt,
+                setupModel: daemonSetupModel,
+                launchAtLoginModel: launchAtLoginModel,
+                isFloating: true
+            ))
+        }
+        floatingDeckModel.onDetach = { floatingDeckController.show() }
+        floatingDeckModel.onReattach = { floatingDeckController.close() }
+        self.floatingDeckController = floatingDeckController
+        _floatingDeckModel = StateObject(wrappedValue: floatingDeckModel)
+
         _statusModel = StateObject(wrappedValue: statusModel)
         _deckModel = StateObject(wrappedValue: deckModel)
         _settingsSync = StateObject(wrappedValue: settingsSync)
@@ -375,6 +445,8 @@ struct ModelDeckMacApp: App {
         _addAccountModel = StateObject(wrappedValue: addAccountModel)
         _signInModel = StateObject(wrappedValue: signInModel)
         _renewModel = StateObject(wrappedValue: renewModel)
+        _proxyPoolModel = StateObject(wrappedValue: proxyPoolModel)
+        _identityVerifyModel = StateObject(wrappedValue: identityVerifyModel)
         _sharedScopeModel = StateObject(wrappedValue: sharedScopeModel)
         _toolUpdateModel = StateObject(wrappedValue: toolUpdateModel)
         _appUpdateModel = StateObject(wrappedValue: appUpdateModel)
@@ -415,17 +487,28 @@ struct ModelDeckMacApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            DeckPopoverView(
-                statusModel: statusModel,
-                deckModel: deckModel,
-                renewModel: renewModel,
-                signInModel: signInModel,
-                appUpdateModel: appUpdateModel,
-                appUpdateInstallModel: appUpdateInstallModel,
-                stagedPromptModel: appUpdateStagedPrompt,
-                setupModel: daemonSetupModel,
-                launchAtLoginModel: launchAtLoginModel
-            )
+            // Issue #295: while the deck floats, the popover shows the
+            // placeholder — never a second live deck.
+            DeckMenuBarRootView(floating: floatingDeckModel) {
+                DeckPopoverView(
+                    statusModel: statusModel,
+                    deckModel: deckModel,
+                    renewModel: renewModel,
+                    signInModel: signInModel,
+                    appUpdateModel: appUpdateModel,
+                    appUpdateInstallModel: appUpdateInstallModel,
+                    stagedPromptModel: appUpdateStagedPrompt,
+                    setupModel: daemonSetupModel,
+                    launchAtLoginModel: launchAtLoginModel,
+                    onDetach: { [weak floatingDeckModel = floatingDeckModel] in
+                        // Flip the mode (opens the window via the model's
+                        // hook), then dismiss the popover the deck just
+                        // left — the same choke point Settings uses.
+                        floatingDeckModel?.detach()
+                        SettingsWindowFronting.closeDeckPopover()
+                    }
+                )
+            }
         } label: {
             // Issue #45: the view observes the model ITSELF — passing a
             // value snapshot from this Scene body left the status-item
@@ -436,6 +519,12 @@ struct ModelDeckMacApp: App {
                 .task {
                     IconDebugLog.log("label .task fired; starting initial refresh")
                     contextMenuController.install()
+                    // Issue #295: a deck that was floating at last quit
+                    // (including a Sparkle self-relaunch, #241) comes back
+                    // floating, at its remembered position.
+                    if floatingDeckModel.isDetached {
+                        floatingDeckController.show(activate: false)
+                    }
                     // Issue #96: evaluate the bundled-service state before
                     // the first refresh so a true first run shows the
                     // consent card, not a bare "daemon unreachable".
@@ -475,6 +564,8 @@ struct ModelDeckMacApp: App {
                 deckModel: deckModel,
                 signInModel: signInModel,
                 renewModel: renewModel,
+                proxyPoolModel: proxyPoolModel,
+                identityVerifyModel: identityVerifyModel,
                 updateModel: toolUpdateModel,
                 appUpdateModel: appUpdateModel,
                 appUpdateAutoChecker: appUpdateAutoChecker,

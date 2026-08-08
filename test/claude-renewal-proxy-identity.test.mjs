@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 import { Store } from '../src/db.mjs';
 import { ModelDeckService } from '../src/service.mjs';
+import { createApp } from '../src/server.mjs';
 
 // Issue #263 (Tim, 2026-08-05). Four of his six Claude accounts went idle every
 // ~8h and stayed idle until he signed in by hand; the other two healed
@@ -49,6 +51,8 @@ const HELPER_STATUS = JSON.stringify({
   apiKeySource: 'helper',
 });
 const OTHER_ACCOUNT_STATUS = JSON.stringify({ email: 'someone-else@example.invalid' });
+const VERIFY_API_PORT = 43280;
+const VERIFY_API_TOKEN = 'identity-verification-placeholder-token';
 
 function fixture(options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-263-'));
@@ -91,6 +95,8 @@ function fixture(options = {}) {
     listProviderProcesses: async () => ['claude'],
     childEnv: {
       PATH: '/fixture/bin',
+      ANTHROPIC_API_KEY: 'ambient-key-must-not-reach-renewal-child',
+      ANTHROPIC_AUTH_TOKEN: 'ambient-token-must-not-reach-renewal-child',
       ANTHROPIC_BASE_URL: 'https://must-not-reach-child.invalid',
     },
     userInfo: () => ({ username: 'fixture-user' }),
@@ -103,10 +109,15 @@ function fixture(options = {}) {
       //    which is why an empty scratch dir returned authMethod "claude.ai"
       //    with email null until the profile's file was linked in.
       if (args[0] === 'auth') {
+        options.onAuthCall?.();
+        if (options.authGate) await options.authGate;
         if (options.authThrows) {
           // A failed invocation with NO usable stdout: timeout, ENOENT,
           // a crash. Distinct from "ran fine and named nobody".
-          throw Object.assign(new Error('fixture auth status failed'), { code: 'ETIMEDOUT' });
+          throw Object.assign(new Error('fixture auth status failed'), {
+            code: 'ETIMEDOUT',
+            ...(options.authErrorStdout ? { stdout: options.authErrorStdout } : {}),
+          });
         }
         const configDir = execOptions.env.CLAUDE_CONFIG_DIR;
         const read = (file) => {
@@ -124,19 +135,22 @@ function fixture(options = {}) {
       return { stdout: '', stderr: '' };
     },
     fetchClaude: async () => SNAPSHOTS,
+    ...options.serviceOptions,
   });
 
   const target = store.saveAccount({
     provider: 'claude',
     label: 'Target',
     profileRef: targetHome,
-    identity: TARGET_EMAIL,
-    metadata: { claudeAccountUuid: TARGET_UUID },
+    identity: Object.hasOwn(options, 'targetIdentity') ? options.targetIdentity : TARGET_EMAIL,
+    metadata: Object.hasOwn(options, 'targetMetadata')
+      ? options.targetMetadata
+      : { claudeAccountUuid: TARGET_UUID },
   });
   store.saveAccount({ provider: 'claude', label: 'Prior', profileRef: priorHome, isDefault: true });
 
   return {
-    root, targetHome, store, service, calls, target,
+    root, priorHome, targetHome, activeLink, store, service, calls, target,
     expire() {
       service.recordAccountRefreshResults([{ accountId: target.id, ok: false, error: EXPIRED }]);
     },
@@ -145,6 +159,49 @@ function fixture(options = {}) {
       fs.rmSync(root, { recursive: true, force: true });
     },
   };
+}
+
+function verifyApi(data) {
+  return createApp({
+    store: data.store,
+    service: data.service,
+    host: '127.0.0.1',
+    port: VERIFY_API_PORT,
+    mutationToken: VERIFY_API_TOKEN,
+  });
+}
+
+async function verifyApiRequest(app, route, { method = 'POST', authenticated = true } = {}) {
+  const req = Readable.from([]);
+  Object.assign(req, {
+    method,
+    url: route,
+    headers: {
+      host: `127.0.0.1:${VERIFY_API_PORT}`,
+      ...(method !== 'GET' && authenticated ? {
+        'x-modeldeck-token': VERIFY_API_TOKEN,
+        cookie: `modeldeck_session=${VERIFY_API_TOKEN}`,
+      } : {}),
+    },
+  });
+  let status;
+  let payload;
+  const res = {
+    writeHead(value) { status = value; },
+    end(value) {
+      payload = value == null || value === '' ? null : JSON.parse(String(value));
+    },
+  };
+  await app.server.listeners('request')[0](req, res);
+  return { status, body: payload };
+}
+
+function assertVerifyNeverInvokedInference(data) {
+  assert.equal(
+    data.calls.some((call) => call.args.includes('-p')),
+    false,
+    'verify-identity never includes -p in any provider exec call',
+  );
 }
 
 test('a proxy-routed profile renews on the no-flip rung while Claude is running', async (t) => {
@@ -243,6 +300,384 @@ test('a proxy-routed profile renews on the no-flip rung while Claude is running'
       assert.equal(renew.outcome, 'busy');
       assert.equal(renew.identityDecline, 'absent');
     } finally { data.close(); }
+  });
+});
+
+test('service-wired routing preserves the #263 renewal isolation pin', async () => {
+  const data = fixture({
+    settings: {
+      opaque: {
+        nested: ['placeholder', { enabled: false }],
+        whitespace: '  value bytes survive  ',
+      },
+      env: { KEEP_ME: 'unrelated-value' },
+    },
+  });
+  try {
+    const settingsPath = path.join(data.targetHome, 'settings.json');
+    const routed = await data.service.wireProxyRouting(data.target.id);
+    assert.deepEqual(routed, {
+      accountId: data.target.id,
+      provider: 'claude',
+      proxyRouted: true,
+      cliproxyRouted: true,
+      helperRouted: true,
+    });
+
+    // Capture the REAL profile after the routing mutation. Renewal must treat
+    // these bytes as read-only: its settings-free scratch config is the #263
+    // boundary that keeps apiKeyHelper from blinding the identity rung.
+    const wiredSettings = fs.readFileSync(settingsPath, 'utf8');
+    const parsed = JSON.parse(wiredSettings);
+    assert.equal(parsed.env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:8317');
+    assert.equal(parsed.env.KEEP_ME, 'unrelated-value');
+    assert.equal(
+      parsed.apiKeyHelper,
+      'security find-generic-password -s cli-proxy-api-client -w',
+    );
+
+    data.expire();
+    const renew = await data.service.renewClaudeAccount(data.target.id);
+    assert.equal(renew.outcome, 'renewed');
+    assert.equal(renew.path, 'no-flip');
+    assert.ok(data.calls.length > 0, 'renewal spawned at least one Claude child');
+
+    for (const call of data.calls) {
+      for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL']) {
+        assert.equal(Object.hasOwn(call.options.env, key), false, `${key} stayed out of the renewal child`);
+      }
+      const scratchConfig = call.options.env.CLAUDE_CONFIG_DIR;
+      assert.notEqual(scratchConfig, data.targetHome);
+      assert.equal(fs.existsSync(path.join(scratchConfig, 'settings.json')), false);
+      assert.equal(fs.existsSync(path.join(scratchConfig, 'settings.local.json')), false);
+    }
+    assert.equal(fs.readFileSync(settingsPath, 'utf8'), wiredSettings);
+  } finally {
+    data.close();
+  }
+});
+
+test('POST verify-identity uses only the scoped auth-status identity rung (#280)', async (t) => {
+  await t.test('a matching seed is promoted and the pill predicate field is visible through /api/state', async () => {
+    const data = fixture({ targetMetadata: { identitySource: 'seed', fixtureMarker: 'preserved' } });
+    const app = verifyApi(data);
+    try {
+      const activeBefore = fs.realpathSync(data.activeLink);
+      const result = await verifyApiRequest(app, `/api/accounts/${data.target.id}/verify-identity`);
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.body, { outcome: 'verified' });
+      assert.deepEqual(data.calls.map((call) => call.args), [['auth', 'status', '--json']]);
+      assert.equal(data.calls[0].options.env.CLAUDE_SECURESTORAGE_CONFIG_DIR, data.targetHome);
+      assert.notEqual(data.calls[0].options.env.CLAUDE_CONFIG_DIR, data.targetHome);
+      assert.equal(fs.realpathSync(data.activeLink), activeBefore, 'identity verification never flips activation');
+
+      const state = await verifyApiRequest(app, '/api/state', { method: 'GET' });
+      const account = state.body.accounts.find((item) => item.id === data.target.id);
+      assert.equal(account.metadata.identitySource, 'verified');
+      assert.equal(account.metadata.claudeAccountUuid, TARGET_UUID);
+      assert.equal(account.metadata.fixtureMarker, 'preserved');
+
+      const reset = data.service.resetClaudeIdentity(data.target.id);
+      assert.equal(Object.hasOwn(reset.metadata, 'identitySource'), false);
+      assert.equal(Object.hasOwn(reset.metadata, 'claudeAccountUuid'), false);
+    } finally {
+      assertVerifyNeverInvokedInference(data);
+      data.close();
+    }
+  });
+
+  await t.test('an already-verified account re-checks idempotently with zero store writes', async () => {
+    const data = fixture({
+      targetMetadata: { identitySource: 'verified' },
+    });
+    const app = verifyApi(data);
+    const originalSave = data.store.saveAccount.bind(data.store);
+    let saves = 0;
+    data.store.saveAccount = (input) => {
+      saves += 1;
+      return originalSave(input);
+    };
+    try {
+      const result = await verifyApiRequest(app, `/api/accounts/${data.target.id}/verify-identity`);
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.body, { outcome: 'verified' });
+      assert.equal(saves, 0);
+      assert.equal(data.store.getAccount(data.target.id).metadata.claudeAccountUuid, undefined);
+      assert.deepEqual(data.calls.map((call) => call.args), [['auth', 'status', '--json']]);
+    } finally {
+      assertVerifyNeverInvokedInference(data);
+      data.close();
+    }
+  });
+
+  await t.test('a mismatch reports the provider email without changing seeded metadata', async () => {
+    const metadata = { identitySource: 'seed', fixtureMarker: 'preserved' };
+    const data = fixture({ statusOutput: OTHER_ACCOUNT_STATUS, targetMetadata: metadata });
+    const app = verifyApi(data);
+    try {
+      const result = await verifyApiRequest(app, `/api/accounts/${data.target.id}/verify-identity`);
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.body, {
+        outcome: 'mismatch',
+        reported: 'someone-else@example.invalid',
+      });
+      assert.deepEqual(data.store.getAccount(data.target.id).metadata, metadata);
+      assert.deepEqual(data.calls.map((call) => call.args), [['auth', 'status', '--json']]);
+    } finally {
+      assertVerifyNeverInvokedInference(data);
+      data.close();
+    }
+  });
+
+  await t.test('a matching email with a contradictory UUID is unavailable, not a same-email mismatch', async () => {
+    const metadata = {
+      identitySource: 'seed',
+      claudeAccountUuid: TARGET_UUID,
+      fixtureMarker: 'preserved',
+    };
+    const data = fixture({
+      statusOutput: JSON.stringify({ email: TARGET_EMAIL, accountUuid: 'uuid-other-placeholder' }),
+      targetMetadata: metadata,
+    });
+    const app = verifyApi(data);
+    try {
+      const result = await verifyApiRequest(app, `/api/accounts/${data.target.id}/verify-identity`);
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.body, {
+        outcome: 'unavailable',
+        detail: 'Claude reported conflicting identity details for this account.',
+      });
+      assert.deepEqual(data.store.getAccount(data.target.id).metadata, metadata);
+      assert.deepEqual(data.calls.map((call) => call.args), [['auth', 'status', '--json']]);
+    } finally {
+      assertVerifyNeverInvokedInference(data);
+      data.close();
+    }
+  });
+
+  await t.test('a successful CLI read that names nobody is unavailable', async () => {
+    const data = fixture({ statusOutput: HELPER_STATUS, targetMetadata: { identitySource: 'seed' } });
+    const app = verifyApi(data);
+    try {
+      const result = await verifyApiRequest(app, `/api/accounts/${data.target.id}/verify-identity`);
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.body, {
+        outcome: 'unavailable',
+        detail: 'Claude did not report an identity for this account.',
+      });
+      assert.deepEqual(data.store.getAccount(data.target.id).metadata, { identitySource: 'seed' });
+      assert.deepEqual(data.calls.map((call) => call.args), [['auth', 'status', '--json']]);
+    } finally {
+      assertVerifyNeverInvokedInference(data);
+      data.close();
+    }
+  });
+
+  await t.test('an account with no stored identity reports the no-identity detail', async () => {
+    // CodeRabbit (PR #284): the third `unavailable` detail was unpinned. With
+    // nothing stored there is nothing to compare against, so verification must
+    // say so plainly rather than silently promoting or reporting a mismatch.
+    const data = fixture({ targetIdentity: '', targetMetadata: { identitySource: 'seed' } });
+    const app = verifyApi(data);
+    try {
+      const result = await verifyApiRequest(app, `/api/accounts/${data.target.id}/verify-identity`);
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.body, {
+        outcome: 'unavailable',
+        detail: 'This account has no stored Claude identity to verify.',
+      });
+      assert.deepEqual(data.store.getAccount(data.target.id).metadata, { identitySource: 'seed' });
+    } finally {
+      assertVerifyNeverInvokedInference(data);
+      data.close();
+    }
+  });
+
+  await t.test('an invocation failure is unavailable and never exposes usable raw stdout', async () => {
+    const rawMarker = 'raw-stdout-placeholder-must-not-surface';
+    const data = fixture({
+      authThrows: true,
+      authErrorStdout: JSON.stringify({ email: TARGET_EMAIL, opaque: rawMarker }),
+      targetMetadata: { identitySource: 'seed' },
+    });
+    const app = verifyApi(data);
+    try {
+      const result = await verifyApiRequest(app, `/api/accounts/${data.target.id}/verify-identity`);
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.body, {
+        outcome: 'unavailable',
+        detail: 'ModelDeck could not read this account’s Claude identity.',
+      });
+      assert.doesNotMatch(JSON.stringify(result.body), new RegExp(`${rawMarker}|fixture auth status failed|ETIMEDOUT`));
+      assert.deepEqual(data.store.getAccount(data.target.id).metadata, { identitySource: 'seed' });
+      assert.deepEqual(data.calls.map((call) => call.args), [['auth', 'status', '--json']]);
+    } finally {
+      assertVerifyNeverInvokedInference(data);
+      data.close();
+    }
+  });
+
+  await t.test('evidence from an old profile cannot promote an account moved during the read', async () => {
+    let releaseAuth;
+    const authGate = new Promise((resolve) => { releaseAuth = resolve; });
+    let markAuthStarted;
+    const authStarted = new Promise((resolve) => { markAuthStarted = resolve; });
+    const data = fixture({
+      authGate,
+      onAuthCall: markAuthStarted,
+      targetMetadata: { identitySource: 'seed' },
+    });
+    const app = verifyApi(data);
+    let verification;
+    try {
+      verification = verifyApiRequest(app, `/api/accounts/${data.target.id}/verify-identity`);
+      await authStarted;
+      const movedHome = path.join(data.root, 'profiles', 'moved-placeholder');
+      fs.mkdirSync(movedHome, { mode: 0o700 });
+      const current = data.store.getAccount(data.target.id);
+      data.store.saveAccount({
+        id: current.id,
+        provider: current.provider,
+        label: current.label,
+        profileRef: movedHome,
+        identity: current.identity,
+        color: current.color,
+        enabled: current.enabled,
+        metadata: current.metadata,
+      });
+      releaseAuth();
+
+      const result = await verification;
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.body, {
+        outcome: 'unavailable',
+        detail: 'This account changed while ModelDeck was checking its Claude identity.',
+      });
+      assert.equal(data.store.getAccount(data.target.id).metadata.identitySource, 'seed');
+      assert.deepEqual(data.calls.map((call) => call.args), [['auth', 'status', '--json']]);
+    } finally {
+      releaseAuth?.();
+      if (verification) await verification.catch(() => {});
+      assertVerifyNeverInvokedInference(data);
+      data.close();
+    }
+  });
+
+  await t.test('non-Claude accounts return 400 and unknown accounts return 404 without an exec', async () => {
+    const data = fixture();
+    const app = verifyApi(data);
+    try {
+      const codexHome = path.join(data.root, 'codex-placeholder');
+      fs.mkdirSync(codexHome, { mode: 0o700 });
+      const codex = data.store.saveAccount({
+        provider: 'codex',
+        label: 'Codex Placeholder',
+        profileRef: codexHome,
+      });
+
+      let result = await verifyApiRequest(app, `/api/accounts/${codex.id}/verify-identity`);
+      assert.equal(result.status, 400);
+      assert.deepEqual(result.body, {
+        error: 'identity verification is only supported for claude accounts',
+      });
+
+      result = await verifyApiRequest(app, '/api/accounts/missing/verify-identity');
+      assert.equal(result.status, 404);
+      assert.deepEqual(result.body, { error: 'account not found' });
+      assert.deepEqual(data.calls, []);
+    } finally {
+      assertVerifyNeverInvokedInference(data);
+      data.close();
+    }
+  });
+});
+
+test('POST verify-identity returns 409 for same-account work already in flight (#280)', async (t) => {
+  await t.test('another identity verification', async () => {
+    let releaseAuth;
+    const authGate = new Promise((resolve) => { releaseAuth = resolve; });
+    let markAuthStarted;
+    const authStarted = new Promise((resolve) => { markAuthStarted = resolve; });
+    const data = fixture({
+      authGate,
+      onAuthCall: markAuthStarted,
+      targetMetadata: { identitySource: 'verified', claudeAccountUuid: TARGET_UUID },
+    });
+    const app = verifyApi(data);
+    let first;
+    try {
+      first = verifyApiRequest(app, `/api/accounts/${data.target.id}/verify-identity`);
+      await authStarted;
+      const conflict = await verifyApiRequest(app, `/api/accounts/${data.target.id}/verify-identity`);
+      assert.equal(conflict.status, 409);
+      assert.match(conflict.body.error, /in-flight operation/i);
+      releaseAuth();
+      assert.deepEqual((await first).body, { outcome: 'verified' });
+      assert.deepEqual(data.calls.map((call) => call.args), [['auth', 'status', '--json']]);
+    } finally {
+      releaseAuth?.();
+      if (first) await first.catch(() => {});
+      assertVerifyNeverInvokedInference(data);
+      data.close();
+    }
+  });
+
+  await t.test('a renewal for the account', async () => {
+    let releaseAuth;
+    const authGate = new Promise((resolve) => { releaseAuth = resolve; });
+    let markAuthStarted;
+    const authStarted = new Promise((resolve) => { markAuthStarted = resolve; });
+    const data = fixture({ authGate, onAuthCall: markAuthStarted });
+    const app = verifyApi(data);
+    let renewal;
+    try {
+      data.expire();
+      renewal = data.service.renewClaudeAccount(data.target.id);
+      await authStarted;
+      const conflict = await verifyApiRequest(app, `/api/accounts/${data.target.id}/verify-identity`);
+      assert.equal(conflict.status, 409);
+      assert.match(conflict.body.error, /in-flight operation/i);
+      releaseAuth();
+      assert.equal((await renewal).outcome, 'renewed');
+      assert.deepEqual(data.calls.map((call) => call.args), [['auth', 'status', '--json']]);
+    } finally {
+      releaseAuth?.();
+      if (renewal) await renewal.catch(() => {});
+      assertVerifyNeverInvokedInference(data);
+      data.close();
+    }
+  });
+
+  await t.test('an activation for the account', async () => {
+    let releaseActivation;
+    const activationGate = new Promise((resolve) => { releaseActivation = resolve; });
+    let markActivationStarted;
+    const activationStarted = new Promise((resolve) => { markActivationStarted = resolve; });
+    const data = fixture({
+      serviceOptions: {
+        activateClaude: async () => {
+          markActivationStarted();
+          await activationGate;
+        },
+      },
+    });
+    const app = verifyApi(data);
+    let activation;
+    try {
+      activation = data.service.activateAccount(data.target.id);
+      await activationStarted;
+      const conflict = await verifyApiRequest(app, `/api/accounts/${data.target.id}/verify-identity`);
+      assert.equal(conflict.status, 409);
+      assert.match(conflict.body.error, /in-flight operation/i);
+      releaseActivation();
+      await activation;
+      assert.deepEqual(data.calls, []);
+    } finally {
+      releaseActivation?.();
+      if (activation) await activation.catch(() => {});
+      assertVerifyNeverInvokedInference(data);
+      data.close();
+    }
   });
 });
 

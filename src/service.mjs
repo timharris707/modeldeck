@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { activeLinkBlockedError } from './adapters/provider-profile.mjs';
-import { execFile } from 'node:child_process';
+import { execFile, spawn as spawnChild } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,6 +10,7 @@ import { promisify } from 'node:util';
 import {
   activateClaudeProfile,
   claudePinnedEnvFileContent,
+  claudeProxyPointerShellSnippet,
   createClaudeProfileHome,
   fetchClaudeUsage,
   importClaudeSwapProfiles as migrateClaudeSwapProfiles,
@@ -87,6 +88,12 @@ const CLAUDE_AUTH_OVERRIDE_ABSENT = Object.freeze({
   cliproxyRouted: false,
   helperRouted: false,
 });
+
+export const CLIPROXY_API_KEY_HELPER = 'security find-generic-password -s cli-proxy-api-client -w';
+export const DEFAULT_CLIPROXY_BASE_URL = 'http://127.0.0.1:8317';
+const DEFAULT_PROXY_JOIN_POLL_INTERVAL_MS = 2_000;
+const DEFAULT_PROXY_JOIN_TIMEOUT_MS = 5 * 60_000;
+const DEFAULT_PROXY_JOIN_TERMINATION_GRACE_MS = 2_000;
 
 // A CLIProxyAPI instance is local by definition; anything else (corporate
 // gateway, an explicit api.anthropic.com) must never receive the client key.
@@ -306,6 +313,14 @@ function updaterEnv(extra = {}, sourceEnv = process.env) {
   };
 }
 
+function proxyLoginEnv(sourceEnv = process.env) {
+  const identity = ['USER', 'LOGNAME', 'SHELL', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME'];
+  return updaterEnv(
+    Object.fromEntries(identity.filter((key) => sourceEnv[key]).map((key) => [key, sourceEnv[key]])),
+    sourceEnv,
+  );
+}
+
 class ToolUpdateConflictError extends Error {
   constructor(message) {
     super(message);
@@ -318,6 +333,53 @@ class ClaudeRenewalConflictError extends Error {
     super('a Claude account renewal is already in progress');
     this.statusCode = 409;
   }
+}
+
+class ClaudeIdentityVerificationConflictError extends Error {
+  constructor() {
+    super('Claude identity verification conflicts with an in-flight operation for this account');
+    this.statusCode = 409;
+  }
+}
+
+class ProxyPoolJoinConflictError extends Error {
+  constructor(provider) {
+    super(`a ${provider} proxy-pool join is already in progress`);
+    this.statusCode = 409;
+  }
+}
+
+class ClaudeProxyRoutingConflictError extends Error {
+  constructor(operation) {
+    super(`cannot change proxy routing while this account's Claude ${operation} is in progress`);
+    this.statusCode = 409;
+  }
+}
+
+function serviceError(message, statusCode) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
+// JSON numbers are not all exactly representable as JavaScript Numbers. The
+// routing mutation must preserve every untouched value, including large
+// integers, -0, and deliberately formatted exponents. Node >=24 supplies the
+// source token to the reviver and JSON.rawJSON lets stringify emit it without
+// rounding; other JSON values retain their normal parsed semantics.
+function parseJsonPreservingNumberValues(raw) {
+  return JSON.parse(raw, (_key, value, context) => (
+    typeof value === 'number' && typeof context?.source === 'string'
+      ? JSON.rawJSON(context.source)
+      : value
+  ));
+}
+
+function isJsonObject(value) {
+  return Boolean(value)
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && !(typeof JSON.isRawJSON === 'function' && JSON.isRawJSON(value));
 }
 
 function codexPlanMetadata(planType) {
@@ -374,11 +436,39 @@ export class ModelDeckService {
     // adapter script with the same Node.
     this.claudeStatuslineDir = options.claudeStatuslineDir
       || path.join(path.dirname(this.claudeProfilesDir), 'statusline');
-    // CLIProxyAPI auth dir (external tool, read-only weight display). No
+    // CLIProxyAPI auth dir (external tool; ModelDeck reads metadata only). No
     // homedir default here: only the production server wires the real path
     // (CLIPROXY_AUTH_DIR), so test fixtures can never accidentally read a
     // developer's live proxy files. Null = enrichment off.
     this.cliproxyAuthDir = options.cliproxyAuthDir || null;
+    // CLIProxyAPI login owns browser OAuth. ModelDeck only starts it and
+    // watches the configured auth directory for matching identity evidence.
+    // Keep the binary/base URL configurable like claudePath/codexPath so a
+    // packaged daemon never relies on a particular interactive shell PATH.
+    this.cliproxyPath = options.cliproxyPath || options.cliproxyBin || 'cliproxyapi';
+    this.cliproxyBaseUrl = options.cliproxyBaseUrl || DEFAULT_CLIPROXY_BASE_URL;
+    this.spawn = options.spawn || spawnChild;
+    const proxyJoinPollIntervalMs = Number(options.proxyJoinPollIntervalMs ?? DEFAULT_PROXY_JOIN_POLL_INTERVAL_MS);
+    const proxyJoinTimeoutMs = Number(options.proxyJoinTimeoutMs ?? DEFAULT_PROXY_JOIN_TIMEOUT_MS);
+    const proxyJoinTerminationGraceMs = Number(options.proxyJoinTerminationGraceMs ?? DEFAULT_PROXY_JOIN_TERMINATION_GRACE_MS);
+    this.proxyJoinPollIntervalMs = Number.isFinite(proxyJoinPollIntervalMs) && proxyJoinPollIntervalMs > 0
+      ? proxyJoinPollIntervalMs
+      : DEFAULT_PROXY_JOIN_POLL_INTERVAL_MS;
+    this.proxyJoinTimeoutMs = Number.isFinite(proxyJoinTimeoutMs) && proxyJoinTimeoutMs > 0
+      ? proxyJoinTimeoutMs
+      : DEFAULT_PROXY_JOIN_TIMEOUT_MS;
+    this.proxyJoinTerminationGraceMs = Number.isFinite(proxyJoinTerminationGraceMs) && proxyJoinTerminationGraceMs > 0
+      ? proxyJoinTerminationGraceMs
+      : DEFAULT_PROXY_JOIN_TERMINATION_GRACE_MS;
+    this.proxyJoinWait = options.proxyJoinWait || ((signal, duration) => new Promise((resolve) => {
+      const timer = globalThis.setTimeout(() => resolve(false), duration);
+      signal.then(() => {
+        globalThis.clearTimeout(timer);
+        resolve(true);
+      });
+    }));
+    this.proxyJoinNow = options.proxyJoinNow || (() => globalThis.performance.now());
+    this.proxyJoinPromises = new Map();
     this.dataDir = options.dataDir || path.dirname(this.claudeProfilesDir);
     this.claudeRenewalScratchDir = options.claudeRenewalScratchDir
       || path.join(this.dataDir, 'claude-renewal');
@@ -451,6 +541,10 @@ export class ModelDeckService {
     // contract returns 409 for a second renewal instead of silently queuing it.
     this.claudeActivationTail = Promise.resolve();
     this.claudeRenewalPromise = null;
+    this.claudeRenewalAccountId = null;
+    this.claudeActivationAccountCounts = new Map();
+    this.claudeIdentityVerificationPromises = new Map();
+    this.claudeProfileSettingsTails = new Map();
     this.toolProbeCache = null;
     this.toolProbePromise = null;
     this.toolProbePromiseGeneration = null;
@@ -511,6 +605,13 @@ export class ModelDeckService {
     // down, then watch for new ones — server-truth windows should not wait
     // for the next scheduled provider refresh.
     void this.ingestClaudeStatuslineCaptures().catch(() => {});
+    // #282 adversarial review, major 2: a crash between the settings.json
+    // write and the shell pin write leaves the two split-brained until the
+    // next activation or routing change. Reconcile the pin from the active
+    // profile's ACTUAL routing state at startup, like the other repairs
+    // above — the write path is idempotent, so a consistent state is a
+    // no-op.
+    void this.reconcileClaudeShellEnvFile().catch(() => {});
     this.startClaudeStatuslineWatcher();
     const generation = ++this.autoRefreshGeneration;
     const settings = this.store.getSettings();
@@ -704,6 +805,13 @@ export class ModelDeckService {
       throw error;
     }
     const profileRef = managedClaudeProfile(account.profileRef, this.claudeProfilesDir);
+    return this.withClaudeProfileSettingsLock(
+      profileRef,
+      () => this.performInstallClaudeStatusline(account, profileRef),
+    );
+  }
+
+  async performInstallClaudeStatusline(account, profileRef) {
     const settingsPath = path.join(profileRef, 'settings.json');
     let raw = null;
     try { raw = await fs.promises.readFile(settingsPath, 'utf8'); }
@@ -785,6 +893,13 @@ export class ModelDeckService {
       throw error;
     }
     const profileRef = managedClaudeProfile(account.profileRef, this.claudeProfilesDir);
+    return this.withClaudeProfileSettingsLock(
+      profileRef,
+      () => this.performUninstallClaudeStatusline(account, profileRef),
+    );
+  }
+
+  async performUninstallClaudeStatusline(account, profileRef) {
     const settingsPath = path.join(profileRef, 'settings.json');
     const backupFile = this.claudeStatuslineBackupFile(account.id);
     let backup = null;
@@ -839,14 +954,36 @@ export class ModelDeckService {
   /// must never see a torn document.
   async writeClaudeProfileSettings(settingsPath, content) {
     let mode = 0o600;
-    try { mode = (await fs.promises.stat(settingsPath)).mode & 0o777; } catch { /* fresh file */ }
+    try { mode = (await fs.promises.stat(settingsPath)).mode & 0o777; }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
     const temporary = `${settingsPath}.modeldeck-${process.pid}-${crypto.randomUUID()}`;
     try {
       await fs.promises.writeFile(temporary, content, { mode });
+      // writeFile's creation mode is filtered through the process umask.
+      // Preserve the existing file's exact mode as promised, including bits
+      // the daemon's umask would otherwise silently remove.
+      await fs.promises.chmod(temporary, mode);
       await fs.promises.rename(temporary, settingsPath);
     } catch (error) {
       await fs.promises.unlink(temporary).catch(() => {});
       throw error;
+    }
+  }
+
+  async withClaudeProfileSettingsLock(profileRef, operation) {
+    const previous = this.claudeProfileSettingsTails.get(profileRef) || Promise.resolve();
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const current = previous.catch(() => {}).then(() => gate);
+    this.claudeProfileSettingsTails.set(profileRef, current);
+    await previous.catch(() => {});
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.claudeProfileSettingsTails.get(profileRef) === current) {
+        this.claudeProfileSettingsTails.delete(profileRef);
+      }
     }
   }
 
@@ -1793,6 +1930,60 @@ export class ModelDeckService {
     });
   }
 
+  // Issue #280: the renewal identity rung and the on-demand verifier must be
+  // the SAME cheap provider read. Keeping the fixed auth-status argv here
+  // makes the verifier's no-inference contract structural: unlike
+  // finishClaudeRenewal, this helper has no path to the `-p` rung.
+  async readScopedClaudeAuthStatus(profileRef) {
+    let invocation;
+    let failed = false;
+    try {
+      invocation = await this.runClaudeRenewalCli(['auth', 'status', '--json'], profileRef);
+    } catch (error) {
+      invocation = error;
+      failed = true;
+    }
+    return {
+      invocation,
+      failed,
+      reportedIdentity: claudeRenewalStatusIdentity(invocation?.stdout),
+    };
+  }
+
+  // Promotion is deliberately a conditional metadata mutation, not a
+  // refresh-time rewrite. Re-read after the provider await so reset-identity
+  // or an identity edit that landed meanwhile cannot be resurrected or
+  // certified from stale evidence.
+  promoteSeededClaudeIdentity(accountId, profileRef, reportedIdentity) {
+    const account = this.store.getAccount(accountId);
+    if (!account
+      || account.provider !== 'claude'
+      || account.profileRef !== profileRef
+      || account.metadata?.identitySource !== 'seed'
+      || !claudeRenewalIdentityMatches(account, reportedIdentity)) {
+      return account;
+    }
+
+    const metadata = { ...account.metadata, identitySource: 'verified' };
+    const storedUuid = typeof metadata.claudeAccountUuid === 'string'
+      ? metadata.claudeAccountUuid.trim()
+      : '';
+    if (!storedUuid && reportedIdentity.accountUuids.size === 1) {
+      metadata.claudeAccountUuid = [...reportedIdentity.accountUuids][0];
+    }
+    return this.store.saveAccount({
+      id: account.id,
+      provider: account.provider,
+      label: account.label,
+      identity: account.identity,
+      purpose: account.purpose,
+      profileRef: account.profileRef,
+      color: account.color,
+      enabled: account.enabled,
+      metadata,
+    });
+  }
+
   claudeModelRejected(error) {
     const output = `${error?.stderr ?? ''}\n${error?.stdout ?? ''}\n${error?.message ?? ''}`;
     return /(?:model.*(?:invalid|unknown|not found|unsupported|does not exist)|invalid.*--model|--model.*(?:invalid|unknown))/i.test(output);
@@ -1991,16 +2182,18 @@ export class ModelDeckService {
       return decided('failed', null, 'ModelDeck could not safely inspect this profile’s Claude settings, so renewal was not attempted.');
     }
 
-    let authStatus;
-    try {
-      authStatus = await this.runClaudeRenewalCli(['auth', 'status', '--json'], account.profileRef);
-    } catch (error) {
-      authStatus = error;
+    const authStatus = await this.readScopedClaudeAuthStatus(account.profileRef);
+    const { reportedIdentity } = authStatus;
+    const latestAccount = this.store.getAccount(accountId);
+    if (!latestAccount || !latestAccount.enabled) {
+      return decided('signin-required', null, 'This account requires an explicit Claude sign-in; automatic renewal was not attempted.');
     }
-
-    const reportedIdentity = claudeRenewalStatusIdentity(authStatus?.stdout);
-    if (claudeRenewalIdentityMatches(account, reportedIdentity)) {
-      const result = await this.finishClaudeRenewal(account, at, 'no-flip');
+    if (latestAccount.provider !== 'claude' || latestAccount.profileRef !== account.profileRef) {
+      return decided('failed', null, 'This account changed while ModelDeck was checking its Claude identity, so renewal was not attempted.');
+    }
+    if (claudeRenewalIdentityMatches(latestAccount, reportedIdentity)) {
+      this.promoteSeededClaudeIdentity(account.id, account.profileRef, reportedIdentity);
+      const result = await this.finishClaudeRenewal(latestAccount, at, 'no-flip');
       return this.recordClaudeRenewalAttempt(accountId, result);
     }
 
@@ -2016,8 +2209,8 @@ export class ModelDeckService {
     // identity always wins over the error.
     let identityDecline;
     if (reportedIdentity) identityDecline = 'mismatched';
-    else if (authStatus?.modeldeckRenewalStage === 'config-dir') identityDecline = 'setup-failed';
-    else if (authStatus instanceof Error) identityDecline = 'error';
+    else if (authStatus.invocation?.modeldeckRenewalStage === 'config-dir') identityDecline = 'setup-failed';
+    else if (authStatus.failed) identityDecline = 'error';
     else identityDecline = 'absent';
 
     try {
@@ -2028,7 +2221,7 @@ export class ModelDeckService {
       return decided('failed', null, 'ModelDeck could not confirm that Claude was idle, so renewal was not attempted.', { path: 'flip', identityDecline });
     }
 
-    const result = await this.performClaudeFlipRenewal(account, at);
+    const result = await this.performClaudeFlipRenewal(latestAccount, at);
     return this.recordClaudeRenewalAttempt(accountId, { ...result, identityDecline });
   }
 
@@ -2046,10 +2239,100 @@ export class ModelDeckService {
     }
     const promise = this.withClaudeActivationLock(() => this.performClaudeRenewal(accountId));
     this.claudeRenewalPromise = promise;
+    this.claudeRenewalAccountId = account?.provider === 'claude' ? accountId : null;
     try {
       return await promise;
     } finally {
-      if (this.claudeRenewalPromise === promise) this.claudeRenewalPromise = null;
+      if (this.claudeRenewalPromise === promise) {
+        this.claudeRenewalPromise = null;
+        this.claudeRenewalAccountId = null;
+      }
+    }
+  }
+
+  assertClaudeIdentityVerificationProviderIdle(accountId) {
+    if (this.claudeRenewalAccountId === accountId
+      || this.claudeActivationAccountCounts.has(accountId)) {
+      throw new ClaudeIdentityVerificationConflictError();
+    }
+  }
+
+  async performClaudeIdentityVerification(accountId) {
+    // Re-check after waiting behind unrelated Claude work. Activation marks
+    // its account before queueing and renewal records its account while
+    // queued, so same-account work that arrived meanwhile becomes an honest
+    // conflict instead of overlapping this provider read.
+    this.assertClaudeIdentityVerificationProviderIdle(accountId);
+    const account = this.store.getAccount(accountId);
+    if (!account) throw serviceError('account not found', 404);
+    if (account.provider !== 'claude') {
+      throw serviceError('identity verification is only supported for claude accounts', 400);
+    }
+
+    const authStatus = await this.readScopedClaudeAuthStatus(account.profileRef);
+    if (authStatus.failed) {
+      return {
+        outcome: 'unavailable',
+        detail: 'ModelDeck could not read this account\u2019s Claude identity.',
+      };
+    }
+
+    const reported = authStatus.reportedIdentity;
+    const latest = this.store.getAccount(accountId);
+    if (!latest) throw serviceError('account not found', 404);
+    if (latest.provider !== 'claude' || latest.profileRef !== account.profileRef) {
+      return {
+        outcome: 'unavailable',
+        detail: 'This account changed while ModelDeck was checking its Claude identity.',
+      };
+    }
+    if (claudeRenewalIdentityMatches(latest, reported)) {
+      this.promoteSeededClaudeIdentity(accountId, account.profileRef, reported);
+      return { outcome: 'verified' };
+    }
+
+    const reportedEmails = reported
+      && !reported.malformed
+      && !reported.explicitlyUnauthenticated
+      ? [...reported.emails]
+      : [];
+    const expectedEmail = latest.identity?.trim().toLowerCase() || null;
+    if (expectedEmail && reportedEmails.length === 1 && reportedEmails[0] !== expectedEmail) {
+      return { outcome: 'mismatch', reported: reportedEmails[0] };
+    }
+    let detail = 'This account has no stored Claude identity to verify.';
+    if (expectedEmail) {
+      detail = reported
+        ? 'Claude reported conflicting identity details for this account.'
+        : 'Claude did not report an identity for this account.';
+    }
+    return {
+      outcome: 'unavailable',
+      detail,
+    };
+  }
+
+  async verifyClaudeIdentity(accountId) {
+    const account = this.store.getAccount(accountId);
+    if (!account) throw serviceError('account not found', 404);
+    if (account.provider !== 'claude') {
+      throw serviceError('identity verification is only supported for claude accounts', 400);
+    }
+    this.assertClaudeIdentityVerificationProviderIdle(accountId);
+    if (this.claudeIdentityVerificationPromises.has(accountId)) {
+      throw new ClaudeIdentityVerificationConflictError();
+    }
+
+    const promise = this.withClaudeActivationLock(
+      () => this.performClaudeIdentityVerification(accountId),
+    );
+    this.claudeIdentityVerificationPromises.set(accountId, promise);
+    try {
+      return await promise;
+    } finally {
+      if (this.claudeIdentityVerificationPromises.get(accountId) === promise) {
+        this.claudeIdentityVerificationPromises.delete(accountId);
+      }
     }
   }
 
@@ -2090,6 +2373,28 @@ export class ModelDeckService {
     }
   }
 
+  beginClaudeActivation(accountId) {
+    this.claudeActivationAccountCounts.set(
+      accountId,
+      (this.claudeActivationAccountCounts.get(accountId) || 0) + 1,
+    );
+  }
+
+  endClaudeActivation(accountId) {
+    const remaining = (this.claudeActivationAccountCounts.get(accountId) || 1) - 1;
+    if (remaining > 0) this.claudeActivationAccountCounts.set(accountId, remaining);
+    else this.claudeActivationAccountCounts.delete(accountId);
+  }
+
+  assertClaudeProxyRoutingIdle(accountId) {
+    if (this.claudeRenewalAccountId === accountId) {
+      throw new ClaudeProxyRoutingConflictError('renewal');
+    }
+    if (this.claudeActivationAccountCounts.has(accountId)) {
+      throw new ClaudeProxyRoutingConflictError('activation');
+    }
+  }
+
   async activateAccount(id) {
     const account = this.store.getAccount(id);
     if (!account) throw new Error('account not found');
@@ -2097,22 +2402,27 @@ export class ModelDeckService {
 
     let warnings = [];
     if (account.provider === 'claude') {
-      return this.withClaudeActivationLock(async () => {
-        // Re-read after waiting: a queued activation must not revive a deleted
-        // or newly disabled account.
-        const latest = this.store.getAccount(id);
-        if (!latest) throw new Error('account not found');
-        if (!latest.enabled) throw new Error('account is disabled');
-        // Pre-flip honesty (issue #66): sessions launched before the pinned
-        // env existed still resolve storage through the ~/.claude symlink and
-        // can silently lose transcript history when it flips. Detect them
-        // before the flip so the response can say so; best-effort only —
-        // detection failure must never block activation.
-        warnings = await this.claudeRunningSessionWarnings();
-        await this.activateClaude({ profileRef: latest.profileRef, activeLink: this.claudeActiveLink, profilesDir: this.claudeProfilesDir });
-        await this.scopeClaudeSecureStorage(latest.profileRef);
-        return { account: this.setDefaultAccount(latest.provider, latest.id), warnings };
-      });
+      this.beginClaudeActivation(id);
+      try {
+        return await this.withClaudeActivationLock(async () => {
+          // Re-read after waiting: a queued activation must not revive a deleted
+          // or newly disabled account.
+          const latest = this.store.getAccount(id);
+          if (!latest) throw new Error('account not found');
+          if (!latest.enabled) throw new Error('account is disabled');
+          // Pre-flip honesty (issue #66): sessions launched before the pinned
+          // env existed still resolve storage through the ~/.claude symlink and
+          // can silently lose transcript history when it flips. Detect them
+          // before the flip so the response can say so; best-effort only —
+          // detection failure must never block activation.
+          warnings = await this.claudeRunningSessionWarnings();
+          await this.activateClaude({ profileRef: latest.profileRef, activeLink: this.claudeActiveLink, profilesDir: this.claudeProfilesDir });
+          await this.scopeClaudeSecureStorage(latest.profileRef);
+          return { account: this.setDefaultAccount(latest.provider, latest.id), warnings };
+        });
+      } finally {
+        this.endClaudeActivation(id);
+      }
     } else {
       if (!this.codexActiveLink) throw new Error('Codex active profile link is not configured');
       await this.activateCodexProfile(account.profileRef);
@@ -2209,6 +2519,24 @@ export class ModelDeckService {
 
   // Atomic write (temp + rename) so a shell sourcing the snippet mid-switch
   // never sees a half-written file.
+  /// #282 adversarial review, major 2: startup repair for the two-file
+  /// routing state. settings.json and the shell pin cannot be written
+  /// atomically together; a crash between them leaves a shell that still
+  /// exports (or lacks) the proxy key against what settings.json says.
+  /// Recomputing the pin from the ACTIVE profile's actual routing state is
+  /// idempotent, so a consistent pair is untouched. No active profile (no
+  /// symlink yet) means no pin to repair.
+  async reconcileClaudeShellEnvFile() {
+    let activeRealPath;
+    try { activeRealPath = await this.realpath(this.claudeActiveLink); }
+    catch (error) {
+      if (error.code === 'ENOENT') return;
+      throw error;
+    }
+    const { cliproxyRouted } = await this.claudeAuthOverrideState(activeRealPath);
+    await this.writeClaudeShellEnvFile(activeRealPath, cliproxyRouted);
+  }
+
   async writeClaudeShellEnvFile(profileRealPath, proxyRouted = false) {
     const file = this.claudeShellEnvFile;
     await fs.promises.mkdir(path.dirname(file), { recursive: true });
@@ -2351,13 +2679,17 @@ export class ModelDeckService {
     return 'missing';
   }
 
-  // CLIProxyAPI weight display: reads the non-secret identity + `weight`
-  // fields from each auth file in the configured proxy directory. Join keys
-  // mirror what each side reliably has — Claude by identity email, Codex by
-  // the `tokens.account_id` identifier the #108 duplicate detection already
-  // remembers (Codex daemon identities are empty). Every failure mode
-  // (missing dir, unreadable/malformed file, non-integer weight) reads as
-  // absence: the proxy is optional tooling and must never degrade /api/state.
+  // CLIProxyAPI pool/weight display: reads ONLY the non-secret identity,
+  // weight, and model-exclusion fields from auth files. Credential values are
+  // never accessed. Join keys mirror what each side reliably has — Claude by
+  // identity email, Codex by the `tokens.account_id` identifier the #108
+  // duplicate detection already remembers (Codex daemon identities are
+  // empty). A recognized identity remains membership evidence before the
+  // external rebalance job adds a valid weight.
+  //
+  // Null deliberately means "pool state unavailable": no configured/readable
+  // directory, or no parseable JSON auth object. Once any parseable auth file
+  // exists, absence of an account identity is affirmative `absent` state.
   async readProxyWeights() {
     if (!this.cliproxyAuthDir) return null;
     let names;
@@ -2365,13 +2697,22 @@ export class ModelDeckService {
     catch { return null; }
     const byClaudeEmail = new Map();
     const byCodexAccountId = new Map();
+    let parseableFiles = 0;
     for (const name of names) {
       if (!name.endsWith('.json')) continue;
       try {
         const data = JSON.parse(await fs.promises.readFile(path.join(this.cliproxyAuthDir, name), 'utf8'));
+        if (!data || typeof data !== 'object' || Array.isArray(data)) continue;
+        parseableFiles += 1;
         const weight = data?.weight;
-        if (!Number.isInteger(weight) || weight < 0) continue;
-        if (data.type === 'claude' && typeof data.email === 'string' && data.email.trim()) {
+        // #282 adversarial review, minor: an identity alone is not
+        // membership. The login child writes tokens with the identity; a
+        // parseable {type,email} torso (partial write, hand-made file)
+        // must not satisfy a join before the child fails. Presence-only —
+        // token VALUES are never read past this boolean.
+        const hasClaudeCredential = (typeof data.access_token === 'string' && data.access_token.trim() !== '')
+          || (typeof data.refresh_token === 'string' && data.refresh_token.trim() !== '');
+        if (data.type === 'claude' && typeof data.email === 'string' && data.email.trim() && hasClaudeCredential) {
           // Issue #272: the two-tier rebalance policy benches a Fable-drained
           // account via per-credential `excluded-models` while its `weight`
           // switches to general-pace duty. One number, two meanings — so the
@@ -2382,31 +2723,374 @@ export class ModelDeckService {
           const excluded = data['excluded-models'];
           const fableExcluded = Array.isArray(excluded)
             && excluded.some((m) => typeof m === 'string' && m.startsWith('claude-fable'));
-          byClaudeEmail.set(data.email.trim().toLowerCase(), { weight, fableExcluded });
+          const email = data.email.trim().toLowerCase();
+          const seen = byClaudeEmail.get(email) || {};
+          byClaudeEmail.set(email, {
+            ...seen,
+            ...(Number.isInteger(weight) && weight >= 0 ? { weight } : {}),
+            // CodeRabbit (PR #282): OR, never overwrite. Two auth files can
+            // carry the same identity (a re-login leaves the old one behind),
+            // and readdir order then decided the answer — a benched account
+            // could read as routable purely because its unbenched sibling
+            // was parsed second. Benched wins, which is the direction #272
+            // exists to protect: the badge must never OVERSTATE Fable
+            // routing. It can understate in this anomalous mixed state, and
+            // that is the safe side of the trade.
+            fableExcluded: Boolean(seen.fableExcluded) || fableExcluded,
+          });
         } else if (data.type === 'codex' && typeof data.account_id === 'string' && data.account_id.trim()) {
-          byCodexAccountId.set(data.account_id.trim(), { weight, fableExcluded: false });
+          const accountId = data.account_id.trim();
+          byCodexAccountId.set(accountId, {
+            ...(byCodexAccountId.get(accountId) || {}),
+            ...(Number.isInteger(weight) && weight >= 0 ? { weight } : {}),
+            fableExcluded: false,
+          });
         }
-      } catch { /* malformed or unreadable auth file: no weight for it */ }
+      } catch { /* malformed or unreadable auth file: no membership evidence */ }
     }
-    return { byClaudeEmail, byCodexAccountId };
+    return parseableFiles > 0 ? { byClaudeEmail, byCodexAccountId } : null;
   }
 
-  // Weight 0 is a real value (the proxy stops routing there) — every lookup
-  // distinguishes "mapped to 0" from "not mapped" via has(), never truthiness.
-  // Returns { weight, fableExcluded } or null.
-  proxyWeightFor(account, weights) {
-    if (!weights) return null;
+  proxyPoolIdentityFor(account) {
     if (account.provider === 'claude') {
       const email = account.identity?.trim().toLowerCase();
-      if (!email || !weights.byClaudeEmail.has(email)) return null;
-      return weights.byClaudeEmail.get(email);
+      return email ? { provider: 'claude', value: email } : null;
     }
     if (account.provider === 'codex') {
       const identifier = this.codexAccountIdentifiers.get(account.id);
-      if (identifier == null || !weights.byCodexAccountId.has(identifier)) return null;
-      return weights.byCodexAccountId.get(identifier);
+      return identifier ? { provider: 'codex', value: identifier } : null;
     }
     return null;
+  }
+
+  proxyPoolRecordFor(account, weights) {
+    if (!weights) return null;
+    const identity = this.proxyPoolIdentityFor(account);
+    if (!identity) return null;
+    const records = identity.provider === 'claude'
+      ? weights.byClaudeEmail
+      : weights.byCodexAccountId;
+    return records.has(identity.value) ? records.get(identity.value) : null;
+  }
+
+  proxyPoolFor(account, weights) {
+    if (!weights) return null;
+    return this.proxyPoolRecordFor(account, weights) ? 'member' : 'absent';
+  }
+
+  // Weight 0 is a real value (the proxy stops routing there). Membership and
+  // weight are separate: a fresh auth file can prove membership while weight
+  // remains absent until the external rebalance job runs.
+  proxyWeightFor(account, weights) {
+    const record = this.proxyPoolRecordFor(account, weights);
+    return Number.isInteger(record?.weight) && record.weight >= 0 ? record : null;
+  }
+
+  async joinProxyPool(accountId) {
+    const account = this.store.getAccount(accountId);
+    if (!account) throw serviceError('account not found', 404);
+    if (account.provider !== 'claude' && account.provider !== 'codex') {
+      throw serviceError('proxy-pool login is only supported for claude and codex accounts', 400);
+    }
+    if (this.proxyJoinPromises.has(account.provider)) {
+      throw new ProxyPoolJoinConflictError(account.provider);
+    }
+    const promise = this.performProxyPoolJoin(account);
+    this.proxyJoinPromises.set(account.provider, promise);
+    try {
+      return await promise;
+    } finally {
+      if (this.proxyJoinPromises.get(account.provider) === promise) {
+        this.proxyJoinPromises.delete(account.provider);
+      }
+    }
+  }
+
+  async performProxyPoolJoin(account) {
+    if (!this.cliproxyAuthDir) {
+      throw serviceError('CLIProxyAPI auth directory is not configured', 409);
+    }
+    if (!this.proxyPoolIdentityFor(account)) {
+      const evidence = account.provider === 'claude'
+        ? 'identity email'
+        : 'remembered account_id';
+      throw serviceError(`cannot join this ${account.provider} account until its ${evidence} is available; refresh the account first`, 409);
+    }
+    try { await fs.promises.readdir(this.cliproxyAuthDir); }
+    catch (error) {
+      // A first login may create the auth directory. Every other failure means
+      // there is no directory the bounded watcher can honestly observe.
+      if (error.code !== 'ENOENT') {
+        const code = typeof error.code === 'string'
+          ? error.code.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64)
+          : '';
+        throw serviceError(`CLIProxyAPI auth directory is not readable${code ? ` (${code})` : ''}`, 409);
+      }
+    }
+
+    const initial = await this.readProxyWeights();
+    if (this.proxyPoolFor(account, initial) === 'member') {
+      return {
+        accountId: account.id,
+        provider: account.provider,
+        proxyPool: 'member',
+        alreadyMember: true,
+      };
+    }
+
+    const args = [account.provider === 'claude' ? '-claude-login' : '-codex-login'];
+    let child;
+    try {
+      child = this.spawn(this.cliproxyPath, args, {
+        // Browser OAuth needs process basics, not the daemon's provider keys,
+        // mutation token, or unrelated ambient credentials.
+        env: proxyLoginEnv(this.childEnv),
+        shell: false,
+        // OAuth URLs can contain tokens. Never capture, log, or return either
+        // stream; process status below is the complete public failure detail.
+        stdio: ['ignore', 'ignore', 'ignore'],
+      });
+    } catch (error) {
+      const code = typeof error?.code === 'string'
+        ? error.code.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64)
+        : '';
+      throw serviceError(`CLIProxyAPI ${account.provider} login could not start${code ? ` (${code})` : ''}`, 502);
+    }
+    if (!child || typeof child.once !== 'function') {
+      throw serviceError(`CLIProxyAPI ${account.provider} login did not start a watchable child process`, 502);
+    }
+
+    let childOutcome = null;
+    let resolveChild;
+    const childSettled = new Promise((resolve) => { resolveChild = resolve; });
+    const settleChild = (outcome) => {
+      if (childOutcome) return;
+      childOutcome = outcome;
+      resolveChild();
+    };
+    const onError = (error) => settleChild({
+      kind: 'error',
+      code: typeof error?.code === 'string'
+        ? error.code.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64)
+        : null,
+    });
+    const onExit = (code, signal) => settleChild({ kind: 'exit', code, signal });
+    const onClose = (code, signal) => settleChild({ kind: 'exit', code, signal });
+    child.once('error', onError);
+    child.once('exit', onExit);
+    child.once('close', onClose);
+    if (child.exitCode != null || child.signalCode != null) {
+      settleChild({ kind: 'exit', code: child.exitCode, signal: child.signalCode });
+    }
+
+    const startedAt = this.proxyJoinNow();
+    while (true) {
+      const pool = await this.readProxyWeights();
+      if (this.proxyPoolFor(account, pool) === 'member') {
+        return {
+          accountId: account.id,
+          provider: account.provider,
+          proxyPool: 'member',
+          alreadyMember: false,
+        };
+      }
+      if (childOutcome?.kind === 'error') {
+        throw serviceError(
+          `CLIProxyAPI ${account.provider} login failed to start before a matching auth file appeared${childOutcome.code ? ` (${childOutcome.code})` : ''}`,
+          502,
+        );
+      }
+      if (childOutcome?.kind === 'exit') {
+        const exitDetail = childOutcome.signal
+          ? `signal ${String(childOutcome.signal).replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64)}`
+          : `exit code ${Number.isInteger(childOutcome.code) ? childOutcome.code : 'unknown'}`;
+        throw serviceError(
+          `CLIProxyAPI ${account.provider} login exited before a matching auth file appeared (${exitDetail})`,
+          502,
+        );
+      }
+      const elapsed = Math.max(0, this.proxyJoinNow() - startedAt);
+      if (elapsed >= this.proxyJoinTimeoutMs) {
+        try { child.kill?.('SIGTERM'); } catch { /* best-effort cleanup */ }
+        await this.proxyJoinWait(childSettled, this.proxyJoinTerminationGraceMs);
+        if (!childOutcome) {
+          try { child.kill?.('SIGKILL'); } catch { /* best-effort cleanup */ }
+          await this.proxyJoinWait(childSettled, this.proxyJoinTerminationGraceMs);
+        }
+        const termination = childOutcome?.kind === 'exit'
+          ? (childOutcome.signal
+            ? `terminated by ${String(childOutcome.signal).replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64)}`
+            : `exited with code ${Number.isInteger(childOutcome.code) ? childOutcome.code : 'unknown'}`)
+          : childOutcome?.kind === 'error'
+            ? `reported ${childOutcome.code || 'a process error'}`
+            : 'did not exit after termination';
+        throw serviceError(
+          `CLIProxyAPI ${account.provider} login timed out without a matching auth file; child ${termination}`,
+          504,
+        );
+      }
+      const remaining = this.proxyJoinTimeoutMs - elapsed;
+      const interval = Math.max(1, Math.min(this.proxyJoinPollIntervalMs, remaining));
+      await this.proxyJoinWait(childSettled, interval);
+    }
+  }
+
+  wireProxyRouting(accountId) {
+    return this.setProxyRouting(accountId, true);
+  }
+
+  unwireProxyRouting(accountId) {
+    return this.setProxyRouting(accountId, false);
+  }
+
+  async setProxyRouting(accountId, enabled) {
+    const account = this.store.getAccount(accountId);
+    if (!account) throw serviceError('account not found', 404);
+    if (account.provider !== 'claude') {
+      throw serviceError('proxy session routing is only supported for claude accounts', 400);
+    }
+    // Immediate account-specific conflict: do not queue a settings mutation
+    // behind a renewal/activation whose assumptions it would change.
+    this.assertClaudeProxyRoutingIdle(accountId);
+    return this.withClaudeActivationLock(async () => {
+      // Re-check after waiting behind unrelated Claude work. A same-account
+      // operation may have arrived while this request was queued.
+      this.assertClaudeProxyRoutingIdle(accountId);
+      const latest = this.store.getAccount(accountId);
+      if (!latest) throw serviceError('account not found', 404);
+      if (latest.provider !== 'claude') {
+        throw serviceError('proxy session routing is only supported for claude accounts', 400);
+      }
+      const profileRef = managedClaudeProfile(latest.profileRef, this.claudeProfilesDir);
+      return this.withClaudeProfileSettingsLock(
+        profileRef,
+        () => this.updateClaudeProxyRoutingSettings(latest, profileRef, enabled),
+      );
+    });
+  }
+
+  async updateClaudeProxyRoutingSettings(account, profileRef, enabled) {
+    this.assertClaudeProxyRoutingIdle(account.id);
+    const settingsPath = path.join(profileRef, 'settings.json');
+    let raw = null;
+    try { raw = await fs.promises.readFile(settingsPath, 'utf8'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+
+    let settings = {};
+    if (raw != null) {
+      try { settings = parseJsonPreservingNumberValues(raw); }
+      catch { throw serviceError('Claude profile settings.json is not valid JSON; fix it before changing proxy routing', 400); }
+      if (!isJsonObject(settings)) {
+        throw serviceError('Claude profile settings.json must contain a JSON object', 400);
+      }
+    }
+    if (Object.hasOwn(settings, 'env')
+      && !isJsonObject(settings.env)) {
+      throw serviceError('Claude profile settings.json env must contain a JSON object', 400);
+    }
+
+    // #282 adversarial review, major 4: ModelDeck only manages its OWN
+    // routing values. A base URL that is not a local CLIProxy, or a helper
+    // that is not ModelDeck's, is the user's configuration — wire refuses
+    // to overwrite it and unwire refuses to delete it, with an error that
+    // says exactly what is in the way. Without this, "Stop routing" on a
+    // corporate-gateway profile silently destroyed user settings.
+    const existingBase = isJsonObject(settings.env) ? settings.env.ANTHROPIC_BASE_URL : undefined;
+    const foreignBase = typeof existingBase === 'string'
+      && existingBase !== this.cliproxyBaseUrl
+      && !isLoopbackUrl(existingBase);
+    const foreignHelper = typeof settings.apiKeyHelper === 'string'
+      && settings.apiKeyHelper !== CLIPROXY_API_KEY_HELPER;
+    if (foreignBase || foreignHelper) {
+      const inTheWay = [
+        ...(foreignBase ? [`env.ANTHROPIC_BASE_URL (${existingBase})`] : []),
+        ...(foreignHelper ? ['apiKeyHelper'] : []),
+      ].join(' and ');
+      throw serviceError(
+        `this profile's settings.json carries ${inTheWay} that ModelDeck did not write; `
+        + `remove it yourself before ${enabled ? 'routing' : 'un-routing'} sessions through the proxy`,
+        409,
+      );
+    }
+
+    const next = { ...settings };
+    if (enabled) {
+      next.env = {
+        ...(settings.env || {}),
+        ANTHROPIC_BASE_URL: this.cliproxyBaseUrl,
+      };
+      next.apiKeyHelper = CLIPROXY_API_KEY_HELPER;
+    } else {
+      delete next.apiKeyHelper;
+      if (settings.env) {
+        next.env = { ...settings.env };
+        delete next.env.ANTHROPIC_BASE_URL;
+        if (Object.keys(next.env).length === 0) delete next.env;
+      }
+    }
+
+    const written = `${JSON.stringify(next, null, 2)}\n`;
+    const settingsChanged = raw == null
+      ? enabled || Object.keys(next).length > 0
+      : raw !== written;
+    const active = await this.claudeProfileIsActive(profileRef);
+    let wroteSettings = false;
+    try {
+      if (settingsChanged) {
+        await this.writeClaudeProfileSettings(settingsPath, written);
+        wroteSettings = true;
+      }
+      const routing = await this.claudeAuthOverrideState(profileRef);
+      if (active) {
+        // cliproxyRouted, not proxyRouted: the shell key pointer goes only
+        // to profiles whose base URL is actually a local CLIProxy (#277
+        // review) — same predicate the activation path uses.
+        await this.writeClaudeShellEnvFile(profileRef, routing.cliproxyRouted);
+      }
+      return {
+        accountId: account.id,
+        provider: 'claude',
+        proxyRouted: routing.proxyRouted,
+        cliproxyRouted: routing.cliproxyRouted,
+        helperRouted: routing.helperRouted,
+      };
+    } catch (error) {
+      // settings.json and the active shell pin are two files, so the last
+      // rename cannot be globally atomic. If the pin write fails, restore
+      // the exact pre-action settings bytes and best-effort restore its pin.
+      if (wroteSettings) {
+        try {
+          if (raw == null) await fs.promises.unlink(settingsPath).catch((unlinkError) => {
+            if (unlinkError.code !== 'ENOENT') throw unlinkError;
+          });
+          else await this.writeClaudeProfileSettings(settingsPath, raw);
+          if (active) {
+            const restored = await this.claudeAuthOverrideState(profileRef);
+            await this.writeClaudeShellEnvFile(profileRef, restored.cliproxyRouted);
+          }
+        } catch (rollbackError) {
+          throw serviceError(
+            `proxy routing update failed and settings rollback also failed: ${errorMessage(rollbackError)}`,
+            500,
+          );
+        }
+      }
+      throw error;
+    }
+  }
+
+  async claudeProfileIsActive(profileRef) {
+    const profileRealPath = await this.realpath(profileRef);
+    let activeRealPath;
+    try { activeRealPath = await this.realpath(this.claudeActiveLink); }
+    catch (error) {
+      // Unlinked/dangling is affirmative inactive state. Permission or I/O
+      // failures are unknown state and must abort before settings change; a
+      // false "inactive" would skip #277's required active shell-pin rewrite.
+      if (error.code === 'ENOENT') return false;
+      throw error;
+    }
+    return profileRealPath === activeRealPath;
   }
 
   async accountsWithAuthState(accounts = this.store.listAccounts()) {
@@ -2426,8 +3110,17 @@ export class ModelDeckService {
         ? { installed: await this.claudeStatuslineInstalled(account.profileRef) }
         : null;
       let renew = null;
+      let claudeRouting = null;
       if (account.provider === 'claude') {
         const override = await this.claudeAuthOverrideState(account.profileRef);
+        claudeRouting = {
+          proxyRouted: override.proxyRouted,
+          // #282 review, major 4 (UI half): loopback-verified, so the app
+          // can gate its "Stop routing" offer on ModelDeck's OWN routing
+          // rather than any base URL's mere presence.
+          cliproxyRouted: override.cliproxyRouted,
+          helperRouted: override.helperRouted,
+        };
         const storedAttempt = account.metadata?.claudeRenewal?.lastAttempt;
         const lastAttempt = storedAttempt?.at && storedAttempt?.outcome
           ? {
@@ -2459,8 +3152,10 @@ export class ModelDeckService {
         };
       }
       // Additive (the #149/#174 discipline): accounts the proxy doesn't
-      // know — or a machine without the proxy at all — omit the key.
+      // have emit `absent` only when at least one parseable auth object made
+      // pool state knowable. A machine without the proxy omits the key.
       const proxyRouting = this.proxyWeightFor(account, proxyWeights);
+      const proxyPool = this.proxyPoolFor(account, proxyWeights);
       // Additive Codex identity evidence: the #108 remembered
       // `tokens.account_id` IDENTIFIER (never a token value). Codex daemon
       // identities are empty, so external tools joining accounts to their
@@ -2477,6 +3172,8 @@ export class ModelDeckService {
         ...(lastRefreshError ? { lastRefreshError } : {}),
         ...(claudeStatusline ? { claudeStatusline } : {}),
         ...(renew ? { renew } : {}),
+        ...(claudeRouting || {}),
+        ...(proxyPool ? { proxyPool } : {}),
         ...(proxyRouting != null ? { proxyWeight: proxyRouting.weight } : {}),
         // Issue #272, additive and Claude-only in practice: true when the
         // proxy's auth file benches this account for the Fable family via
@@ -2789,7 +3486,7 @@ export class ModelDeckService {
     });
   }
 
-  launchSpec(provider, projectPath, extraArgs = []) {
+  async launchSpec(provider, projectPath, extraArgs = []) {
     if (!['claude', 'codex'].includes(provider)) throw new Error('provider must be claude or codex');
     const resolvedPath = path.resolve(projectPath || process.cwd());
     const { project, account } = accountFor(this.store, provider, resolvedPath);
@@ -2799,6 +3496,25 @@ export class ModelDeckService {
 
     if (provider === 'claude') {
       const profileRef = managedClaudeProfile(account.profileRef, this.claudeProfilesDir);
+      // Adversarial review of #278, blocker 1: the MAPPED account decides
+      // the credential, not the shell the launch happens from. A proxied
+      // shell launching a direct account must not carry ModelDeck's proxy
+      // key into it (the key would override that profile's stored OAuth);
+      // a clean shell launching a cliproxy-routed account needs the #277
+      // key pointer or its headless children can't authenticate. The spec
+      // carries a DIRECTIVE — never a credential value: `resolve` prints
+      // specs as JSON, and the launcher resolves the pointer at spawn.
+      const { cliproxyRouted } = await this.claudeAuthOverrideState(profileRef);
+      const credential = cliproxyRouted ? 'cliproxy-pointer' : 'clear-managed';
+      const pins = `CLAUDE_CONFIG_DIR=${shellQuote(profileRef)} CLAUDE_SECURESTORAGE_CONFIG_DIR=${shellQuote(profileRef)}`;
+      const invocation = `${shellQuote(this.claudePath)}${extraArgs.length ? ` ${extraArgs.map(shellQuote).join(' ')}` : ''}`;
+      // The routed preview reuses the env file's exact guarded fragment
+      // (CodeRabbit, PR #301): a pasted preview run under `zsh -x` must be
+      // as trace-safe as the generated shell env, and must resolve
+      // `security` the same way.
+      const preview = cliproxyRouted
+        ? `cd ${shellQuote(cwd)} && ${claudeProxyPointerShellSnippet()}; ${pins} ${invocation}`
+        : `cd ${shellQuote(cwd)} && if [ "\${MODELDECK_MANAGED_ANTHROPIC_API_KEY:-}" = "1" ]; then unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY; fi; ${pins} ${invocation}`;
       return {
         provider,
         account,
@@ -2809,7 +3525,8 @@ export class ModelDeckService {
         // Issue #66: pinned pair — see loginSpec. Resumes re-apply the same
         // env so `claude -r` finds the transcript under the same pin.
         env: { CLAUDE_CONFIG_DIR: profileRef, CLAUDE_SECURESTORAGE_CONFIG_DIR: profileRef },
-        preview: `cd ${shellQuote(cwd)} && CLAUDE_CONFIG_DIR=${shellQuote(profileRef)} CLAUDE_SECURESTORAGE_CONFIG_DIR=${shellQuote(profileRef)} ${shellQuote(this.claudePath)}${extraArgs.length ? ` ${extraArgs.map(shellQuote).join(' ')}` : ''}`,
+        credential,
+        preview,
       };
     }
 

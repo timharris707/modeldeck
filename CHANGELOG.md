@@ -1,8 +1,9 @@
 # Changelog
 
-All notable changes to ModelDeck are documented here. Versioning follows the
-roadmap in `design/mac-app-roadmap.md`: `v0.1-web` tags the retired web MVP,
-and `v0.2.0` ships when the Mac menu bar app reaches parity (Phase 6).
+**This file is retired.** As of v0.3.17 (August 2026), release notes live on
+[GitHub Releases](https://github.com/timharris707/modeldeck/releases) — one
+entry per version, published with each release. The entries below are the
+frozen historical record through 0.3.16 and will not be extended.
 
 ## 0.3.16 — 2026-08-02
 

@@ -223,6 +223,7 @@ struct BurnWindowPersistenceTests {
             for: .claude, state: state, now: fixedNow, burstPointsPerDay: nil
         )
         let presentation = AvailabilityHealthPresentation.make(report: report, now: fixedNow)
-        #expect(presentation.factLines.contains("Today's burn: still measuring"))
+        #expect(presentation.section(AvailabilityHealthPresentation.SectionTitle.pace)?
+            .row("Today's burn")?.value == "still measuring")
     }
 }

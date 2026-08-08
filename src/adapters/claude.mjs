@@ -277,6 +277,26 @@ const assertOwnerOnlyDirectory = claudeProfile.assertOwnerOnlyDirectory;
 // pinned session store its transcript under one profile while authenticating
 // as another. Verified on Claude Code 2.1.216; the keychain-scope derivation
 // is an undocumented internal — revalidate on CLI upgrades.
+/// The one-line form of the guarded #277 pointer, for launch PREVIEWS
+/// (CodeRabbit, PR #301): same absolute-path lookup, same non-empty-only
+/// export, same stale-managed-key clear, and xtrace suspended around the
+/// credential handling — a preview a user pastes under `zsh -x` must be
+/// exactly as trace-safe as the generated env file.
+export function claudeProxyPointerShellSnippet() {
+  return [
+    // An inherited stale __modeldeck_xtrace=1 must not re-enable tracing
+    // for a shell that never had it on (CodeRabbit, PR #301).
+    'unset __modeldeck_xtrace',
+    'case $- in *x*) __modeldeck_xtrace=1; set +x;; esac',
+    '__modeldeck_key="$("${MODELDECK_SECURITY_BIN:-/usr/bin/security}" find-generic-password -s cli-proxy-api-client -w 2>/dev/null || true)"',
+    'if [ -n "${__modeldeck_key:-}" ]; then export ANTHROPIC_API_KEY="$__modeldeck_key" MODELDECK_MANAGED_ANTHROPIC_API_KEY=1',
+    'elif [ "${MODELDECK_MANAGED_ANTHROPIC_API_KEY:-}" = "1" ]; then unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY; fi',
+    'unset __modeldeck_key',
+    'if [ "${__modeldeck_xtrace:-}" = "1" ]; then set -x; fi',
+    'unset __modeldeck_xtrace',
+  ].join('; ');
+}
+
 export function claudePinnedEnvFileContent(profileRealPath, proxyRouted = false) {
   if (!profileRealPath || typeof profileRealPath !== 'string') {
     throw new Error('Claude profile real path is required');
@@ -287,30 +307,61 @@ export function claudePinnedEnvFileContent(profileRealPath, proxyRouted = false)
     '# Pins new Claude Code sessions to the active profile real path so a',
     '# later account switch cannot split their session storage. Both',
     '# variables must always carry the same value (issue #66).',
-    `export CLAUDE_CONFIG_DIR=${quoted}`,
-    `export CLAUDE_SECURESTORAGE_CONFIG_DIR=${quoted}`,
+    '#',
+    '# The whole block is skipped when a pin is already exported: a nested',
+    '# shell belongs to the SESSION that started it, and repinning it to',
+    '# whatever account is active NOW would split that session across',
+    '# profiles and strip its inherited credential state (adversarial',
+    '# review of #278, blocker 3). Only pin-less shells — fresh terminals —',
+    '# adopt the active account.',
+    'if [ -z "${CLAUDE_CONFIG_DIR:-}" ]; then',
+    `  export CLAUDE_CONFIG_DIR=${quoted}`,
+    `  export CLAUDE_SECURESTORAGE_CONFIG_DIR=${quoted}`,
+    // An inherited stale __modeldeck_xtrace=1 must not re-enable tracing
+    // for a shell that never had it on (CodeRabbit, PR #301).
+    '  unset __modeldeck_xtrace',
+    // The credential lines run with xtrace suspended: `zsh -x` (or a user's
+    // `setopt xtrace` in .zshrc) would otherwise print the expanded key
+    // assignment to stderr (adversarial review of #278, major 1).
+    '  case $- in *x*) __modeldeck_xtrace=1; set +x;; esac',
     ...(proxyRouted ? [
       '',
-      '# Proxy-routed profile: headless children need a key the apiKeyHelper',
-      '# cannot supply without an interactive approval (issue #277). Pointer',
-      '# only — the value is fetched from the Keychain at shell startup and',
-      '# never written to disk. The marker records that WE set it, so the',
-      '# unproxied branch below can clear ours without touching a key the',
-      '# user set for their own tooling.',
-      'export ANTHROPIC_API_KEY="$(security find-generic-password -s cli-proxy-api-client -w 2>/dev/null)"',
-      'export MODELDECK_MANAGED_ANTHROPIC_API_KEY=1',
+      '  # Proxy-routed profile: headless children need a key the apiKeyHelper',
+      '  # cannot supply without an interactive approval (issue #277). Pointer',
+      '  # only — the value is fetched from the Keychain at shell startup and',
+      '  # never written to disk. A missing/empty item exports NOTHING (an',
+      '  # empty ANTHROPIC_API_KEY would override stored OAuth and break the',
+      '  # session). The marker records that WE set it, so the unproxied',
+      '  # branch below can clear ours without touching a key the user set',
+      '  # for their own tooling.',
+      // Absolute path by default — a bare `security` would be PATH/function
+      // resolved for a credential read. The override exists ONLY so tests
+      // can stand in a fake without touching the real Keychain; it carries
+      // no security cost (anyone who controls the sourcing environment
+      // already controls PATH).
+      '  __modeldeck_key="$("${MODELDECK_SECURITY_BIN:-/usr/bin/security}" find-generic-password -s cli-proxy-api-client -w 2>/dev/null || true)"',
+      '  if [ -n "${__modeldeck_key:-}" ]; then',
+      '    export ANTHROPIC_API_KEY="$__modeldeck_key"',
+      '    export MODELDECK_MANAGED_ANTHROPIC_API_KEY=1',
+      '  elif [ "${MODELDECK_MANAGED_ANTHROPIC_API_KEY:-}" = "1" ]; then',
+      '    # The Keychain item vanished since a parent exported it: a stale',
+      '    # managed key must not outlive its source.',
+      '    unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY',
+      '  fi',
+      '  unset __modeldeck_key',
     ] : [
       '',
-      '# Not proxy-routed: this profile authenticates with its stored OAuth,',
-      '# and an API key would OVERRIDE that and break it. Omitting the export',
-      '# is not enough — a nested shell inherits the key from a parent that',
-      '# was started while a proxied profile was active (CodeRabbit, PR #278).',
-      '# Guarded on our own marker so a key the user exported for their own',
-      '# tooling is never touched.',
-      'if [ "${MODELDECK_MANAGED_ANTHROPIC_API_KEY:-}" = "1" ]; then',
-      '  unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY',
-      'fi',
+      '  # Not proxy-routed: this profile authenticates with its stored OAuth,',
+      '  # and an API key would OVERRIDE that and break it. Guarded on our own',
+      '  # marker so a key the user exported for their own tooling is never',
+      '  # touched.',
+      '  if [ "${MODELDECK_MANAGED_ANTHROPIC_API_KEY:-}" = "1" ]; then',
+      '    unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY',
+      '  fi',
     ]),
+    '  if [ "${__modeldeck_xtrace:-}" = "1" ]; then set -x; fi',
+    '  unset __modeldeck_xtrace',
+    'fi',
     '',
   ].join('\n');
 }

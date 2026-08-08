@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import path from 'node:path';
 import { Store } from '../src/db.mjs';
 import { ModelDeckService } from '../src/service.mjs';
@@ -104,7 +104,7 @@ if (command === 'serve') {
       console.log(JSON.stringify(mapped, null, 2));
     } else if (command === 'resolve') {
       const [provider, projectPath = process.cwd()] = args;
-      const spec = service.launchSpec(provider, projectPath);
+      const spec = await service.launchSpec(provider, projectPath);
       console.log(JSON.stringify({ provider, project: spec.project, account: spec.account, command: spec.preview }, null, 2));
     } else if (command === 'launch') {
       const provider = args[0];
@@ -113,13 +113,46 @@ if (command === 'serve') {
       const providerArgs = separator >= 0 ? args.slice(separator + 1) : [];
       const projectPath = valueAfter(flags, '--project') || process.cwd();
       const dryRun = flags.includes('--dry-run');
-      const spec = service.launchSpec(provider, projectPath, providerArgs);
+      const spec = await service.launchSpec(provider, projectPath, providerArgs);
       service.recordLaunch(spec, dryRun);
       if (dryRun) console.log(spec.preview);
       else {
+        const env = { ...process.env, ...spec.env };
+        // The MAPPED account decides the credential, not the shell this
+        // command runs from (adversarial review of #278, blocker 1).
+        if (spec.credential === 'cliproxy-pointer') {
+          // Pointer resolved at spawn, value never printed or persisted.
+          // An empty/missing Keychain item exports nothing — an empty
+          // ANTHROPIC_API_KEY would override the profile's stored OAuth —
+          // and a managed key inherited from the launching shell is
+          // cleared rather than left stale.
+          let key = '';
+          try {
+            key = execFileSync(process.env.MODELDECK_SECURITY_BIN || '/usr/bin/security', [
+              'find-generic-password', '-s', 'cli-proxy-api-client', '-w',
+            ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+          } catch {
+            key = '';
+          }
+          if (key) {
+            env.ANTHROPIC_API_KEY = key;
+            env.MODELDECK_MANAGED_ANTHROPIC_API_KEY = '1';
+          } else if (env.MODELDECK_MANAGED_ANTHROPIC_API_KEY === '1') {
+            delete env.ANTHROPIC_API_KEY;
+            delete env.MODELDECK_MANAGED_ANTHROPIC_API_KEY;
+          }
+        } else if (spec.credential === 'clear-managed') {
+          // Direct account: ModelDeck's own proxy key must not ride along
+          // from a proxied shell. Guarded on the marker so a key the user
+          // exported for their own tooling is never touched.
+          if (env.MODELDECK_MANAGED_ANTHROPIC_API_KEY === '1') {
+            delete env.ANTHROPIC_API_KEY;
+            delete env.MODELDECK_MANAGED_ANTHROPIC_API_KEY;
+          }
+        }
         const child = spawn(spec.command, spec.args, {
           cwd: spec.cwd,
-          env: { ...process.env, ...spec.env },
+          env,
           stdio: 'inherit',
           shell: false,
         });

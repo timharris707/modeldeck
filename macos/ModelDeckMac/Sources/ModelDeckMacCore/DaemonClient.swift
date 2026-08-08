@@ -284,6 +284,64 @@ public struct DaemonClient: Sendable {
         return envelope.renew
     }
 
+    // MARK: - Proxy pool + session routing (issue #279)
+
+    /// `POST /api/accounts/:id/proxy-pool/join` — asks the daemon to spawn
+    /// the proxy's own login for this account's provider. The browser OAuth
+    /// is the user's step; the daemon resolves only when a matching auth
+    /// file appears (or refuses: 409 concurrent, 502 early exit, 504
+    /// timeout — all surfacing as the standard daemon error, sanitized
+    /// daemon-side). The daemon watches for up to five minutes, so this
+    /// call gets matching room.
+    public func joinProxyPool(accountID: String) async throws -> ProxyPoolJoin {
+        var request = try await authorizedRequest(
+            method: "POST",
+            pathComponents: ["api", "accounts", accountID, "proxy-pool", "join"]
+        )
+        // Daemon join watch is 5 minutes (DEFAULT_PROXY_JOIN_TIMEOUT_MS)
+        // plus termination grace; the transport must outlive it so the 504's
+        // honest detail arrives instead of a client-side timeout.
+        request.timeoutInterval = 330
+        return try await send(request)
+    }
+
+    /// `POST /api/accounts/:id/proxy-routing/{wire|unwire}` — adds or
+    /// removes the proxy base URL + Keychain-pointer apiKeyHelper in the
+    /// profile's own settings.json (atomic daemon-side, reversible, #263
+    /// renewal-safe). Returns the daemon's re-read routing truth.
+    public func setProxyRouting(accountID: String, enabled: Bool) async throws -> ProxyRoutingState {
+        var request = try await authorizedRequest(
+            method: "POST",
+            pathComponents: ["api", "accounts", accountID, "proxy-routing", enabled ? "wire" : "unwire"]
+        )
+        // Adversarial review M5: the write queues on the daemon's GLOBAL
+        // Claude activation lock, which a renewal of another account can
+        // hold for up to 60s — 30 timed the client out while the daemon was
+        // still legitimately queued. 60s lock hold + the write + margin.
+        request.timeoutInterval = 120
+        return try await send(request)
+    }
+
+    // MARK: - On-demand identity verify (issue #280)
+
+    /// `POST /api/accounts/:id/verify-identity` — the cheap read-only
+    /// identity check (scoped `claude auth status`; no `-p` rung, no quota
+    /// spend, no flip). The daemon promotes a matching seeded identity to
+    /// verified itself; this client only relays the decided outcome.
+    public func verifyIdentity(accountID: String) async throws -> IdentityVerification {
+        var request = try await authorizedRequest(
+            method: "POST",
+            pathComponents: ["api", "accounts", accountID, "verify-identity"]
+        )
+        // Adversarial review M5: the daemon's verify runs `claude auth
+        // status` with its own 60s budget AND queues on the global Claude
+        // activation lock a renewal of another account can hold for 60s —
+        // 60 + 60 + margin, or the client abandons a verify the daemon
+        // still finishes.
+        request.timeoutInterval = 150
+        return try await send(request)
+    }
+
     // MARK: - Shared user scope (issue #204)
 
     /// `POST /api/shared-scope/{enable|disable}` — the guarded shared-scope

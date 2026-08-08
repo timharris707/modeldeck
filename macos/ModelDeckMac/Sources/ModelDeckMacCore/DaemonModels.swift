@@ -81,6 +81,27 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
     /// routes only OTHER models, and the deck's Fable view must not present
     /// it as Fable routing. Absent everywhere the exclusion doesn't apply.
     public var proxyFableExcluded: Bool?
+    /// Issue #279: CLIProxyAPI pool membership — "member" / "absent".
+    /// Emitted ONLY when a real pool exists on this machine (auth dir
+    /// configured, readable, non-empty); a machine without the proxy omits
+    /// the key entirely and the proxy UI renders NOTHING anywhere (the
+    /// #149/#174 discipline). Decoded shape-tolerantly — an unexpected type
+    /// reads as absent-key, never a failed account decode.
+    public var proxyPool: String?
+    /// Issue #279: whether this Claude profile's OWN sessions route through
+    /// the proxy (`env.ANTHROPIC_BASE_URL` present in its settings). A
+    /// separate dimension from pool membership — any combination is legal.
+    /// Claude only; Codex accounts and old daemons omit it.
+    public var proxyRouted: Bool?
+    /// Adversarial review M4: whether the profile's `ANTHROPIC_BASE_URL`
+    /// was verified to point at the LOCAL CLIProxyAPI (loopback), not just
+    /// any base URL — `proxyRouted` above is presence-only, so a corporate
+    /// gateway also reads as routed. Optional: an older daemon omits it and
+    /// the unroute offer falls back to the presence-only fact.
+    public var cliproxyRouted: Bool?
+    /// Issue #279: whether the profile authenticates via an `apiKeyHelper`
+    /// (the #263 Keychain-pointer route). Claude only, same skew contract.
+    public var helperRouted: Bool?
 
     public init(
         id: String,
@@ -99,7 +120,11 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         claudeStatusline: ClaudeStatuslineOptIn? = nil,
         renew: AccountRenewCapability? = nil,
         proxyWeight: Int? = nil,
-        proxyFableExcluded: Bool? = nil
+        proxyFableExcluded: Bool? = nil,
+        proxyPool: String? = nil,
+        proxyRouted: Bool? = nil,
+        cliproxyRouted: Bool? = nil,
+        helperRouted: Bool? = nil
     ) {
         self.id = id
         self.provider = provider
@@ -118,6 +143,48 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         self.renew = renew
         self.proxyWeight = proxyWeight
         self.proxyFableExcluded = proxyFableExcluded
+        self.proxyPool = proxyPool
+        self.proxyRouted = proxyRouted
+        self.cliproxyRouted = cliproxyRouted
+        self.helperRouted = helperRouted
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, provider, label, identity, purpose, color, profileRef
+        case enabled, isDefault, metadata, authState, lastRefreshError
+        case signinReason, claudeStatusline, renew
+        case proxyWeight, proxyFableExcluded
+        case proxyPool, proxyRouted, cliproxyRouted, helperRouted
+    }
+
+    /// Custom decode, byte-compatible with the synthesized one for every
+    /// pre-#279 field; only the #279 additions (and M4's `cliproxyRouted`,
+    /// same skew contract) use the shape-tolerant
+    /// `try?` pattern (`AccountRenewAttempt` policy) so an unexpected type
+    /// there can never fail the whole account decode on an old daemon.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(String.self, forKey: .id)
+        self.provider = try container.decode(String.self, forKey: .provider)
+        self.label = try container.decode(String.self, forKey: .label)
+        self.identity = try container.decodeIfPresent(String.self, forKey: .identity)
+        self.purpose = try container.decodeIfPresent(String.self, forKey: .purpose)
+        self.color = try container.decodeIfPresent(String.self, forKey: .color)
+        self.profileRef = try container.decodeIfPresent(String.self, forKey: .profileRef)
+        self.enabled = try container.decode(Bool.self, forKey: .enabled)
+        self.isDefault = try container.decode(Bool.self, forKey: .isDefault)
+        self.metadata = try container.decodeIfPresent(DeckAccountMetadata.self, forKey: .metadata)
+        self.authState = try container.decodeIfPresent(String.self, forKey: .authState)
+        self.lastRefreshError = try container.decodeIfPresent(AccountRefreshError.self, forKey: .lastRefreshError)
+        self.signinReason = try container.decodeIfPresent(String.self, forKey: .signinReason)
+        self.claudeStatusline = try container.decodeIfPresent(ClaudeStatuslineOptIn.self, forKey: .claudeStatusline)
+        self.renew = try container.decodeIfPresent(AccountRenewCapability.self, forKey: .renew)
+        self.proxyWeight = try container.decodeIfPresent(Int.self, forKey: .proxyWeight)
+        self.proxyFableExcluded = try container.decodeIfPresent(Bool.self, forKey: .proxyFableExcluded)
+        self.proxyPool = (try? container.decodeIfPresent(String.self, forKey: .proxyPool)) ?? nil
+        self.proxyRouted = (try? container.decodeIfPresent(Bool.self, forKey: .proxyRouted)) ?? nil
+        self.cliproxyRouted = (try? container.decodeIfPresent(Bool.self, forKey: .cliproxyRouted)) ?? nil
+        self.helperRouted = (try? container.decodeIfPresent(Bool.self, forKey: .helperRouted)) ?? nil
     }
 
     /// Per-account health chip (issue #32): each roster row reads its OWN
@@ -815,6 +882,121 @@ public struct LoginCommand: Codable, Equatable, Sendable {
     /// Whether the sign-in must be driven through activation first.
     public var needsActivationFirst: Bool {
         requiresActivation == true
+    }
+}
+
+// MARK: - Proxy pool + routing (issue #279) and identity verify (issue #280)
+
+/// `POST /api/accounts/:id/proxy-pool/join` — the decided 200 body after the
+/// proxy's own browser OAuth produced a matching auth file (or the account
+/// was already a member). Refusals/failures arrive as the standard daemon
+/// `{"error": …}` with 409 (concurrent join / no pool), 502 (login exited
+/// early), or 504 (timed out) and surface verbatim. Decoding is deliberately
+/// shape-tolerant (the `AccountRenewAttempt` policy).
+public struct ProxyPoolJoin: Codable, Equatable, Sendable {
+    public var accountId: String?
+    public var provider: String?
+    /// "member" on success.
+    public var proxyPool: String?
+    public var alreadyMember: Bool?
+
+    public init(
+        accountId: String? = nil,
+        provider: String? = nil,
+        proxyPool: String? = nil,
+        alreadyMember: Bool? = nil
+    ) {
+        self.accountId = accountId
+        self.provider = provider
+        self.proxyPool = proxyPool
+        self.alreadyMember = alreadyMember
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case accountId, provider, proxyPool, alreadyMember
+    }
+
+    public init(from decoder: Decoder) throws {
+        guard let container = try? decoder.container(keyedBy: CodingKeys.self) else {
+            self.init()
+            return
+        }
+        self.init(
+            accountId: (try? container.decodeIfPresent(String.self, forKey: .accountId)) ?? nil,
+            provider: (try? container.decodeIfPresent(String.self, forKey: .provider)) ?? nil,
+            proxyPool: (try? container.decodeIfPresent(String.self, forKey: .proxyPool)) ?? nil,
+            alreadyMember: (try? container.decodeIfPresent(Bool.self, forKey: .alreadyMember)) ?? nil
+        )
+    }
+}
+
+/// `POST /api/accounts/:id/proxy-routing/{wire|unwire}` — the daemon's
+/// post-write routing truth, re-read from the profile's settings (never an
+/// echo of intent). 409 while a renewal/activation is in flight and 400 for
+/// non-Claude accounts arrive as the standard daemon error.
+public struct ProxyRoutingState: Codable, Equatable, Sendable {
+    public var accountId: String?
+    public var proxyRouted: Bool?
+    public var helperRouted: Bool?
+
+    public init(accountId: String? = nil, proxyRouted: Bool? = nil, helperRouted: Bool? = nil) {
+        self.accountId = accountId
+        self.proxyRouted = proxyRouted
+        self.helperRouted = helperRouted
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case accountId, proxyRouted, helperRouted
+    }
+
+    public init(from decoder: Decoder) throws {
+        guard let container = try? decoder.container(keyedBy: CodingKeys.self) else {
+            self.init()
+            return
+        }
+        self.init(
+            accountId: (try? container.decodeIfPresent(String.self, forKey: .accountId)) ?? nil,
+            proxyRouted: (try? container.decodeIfPresent(Bool.self, forKey: .proxyRouted)) ?? nil,
+            helperRouted: (try? container.decodeIfPresent(Bool.self, forKey: .helperRouted)) ?? nil
+        )
+    }
+}
+
+/// `POST /api/accounts/:id/verify-identity` (issue #280) — the cheap
+/// read-only half of #263's renewal identity rung, run on demand:
+/// `{outcome: "verified"}` / `{outcome: "mismatch", reported}` /
+/// `{outcome: "unavailable", detail}`. 409 while a renewal/activation is in
+/// flight and 400 for non-Claude accounts arrive as the standard daemon
+/// error. Shape-tolerant by the same policy: a response this client can't
+/// read decodes to a nil outcome, which the model reports as a plain
+/// failure — never a crash, never a fake success.
+public struct IdentityVerification: Codable, Equatable, Sendable {
+    public var outcome: String?
+    /// The provider-reported identity on a mismatch.
+    public var reported: String?
+    /// The daemon's sanitized human sentence on "unavailable".
+    public var detail: String?
+
+    public init(outcome: String? = nil, reported: String? = nil, detail: String? = nil) {
+        self.outcome = outcome
+        self.reported = reported
+        self.detail = detail
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case outcome, reported, detail
+    }
+
+    public init(from decoder: Decoder) throws {
+        guard let container = try? decoder.container(keyedBy: CodingKeys.self) else {
+            self.init()
+            return
+        }
+        self.init(
+            outcome: (try? container.decodeIfPresent(String.self, forKey: .outcome)) ?? nil,
+            reported: (try? container.decodeIfPresent(String.self, forKey: .reported)) ?? nil,
+            detail: (try? container.decodeIfPresent(String.self, forKey: .detail)) ?? nil
+        )
     }
 }
 

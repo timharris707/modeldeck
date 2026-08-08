@@ -10,7 +10,7 @@ import { runStatuslineCli as runClaudeStatusline, STATUSLINE_SEA_COMMAND } from 
 import {
   HOST, PORT, DB_PATH, PROJECTS_ROOT, CLAUDE_PATH, CLAUDE_PROFILES_DIR, CLAUDE_ACTIVE_LINK,
   CLAUDE_SHELL_ENV_FILE, CLAUDE_STATUSLINE_DIR, CODEX_PATH, CODEX_ACTIVE_LINK, CODEX_PROFILES_DIR,
-  CLIPROXY_AUTH_DIR,
+  CLIPROXY_AUTH_DIR, CLIPROXY_BIN, CLIPROXY_BASE_URL,
 } from './paths.mjs';
 
 // esbuild replaces the build-only identifier with a string literal for SEA;
@@ -85,6 +85,8 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
     codexActiveLink: CODEX_ACTIVE_LINK,
     codexProfilesDir: CODEX_PROFILES_DIR,
     cliproxyAuthDir: CLIPROXY_AUTH_DIR,
+    cliproxyPath: CLIPROXY_BIN,
+    cliproxyBaseUrl: CLIPROXY_BASE_URL,
     daemonGitCommit: GIT_COMMIT,
     // DEMO/DEV ONLY (issue #129): seeded fixture snapshots are authoritative —
     // provider refresh becomes a no-op and nothing is ever scheduled. Set by
@@ -202,6 +204,36 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
         if (!account) return json(res, 404, { error: 'account not found' });
         return json(res, 200, await ownedService.verifyAccount(account.id));
       }
+      // Issue #280: re-check a remembered Claude identity through the same
+      // isolated, auth-status-only read used by renewal. This endpoint never
+      // reaches renewal probing or its inference fallback.
+      const verifyIdentityMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/verify-identity$/);
+      if (req.method === 'POST' && verifyIdentityMatch) {
+        const account = ownedStore.getAccount(decodeURIComponent(verifyIdentityMatch[1]));
+        if (!account) return json(res, 404, { error: 'account not found' });
+        return json(res, 200, await ownedService.verifyClaudeIdentity(account.id));
+      }
+      // Issue #279: user-initiated CLIProxyAPI OAuth. The proxy binary opens
+      // the browser; the daemon waits only for matching identity evidence in
+      // the auth directory and never captures child output or credential data.
+      const proxyPoolJoinMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/proxy-pool\/join$/);
+      if (req.method === 'POST' && proxyPoolJoinMatch) {
+        const account = ownedStore.getAccount(decodeURIComponent(proxyPoolJoinMatch[1]));
+        if (!account) return json(res, 404, { error: 'account not found' });
+        return json(res, 200, await ownedService.joinProxyPool(account.id));
+      }
+      // Session routing is deliberately separate from pool membership: any
+      // combination is legal. Claude-only until Codex provider routing can be
+      // detected and mutated honestly.
+      const proxyRoutingMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/proxy-routing\/(wire|unwire)$/);
+      if (req.method === 'POST' && proxyRoutingMatch) {
+        const account = ownedStore.getAccount(decodeURIComponent(proxyRoutingMatch[1]));
+        if (!account) return json(res, 404, { error: 'account not found' });
+        const routing = proxyRoutingMatch[2] === 'wire'
+          ? await ownedService.wireProxyRouting(account.id)
+          : await ownedService.unwireProxyRouting(account.id);
+        return json(res, 200, routing);
+      }
       // Issue #174: per-profile statusline capture opt-in. Both writes stay
       // inside the profile's OWN settings.json (never the active-profile
       // symlink) and are token-gated like every mutation.
@@ -254,7 +286,7 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
       }
       if (req.method === 'POST' && url.pathname === '/api/refresh') return json(res, 200, await ownedService.refreshAll());
       if (req.method === 'GET' && url.pathname === '/api/launch') {
-        const spec = ownedService.launchSpec(url.searchParams.get('provider'), url.searchParams.get('project') || process.cwd());
+        const spec = await ownedService.launchSpec(url.searchParams.get('provider'), url.searchParams.get('project') || process.cwd());
         return json(res, 200, {
           provider: spec.provider,
           project: spec.project,

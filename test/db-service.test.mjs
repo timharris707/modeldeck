@@ -45,17 +45,56 @@ test('stores project mappings and resolves nearest mapped ancestor', () => {
   } finally { data.close(); }
 });
 
-test('launch specs preserve project identity with process-scoped profile homes', () => {
+test('launch specs preserve project identity with process-scoped profile homes', async () => {
   const data = fixture();
   try {
     const service = new ModelDeckService(data.store, { projectsRoot: path.dirname(data.projectPath), claudeProfilesDir: data.claudeProfilesDir, claudePath: 'claude', codexPath: 'codex' });
-    const claude = service.launchSpec('claude', path.join(data.projectPath, 'apps', 'web'), ['--resume']);
+    const claude = await service.launchSpec('claude', path.join(data.projectPath, 'apps', 'web'), ['--resume']);
     assert.deepEqual(claude.args, ['--resume']);
     assert.equal(claude.env.CLAUDE_CONFIG_DIR, data.claudeBusinessHome);
     assert.match(claude.preview, /CLAUDE_CONFIG_DIR='.*\/claude-profiles\/business' 'claude' '--resume'/);
-    const codex = service.launchSpec('codex', data.projectPath, ['--full-auto']);
+    const codex = await service.launchSpec('codex', data.projectPath, ['--full-auto']);
     assert.equal(codex.env.CODEX_HOME, data.codexHome);
     assert.deepEqual(codex.args, ['--full-auto']);
+  } finally { data.close(); }
+});
+
+test('the MAPPED account decides the launch credential, not the launching shell (#278 review, blocker 1)', async () => {
+  const data = fixture();
+  try {
+    const service = new ModelDeckService(data.store, { projectsRoot: path.dirname(data.projectPath), claudeProfilesDir: data.claudeProfilesDir, claudePath: 'claude', codexPath: 'codex' });
+    // The fixture profile has no settings.json → not cliproxy-routed: the
+    // spec must direct the launcher to clear a ModelDeck-managed key
+    // inherited from a proxied shell, and the preview must show the
+    // guarded clear so a dry-run tells the same story the spawn enacts.
+    const direct = await service.launchSpec('claude', path.join(data.projectPath, 'apps', 'web'));
+    assert.equal(direct.credential, 'clear-managed');
+    assert.match(direct.preview, /MODELDECK_MANAGED_ANTHROPIC_API_KEY.*unset ANTHROPIC_API_KEY/s);
+    assert.ok(!('ANTHROPIC_API_KEY' in direct.env), 'spec env must never carry a credential value');
+
+    // Route the profile at a loopback CLIProxy → the spec flips to the
+    // #277 pointer directive, resolved at spawn time by the launcher.
+    fs.writeFileSync(path.join(data.claudeBusinessHome, 'settings.json'), JSON.stringify({
+      env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8317' },
+      apiKeyHelper: 'security find-generic-password -s cli-proxy-api-client -w',
+    }));
+    const routed = await service.launchSpec('claude', path.join(data.projectPath, 'apps', 'web'));
+    assert.equal(routed.credential, 'cliproxy-pointer');
+    assert.match(routed.preview, /find-generic-password -s cli-proxy-api-client -w/);
+    // CodeRabbit (PR #301): the pasted preview must be as trace-safe and
+    // path-safe as the generated env file — same guarded fragment.
+    assert.ok(routed.preview.includes('${MODELDECK_SECURITY_BIN:-/usr/bin/security}'));
+    assert.ok(routed.preview.includes('case $- in *x*) __modeldeck_xtrace=1; set +x;; esac'));
+    assert.ok(routed.preview.includes('if [ -n "${__modeldeck_key:-}" ]; then export ANTHROPIC_API_KEY'));
+    assert.ok(!('ANTHROPIC_API_KEY' in routed.env), 'spec env must never carry a credential value');
+
+    // A NON-loopback base URL (corporate gateway) is NOT CLIProxy routing:
+    // no pointer — and the managed-key clear still applies.
+    fs.writeFileSync(path.join(data.claudeBusinessHome, 'settings.json'), JSON.stringify({
+      env: { ANTHROPIC_BASE_URL: 'https://gateway.example.com' },
+    }));
+    const gateway = await service.launchSpec('claude', path.join(data.projectPath, 'apps', 'web'));
+    assert.equal(gateway.credential, 'clear-managed');
   } finally { data.close(); }
 });
 

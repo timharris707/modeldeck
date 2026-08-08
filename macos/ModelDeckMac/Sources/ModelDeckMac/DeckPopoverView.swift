@@ -39,6 +39,15 @@ struct DeckPopoverView: View {
     /// once in the model's load(), never in this struct's initializer (an
     /// XPC round-trip per App-body evaluation — the #68 re-render tax).
     @ObservedObject var launchAtLoginModel: LaunchAtLoginModel
+    /// Issue #295: true when this deck renders inside the FLOATING window
+    /// rather than the menu-bar popover. Floating mode skips the #230
+    /// window capture (the registry is the popover-dismissal choke point,
+    /// and Settings fronting must never close a deck the user parked) and
+    /// hides the detach control (the window's close button is the way
+    /// back).
+    var isFloating: Bool = false
+    /// Issue #295: the footer's detach action; nil hides the control.
+    var onDetach: (() -> Void)?
     /// Issue #45: Settings opens via the environment action wrapped in
     /// activation + fronting (see SettingsWindowFronting) instead of a bare
     /// SettingsLink, which with the accessory activation policy opened the
@@ -82,7 +91,10 @@ struct DeckPopoverView: View {
         // dismissal choke point closes THE window instead of guessing
         // private class names (the guess broke on macOS 26). Background:
         // zero-size, hit-test-inert, renders nothing.
-        .background(DeckWindowCaptureView())
+        // Issue #295: NEVER in floating mode — whatever is registered gets
+        // closed by Settings fronting, and that must not reach the deck
+        // window the user chose to keep open.
+        .background { if !isFloating { DeckWindowCaptureView() } }
         .onAppear {
             // Tim directive 2026-08-02: one diff per open, against the
             // snapshot stored at the PREVIOUS open — the changed cards glow
@@ -767,39 +779,105 @@ struct DeckPopoverView: View {
                 }
             }
             Spacer()
+            // Issue #295 (Tim): pop the deck out into a floating desktop
+            // window. Hidden in the floating deck itself — the window's
+            // close button (or the placeholder's Reattach) is the way back.
+            if !isFloating, let onDetach {
+                Button {
+                    onDetach()
+                } label: {
+                    Image(systemName: "macwindow.on.rectangle")
+                }
+                .help(FloatingDeckModel.detachHelp)
+                .accessibilityLabel(FloatingDeckModel.detachAccessibilityLabel)
+            }
             if showsFooterAddAccount {
                 // Issue #226: growing the pool never requires the Settings
                 // detour. One modest surface-level affordance in the footer —
                 // where the deck's other surface action (Refresh) already
                 // lives — never per-column buttons (the add flow's next
                 // screen asks Claude vs Codex itself).
-                Button {
-                    beginAddAccount()
-                } label: {
-                    Label("Add account", systemImage: "plus")
-                }
-                .help("Create an isolated profile and sign in via the provider's own flow")
-                .accessibilityLabel("Add account")
-                .accessibilityHint("Opens Settings and starts the add-account flow")
+                // Issue #283 (Tim: "less is more"): bare glyph, no fill, no
+                // border, no text. The NAME survives in the tooltip and the
+                // accessibility label, so nothing is actually lost.
+                DeckFooterIconButton(
+                    systemImage: "plus",
+                    name: "Add account…",
+                    help: "Create an isolated profile and sign in via the provider's own flow",
+                    accessibilityLabel: "Add account",
+                    accessibilityHint: "Opens Settings and starts the add-account flow",
+                    action: beginAddAccount
+                )
             }
-            Button {
-                // Issue #72: manual Refresh = forced provider poll + state
-                // re-read, so the "Data from…" counter actually restarts
-                // (the plain cached read never advanced observedAt).
-                Task { await statusModel.refreshFromProviders() }
-            } label: {
-                HStack(spacing: 4) {
-                    if statusModel.isRefreshing {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                    Text("Refresh")
+            // Issue #283: same bare treatment, with the in-flight spinner
+            // kept exactly as it was — a refresh you can't see is worse than
+            // a button you can't read.
+            DeckFooterIconButton(
+                systemImage: "arrow.clockwise",
+                name: "Refresh now",
+                help: "Ask the daemon to poll the providers for fresh usage now",
+                accessibilityLabel: "Refresh now",
+                isBusy: statusModel.isRefreshing,
+                action: {
+                    // Issue #72: manual Refresh = forced provider poll + state
+                    // re-read, so the "Data from…" counter actually restarts
+                    // (the plain cached read never advanced observedAt).
+                    Task { await statusModel.refreshFromProviders() }
                 }
-            }
-            .disabled(statusModel.isRefreshing)
-            .help("Ask the daemon to poll the providers for fresh usage now")
+            )
         }
+    }
+}
+
+/// Issue #283: the deck footer's bare-glyph action. No fill, no border, no
+/// text — secondary at rest, primary on hover — with the button's NAME kept
+/// in the tooltip and the accessibility label so a bare icon costs a
+/// VoiceOver user nothing.
+struct DeckFooterIconButton: View {
+    let systemImage: String
+    /// The name the glyph no longer says out loud; leads the tooltip.
+    let name: String
+    let help: String
+    let accessibilityLabel: String
+    var accessibilityHint: String?
+    /// Renders the in-flight spinner in the glyph's place and disables the
+    /// button (the pre-#283 Refresh affordance, preserved).
+    var isBusy: Bool = false
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        if let accessibilityHint {
+            button.accessibilityHint(accessibilityHint)
+        } else {
+            button
+        }
+    }
+
+    private var button: some View {
+        Button(action: action) {
+            Group {
+                if isBusy {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: systemImage)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(isHovered ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                }
+            }
+            // Issue #271's lesson, stated: size FIRST, then take a plain
+            // content shape. `Rectangle().size(…)` anchors the shape at the
+            // view's origin, so the hit target drifts off the glyph — that
+            // was the #271 bug and it must not be re-introduced here.
+            .frame(width: 22, height: 22)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isBusy)
+        .onHover { isHovered = $0 }
+        .help("\(name) — \(help)")
+        .accessibilityLabel(accessibilityLabel)
     }
 }
 
@@ -1371,6 +1449,29 @@ struct DeckAccountRowView: View {
                 : "Pin to Menu Bar") {
                 deckModel.toggleMenuBarPin(accountID: row.account.id)
             }
+            // Issue #292 (Tim's field report): a pinned account always
+            // showed its lowest window — no way to watch the Fable weekly.
+            // While pinned, the pin can choose a window class; "Lowest
+            // window" is the unchanged default, and a chosen window the
+            // account stops reporting falls back to lowest with honest
+            // copy in the popover source line.
+            if deckModel.isMenuBarPinned(row.account.id) {
+                Picker("Menu Bar Window", selection: Binding(
+                    get: {
+                        deckModel.menuBarPinWindow(for: row.account.id)?.rawValue ?? ""
+                    },
+                    set: { key in
+                        deckModel.pinMenuBar(
+                            accountID: row.account.id,
+                            window: MenuBarPinResolver.PinWindow(rawValue: key)
+                        )
+                    }
+                )) {
+                    ForEach(pinWindowMenuOptions, id: \.key) { option in
+                        Text(option.title).tag(option.key)
+                    }
+                }
+            }
             if let provider = DeckProvider.from(row.account.provider) {
                 Toggle(
                     "Follow Active \(provider.displayName) Account",
@@ -1381,6 +1482,26 @@ struct DeckAccountRowView: View {
                 )
             }
         }
+    }
+
+    /// Issue #292: the pin's window rows — "Lowest window" plus only the
+    /// window classes this account actually reports (CodeRabbit, PR #293:
+    /// offering a class the account never has invites a dead choice), each
+    /// named with the card's own window title ("Weekly · Fable"). A stored
+    /// choice whose class isn't reported right now earns a ghost row so
+    /// the picker always contains its current selection.
+    private var pinWindowMenuOptions: [(key: String, title: String)] {
+        var options: [(key: String, title: String)] = [(key: "", title: "Lowest window")]
+        for choice in MenuBarPinResolver.PinWindow.allCases {
+            if let window = row.windows.first(where: { choice.matches(scope: $0.scope) }) {
+                options.append((key: choice.rawValue, title: window.title))
+            }
+        }
+        if let current = deckModel.menuBarPinWindow(for: row.account.id),
+           !options.contains(where: { $0.key == current.rawValue }) {
+            options.append((key: current.rawValue, title: "\(current.genericTitle) (not reported)"))
+        }
+        return options
     }
 
     /// Issue #213: the card's inline sign-in flow surface — the same phase
@@ -1886,37 +2007,48 @@ struct AvailabilityGaugeView: View {
 }
 
 /// Issue #235: the chip's click-open detail popover — gauge + needle, the
-/// plain-language sustainable-pace readout, the non-jargon decision
-/// paragraph, then the numbers (pool, pace, 7-day low, drought time when
-/// applicable, burst headroom, next big reset) and the honest exclusions.
+/// plain-language sustainable-pace readout, then the numbers and the honest
+/// exclusions. Issue #281 (Tim: "much cleaner, please"): the ten-line fact
+/// wall became titled groups of label/value rows, and the three-band legend
+/// paragraph moved onto the verdict bar's hover, leaving one sentence of
+/// guidance for the band the deck is actually in.
 /// Every string comes from `AvailabilityHealthPresentation` (Core, tested).
 struct AvailabilityHealthPopoverView: View {
     let presentation: AvailabilityHealthPresentation
+
+    /// The popover's real width — the number every #281 layout decision was
+    /// measured against (Tim's width addendum: design to the narrow width,
+    /// not to a wide preview).
+    static let width: CGFloat = 300
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(presentation.title)
                 .font(.system(size: 12, weight: .semibold))
             if let score = presentation.score {
+                // Issue #281: the legend RELOCATES here — the bar is what
+                // encodes the band, so its hover is where "what do the
+                // colors mean" belongs. Spoken too, so VoiceOver keeps the
+                // full legend it used to hear from the popover body.
                 AvailabilityGaugeView(score: score)
+                    .help(AvailabilityHealthPresentation.meaningParagraph)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(
+                        "What the colors mean. "
+                        + AvailabilityHealthPresentation.meaningParagraph
+                    )
             }
             Text(presentation.readout)
                 .font(.system(size: 11, weight: .medium))
                 .fixedSize(horizontal: false, vertical: true)
-            Text(AvailabilityHealthPresentation.meaningParagraph)
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if !presentation.factLines.isEmpty {
-                VStack(alignment: .leading, spacing: 3) {
-                    ForEach(presentation.factLines, id: \.self) { line in
-                        Text(line)
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
+            if let guidance = presentation.guidance {
+                Text(guidance)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            ForEach(presentation.sections, id: \.title) { section in
+                HealthSectionView(section: section)
             }
             if let excluded = presentation.excludedLine {
                 Text(excluded)
@@ -1936,7 +2068,77 @@ struct AvailabilityHealthPopoverView: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(12)
-        .frame(width: 300, alignment: .leading)
+        .frame(width: Self.width, alignment: .leading)
+    }
+}
+
+/// Issue #281: one titled group of the health detail — a small-caps header
+/// above its rows, NOT a left gutter column. Measured decision, not taste:
+/// the popover is 300 pt wide and 24 pt of that is padding, so a gutter wide
+/// enough for "WEEK AHEAD" (~72 pt) plus the label column (~66 pt) would
+/// leave the value column near 130 pt — and the relief row's numbers alone
+/// need ~150 pt. The header costs one 12 pt line per group and gives the
+/// values the full width back.
+struct HealthSectionView: View {
+    let section: HealthSection
+
+    /// The label column, sized to the longest label the redesign can
+    /// produce ("Today's burn" / "Lowest point" at 11 pt ≈ 66 pt). Fixed
+    /// rather than intrinsic so the value column's numbers line up down the
+    /// WHOLE popover, not just within one group.
+    static let labelWidth: CGFloat = 68
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(section.title.uppercased())
+                .font(.system(size: 9, weight: .semibold))
+                .tracking(0.6)
+                .foregroundStyle(.tertiary)
+            ForEach(section.rows, id: \.self) { row in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(row.label)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .frame(width: Self.labelWidth, alignment: .leading)
+                    // The value column: numbers primary and monospaced so
+                    // the eye can scan down them, right-aligned against the
+                    // popover's edge for the same reason.
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        Spacer(minLength: 0)
+                        if let name = row.name, !name.isEmpty {
+                            // The ONLY ellipsizable part of any row (Tim's
+                            // width rule). It yields width first because
+                            // the numbers beside it carry `layoutPriority`.
+                            Text(name)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                        Text(row.value)
+                            .font(.system(size: 11))
+                            .monospacedDigit()
+                            // Never truncated (Tim's width rule: only the
+                            // NAME may ellipsize, never the numbers): in
+                            // the pathological case the value wraps to a
+                            // second line rather than losing a digit or a
+                            // unit — a one-line ellipsis here could eat
+                            // exactly the numbers this redesign exists to
+                            // surface (CodeRabbit, PR #294).
+                            .fixedSize(horizontal: false, vertical: true)
+                            .multilineTextAlignment(.trailing)
+                            .layoutPriority(1)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+            }
+        }
+        // Issue #65/#113 discipline, applied per GROUP: VoiceOver hears
+        // "Now: Pool 380 of 12000 pts; Usable 160 pts · 1 of 6 accounts"
+        // instead of a scatter of bare values.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(section.accessibilityLabel)
     }
 }
 
@@ -1987,6 +2189,11 @@ struct ProxyWeightBadge: View {
     /// Fable weight — the tooltip carries the rest of the story so the live
     /// weight is one hover away, not hidden.
     private var tooltip: String {
+        // Issue #279: the pool has this machine but not this account — the
+        // quiet fact, stated; the join affordance lives in Settings.
+        if presentation.absentFromPool {
+            return ProxyPool.notInPoolTooltip
+        }
         if presentation.benchedForFable {
             return "Benched for Fable routing — weight \(presentation.liveWeight) "
                 + "still routes this account's other-model traffic"
@@ -1999,16 +2206,22 @@ struct ProxyWeightBadge: View {
         HStack(spacing: 2) {
             Image(systemName: "arrow.triangle.branch")
                 .font(.system(size: 8.5))
-            Text("\(presentation.weight)")
-                .font(DeckType.tier)
-                .monospacedDigit()
+            // Issue #279: the absent state is glyph-only — a number would
+            // claim a routing weight that doesn't exist.
+            if !presentation.absentFromPool {
+                Text("\(presentation.weight)")
+                    .font(DeckType.tier)
+                    .monospacedDigit()
+            }
         }
-        .foregroundStyle(.secondary)
+        .foregroundStyle(presentation.absentFromPool ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.secondary))
         .help(tooltip)
         .accessibilityLabel(
-            presentation.benchedForFable
-                ? "Benched for Fable routing, weight \(presentation.liveWeight) for other models"
-                : "Proxy routing weight \(presentation.weight)"
+            presentation.absentFromPool
+                ? ProxyPool.notInPoolTooltip
+                : presentation.benchedForFable
+                    ? "Benched for Fable routing, weight \(presentation.liveWeight) for other models"
+                    : "Proxy routing weight \(presentation.weight)"
         )
     }
 }

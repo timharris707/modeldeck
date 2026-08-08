@@ -353,6 +353,174 @@ test('matching auth-status renews without a flip while Claude is running and san
   } finally { data.close(); }
 });
 
+test('matching renewal promotes only seeded Claude identity provenance (#280)', async (t) => {
+  await t.test('a seeded match becomes verified, learns the UUID, and is visible in state metadata', async () => {
+    const data = fixture();
+    try {
+      data.store.saveAccount({
+        id: data.target.id,
+        provider: data.target.provider,
+        label: data.target.label,
+        profileRef: data.target.profileRef,
+        identity: data.target.identity,
+        color: data.target.color,
+        enabled: data.target.enabled,
+        metadata: { identitySource: 'seed', fixtureMarker: 'preserved' },
+      });
+      data.expire();
+
+      const renew = await data.service.renewClaudeAccount(data.target.id);
+
+      assert.equal(renew.outcome, 'renewed');
+      assert.equal(renew.mechanism, 'auth-status');
+      assert.equal(renew.path, 'no-flip');
+      const saved = data.store.getAccount(data.target.id);
+      assert.equal(saved.metadata.identitySource, 'verified');
+      assert.equal(saved.metadata.claudeAccountUuid, TARGET_UUID);
+      assert.equal(saved.metadata.fixtureMarker, 'preserved');
+      const stateAccount = (await data.service.state()).accounts.find((item) => item.id === data.target.id);
+      assert.equal(stateAccount.metadata.identitySource, 'verified');
+      assert.equal(stateAccount.metadata.claudeAccountUuid, TARGET_UUID);
+    } finally { data.close(); }
+  });
+
+  await t.test('an already-verified match performs zero identity store writes', async () => {
+    const data = fixture();
+    try {
+      data.store.saveAccount({
+        id: data.target.id,
+        provider: data.target.provider,
+        label: data.target.label,
+        profileRef: data.target.profileRef,
+        identity: data.target.identity,
+        color: data.target.color,
+        enabled: data.target.enabled,
+        metadata: { identitySource: 'verified' },
+      });
+      data.expire();
+
+      // A completed renewal always persists its attempt history. Stub that
+      // established bookkeeping write so this pin measures only #280's
+      // promotion path: already-verified evidence must not call saveAccount.
+      data.service.recordClaudeRenewalAttempt = (_accountId, attempt) => attempt;
+      const originalSave = data.store.saveAccount.bind(data.store);
+      let identityWrites = 0;
+      data.store.saveAccount = (input) => {
+        identityWrites += 1;
+        return originalSave(input);
+      };
+
+      const renew = await data.service.renewClaudeAccount(data.target.id);
+
+      assert.equal(renew.outcome, 'renewed');
+      assert.equal(renew.path, 'no-flip');
+      assert.equal(identityWrites, 0);
+      assert.equal(data.store.getAccount(data.target.id).metadata.identitySource, 'verified');
+      assert.equal(data.store.getAccount(data.target.id).metadata.claudeAccountUuid, undefined);
+    } finally { data.close(); }
+  });
+
+  await t.test('an unseeded match performs zero identity store writes', async () => {
+    const data = fixture();
+    try {
+      data.store.saveAccount({
+        id: data.target.id,
+        provider: data.target.provider,
+        label: data.target.label,
+        profileRef: data.target.profileRef,
+        identity: data.target.identity,
+        color: data.target.color,
+        enabled: data.target.enabled,
+        metadata: {},
+      });
+      data.expire();
+
+      data.service.recordClaudeRenewalAttempt = (_accountId, attempt) => attempt;
+      const originalSave = data.store.saveAccount.bind(data.store);
+      let identityWrites = 0;
+      data.store.saveAccount = (input) => {
+        identityWrites += 1;
+        return originalSave(input);
+      };
+
+      const renew = await data.service.renewClaudeAccount(data.target.id);
+
+      assert.equal(renew.outcome, 'renewed');
+      assert.equal(renew.path, 'no-flip');
+      assert.equal(identityWrites, 0);
+      assert.equal(data.store.getAccount(data.target.id).metadata.identitySource, undefined);
+      assert.equal(data.store.getAccount(data.target.id).metadata.claudeAccountUuid, undefined);
+    } finally { data.close(); }
+  });
+
+  await t.test('a mismatched seeded identity stays untouched and keeps the existing renewal outcome', async () => {
+    const data = fixture({
+      statusOutput: JSON.stringify({
+        email: 'other@example.invalid',
+        accountUuid: 'uuid-other-placeholder',
+      }),
+    });
+    try {
+      const metadata = { identitySource: 'seed', fixtureMarker: 'preserved' };
+      data.store.saveAccount({
+        id: data.target.id,
+        provider: data.target.provider,
+        label: data.target.label,
+        profileRef: data.target.profileRef,
+        identity: data.target.identity,
+        color: data.target.color,
+        enabled: data.target.enabled,
+        metadata,
+      });
+      data.expire();
+
+      const renew = await data.service.renewClaudeAccount(data.target.id);
+
+      // This is the pre-#280 mismatch result: a quiet guarded flip succeeds.
+      assert.equal(renew.outcome, 'renewed');
+      assert.equal(renew.mechanism, 'auth-status');
+      assert.equal(renew.path, 'flip');
+      assert.equal(renew.identityDecline, 'mismatched');
+      const saved = data.store.getAccount(data.target.id);
+      assert.equal(saved.identity, TARGET_EMAIL);
+      assert.equal(saved.metadata.identitySource, 'seed');
+      assert.equal(saved.metadata.claudeAccountUuid, undefined);
+      assert.equal(saved.metadata.fixtureMarker, 'preserved');
+    } finally { data.close(); }
+  });
+
+  await t.test('ambiguous reported UUIDs are never chosen for metadata', async () => {
+    const data = fixture({
+      statusOutput: JSON.stringify({
+        email: TARGET_EMAIL,
+        accountUuid: 'uuid-first-placeholder',
+        nested: { account_uuid: 'uuid-second-placeholder' },
+      }),
+    });
+    try {
+      data.store.saveAccount({
+        id: data.target.id,
+        provider: data.target.provider,
+        label: data.target.label,
+        profileRef: data.target.profileRef,
+        identity: data.target.identity,
+        color: data.target.color,
+        enabled: data.target.enabled,
+        metadata: { identitySource: 'seed' },
+      });
+      data.expire();
+
+      const renew = await data.service.renewClaudeAccount(data.target.id);
+
+      assert.equal(renew.outcome, 'renewed');
+      assert.equal(renew.path, 'no-flip');
+      const saved = data.store.getAccount(data.target.id);
+      assert.equal(saved.metadata.identitySource, 'verified');
+      assert.equal(saved.metadata.claudeAccountUuid, undefined);
+    } finally { data.close(); }
+  });
+});
+
 test('identity mismatch falls back to a quiet guarded flip and restores activation', async () => {
   const data = fixture({ statusOutput: JSON.stringify({ email: 'other@example.invalid' }) });
   try {

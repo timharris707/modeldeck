@@ -243,17 +243,32 @@ struct Issue244PresentationTests {
 
     @Test func currentBurnLineIsPinned() {
         // Tim's first live number: today's rate, and how far ahead of the
-        // weekly pace it runs. 2800 / ~406.7 → 6.9×.
-        #expect(degradedPresentation.factLines.contains(
-            "Current burn: ~2800 pts/day (6.9× your weekly pace)"
-        ))
+        // weekly pace it runs. 2800 / ~406.7 → 6.9×. Issue #281 moved it
+        // into the PACE group as a label/value row — same numbers, and the
+        // weekly pace it compares against now sits one row above it.
+        let pace = degradedPresentation.section(
+            AvailabilityHealthPresentation.SectionTitle.pace
+        )
+        // #281 also grouped thousands for readability. The separator is
+        // LOCALE-AWARE, so build the expectation with the same formatter
+        // configuration rather than hardcoding a US comma — CodeRabbit (PR
+        // #285) caught that the first version of this pin would fail on a
+        // non-US install.
+        let grouping: (Int) -> String = { value in
+            let formatter = NumberFormatter()
+            formatter.numberStyle = .decimal
+            formatter.usesGroupingSeparator = true
+            formatter.maximumFractionDigits = 0
+            return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+        }
+        #expect(pace?.row("Today's burn")?.value == "~\(grouping(2800)) pts/day · 6.9× pace")
+        #expect(pace?.row("Weekly pace")?.value.hasSuffix(" pts/day") == true)
     }
 
     @Test func bottomsOutVersusResetLineIsPinned() {
         // Tim's second live number: straight-line runway vs the rescue.
-        #expect(degradedPresentation.factLines.contains(
-            "At today's rate: pool bottoms out in ~10 hr; next reset lands in 7 hr"
-        ))
+        #expect(degradedPresentation.row("Runway")?.value
+            == "bottoms out ~10 hr · reset in 7 hr")
     }
 
     @Test func degradedReadoutOwnsTheYellowAndNamesTheBurst() {
@@ -303,8 +318,10 @@ struct Issue244PresentationTests {
             report: AvailabilityHealthEngine.report(for: .claude, state: fieldState, now: fixedNow),
             now: fixedNow
         )
-        #expect(!presentation.factLines.contains { $0.hasPrefix("Current burn:") })
-        #expect(!presentation.factLines.contains { $0.hasPrefix("At today's rate:") })
+        // #260's cold-window line still owns the burn slot, and there is
+        // no runway row to state a rate the window never measured.
+        #expect(presentation.row("Today's burn")?.value == "still measuring")
+        #expect(presentation.row("Runway") == nil)
     }
 
     @Test func yellowDeckReadoutCarriesTheBurstClause() {
@@ -322,7 +339,7 @@ struct Issue244PresentationTests {
         #expect(presentation.readout.hasSuffix(
             "Today's burn runs ahead of that pace and would dry the pool in 6 hr."
         ))
-        #expect(presentation.factLines.contains { $0.hasPrefix("At today's rate:") })
+        #expect(presentation.row("Runway") != nil)
     }
 
     @Test func redDeckShowsTheBurstFactLines() {
@@ -337,8 +354,12 @@ struct Issue244PresentationTests {
             now: fixedNow
         )
         #expect(presentation.verdict == .red)
-        #expect(presentation.factLines.contains { $0.hasPrefix("Pool dry in ") })
-        #expect(presentation.factLines.contains { $0.hasPrefix("At today's rate:") })
+        #expect(presentation.row("Pool dry")?.value.hasPrefix("in ") == true)
+        #expect(presentation.row("Runway") != nil)
+        // #281: both live in their own groups, never one merged line.
+        #expect(presentation.section(
+            AvailabilityHealthPresentation.SectionTitle.weekAhead
+        )?.row("Pool dry") != nil)
     }
 
     @Test func zeroRateBurnLineIsSuppressed() {
@@ -351,7 +372,7 @@ struct Issue244PresentationTests {
             ),
             now: fixedNow
         )
-        #expect(!presentation.factLines.contains { $0.hasPrefix("Current burn:") })
+        #expect(presentation.row("Today's burn") == nil)
         // At 1 pt/day the line is honest again.
         let onePoint = AvailabilityHealthPresentation.make(
             report: AvailabilityHealthEngine.report(
@@ -359,7 +380,7 @@ struct Issue244PresentationTests {
             ),
             now: fixedNow
         )
-        #expect(onePoint.factLines.contains { $0.hasPrefix("Current burn: ~1 pts/day") })
+        #expect(onePoint.row("Today's burn")?.value.hasPrefix("~1 pts/day") == true)
     }
 
     @Test func activeButHarmlessBurnShowsTheRateOnly() {
@@ -369,8 +390,8 @@ struct Issue244PresentationTests {
             ),
             now: fixedNow
         )
-        #expect(presentation.factLines.contains { $0.hasPrefix("Current burn: ~500 pts/day") })
-        #expect(!presentation.factLines.contains { $0.hasPrefix("At today's rate:") })
+        #expect(presentation.row("Today's burn")?.value.hasPrefix("~500 pts/day") == true)
+        #expect(presentation.row("Runway") == nil)
         // Steady-state readout untouched.
         #expect(presentation.readout.contains("your current pace"))
     }

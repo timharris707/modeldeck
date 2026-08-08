@@ -517,12 +517,35 @@ struct AvailabilityReportTests {
         #expect(presentation.title == "Claude availability")
         #expect(presentation.verdict == report.verdict)
         #expect(presentation.chipWord == report.verdict?.displayWord)
-        #expect(presentation.factLines.contains("Pool now: 300 of 600 pts"))
-        #expect(presentation.factLines.contains { $0.hasPrefix("Measured pace: ") })
-        #expect(presentation.factLines.contains { $0.hasPrefix("Lowest point over 7 days: ") })
-        #expect(presentation.factLines.contains { $0.hasPrefix("Burst headroom today: ~") })
-        // Studio (5x, 60% used) restores 300 pts — the big reset.
-        #expect(presentation.factLines.contains { $0.hasPrefix("Next big reset: Studio, ") && $0.hasSuffix("(+300 pts)") })
+        // Issue #281: the same facts, now grouped label/value rows. Every
+        // number is byte-identical to the flat wall this replaced; only the
+        // labels and the grouping are new.
+        let now = presentation.section(AvailabilityHealthPresentation.SectionTitle.now)
+        let pace = presentation.section(AvailabilityHealthPresentation.SectionTitle.pace)
+        let week = presentation.section(AvailabilityHealthPresentation.SectionTitle.weekAhead)
+        // Locale-safe pin (CodeRabbit, PR #294): the presentation's point
+        // formatter is locale-aware (grouping AND digit glyphs), so the
+        // expectation is built with the same configuration rather than
+        // hardcoding ASCII digits.
+        let pts: (Int) -> String = { value in
+            let formatter = NumberFormatter()
+            formatter.numberStyle = .decimal
+            formatter.usesGroupingSeparator = true
+            formatter.maximumFractionDigits = 0
+            return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+        }
+        #expect(now?.row("Pool")?.value == "\(pts(300)) of \(pts(600)) pts")
+        #expect(pace?.row("Weekly pace")?.value.hasSuffix(" pts/day") == true)
+        #expect(week?.row("Lowest point")?.value.hasSuffix(" pts") == true)
+        #expect(week?.row("Burst room")?.value.hasPrefix("~") == true)
+        #expect(week?.row("Burst room")?.value.hasSuffix(" pts today") == true)
+        // Studio (5x, 60% used) restores 300 pts — the big reset. The
+        // account NAME travels separately: it is the only part the popover
+        // may ellipsize, and the numbers beside it never are.
+        let relief = week?.row("Next relief")
+        #expect(relief?.name == "Studio")
+        #expect(relief?.value.hasPrefix("+\(pts(300)) pts · ") == true)
+        #expect(relief?.spokenValue.hasPrefix("Studio +\(pts(300)) pts") == true)
         #expect(presentation.unknownTierLine == "Tier unknown, counted as 1×: Mystery")
         #expect(presentation.excludedLine == nil)
         #expect(presentation.chipTooltip.hasSuffix("Click for details."))
@@ -540,7 +563,8 @@ struct AvailabilityReportTests {
         #expect(report.verdict == .red)
         #expect(report.firstDroughtHours != nil)
         let presentation = AvailabilityHealthPresentation.make(report: report, now: fixedNow)
-        #expect(presentation.factLines.contains { $0.hasPrefix("Pool dry in ") })
+        #expect(presentation.row("Pool dry")?.value.hasPrefix("in ") == true)
+        #expect(presentation.row("Pool dry")?.value.hasSuffix(" at the current pace") == true)
     }
 
     @Test func droughtHoursTextFormats() {

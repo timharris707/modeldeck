@@ -61,27 +61,120 @@ test('sourcing the block exports the pinned pair when the env file exists', (t) 
   assert.deepEqual(output.split('\n'), [profile, profile]);
 });
 
-test('a failed proxy Keychain lookup exports an empty key without breaking shell startup', (t) => {
-  const home = fixtureHome(t);
-  runInstaller(home);
-  const dataDir = path.join(home, 'Library', 'Application Support', 'ModelDeck');
+/// A fake `security` for the MODELDECK_SECURITY_BIN test seam — never the
+/// real Keychain. `mode` 'missing' models an absent item (noisy non-zero
+/// exit); 'present' prints a placeholder key.
+function fakeSecurity(t, home, mode) {
   const binDir = path.join(home, 'bin');
-  fs.mkdirSync(dataDir, { recursive: true });
-  fs.mkdirSync(binDir);
-  fs.writeFileSync(path.join(dataDir, 'claude-env.sh'), claudePinnedEnvFileContent('/profiles/proxied', true));
-  // Never touch the test runner's real Keychain. This stand-in models a
-  // missing item by failing noisily; the generated pointer must suppress the
-  // error, export an empty value, and let even a `set -e` shell continue.
-  fs.writeFileSync(path.join(binDir, 'security'), [
+  fs.mkdirSync(binDir, { recursive: true });
+  const bin = path.join(binDir, 'security');
+  fs.writeFileSync(bin, mode === 'present' ? [
+    '#!/bin/sh',
+    'printf "FAKE-PLACEHOLDER-KEY\\n"',
+    '',
+  ].join('\n') : [
     '#!/bin/sh',
     'echo "fixture Keychain item missing" >&2',
     'exit 44',
     '',
   ].join('\n'), { mode: 0o700 });
-  const output = execFileSync('/bin/sh', ['-c', 'set -eu; . "$HOME/.zshenv"; printf "<%s>\\ncontinued" "$ANTHROPIC_API_KEY"'], {
-    env: { HOME: home, PATH: `${binDir}:/usr/bin:/bin` },
+  return bin;
+}
+
+test('a failed proxy Keychain lookup exports NOTHING and shell startup continues (#277 / #278 review, major 1)', (t) => {
+  // An empty exported ANTHROPIC_API_KEY is not harmless — it overrides the
+  // profile's stored OAuth. A missing item must leave the variable unset.
+  const home = fixtureHome(t);
+  runInstaller(home);
+  const dataDir = path.join(home, 'Library', 'Application Support', 'ModelDeck');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, 'claude-env.sh'), claudePinnedEnvFileContent('/profiles/proxied', true));
+  const security = fakeSecurity(t, home, 'missing');
+  const output = execFileSync('/bin/sh', ['-c', 'set -eu; . "$HOME/.zshenv"; printf "<%s|%s>\\ncontinued" "${ANTHROPIC_API_KEY-unset}" "${MODELDECK_MANAGED_ANTHROPIC_API_KEY-unset}"'], {
+    env: { HOME: home, PATH: process.env.PATH, MODELDECK_SECURITY_BIN: security },
   }).toString();
-  assert.equal(output, '<>\ncontinued');
+  assert.equal(output, '<unset|unset>\ncontinued');
+});
+
+test('a present Keychain item exports the pointer value with the managed marker', (t) => {
+  const home = fixtureHome(t);
+  runInstaller(home);
+  const dataDir = path.join(home, 'Library', 'Application Support', 'ModelDeck');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, 'claude-env.sh'), claudePinnedEnvFileContent('/profiles/proxied', true));
+  const security = fakeSecurity(t, home, 'present');
+  const output = execFileSync('/bin/sh', ['-c', 'set -eu; . "$HOME/.zshenv"; printf "<%s|%s>" "$ANTHROPIC_API_KEY" "$MODELDECK_MANAGED_ANTHROPIC_API_KEY"'], {
+    env: { HOME: home, PATH: process.env.PATH, MODELDECK_SECURITY_BIN: security },
+  }).toString();
+  assert.equal(output, '<FAKE-PLACEHOLDER-KEY|1>');
+});
+
+test('a vanished Keychain item clears an inherited managed key instead of leaving it stale', (t) => {
+  const home = fixtureHome(t);
+  runInstaller(home);
+  const dataDir = path.join(home, 'Library', 'Application Support', 'ModelDeck');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, 'claude-env.sh'), claudePinnedEnvFileContent('/profiles/proxied', true));
+  const security = fakeSecurity(t, home, 'missing');
+  const output = execFileSync('/bin/sh', ['-c', 'set -eu; . "$HOME/.zshenv"; printf "<%s>" "${ANTHROPIC_API_KEY-unset}"'], {
+    env: {
+      HOME: home,
+      PATH: process.env.PATH,
+      MODELDECK_SECURITY_BIN: security,
+      ANTHROPIC_API_KEY: 'inherited-managed-placeholder',
+      MODELDECK_MANAGED_ANTHROPIC_API_KEY: '1',
+    },
+  }).toString();
+  assert.equal(output, '<unset>');
+});
+
+test('xtrace never prints the expanded key assignment (#278 review, major 1)', (t) => {
+  const home = fixtureHome(t);
+  runInstaller(home);
+  const dataDir = path.join(home, 'Library', 'Application Support', 'ModelDeck');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, 'claude-env.sh'), claudePinnedEnvFileContent('/profiles/proxied', true));
+  const security = fakeSecurity(t, home, 'present');
+  // `sh -x` traces every expansion to stderr; the credential block must
+  // suspend tracing around the assignment and restore it afterwards.
+  const result = execFileSync('/bin/sh', ['-xc', '. "$HOME/.zshenv"; printf "traced-after:%s" "$MODELDECK_MANAGED_ANTHROPIC_API_KEY"'], {
+    env: { HOME: home, PATH: process.env.PATH, MODELDECK_SECURITY_BIN: security },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).toString();
+  assert.equal(result, 'traced-after:1');
+  const stderr = execFileSync('/bin/sh', ['-c', `/bin/sh -xc '. "$HOME/.zshenv"; :' 2>&1 1>/dev/null || true`], {
+    env: { HOME: home, PATH: process.env.PATH, MODELDECK_SECURITY_BIN: security },
+  }).toString();
+  assert.ok(!stderr.includes('FAKE-PLACEHOLDER-KEY'), `xtrace leaked the key:\n${stderr}`);
+  // Tracing is restored after the block, so the user's own -x still works.
+  assert.ok(stderr.includes('traced-after') || stderr.includes(':'), 'xtrace was not restored');
+});
+
+test('a nested shell with pins keeps its session identity and key — no repin (#278 review, blocker 3)', (t) => {
+  // A nested zsh belongs to the session that spawned it. After a
+  // proxy → direct activation flip rewrites claude-env.sh, a child of the
+  // OLD proxied session must keep the old pins AND its inherited managed
+  // key; repinning it would split the session across profiles and strip
+  // the credential its headless children need (#277).
+  const home = fixtureHome(t);
+  runInstaller(home);
+  const dataDir = path.join(home, 'Library', 'Application Support', 'ModelDeck');
+  fs.mkdirSync(dataDir, { recursive: true });
+  // The file on disk is the NEW direct profile's — what a nested shell
+  // would source after the flip.
+  fs.writeFileSync(path.join(dataDir, 'claude-env.sh'), claudePinnedEnvFileContent('/profiles/new-direct', false));
+  const output = execFileSync('/bin/sh', ['-c', 'set -eu; . "$HOME/.zshenv"; printf "<%s|%s|%s>" "$CLAUDE_CONFIG_DIR" "${ANTHROPIC_API_KEY-unset}" "${MODELDECK_MANAGED_ANTHROPIC_API_KEY-unset}"'], {
+    env: {
+      HOME: home,
+      PATH: process.env.PATH,
+      // Inherited from the old proxied session:
+      CLAUDE_CONFIG_DIR: '/profiles/old-proxied',
+      CLAUDE_SECURESTORAGE_CONFIG_DIR: '/profiles/old-proxied',
+      ANTHROPIC_API_KEY: 'inherited-managed-placeholder',
+      MODELDECK_MANAGED_ANTHROPIC_API_KEY: '1',
+    },
+  }).toString();
+  assert.equal(output, '</profiles/old-proxied|inherited-managed-placeholder|1>');
 });
 
 test('an unproxied profile clears an inherited key, but never the user\'s own (CodeRabbit, PR #278)', (t) => {

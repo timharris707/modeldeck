@@ -87,6 +87,18 @@ public final class MenuBarStatusModel: ObservableObject {
         didSet { recomputeIconState() }
     }
 
+    /// Issue #297: the deck's #254 general-weekly focus toggle, mirrored in
+    /// from `DeckPopoverModel` (it is an app-local popover preference, not a
+    /// daemon setting, so it never arrives through the settings document
+    /// like the pin and quiet mode do). The health-mode dot must evaluate
+    /// the same pool as the popover chip (issue #258: the toggle, Claude
+    /// only inside the engine) — otherwise dot and chip can disagree.
+    /// Display-only like every mode input here: `worstRemaining` and
+    /// `onStateUpdate` are untouched.
+    @Published public var focusGeneralWeekly: Bool = false {
+        didSet { recomputeIconState() }
+    }
+
     /// The account id the stored pin currently resolves to; nil while
     /// unpinned or unresolvable (account removed, no active account yet).
     public var resolvedPinnedAccountId: String? {
@@ -131,9 +143,25 @@ public final class MenuBarStatusModel: ObservableObject {
             return nil
         }
         if let state = deckState, let resolved = resolvedPinnedAccountId {
-            return WorstRemainingCalculator.worstRemaining(in: state, accountId: resolved)
+            return pinnedWorstRemaining(state: state, resolved: resolved)
         }
         return worstRemaining
+    }
+
+    /// Issue #292: the pinned account's displayed window — the pin's chosen
+    /// window class when it carries one AND the account reports a measurable
+    /// window of that class; the lowest non-spend window otherwise (both the
+    /// plain pre-#292 pin and the honest fallback for an absent class, e.g.
+    /// a pin on "model weekly" while the account reports no model window).
+    private func pinnedWorstRemaining(state: DeckState, resolved: String) -> WorstRemaining? {
+        if let stored = pinnedAccountId,
+           let choice = MenuBarPinResolver.pinWindow(stored),
+           let chosen = WorstRemainingCalculator.worstRemaining(
+               in: state, accountId: resolved, pinWindow: choice
+           ) {
+            return chosen
+        }
+        return WorstRemainingCalculator.worstRemaining(in: state, accountId: resolved)
     }
 
     /// Issue #249: the popover's rendered source caption ("Menu bar 36% —
@@ -183,7 +211,11 @@ public final class MenuBarStatusModel: ObservableObject {
             let verdict = deckState.flatMap {
                 AvailabilityHealthEngine.report(
                     for: healthProvider, state: $0, now: now,
-                    burstPointsPerDay: burnWindow.burstRate(for: healthProvider, now: now)
+                    burstPointsPerDay: burnWindow.burstRate(for: healthProvider, now: now),
+                    // Issue #297: same pool selection as the popover chip
+                    // (the deck's general-weekly toggle), so the two can
+                    // never render different verdicts from one state.
+                    generalWeekly: focusGeneralWeekly
                 ).verdict
             }
             // Issue #238 quiet mode: "When yellow or worse" / "Only when
@@ -223,7 +255,8 @@ public final class MenuBarStatusModel: ObservableObject {
         // notifications keep watching every account.
         let showWhenMode = MenuBarShowWhen.parse(showWhen)
         if let state = deckState, let resolved = resolvedPinnedAccountId {
-            let pinned = WorstRemainingCalculator.worstRemaining(in: state, accountId: resolved)
+            // Issue #292: honors the pin's window choice when it carries one.
+            let pinned = pinnedWorstRemaining(state: state, resolved: resolved)
             if let pinned, !showWhenMode.showsPercent(pinned.percent) {
                 iconState = .plain
                 return

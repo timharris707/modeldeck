@@ -41,8 +41,13 @@ export const CODEX_PROFILES_DIR = path.resolve(
 export const CODEX_ACTIVE_LINK = path.resolve(
   process.env.MODELDECK_CODEX_ACTIVE_LINK || path.join(os.homedir(), '.codex'),
 );
+// CLIProxyAPI owns OAuth and auth-file writes. ModelDeck only spawns its
+// provider login command, then reads identity/routing metadata from the auth
+// directory. Keep binary discovery configurable like Claude/Codex paths.
+export const CLIPROXY_BIN = process.env.MODELDECK_CLIPROXY_BIN || 'cliproxyapi';
+export const CLIPROXY_BASE_URL = process.env.MODELDECK_CLIPROXY_BASE_URL || 'http://127.0.0.1:8317';
 // CLIProxyAPI auth-file directory (an external tool's state, read-only):
-// each account file carries the routing `weight` an hourly rebalance job
+// each account file carries the routing `weight` an external rebalance job
 // maintains from live quota. The daemon only ever READS the non-secret
 // weight/identity fields to enrich /api/state; a missing directory means the
 // proxy simply isn't installed and nothing renders.

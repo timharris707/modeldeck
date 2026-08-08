@@ -852,6 +852,69 @@ public enum AvailabilityHealthEngine {
     }
 }
 
+// MARK: - Structured detail rows (issue #281)
+
+/// One label/value row of the redesigned health detail ("Pool" / "380 of
+/// 12000 pts"). Labels render secondary, values primary with monospaced
+/// digits — the deck cards' hierarchy. One fact per row (Tim's width
+/// addendum): a value never carries another row's fact.
+///
+/// Values carry the SAME numbers the flat fact wall showed; #281 changes
+/// presentation only. Point counts are locale-grouped ("12,000" in en_US)
+/// because legibility at this type size is the redesign's whole purpose —
+/// see `pointsFormatter`.
+public struct HealthFactRow: Equatable, Hashable, Sendable {
+    public var label: String
+    /// An account name that leads the value and is the ONLY part the view
+    /// may ellipsize when the row can't fit (Tim's width addendum: "truncate
+    /// the ACCOUNT NAME with an ellipsis, never the numbers"). Nil on every
+    /// row whose value is numbers only.
+    public var name: String?
+    public var value: String
+
+    public init(label: String, name: String? = nil, value: String) {
+        self.label = label
+        self.name = name
+        self.value = value
+    }
+
+    /// The value as one string — what VoiceOver hears and what tests pin,
+    /// with the truncatable name restored in front of the numbers.
+    public var spokenValue: String {
+        guard let name, !name.isEmpty else { return value }
+        return "\(name) \(value)"
+    }
+}
+
+/// One titled group of fact rows ("Now" / "Pace" / "Week ahead"). The view
+/// renders the title as an uppercased tertiary header ABOVE the rows —
+/// chosen over a left gutter column because the popover is 300 pt wide and
+/// a gutter would steal width the relief row needs (the width addendum
+/// makes that the deciding measurement; verified by screenshot at 300 pt
+/// with six-digit numbers and a 25-character account name).
+public struct HealthSection: Equatable, Sendable {
+    public var title: String
+    public var rows: [HealthFactRow]
+
+    public init(title: String, rows: [HealthFactRow]) {
+        self.title = title
+        self.rows = rows
+    }
+
+    /// The ONE spoken form for the whole group — derived here (the #65/#113
+    /// suppression rule) so VoiceOver reads a section coherently instead of
+    /// a scatter of bare values.
+    public var accessibilityLabel: String {
+        "\(title): " + rows.map { "\($0.label) \($0.spokenValue)" }.joined(separator: "; ")
+    }
+
+    /// The row carrying `label`, or nil — the lookup every migrated
+    /// string-pinning test uses instead of scanning a flat array.
+    public func row(_ label: String) -> HealthFactRow? {
+        rows.first { $0.label == label }
+    }
+}
+
 // MARK: - Presentation (pure strings/values for the chip + detail popover)
 
 /// Everything the deck chip, its detail popover, and accessibility read —
@@ -867,7 +930,14 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
     /// The plain-language sustainable-pace readout ("You could sustain
     /// about 1.8× your current pace — yellow, close to green.").
     public var readout: String
-    public var factLines: [String]
+    /// Issue #281: the CURRENT band's guidance, one sentence. The other two
+    /// bands moved to the verdict bar's hover (`meaningParagraph`) — never
+    /// deleted, just no longer three paragraphs deep in a detail popover.
+    /// Nil when there is no verdict to guide.
+    public var guidance: String?
+    /// Issue #281: the fact wall, grouped. Empty sections are dropped, so a
+    /// deck with nothing to say renders nothing rather than empty headers.
+    public var sections: [HealthSection]
     public var excludedLine: String?
     public var unknownTierLine: String?
     /// Popover title, e.g. "Claude availability".
@@ -878,12 +948,47 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
     public var accessibilitySummary: String
 
     /// One short non-jargon paragraph on what the colors mean as decisions
-    /// (Tim's wording requirement), shared by every popover.
+    /// (Tim's wording requirement). Issue #281 RELOCATED it out of the
+    /// detail popover's body and onto the verdict bar's hover — the bar is
+    /// what encodes the band, so the legend belongs on it. Never deleted:
+    /// the popover body now carries only the current band's sentence
+    /// (`guidance`), which is one of this paragraph's own clauses.
     public static let meaningParagraph =
         "Green: safe to launch heavy multi-agent work. "
         + "Yellow: normal work is fine — hold the heavy runs until the next reset. "
         + "Red: slow down and focus on one project. "
         + "The bar shows how close you are to the neighboring band."
+
+    /// Issue #281: the current band's guidance alone, as a sentence. Same
+    /// words as this band's clause in `meaningParagraph` (pinned by test),
+    /// so the popover body and the bar's hover can never disagree.
+    public static func guidance(for verdict: AvailabilityVerdict?) -> String? {
+        switch verdict {
+        case .green: return "Safe to launch heavy multi-agent work."
+        case .yellow: return "Normal work is fine — hold the heavy runs until the next reset."
+        case .red: return "Slow down and focus on one project."
+        case nil: return nil
+        }
+    }
+
+    /// Issue #281 section titles — one place, so the popover, the tests and
+    /// the VoiceOver grouping all name the same three groups.
+    public enum SectionTitle {
+        public static let now = "Now"
+        public static let pace = "Pace"
+        public static let weekAhead = "Week ahead"
+    }
+
+    /// The group with this title, or nil when it has no facts to show.
+    public func section(_ title: String) -> HealthSection? {
+        sections.first { $0.title == title }
+    }
+
+    /// The row carrying this label, wherever it groups — the lookup the
+    /// migrated string-pinning tests use in place of scanning `factLines`.
+    public func row(_ label: String) -> HealthFactRow? {
+        sections.compactMap { $0.row(label) }.first
+    }
 
     /// The points unit, explained once in fine print.
     public static let pointsFootnote =
@@ -906,7 +1011,8 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
                 verdict: nil,
                 score: nil,
                 readout: readout,
-                factLines: [],
+                guidance: nil,
+                sections: [],
                 excludedLine: excludedLine(report.excluded),
                 unknownTierLine: unknownTierLine(report.unknownTierLabels),
                 title: title,
@@ -954,20 +1060,36 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
                 multiple: multiple, pacePerDay: report.pacePointsPerDay
             )
         }
-        var facts: [String] = [
-            "Pool now: \(points(report.poolPoints)) of \(points(report.capacityPoints)) pts",
-            "Measured pace: \(points(report.pacePointsPerDay)) pts/day",
+        // Issue #281: the same facts, grouped and split into label/value
+        // rows. Nothing is added or dropped here — the flat `factLines`
+        // wall became three titled groups, one fact per row, so a value
+        // column of numbers can be scanned down. Section membership is the
+        // question each fact answers: what is true NOW, how fast it is
+        // moving (PACE), and what the 7-day sim says (WEEK AHEAD).
+        var nowRows: [HealthFactRow] = [
+            HealthFactRow(
+                label: "Pool",
+                value: "\(points(report.poolPoints)) of \(points(report.capacityPoints)) pts"
+            ),
         ]
+        var paceRows: [HealthFactRow] = [
+            HealthFactRow(
+                label: "Weekly pace",
+                value: "\(points(report.pacePointsPerDay)) pts/day"
+            ),
+        ]
+        var weekRows: [HealthFactRow] = []
         // Issue #257: what is reachable RIGHT NOW, stated whenever it
         // differs from the raw pool — points stranded in near-empty
         // accounts are counted in the pool but cannot host a session, and
         // that gap is exactly what made a 13%-full deck read GREEN.
         if report.usableAccountCount < report.pool.count
             || report.usablePoints < report.poolPoints {
-            facts.append(
-                "Usable now: \(points(report.usablePoints)) pts across "
-                + "\(report.usableAccountCount) of \(report.pool.count) accounts"
-            )
+            nowRows.append(HealthFactRow(
+                label: "Usable",
+                value: "\(points(report.usablePoints)) pts · "
+                    + "\(report.usableAccountCount) of \(report.pool.count) accounts"
+            ))
         }
         // Issue #244, Tim's two live numbers. "Current burn" shows
         // whenever the window is active (unless the rate rounds to zero —
@@ -980,45 +1102,64 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
         // reading with no burst opinion in it, and an unexplained GREEN in
         // that gap is exactly what read as broken after v0.3.20 relaunched.
         if report.burstPointsPerDay == nil {
-            facts.append("Today's burn: still measuring")
+            paceRows.append(HealthFactRow(label: "Today's burn", value: "still measuring"))
         }
         if let burn = report.burstPointsPerDay, burn.rounded() >= 1 {
-            var line = "Current burn: ~\(points(burn)) pts/day"
+            var value = "~\(points(burn)) pts/day"
             if report.pacePointsPerDay > 0 {
-                line += " (\(multiplierText(burn / report.pacePointsPerDay))× your weekly pace)"
+                // The weekly pace sits one row above, so "3.0× pace" is
+                // unambiguous where the old flat line had to spell out
+                // "your weekly pace" — and that spelling no longer fits.
+                value += " · \(multiplierText(burn / report.pacePointsPerDay))× pace"
             }
-            facts.append(line)
+            paceRows.append(HealthFactRow(label: "Today's burn", value: value))
         }
         if let bottomsOut = report.burstBottomsOutHours,
            let soonestReset = report.soonestResetHours {
-            facts.append(
-                "At today's rate: pool bottoms out in ~\(hoursText(Int(bottomsOut.rounded())));"
-                + " next reset lands in \(hoursText(Int(soonestReset.rounded())))"
-            )
+            paceRows.append(HealthFactRow(
+                label: "Runway",
+                value: "bottoms out ~\(hoursText(Int(bottomsOut.rounded())))"
+                    + " · reset in \(hoursText(Int(soonestReset.rounded())))"
+            ))
         }
         if let minPool = report.minPoolPoints {
-            facts.append("Lowest point over 7 days: \(points(minPool)) pts")
+            weekRows.append(HealthFactRow(label: "Lowest point", value: "\(points(minPool)) pts"))
         }
         if let droughtHours = report.firstDroughtHours {
-            facts.append("Pool dry in \(hoursText(droughtHours)) at the current pace")
+            weekRows.append(HealthFactRow(
+                label: "Pool dry",
+                value: "in \(hoursText(droughtHours)) at the current pace"
+            ))
         }
         if let headroom = report.burstHeadroomPoints {
-            facts.append("Burst headroom today: ~\(points(headroom)) pts")
+            weekRows.append(HealthFactRow(
+                label: "Burst room", value: "~\(points(headroom)) pts today"
+            ))
         }
         if let reset = report.nextBigReset, reset.restoredPoints >= 1 {
-            let when = lowercasedLead(
-                DeckBuilder.resetText(for: reset.date, now: now, calendar: calendar)
-            )
-            facts.append(
-                "Next big reset: \(reset.accountLabel), \(when) (+\(points(reset.restoredPoints)) pts)"
-            )
+            // The one row whose width is not under our control: an account
+            // label of any length leads it. It is therefore the row the
+            // width addendum names — the NAME ellipsizes, the numbers never
+            // do, which is why it travels as a separate field.
+            weekRows.append(HealthFactRow(
+                label: "Next relief",
+                name: reset.accountLabel,
+                value: "+\(points(reset.restoredPoints)) pts · "
+                    + reliefWhen(for: reset.date, now: now, calendar: calendar)
+            ))
         }
+        let sections = [
+            HealthSection(title: SectionTitle.now, rows: nowRows),
+            HealthSection(title: SectionTitle.pace, rows: paceRows),
+            HealthSection(title: SectionTitle.weekAhead, rows: weekRows),
+        ].filter { !$0.rows.isEmpty }
         return AvailabilityHealthPresentation(
             chipWord: verdict.displayWord,
             verdict: verdict,
             score: report.displayScore,
             readout: readout,
-            factLines: facts,
+            guidance: guidance(for: verdict),
+            sections: sections,
             excludedLine: excludedLine(report.excluded),
             unknownTierLine: unknownTierLine(report.unknownTierLabels),
             title: title,
@@ -1110,8 +1251,22 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
     }
 
     /// Whole points, deterministic formatting (no locale separators).
+    /// Grouped thousands (issue #281): the redesign's whole purpose is a
+    /// number you can read at a glance, and "12,000" beats "12000" at the
+    /// popover's small type. This changes PRESENTATION only — the value is
+    /// the same rounded integer the flat layout showed. Locale-aware, so a
+    /// non-US install groups the way that install expects.
+    private static let pointsFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = true
+        formatter.maximumFractionDigits = 0
+        return formatter
+    }()
+
     private static func points(_ value: Double) -> String {
-        "\(Int(value.rounded()))"
+        let rounded = Int(value.rounded())
+        return pointsFormatter.string(from: NSNumber(value: rounded)) ?? "\(rounded)"
     }
 
     /// "5 hr" under a day, "2.1 days" beyond — the drought-time phrasing.
@@ -1123,5 +1278,18 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
     private static func lowercasedLead(_ text: String) -> String {
         guard let first = text.first else { return text }
         return first.lowercased() + text.dropFirst()
+    }
+
+    /// Issue #281: the relief row's WHEN, without the deck's "Resets " lead
+    /// — the label already says this is the next relief, and the seven
+    /// characters it saves are what let the account name and the numbers
+    /// share one line at the popover's real width. Same source of truth as
+    /// every other reset time (`DeckBuilder.resetText`), so the phrasing
+    /// ("in 3 hr 20 min", "Tue 3:00 PM") can never drift from the cards.
+    static func reliefWhen(for date: Date?, now: Date, calendar: Calendar = .current) -> String {
+        let text = DeckBuilder.resetText(for: date, now: now, calendar: calendar)
+        if text == "resetting now" { return "now" }
+        guard text.hasPrefix("Resets ") else { return lowercasedLead(text) }
+        return String(text.dropFirst("Resets ".count))
     }
 }

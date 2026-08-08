@@ -705,38 +705,50 @@ test('Claude probe env pins the secure-storage scope even over an ambient value'
 
 test('pinned env file exports both variables with one identical quoted path', () => {
   const content = claudePinnedEnvFileContent("/profiles/o'brien");
-  const lines = content.split('\n');
+  const lines = content.split('\n').map((line) => line.trim());
   const expected = `'/profiles/o'\\''brien'`;
   assert.ok(lines.includes(`export CLAUDE_CONFIG_DIR=${expected}`));
   assert.ok(lines.includes(`export CLAUDE_SECURESTORAGE_CONFIG_DIR=${expected}`));
   // Both vars must carry the exact same string (issue #66 spike caveat).
-  const values = lines.filter((line) => line.startsWith('export ')).map((line) => line.split('=').slice(1).join('='));
+  const values = lines.filter((line) => line.startsWith('export CLAUDE')).map((line) => line.split('=').slice(1).join('='));
   assert.equal(values.length, 2);
   assert.equal(values[0], values[1]);
+  // #278 review, blocker 3: the whole block is guarded so a nested shell
+  // that already carries a pin is never repinned to a later activation.
+  assert.ok(content.includes('if [ -z "${CLAUDE_CONFIG_DIR:-}" ]; then'), 'repin guard present');
   // CodeRabbit (PR #278): an unproxied profile must EXPORT no key, but it
-  // must still CLEAR one ModelDeck previously exported — a nested shell
-  // inherits it otherwise. The clear is guarded on our own marker so a key
-  // the user set for their own tooling is never touched.
-  assert.ok(!/^export ANTHROPIC_API_KEY=/m.test(content), 'no export on an unproxied profile');
+  // must still CLEAR one ModelDeck previously exported. The clear is
+  // guarded on our own marker so a key the user set for their own tooling
+  // is never touched.
+  assert.ok(!/^\s*export ANTHROPIC_API_KEY=/m.test(content), 'no export on an unproxied profile');
   assert.ok(content.includes('unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY'));
   assert.ok(content.includes('"${MODELDECK_MANAGED_ANTHROPIC_API_KEY:-}" = "1"'), 'guarded on our marker');
   assert.ok(content.endsWith('\n'));
   assert.throws(() => claudePinnedEnvFileContent(), /real path is required/);
 });
 
-test('proxy-routed pinned env file adds the fixed Keychain pointer without changing the quoted pins', () => {
+test('proxy-routed pinned env file adds the guarded Keychain pointer without changing the quoted pins', () => {
   const content = claudePinnedEnvFileContent("/profiles/o'brien", true);
   const expected = `'/profiles/o'\\''brien'`;
   assert.ok(content.includes(`export CLAUDE_CONFIG_DIR=${expected}`));
   assert.ok(content.includes(`export CLAUDE_SECURESTORAGE_CONFIG_DIR=${expected}`));
+  // #278 review, major 1: absolute-path lookup (with a test-only seam),
+  // captured into a scratch variable; only a NON-EMPTY value is exported —
+  // an empty ANTHROPIC_API_KEY would override stored OAuth.
   assert.ok(content.includes(
-    'export ANTHROPIC_API_KEY="$(security find-generic-password -s cli-proxy-api-client -w 2>/dev/null)"',
+    '__modeldeck_key="$("${MODELDECK_SECURITY_BIN:-/usr/bin/security}" find-generic-password -s cli-proxy-api-client -w 2>/dev/null || true)"',
   ));
-  assert.equal(content.match(/^export ANTHROPIC_API_KEY=/gm)?.length, 1);
+  assert.ok(content.includes('if [ -n "${__modeldeck_key:-}" ]; then'));
+  assert.ok(content.includes('export ANTHROPIC_API_KEY="$__modeldeck_key"'));
   // The marker (CodeRabbit, PR #278) records that WE set the key, so the
   // unproxied branch can clear ours without touching the user's own.
   assert.ok(content.includes('export MODELDECK_MANAGED_ANTHROPIC_API_KEY=1'));
-  assert.ok(!content.includes('unset ANTHROPIC_API_KEY'), 'a proxied profile never clears it');
+  // A vanished item clears a stale inherited managed key — the only unset
+  // a proxied profile performs.
+  assert.ok(content.includes('unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY'));
+  // #278 review, major 1: xtrace is suspended around the credential lines.
+  assert.ok(content.includes('case $- in *x*) __modeldeck_xtrace=1; set +x;; esac'));
+  assert.ok(content.includes('if [ "${__modeldeck_xtrace:-}" = "1" ]; then set -x; fi'));
   assert.ok(content.endsWith('\n'));
 });
 

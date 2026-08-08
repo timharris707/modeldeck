@@ -168,6 +168,78 @@ public enum MenuBarPinResolver {
         stored == noneSentinel
     }
 
+    // MARK: - Pinned window choice (issue #292)
+
+    /// Issue #292 (Tim's field report): a pinned account always displayed
+    /// its LOWEST window — usually the 5-hour burst limit — with no way to
+    /// watch the window he actually plans around (the Fable weekly). An
+    /// account pin can now carry a window choice: "<account id>|win:<key>"
+    /// shows that window CLASS instead of the lowest. Same free-string
+    /// setting, same downgrade contract as every sentinel: an old build
+    /// reads the whole value as a candidate account id, finds no match,
+    /// and falls back to lowest-across — degraded but never a crash.
+    public enum PinWindow: String, CaseIterable, Sendable {
+        /// The 5-hour burst limit.
+        case fiveHour = "5h"
+        /// The all-models weekly window.
+        case generalWeekly = "weekly"
+        /// The model-scoped weekly window (e.g. "Weekly · Fable") — keyed
+        /// on the CLASS, not a model name, so a provider-side model rename
+        /// never strands the pin.
+        case modelWeekly = "model"
+
+        /// Whether a snapshot scope belongs to this window class — the
+        /// same classification the deck's expanded-row ordering uses.
+        public func matches(scope: String) -> Bool {
+            DeckBuilder.windowRank(scope: scope) == windowRank
+        }
+
+        private var windowRank: Int {
+            switch self {
+            case .fiveHour: return 0
+            case .generalWeekly: return 1
+            case .modelWeekly: return 2
+            }
+        }
+
+        /// The class's generic name, for copy that has no concrete window
+        /// to title (e.g. the chosen class is absent from the account).
+        public var genericTitle: String {
+            switch self {
+            case .fiveHour: return "5-hour limit"
+            case .generalWeekly: return "Weekly · all models"
+            case .modelWeekly: return "model weekly"
+            }
+        }
+    }
+
+    /// The suffix separator carrying an account pin's window choice.
+    private static let windowSeparator = "|win:"
+
+    /// The stored value pinning an account to a window choice. A nil
+    /// choice (the "Lowest window" default) stores the plain account id —
+    /// byte-identical to the pre-#292 grammar, so the default never
+    /// writes a value an older build would treat as unresolvable.
+    public static func pinnedValue(accountId: String, window: PinWindow?) -> String {
+        guard let window else { return accountId }
+        return accountId + windowSeparator + window.rawValue
+    }
+
+    /// The stored value with any window-choice suffix removed — what
+    /// account resolution and every base-equality check runs on.
+    public static func pinBase(_ stored: String) -> String {
+        guard let range = stored.range(of: windowSeparator) else { return stored }
+        return String(stored[..<range.lowerBound])
+    }
+
+    /// The pin's window choice; nil for the plain grammar, every
+    /// sentinel, and an unrecognized future key — which degrades to the
+    /// lowest-window behavior rather than failing the whole pin.
+    public static func pinWindow(_ stored: String) -> PinWindow? {
+        guard let range = stored.range(of: windowSeparator) else { return nil }
+        return PinWindow(rawValue: String(stored[range.upperBound...]))
+    }
+
     /// Resolves a stored pin to a concrete account id against the current
     /// deck state; nil when it doesn't resolve (empty/unpinned, account
     /// removed, no active account for the provider, unknown sentinel) — the
@@ -190,7 +262,10 @@ public enum MenuBarPinResolver {
                 DeckProvider.from($0.provider) == provider && $0.isDefault
             }?.id
         }
-        return state.accounts.contains { $0.id == stored } ? stored : nil
+        // Issue #292: an account pin may carry a "|win:<key>" window
+        // choice — resolution runs on the bare account id.
+        let base = pinBase(stored)
+        return state.accounts.contains { $0.id == base } ? base : nil
     }
 }
 
@@ -433,6 +508,19 @@ public enum MenuBarSourceResolver {
         } else if pinnedSetting?.hasPrefix("active:") == true {
             tooltip = "The menu bar follows the active account and shows its lowest "
                 + "usage window — right now \(possessiveWindow)."
+        } else if let choice = pinnedSetting.flatMap(MenuBarPinResolver.pinWindow) {
+            // Issue #292: a pin carrying a window choice states the rule
+            // actually in force — the chosen window while it feeds the
+            // number, the honest fallback while that class isn't reported.
+            if choice.matches(scope: source.scope) {
+                tooltip = "The menu bar is pinned to \(possessiveWindow). "
+                    + "Right-click its card to unpin."
+            } else {
+                tooltip = "The pinned account's \(choice.genericTitle) window isn't "
+                    + "reported right now, so the menu bar shows its lowest "
+                    + "usage window — right now \(possessiveWindow). "
+                    + "Right-click its card to unpin."
+            }
         } else {
             tooltip = "The menu bar is pinned to this account and shows its lowest "
                 + "usage window — right now \(possessiveWindow). "
@@ -460,6 +548,24 @@ public enum WorstRemainingCalculator {
             accounts: state.accounts.filter { $0.id == accountId },
             usage: state.usage.filter {
                 $0.accountId == accountId && !UsageScope.isSpend($0.scope)
+            }
+        )
+    }
+
+    /// Issue #292: the chosen-window pinned variant — the pinned rule
+    /// restricted to one window CLASS of the account. Nil when the account
+    /// reports no measurable window of that class; the caller then falls
+    /// back to the lowest-window pick (and its copy says so) rather than
+    /// showing nothing.
+    public static func worstRemaining(
+        in state: DeckState,
+        accountId: String,
+        pinWindow: MenuBarPinResolver.PinWindow
+    ) -> WorstRemaining? {
+        worstRemaining(
+            accounts: state.accounts.filter { $0.id == accountId },
+            usage: state.usage.filter {
+                $0.accountId == accountId && pinWindow.matches(scope: $0.scope)
             }
         )
     }
