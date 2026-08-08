@@ -178,7 +178,11 @@ struct AvailabilityPoolTests {
                 claudeAccount(id: "c7", label: "Healthy", subscriptionType: "pro"),
             ],
             usage: [
-                snapshot(accountId: "c1", scope: "weekly", remaining: 50),
+                // Issue #264: a flagged account's FRESH data would now be
+                // included (see Issue264PresentationCandidacyTests) — this
+                // fixture's flagged account sits on stale data, so the
+                // exclusion reports the auth story, not generic staleness.
+                snapshot(accountId: "c1", scope: "weekly", remaining: 50, observedMinutesAgo: 45),
                 snapshot(accountId: "c2", scope: "weekly", remaining: 50, observedMinutesAgo: 45),
                 snapshot(accountId: "c3", scope: "weekly", remaining: 50, stale: true),
                 snapshot(accountId: "c4", scope: "weekly", remaining: 50, resetsInHours: nil),
@@ -416,7 +420,10 @@ struct AvailabilityMultipleTests {
         #expect(abs(headroom - 89.5) < 1)
     }
 
-    @Test func nextBigResetPicksTheLargestRestorationTiesBreakSoonest() {
+    @Test func nextReliefSkipsAnImmaterialSoonerReset() {
+        // A near-full 1x account resetting in 5 h restores only 90 pts —
+        // not relief on a pool this size. The 20x restoring 1,000 pts is
+        // the row's answer even though it lands much later.
         let accounts = [
             pool(remaining: 1000, capacity: 2000, resetIn: 100),
             AvailabilityPoolAccount(
@@ -427,6 +434,36 @@ struct AvailabilityMultipleTests {
         #expect(reset?.accountLabel == "Studio")
         #expect(reset?.restoredPoints == 1000)
         #expect(reset?.date == fixedNow.addingTimeInterval(100 * 3600))
+    }
+
+    @Test func nextReliefIsTheSoonestMateriallyRelievingReset() {
+        // Issue #310, Tim's field deck (placeholder labels): seven Max 20x
+        // accounts. "Drained B" restores 20 pts MORE than "Drained A" but
+        // lands a full day later; magnitude-first selection told Tim to
+        // wait until Sunday while a comparably sized relief landed in
+        // 18.5 h. Next relief must name the SOONEST material reset.
+        func account(_ label: String, remainingPercent: Double, resetIn hours: Double)
+            -> AvailabilityPoolAccount {
+            AvailabilityPoolAccount(
+                label: label,
+                remainingPoints: remainingPercent * 20,
+                capacityPoints: 2000,
+                hoursToReset: hours
+            )
+        }
+        let accounts = [
+            account("Drained A", remainingPercent: 2, resetIn: 18.45),  // +1,960 pts
+            account("Drained B", remainingPercent: 1, resetIn: 42.5),   // +1,980 pts, Sunday
+            account("Drained C", remainingPercent: 5, resetIn: 86.5),
+            account("Drained D", remainingPercent: 3, resetIn: 108.5),
+            account("Drained E", remainingPercent: 4, resetIn: 125.5),
+            account("Working", remainingPercent: 19, resetIn: 148.5),
+            account("Fresh", remainingPercent: 96, resetIn: 156.5),
+        ]
+        let reset = AvailabilityHealthEngine.nextBigReset(accounts, now: fixedNow)
+        #expect(reset?.accountLabel == "Drained A")
+        #expect(reset?.restoredPoints == 1960)
+        #expect(reset?.date == fixedNow.addingTimeInterval(18.45 * 3600))
     }
 }
 

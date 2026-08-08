@@ -855,10 +855,10 @@ public struct AccountCreate: Codable, Equatable, Sendable {
 public struct LoginCommand: Codable, Equatable, Sendable {
     public var provider: String
     public var command: String
-    /// Issue #99: the daemon's version-detected Claude sign-in flow —
-    /// "config-dir" (pre-2.1.216 env-scoped login) or "activation"
-    /// (>= 2.1.216: credentials key off the resolved ~/.claude, so the
-    /// target profile must be ACTIVATED before the plain login runs).
+    /// Issue #99: the daemon's conservative Claude sign-in flow —
+    /// "config-dir" below the historical 2.1.216 boundary or "activation"
+    /// at/above it, so affected releases have the target profile ACTIVATED
+    /// before the plain login runs. The daemon owns the compatibility gate.
     /// Absent on Codex specs and on pre-#99 daemons.
     public var flow: String?
     /// Issue #99: when true, the caller must activate this account before
@@ -1024,16 +1024,23 @@ public struct AccountVerification: Codable, Equatable, Sendable {
     /// identity belongs to a different account (issue #99). Optional by
     /// design: older daemons never send it.
     public var identityMismatch: IdentityMismatch?
+    /// Issue #300: optional, non-secret diagnosis for a Claude login found in
+    /// the plain Keychain service instead of this profile's hashed slot.
+    /// Older daemons omit it; callers fall back to their generic signed-out
+    /// copy when it is absent.
+    public var verifyHint: String?
 
     public init(
         account: DeckAccount,
         authenticated: Bool,
         identity: String? = nil,
-        identityMismatch: IdentityMismatch? = nil
+        identityMismatch: IdentityMismatch? = nil,
+        verifyHint: String? = nil
     ) {
         self.account = account
         self.authenticated = authenticated
         self.identity = identity
         self.identityMismatch = identityMismatch
+        self.verifyHint = verifyHint
     }
 }

@@ -5,7 +5,10 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../src/db.mjs';
-import { ModelDeckService } from '../src/service.mjs';
+import {
+  CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT,
+  ModelDeckService,
+} from '../src/service.mjs';
 import { createApp } from '../src/server.mjs';
 
 async function startFixture(serviceOptions = {}) {
@@ -65,6 +68,12 @@ async function request(fixture, route, options = {}) {
   return { response, body: await response.json() };
 }
 
+function claudeSnapshotsExpiringAt(expiresAt) {
+  const snapshots = [{ scope: 'Fable weekly', usedPercent: 20, source: 'fixture' }];
+  Object.defineProperty(snapshots, 'expiresAt', { value: expiresAt, enumerable: false });
+  return snapshots;
+}
+
 function requestWithHost(fixture, host) {
   const url = new URL(fixture.base);
   return new Promise((resolve, reject) => {
@@ -80,6 +89,8 @@ function requestWithHost(fixture, host) {
 test('retired dashboard paths return JSON 404 responses', async (t) => {
   const fixture = await startFixture();
   t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+  assert.equal(fixture.service.usageSnapshotPruneStarted, true,
+    'daemon listen starts retention after Store migration');
 
   for (const route of ['/', '/app.js']) {
     const result = await request(fixture, route);
@@ -406,6 +417,26 @@ test('state surfaces per-account refresh errors and flips authState on expired s
   assert.ok(!Number.isNaN(Date.parse(account.lastRefreshError.at)));
 });
 
+test('credential expiry used by refresh never reaches API payloads (issue #265)', async (t) => {
+  const expiresAt = Date.parse('2098-07-06T05:04:03.210Z');
+  const fixture = await startFixture({
+    fetchClaude: async () => claudeSnapshotsExpiringAt(expiresAt),
+  });
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  const refresh = await request(fixture, '/api/refresh', { method: 'POST', body: '{}' });
+  assert.equal(refresh.response.status, 200);
+  const state = await request(fixture, '/api/state');
+  assert.equal(state.response.status, 200);
+
+  for (const payload of [refresh.body, state.body]) {
+    const serialized = JSON.stringify(payload);
+    assert.doesNotMatch(serialized, new RegExp(String(expiresAt)));
+    assert.doesNotMatch(serialized, new RegExp(new Date(expiresAt).toISOString().replaceAll('.', '\\.')));
+    assert.doesNotMatch(serialized, /"expiresAt"/);
+  }
+});
+
 test('settings API validates partial updates and drives worst-capacity thresholds', async (t) => {
   const fixture = await startFixture();
   t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
@@ -507,14 +538,20 @@ test('settings API validates partial updates and drives worst-capacity threshold
 
 test('add-account flow: create, login spec, verify, and reference-only delete', async (t) => {
   const readCalls = { claude: 0, codex: 0 };
+  const daemonClaudePath = '/fixture/daemon-bin/claude';
+  const canonicalClaudePath = '/fixture/Claude Code/claude';
   const fixture = await startFixture({
     // Issue #99: pin the detected CLI below the resolved-home floor so the
     // login spec deterministically exercises the legacy env-scoped flow
     // (never the machine's real `claude --version`).
-    exec: async (_binary, args) => {
+    exec: async (binary, args) => {
+      if (binary === '/usr/bin/which') return { stdout: `${daemonClaudePath}\n` };
       if (args?.[0] === '--version') return { stdout: 'Claude Code 2.1.215' };
       return { stdout: '' };
     },
+    realpath: async (value) => value === daemonClaudePath
+      ? canonicalClaudePath
+      : fs.promises.realpath(value),
     readClaudeAuth: async ({ claudeConfigDir }) => {
       readCalls.claude += 1;
       readCalls.claudeConfigDir = claudeConfigDir;
@@ -555,6 +592,7 @@ test('add-account flow: create, login spec, verify, and reference-only delete', 
   result = await request(fixture, `/api/accounts/${claudeAccount.id}/login`);
   assert.equal(result.response.status, 200);
   assert.match(result.body.command, /CLAUDE_CONFIG_DIR=.*claude.* auth login$/);
+  assert.match(result.body.command, /'\/fixture\/Claude Code\/claude' auth login$/);
   assert.ok(!result.body.command.includes('logout'));
   assert.equal(result.body.flow, 'config-dir');
   assert.equal(result.body.requiresActivation, false);
@@ -612,16 +650,22 @@ test('add-account flow: create, login spec, verify, and reference-only delete', 
   assert.ok(fs.existsSync(codexAccount.profileRef));
 });
 
-// Issue #99: on Claude Code >= 2.1.216 credentials key off the resolved
-// ~/.claude, so the login spec must be activation-driven (plain
-// `claude /login`, no env override) and verify must refuse a read-back
-// identity that contradicts the intended account instead of laundering it.
-test('resolved-home CLI: activation-driven login spec and identity-mismatch refusal', async (t) => {
+// Issue #99's historical >=2.1.216 boundary keeps this login spec
+// activation-driven (plain `claude /login`, no command-level env override),
+// and verify must refuse a read-back identity that contradicts the intended
+// account instead of laundering it.
+test('historical-boundary CLI: activation-driven login spec and identity-mismatch refusal', async (t) => {
+  const daemonClaudePath = '/fixture/daemon-bin/claude';
+  const canonicalClaudePath = '/fixture/Claude Code/claude';
   const fixture = await startFixture({
-    exec: async (_binary, args) => {
+    exec: async (binary, args) => {
+      if (binary === '/usr/bin/which') return { stdout: `${daemonClaudePath}\n` };
       if (args?.[0] === '--version') return { stdout: 'Claude Code 2.1.216' };
       return { stdout: '' };
     },
+    realpath: async (value) => value === daemonClaudePath
+      ? canonicalClaudePath
+      : fs.promises.realpath(value),
     readClaudeAuth: async () => ({
       authenticated: true,
       identity: 'other@example.invalid',
@@ -639,6 +683,7 @@ test('resolved-home CLI: activation-driven login spec and identity-mismatch refu
   assert.equal(result.body.flow, 'activation');
   assert.equal(result.body.requiresActivation, true);
   assert.match(result.body.command, /claude.* \/login$/);
+  assert.equal(result.body.command, `'${canonicalClaudePath}' /login`);
   assert.ok(!result.body.command.includes('CLAUDE_CONFIG_DIR'));
   assert.ok(!result.body.command.includes('logout'));
 
@@ -654,6 +699,21 @@ test('resolved-home CLI: activation-driven login spec and identity-mismatch refu
   const stored = fixture.store.getAccount(seeded.id);
   assert.equal(stored.identity, 'intended@example.invalid');
   assert.equal(stored.metadata.claudePlan, undefined);
+
+  // A failed read-back whose credential landed in Claude's unhashed service
+  // carries an additive diagnostic on /verify only. No Keychain-derived
+  // state is persisted or copied into the ordinary state payload.
+  fixture.service.readClaudeAuth = async () => ({ authenticated: false, identity: null });
+  fixture.service.claudeCredentialKeychainSlotState = async () => ({
+    profileScoped: false,
+    unscoped: true,
+  });
+  result = await request(fixture, `/api/accounts/${seeded.id}/verify`, { method: 'POST' });
+  assert.equal(result.body.authenticated, false);
+  assert.equal(result.body.verifyHint, CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT);
+  const state = await request(fixture, '/api/state');
+  assert.equal(JSON.stringify(state.body).includes('verifyHint'), false);
+  assert.equal(JSON.stringify(fixture.store.getAccount(seeded.id)).includes('verifyHint'), false);
 });
 
 test('codex profile homes outside the managed directory are rejected end to end', async (t) => {

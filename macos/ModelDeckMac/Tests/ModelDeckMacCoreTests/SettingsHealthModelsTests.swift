@@ -300,6 +300,26 @@ struct AccountSignInModelTests {
         #expect(signedIn == 0)
     }
 
+    @Test func defaultKeychainVerifyHintReplacesGenericSignedOutMessage() async {
+        let backend = StubSignInBackend()
+        let hint = "A Claude credential exists in the default Keychain slot, but none was found for this ModelDeck profile."
+        backend.verifyResult = AccountVerification(
+            account: DeckAccount(id: "acct-1", provider: "claude", label: "Deck One"),
+            authenticated: false,
+            verifyHint: hint
+        )
+        let model = makeModel(backend)
+
+        await model.beginSignIn(account: account)
+        let confirmed = await model.confirmSignedIn(account: account)
+
+        #expect(!confirmed)
+        #expect(model.error(for: "acct-1") == hint)
+        if case .awaitingSignIn? = model.phase(for: "acct-1") {} else {
+            Issue.record("expected to stay on awaitingSignIn")
+        }
+    }
+
     @Test func verifyErrorSurfacesAndReturnsToAwaiting() async {
         let backend = StubSignInBackend()
         backend.verifyError = DaemonClientError.daemonError(message: "mutation token or origin rejected", status: 403)

@@ -480,6 +480,26 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
         DeckFreshness.signInRecovery(for: account)
     }
 
+    /// Issue #264: the clocked variant the deck card renders — upgrades the
+    /// `.idle` tone to `.liveIdle` while this account's newest observation
+    /// is fresh by the same 2×-interval rule as `staleness(now:...)` (a
+    /// running session's statusline captures are server-truth; the card
+    /// must not claim the data is paused). Nil-ness matches the clock-free
+    /// `signInRecovery` exactly, so warning-slot reconciliation
+    /// (`liveWarningIDs`) and the notice-suppression logic never disagree
+    /// with what the card shows.
+    public func signInRecovery(
+        now: Date,
+        autoRefreshInterval: TimeInterval
+    ) -> DeckFreshness.SignInRecovery? {
+        DeckFreshness.signInRecovery(
+            for: account,
+            newestObservedAt: newestObservedAt,
+            now: now,
+            autoRefreshInterval: autoRefreshInterval
+        )
+    }
+
     /// How this row's active marker renders when `isActive`: the full
     /// checkmark only when activation is physically effective (or
     /// unreported); a hollow warning-tinted marker with an honest caption
@@ -636,16 +656,27 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
 public struct DeckColumn: Equatable, Identifiable, Sendable {
     public var provider: DeckProvider
     public var rows: [DeckAccountRow]
+    /// Issue #315: how many of this column's accounts the zero-weight
+    /// filter is currently hiding. Purely presentational bookkeeping so the
+    /// header count can keep telling the truth about the ROSTER ("7
+    /// accounts" over 4 visible rows is the deliberate, minimal hint that
+    /// the filter is on — Tim's suggestion on the issue; no banner).
+    public var hiddenZeroWeightCount: Int
 
     public var id: String { provider.rawValue }
     public var title: String { provider.displayName }
     public var accountCountText: String {
-        rows.count == 1 ? "1 account" : "\(rows.count) accounts"
+        // Issue #315: counts ALL of the provider's deck accounts, hidden
+        // ones included — hiding is visual, and the count not shrinking is
+        // the quiet cue that rows are filtered, not gone.
+        let total = rows.count + hiddenZeroWeightCount
+        return total == 1 ? "1 account" : "\(total) accounts"
     }
 
-    public init(provider: DeckProvider, rows: [DeckAccountRow]) {
+    public init(provider: DeckProvider, rows: [DeckAccountRow], hiddenZeroWeightCount: Int = 0) {
         self.provider = provider
         self.rows = rows
+        self.hiddenZeroWeightCount = hiddenZeroWeightCount
     }
 }
 
@@ -1196,6 +1227,8 @@ public final class DeckPopoverModel: ObservableObject {
     static let preferModelWindowDefaultsKey = "modeldeck.popover.preferModelWindow"
     static let focusGeneralWeeklyDefaultsKey = "modeldeck.popover.focusGeneralWeekly"
     static let glassDefaultsKey = "modeldeck.popover.glass"
+    static let hideZeroWeightDefaultsKey = "modeldeck.popover.hideZeroWeight"
+    static let dismissedHeaderNoticesDefaultsKey = "modeldeck.popover.dismissedHeaderNotices"
 
     @Published public var layout: DeckLayout {
         didSet {
@@ -1679,6 +1712,102 @@ public final class DeckPopoverModel: ObservableObject {
         focusGeneralWeeklyHeadline.toggle()
     }
 
+    // MARK: Zero-weight account filter (issue #315)
+
+    /// Issue #315 (Tim, 2026-08-08): "a toggle that includes or hides
+    /// accounts with a weighting of zero … It wouldn't change how anything
+    /// functions. It would simply just hide or show." A PURE presentation
+    /// filter applied only in `columns(for:)` / `interleavedRows(for:)` —
+    /// the deck's render path. Every functional consumer (menu-bar %,
+    /// Availability Health, notifications, /api/capacity, refresh, renewal)
+    /// reads `DeckState`/snapshots directly and never consults this flag,
+    /// so a hidden account still counts everywhere non-visual (pinned by
+    /// Issue315ZeroWeightFilterTests). App-local (UserDefaults, the #73
+    /// pattern), never synced to the daemon; DEFAULT OFF.
+    @Published public var hideZeroWeightAccounts: Bool {
+        didSet { defaults.set(hideZeroWeightAccounts, forKey: Self.hideZeroWeightDefaultsKey) }
+    }
+
+    /// The footer toggle's action.
+    public func toggleZeroWeightFilter() {
+        hideZeroWeightAccounts.toggle()
+    }
+
+    /// Issue #315, repredicated by #317: which rows the filter hides —
+    /// exactly the accounts whose row DISPLAYS ⑂ 0, read from the same
+    /// `proxyWeightPresentation` derivation the badge renders. The glyph and
+    /// the toggle must never disagree (#317's field failure: six
+    /// Fable-benched rows showed ⑂ 0 — effective weight, live weight > 0 —
+    /// and the old live-weight-only predicate hid none of them, so the
+    /// toggle looked dead). Hides:
+    /// - live `proxyWeight == 0` (the proxy parked the account), and
+    /// - a Fable-benched row while it displays its effective 0 (#272/#287);
+    ///   the same row displaying its general weekly window shows its live
+    ///   weight and stays visible.
+    /// Still visible, matching what they display:
+    /// - nil presentation (no proxy on this machine / unrouted account) —
+    ///   the row shows no ⑂ at all;
+    /// - absent-from-pool rows — glyph-only badge, no number (#279), so
+    ///   there is no displayed 0 for the filter to agree with.
+    nonisolated public static func isHiddenByZeroWeightFilter(_ row: DeckAccountRow) -> Bool {
+        guard let presentation = row.proxyWeightPresentation else { return false }
+        return !presentation.absentFromPool && presentation.weight == 0
+    }
+
+    /// Issue #315: whether the footer offers the toggle at all. Only pool
+    /// machines have weights, so on a machine with no routed account the
+    /// control would be a dead switch — minimal register says omit it.
+    /// A persisted ON survives as an escape hatch via the view's
+    /// `|| hideZeroWeightAccounts` so the filter can always be turned off.
+    nonisolated public static func offersZeroWeightToggle(state: DeckState) -> Bool {
+        state.accounts.contains { $0.enabled && $0.proxyWeight != nil }
+    }
+
+    /// Applies the filter to already-derived rows; identity when OFF.
+    func applyingZeroWeightFilter(_ rows: [DeckAccountRow]) -> [DeckAccountRow] {
+        guard hideZeroWeightAccounts else { return rows }
+        return rows.filter { !Self.isHiddenByZeroWeightFilter($0) }
+    }
+
+    // MARK: Header notice dismissals (issue #302)
+
+    /// Issue #302 (Tim, 2026-08-08): "anything that gets put into that
+    /// space, I would like it to be dismissible." The kinds of persistent
+    /// informational lines the header info space can render. Per-KIND
+    /// dismissal by design: these lines are standing explanations, not
+    /// one-off messages, so dismissing "the menu bar caption" means "I've
+    /// understood what that number is — stop telling me", not "hide this
+    /// particular percent". Raw values are the persistence format — never
+    /// rename a case's raw value.
+    ///
+    /// Deliberately NOT here: live state that self-clears (daemon
+    /// unreachable, install progress) and the #241 staged-update prompt,
+    /// whose dismissal → passive badge is its own locked design.
+    public enum DeckHeaderNotice: String, CaseIterable, Sendable {
+        /// The #249 "Menu bar 36% — Studio · 5-hour limit" source caption.
+        case menuBarSource
+    }
+
+    /// The dismissed kinds. App-local (UserDefaults, the #73 pattern),
+    /// never synced to the daemon — which lines a user has read is a
+    /// display preference. Dismissed means GONE: no residual chrome, and
+    /// no re-enable UI (the caption's content survives in the source row's
+    /// checkmark tooltip, so nothing is lost).
+    @Published public private(set) var dismissedHeaderNotices: Set<DeckHeaderNotice>
+
+    public func isHeaderNoticeDismissed(_ notice: DeckHeaderNotice) -> Bool {
+        dismissedHeaderNotices.contains(notice)
+    }
+
+    public func dismissHeaderNotice(_ notice: DeckHeaderNotice) {
+        guard !dismissedHeaderNotices.contains(notice) else { return }
+        dismissedHeaderNotices.insert(notice)
+        defaults.set(
+            dismissedHeaderNotices.map(\.rawValue).sorted(),
+            forKey: Self.dismissedHeaderNoticesDefaultsKey
+        )
+    }
+
     /// Tim directive 2026-08-02: on each popover open, the cards whose
     /// headline moved since the PREVIOUS open glow briefly and roll their
     /// percent old → new — "what changed since I last looked" at a glance.
@@ -1765,6 +1894,15 @@ public final class DeckPopoverModel: ObservableObject {
         // also falls back to the default rather than to a blank window.
         self.glass = defaults.string(forKey: Self.glassDefaultsKey)
             .flatMap(DeckGlass.init(rawValue:)) ?? .default
+        // Issue #315: absent key reads false — nothing starts hidden.
+        self.hideZeroWeightAccounts = defaults.bool(forKey: Self.hideZeroWeightDefaultsKey)
+        // Issue #302: absent key reads empty — nothing starts dismissed.
+        // Unrecognized raw values (a downgrade, a removed kind) are dropped
+        // rather than crashing or resurrecting as some other notice.
+        self.dismissedHeaderNotices = Set(
+            (defaults.stringArray(forKey: Self.dismissedHeaderNoticesDefaultsKey) ?? [])
+                .compactMap(DeckHeaderNotice.init(rawValue:))
+        )
     }
 
     public func isExpanded(_ accountID: String) -> Bool {
@@ -1810,16 +1948,29 @@ public final class DeckPopoverModel: ObservableObject {
             preferModelWindowHeadline: preferModelWindowHeadline,
             preferGeneralWeeklyHeadline: focusGeneralWeeklyHeadline
         )
-        .map { DeckColumn(provider: $0.provider, rows: applyingActivation($0.rows)) }
+        .map { column in
+            // Issue #315: filter LAST, after the activation override, and
+            // remember how many rows it removed so the header count can
+            // keep describing the whole roster.
+            let rows = applyingActivation(column.rows)
+            let visible = applyingZeroWeightFilter(rows)
+            return DeckColumn(
+                provider: column.provider,
+                rows: visible,
+                hiddenZeroWeightCount: rows.count - visible.count
+            )
+        }
     }
 
     /// Single-column mode content (both providers interleaved by sort).
     public func interleavedRows(for state: DeckState, now: Date = Date()) -> [DeckAccountRow] {
-        applyingActivation(
-            DeckBuilder.interleavedRows(
-                state: state, sortOrder: sortOrder, direction: sortDirection, thresholds: thresholds, now: now,
-                preferModelWindowHeadline: preferModelWindowHeadline,
-                preferGeneralWeeklyHeadline: focusGeneralWeeklyHeadline
+        applyingZeroWeightFilter(
+            applyingActivation(
+                DeckBuilder.interleavedRows(
+                    state: state, sortOrder: sortOrder, direction: sortDirection, thresholds: thresholds, now: now,
+                    preferModelWindowHeadline: preferModelWindowHeadline,
+                    preferGeneralWeeklyHeadline: focusGeneralWeeklyHeadline
+                )
             )
         )
     }

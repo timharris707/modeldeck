@@ -534,8 +534,33 @@ public enum MenuBarSourceResolver {
 /// daemon grows a dedicated evaluation endpoint in Phase 2; this stays the
 /// fallback and the endpoint becomes another `UsageEvaluating` conformer.
 public enum WorstRemainingCalculator {
-    public static func worstRemaining(in state: DeckState) -> WorstRemaining? {
-        worstRemaining(accounts: state.accounts, usage: state.usage)
+    public static func worstRemaining(in state: DeckState, now: Date = Date()) -> WorstRemaining? {
+        worstRemaining(accounts: state.accounts, usage: headlineEligibleUsage(in: state, now: now))
+    }
+
+    /// Issue #264 (bonus fix): an account that cannot refresh — sign-in
+    /// required or Keychain-denied — freezes its stored percentages, yet
+    /// those frozen numbers could still win the lowest-across headline
+    /// while Availability Health counted the same account as ZERO capacity.
+    /// The global headline now keys on data age exactly like health does
+    /// (same `AvailabilityHealthEngine.defaultStaleAfter` threshold): a flagged
+    /// account's rows count only while fresh (a live session's statusline
+    /// captures keep them fresh — that account is honestly usable). The
+    /// PINNED variants are deliberately untouched: a pin is an explicit
+    /// user choice and its tooltip names the window it shows. Mirrors the
+    /// daemon's `evaluateWorstCapacity` authFlagged rule (src/capacity.mjs)
+    /// so the endpoint and this fallback pick the same headline.
+    static func headlineEligibleUsage(in state: DeckState, now: Date) -> [UsageSnapshot] {
+        let flagged = Set(state.accounts.filter {
+            let auth = $0.authState?.lowercased()
+            return auth == "signin-required" || auth == "keychain-denied"
+        }.map(\.id))
+        guard !flagged.isEmpty else { return state.usage }
+        return state.usage.filter { snapshot in
+            guard flagged.contains(snapshot.accountId) else { return true }
+            guard let observed = DeckDateParsing.date(from: snapshot.observedAt) else { return false }
+            return now.timeIntervalSince(observed) <= AvailabilityHealthEngine.defaultStaleAfter
+        }
     }
 
     /// The pinned-account variant: the same lowest-non-spend-window rule,

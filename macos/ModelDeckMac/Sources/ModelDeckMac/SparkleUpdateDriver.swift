@@ -23,6 +23,17 @@ import Sparkle
 final class SparkleUpdateDriver: NSObject, AppUpdateInstalling {
     private let updater: SPUUpdater
     private let userDriver: OneClickUserDriver
+    /// Issue #303: read for `stagedVersion` when an explicit start is
+    /// blocked — same weak ownership as the user driver's reference.
+    private weak var installModel: AppUpdateInstallModel?
+    /// Issue #303: at most one deferred-start wait at a time.
+    private var stagedRetryScheduled = false
+    /// Issue #303 (CodeRabbit, PR #307): ONE absolute deadline for the whole
+    /// deferred restart request — re-entries (a retry that finds the updater
+    /// blocked again) reuse it instead of restarting the clock, so repeated
+    /// transitions can never hold `.checking` past the window. Core-owned
+    /// arithmetic (AppUpdateStagedRetryBudget) so tests pin it.
+    private var stagedRetryBudget = AppUpdateStagedRetryBudget()
 
     /// Builds the driver only when the running bundle is fully configured
     /// for Sparkle (feed URL + EdDSA public key). Anything less returns nil
@@ -37,6 +48,7 @@ final class SparkleUpdateDriver: NSObject, AppUpdateInstalling {
     private init?(installModel: AppUpdateInstallModel, bundle: Bundle) {
         let userDriver = OneClickUserDriver(installModel: installModel)
         self.userDriver = userDriver
+        self.installModel = installModel
         self.updater = SPUUpdater(
             hostBundle: bundle,
             applicationBundle: bundle,
@@ -64,12 +76,71 @@ final class SparkleUpdateDriver: NSObject, AppUpdateInstalling {
             // Issue #163: a silent return here left the model stuck on
             // "Checking…" forever (updateNow() already reported .checking).
             // Say why the click can't act instead of eating it.
-            userDriver.reportBlockedStart()
+            //
+            // Issue #303: unless the blocker is a background session holding
+            // a STAGED install — then "an update is already in progress" is
+            // exactly the update the user is trying to finish, and Restart
+            // must complete it, not shrug. Keep the click alive and start
+            // the user-initiated session (which resumes the staged install)
+            // the moment the updater frees up.
+            switch AppUpdateCheckOutcomePolicy.onBlockedExplicitStart(
+                stagedVersion: installModel?.stagedVersion
+            ) {
+            case .retryWhenUpdaterIdle: beginInstallWhenUpdaterIdle()
+            case .reportBlocked: userDriver.reportBlockedStart()
+            }
             return
         }
+        // The session actually starts: the deferred restart request (if any)
+        // is resolved — the next one gets a fresh wait window.
+        stagedRetryBudget.clear()
         userDriver.mode = .userInitiated
         userDriver.beginUserInitiatedSession()
         updater.checkForUpdates()
+    }
+
+    /// Issue #303: bounded wait for the background session to release the
+    /// updater, then retry the explicit start. The wait only survives while
+    /// the model still shows the click's own `.checking` or the staged
+    /// story it is finishing (`.installedPendingRelaunch` — the background
+    /// session's terminal report can land mid-wait); any other phase means
+    /// something else took over, so the retry drops. The deadline is
+    /// ABSOLUTE for the whole request (CodeRabbit, PR #307): a retry that
+    /// finds the updater blocked again re-enters here and reuses it — the
+    /// clock never restarts. On expiry, fall back to the honest #165
+    /// blocked message — never a silent stuck state.
+    private func beginInstallWhenUpdaterIdle() {
+        guard !stagedRetryScheduled else { return }
+        stagedRetryScheduled = true
+        let deadline = stagedRetryBudget.armIfNeeded(now: Date())
+        Task { @MainActor in
+            while !stagedRetryBudget.isExpired(now: Date()) {
+                let remaining = deadline.timeIntervalSinceNow
+                try? await Task.sleep(
+                    nanoseconds: UInt64(max(0, min(0.5, remaining)) * 1_000_000_000)
+                )
+                switch installModel?.phase {
+                case .checking, .installedPendingRelaunch:
+                    break
+                default:
+                    // Superseded — the request is dead; resolve it.
+                    stagedRetryScheduled = false
+                    stagedRetryBudget.clear()
+                    return
+                }
+                if updater.canCheckForUpdates {
+                    // Clear the schedule flag BEFORE re-entering so a
+                    // (rare) still-blocked retry re-enters this wait —
+                    // against the SAME armed deadline, never a fresh one.
+                    stagedRetryScheduled = false
+                    beginInstall()
+                    return
+                }
+            }
+            stagedRetryScheduled = false
+            stagedRetryBudget.clear()
+            userDriver.reportBlockedStart()
+        }
     }
 
     func checkInBackground() {

@@ -33,6 +33,11 @@ extension DaemonClient: StatuslineConfiguring {}
 public final class AccountsSettingsModel: ObservableObject {
     @Published public private(set) var busyAccountID: String?
     @Published public private(set) var lastError: String?
+    /// Issue #194: non-nil while a statusline install/uninstall is in flight
+    /// for that account — the row's visible capture control renders its
+    /// spinner from this, distinct from the generic `busyAccountID` so an
+    /// edit/remove never puts a spinner on the capture control.
+    @Published public private(set) var statuslineBusyAccountID: String?
 
     /// Fresh daemon state after a successful edit/remove; the app pushes it
     /// into `MenuBarStatusModel.apply(deckState:)`.
@@ -88,6 +93,14 @@ public final class AccountsSettingsModel: ObservableObject {
             lastError = "Statusline capture isn't available in this build."
             return false
         }
+        // CodeRabbit PR #304: mirror `perform`'s single-mutation guard BEFORE
+        // touching the busy marker. Without this, clicking row B's capture
+        // control while row A's mutation is in flight would set the marker to
+        // B, have `perform` reject the call, and B's defer would then clear
+        // the marker while A still runs — stealing A's control spinner.
+        guard busyAccountID == nil else { return false }
+        statuslineBusyAccountID = account.id
+        defer { statuslineBusyAccountID = nil }
         return await perform(accountID: account.id) {
             _ = try await statusline.setClaudeStatuslineCapture(accountID: account.id, enabled: enabled)
         }

@@ -207,6 +207,25 @@ struct AddAccountModelTests {
         #expect(backend.refreshCalls == 0)
     }
 
+    @Test("A default-Keychain-slot verify hint replaces the generic signed-out message")
+    func defaultKeychainVerifyHint() async {
+        let backend = StubOnboardingBackend()
+        let hint = "A Claude credential exists in the default Keychain slot, but none was found for this ModelDeck profile."
+        backend.verification = AccountVerification(
+            account: DeckAccount(id: "acct-1", provider: "claude", label: "Work"),
+            authenticated: false,
+            verifyHint: hint
+        )
+        let model = makeModel(backend)
+        _ = await model.begin(provider: .claude, label: "Work", purpose: "", colorHex: nil)
+
+        let confirmed = await model.confirmSignedIn()
+        #expect(!confirmed)
+        #expect(model.step == .signIn)
+        #expect(model.lastError == hint)
+        #expect(backend.refreshCalls == 0)
+    }
+
     @Test("A failed first usage pull is a soft warning, not a failed flow")
     func softUsageFailure() async {
         let backend = StubOnboardingBackend()
@@ -434,6 +453,18 @@ struct LoginCommandDecodingTests {
         #expect(verification.identityMismatch?.actual == "wrong@example.invalid")
     }
 
+    @Test("A verification hint decodes additively")
+    func verifyHintPayload() throws {
+        let json = #"""
+        {"account":{"id":"a","provider":"claude","label":"Work","enabled":true,"isDefault":false},
+         "authenticated":false,"identity":null,
+         "verifyHint":"A Claude credential exists in the default Keychain slot."}
+        """#
+        let verification = try JSONDecoder().decode(AccountVerification.self, from: Data(json.utf8))
+        #expect(!verification.authenticated)
+        #expect(verification.verifyHint == "A Claude credential exists in the default Keychain slot.")
+    }
+
     @Test("A pre-#99 verification payload decodes with no mismatch")
     func legacyVerificationPayload() throws {
         let json = #"""
@@ -442,5 +473,6 @@ struct LoginCommandDecodingTests {
         """#
         let verification = try JSONDecoder().decode(AccountVerification.self, from: Data(json.utf8))
         #expect(verification.identityMismatch == nil)
+        #expect(verification.verifyHint == nil)
     }
 }

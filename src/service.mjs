@@ -19,7 +19,10 @@ import {
   readClaudeRateLimitTier,
   validateClaudeProfileHome,
 } from './adapters/claude.mjs';
-import { claudeCredentialsPresent } from './adapters/claude-keychain.mjs';
+import {
+  claudeCredentialKeychainSlotState,
+  claudeCredentialsPresent,
+} from './adapters/claude-keychain.mjs';
 import { reconcileClaudeProfileExplainer } from './adapters/claude-profile-explainer.mjs';
 import {
   buildStatuslineCommand,
@@ -37,6 +40,10 @@ import {
   validateCodexProfileHome,
 } from './adapters/codex.mjs';
 import { evaluateWorstCapacity } from './capacity.mjs';
+import {
+  USAGE_SNAPSHOT_PRUNE_BATCH_SIZE,
+  USAGE_SNAPSHOT_RETENTION_DAYS,
+} from './db.mjs';
 import { scanProjectRoot } from './projects.mjs';
 import { SharedScopeEngine } from './shared-scope.mjs';
 
@@ -54,8 +61,12 @@ const execFileAsync = promisify(execFile);
 // honest about it instead of silently starving.
 const ACTIVE_SESSION_REFRESH_CAP_MS = 30 * 60_000;
 
+const DAY_MS = 24 * 60 * 60_000;
+export const USAGE_SNAPSHOT_PRUNE_INTERVAL_MS = DAY_MS;
+
 const CLAUDE_RENEWAL_TIMEOUT_MS = 60_000;
 const CLAUDE_RENEWAL_BACKOFF_MS = 30 * 60_000;
+const CLAUDE_RENEWAL_PRE_EXPIRY_WINDOW_MS = 45 * 60_000;
 const CLAUDE_RENEWAL_DAY_MS = 24 * 60 * 60_000;
 const CLAUDE_RENEWAL_DAILY_LIMIT = 6;
 const CLAUDE_RENEWAL_MODEL = 'claude-haiku-4-5-20251001';
@@ -192,13 +203,17 @@ function autoRefreshIntervalCustomized(settings) {
 // CLAUDE_SECURESTORAGE_CONFIG_DIR scoped-Keychain behavior.
 export const CLAUDE_SECURESTORAGE_MIN_VERSION = '2.1.215';
 
-// Issue #99: from 2.1.216 on, Claude Code keys Keychain CREDENTIAL storage
-// off the resolved (realpath) ~/.claude — CLAUDE_CONFIG_DIR and
-// CLAUDE_SECURESTORAGE_CONFIG_DIR no longer steer where a login lands, even
-// though config writes (.claude.json) still respect CLAUDE_CONFIG_DIR. An
-// env-scoped `claude auth login` on such a version silently overwrites the
-// ACTIVE profile's credential slot with a different account's token.
+// Issue #99 historical boundary: 2.1.216 introduced resolved-home Keychain
+// credential storage. Claude Code later reverted that behavior, but there is
+// no trustworthy version-only transition to replace this gate. Issue #300
+// therefore keeps the conservative flow selection while pinning the version
+// probe and served login command to one canonical executable.
 export const CLAUDE_RESOLVED_HOME_CREDENTIALS_MIN_VERSION = '2.1.216';
+
+// Additive POST /verify diagnostic only. This describes metadata-only slot
+// presence; it contains no credential value and is never persisted or copied
+// into /api/state.
+export const CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT = "A Claude credential exists in the default Keychain slot, but none was found for this ModelDeck profile. Run this account's login command again, then verify.";
 
 // Issue #89: refresh failures whose message carries this phrase mean the
 // stored credentials are unusable (missing or expired) — the account needs a
@@ -509,6 +524,8 @@ export class ModelDeckService {
     this.readCodexPlan = options.readCodexPlan || readCodexPlan;
     this.readCodexAccountId = options.readCodexAccountId || readCodexAccountId;
     this.claudeCredentialsPresent = options.claudeCredentialsPresent || claudeCredentialsPresent;
+    this.claudeCredentialKeychainSlotState = options.claudeCredentialKeychainSlotState
+      || claudeCredentialKeychainSlotState;
     this.migrateClaude = options.migrateClaude || migrateClaudeSwapProfiles;
     this.exec = options.exec || options.execFile || options.run || execFileAsync;
     this.childEnv = options.childEnv || process.env;
@@ -528,6 +545,16 @@ export class ModelDeckService {
     this.now = options.now || Date.now;
     this.setTimeout = options.setTimeout || globalThis.setTimeout;
     this.clearTimeout = options.clearTimeout || globalThis.clearTimeout;
+    this.yieldToServeLoop = options.yieldToServeLoop
+      || (() => new Promise((resolve) => setImmediate(resolve)));
+    this.logUsageSnapshotPrune = options.logUsageSnapshotPrune
+      || ((count) => {
+        if (count > 0) console.log(`[modeldeck] usage snapshots pruned: ${count}`);
+      });
+    this.usageSnapshotPruneTimer = null;
+    this.usageSnapshotPrunePromise = null;
+    this.usageSnapshotPruneStarted = false;
+    this.usageSnapshotPruneGeneration = 0;
     this.autoRefreshInitialDelayMs = Number(options.autoRefreshInitialDelayMs ?? 1_000);
     this.autoRefreshTimer = null;
     this.autoRefreshGeneration = 0;
@@ -542,6 +569,13 @@ export class ModelDeckService {
     this.claudeActivationTail = Promise.resolve();
     this.claudeRenewalPromise = null;
     this.claudeRenewalAccountId = null;
+    // Issue #265: credential expiry is deliberately ephemeral. It must reach
+    // the scheduler, but never account metadata, usage detail, logs, or API
+    // state. The second map is an exact in-process per-token retry floor; a
+    // persisted ordinary attempt time below carries the floor across restarts
+    // without storing the credential-derived timestamp.
+    this.claudeCredentialExpiries = new Map();
+    this.claudePreExpiryAttemptedExpiries = new Map();
     this.claudeActivationAccountCounts = new Map();
     this.claudeIdentityVerificationPromises = new Map();
     this.claudeProfileSettingsTails = new Map();
@@ -642,6 +676,71 @@ export class ModelDeckService {
       this.statuslineWatcher = null;
     }
     this.sharedScope.stopWatchers();
+  }
+
+  // -------------------------------------------------------------------------
+  // Issue #181 — bounded usage snapshot retention.
+
+  /// Start independently of provider auto-refresh: maintenance must still run
+  /// when polling is disabled and in credential-free demo fixture mode. Store
+  /// construction has completed schema migration before server.listen calls it.
+  startUsageSnapshotRetention() {
+    if (this.usageSnapshotPruneStarted) return;
+    this.usageSnapshotPruneStarted = true;
+    const generation = ++this.usageSnapshotPruneGeneration;
+    this.runScheduledUsageSnapshotPrune(generation);
+  }
+
+  async stopUsageSnapshotRetention() {
+    this.usageSnapshotPruneStarted = false;
+    this.usageSnapshotPruneGeneration += 1;
+    if (this.usageSnapshotPruneTimer != null) this.clearTimeout(this.usageSnapshotPruneTimer);
+    this.usageSnapshotPruneTimer = null;
+    // The Store is closed immediately after app.close(), so let a batch already
+    // in progress finish before the caller can close its SQLite connection.
+    await (this.usageSnapshotPrunePromise || Promise.resolve()).catch(() => {});
+  }
+
+  runScheduledUsageSnapshotPrune(generation) {
+    void this.pruneUsageSnapshots().catch((error) => {
+      console.error(`[modeldeck] usage snapshot prune failed: ${error?.message || error}`);
+    }).finally(() => {
+      if (!this.usageSnapshotPruneStarted || generation !== this.usageSnapshotPruneGeneration) return;
+      this.usageSnapshotPruneTimer = this.setTimeout(() => {
+        this.usageSnapshotPruneTimer = null;
+        if (!this.usageSnapshotPruneStarted || generation !== this.usageSnapshotPruneGeneration) return;
+        this.runScheduledUsageSnapshotPrune(generation);
+      }, USAGE_SNAPSHOT_PRUNE_INTERVAL_MS);
+      this.usageSnapshotPruneTimer?.unref?.();
+    });
+  }
+
+  /// Drain expired history through bounded synchronous DELETEs, yielding
+  /// between full batches so a startup backlog cannot monopolize the serve
+  /// loop. Concurrent scheduled/manual requests coalesce with the active run.
+  pruneUsageSnapshots() {
+    if (this.usageSnapshotPrunePromise) return this.usageSnapshotPrunePromise;
+    const cutoff = new Date(this.now() - USAGE_SNAPSHOT_RETENTION_DAYS * DAY_MS).toISOString();
+    const promise = (async () => {
+      let total = 0;
+      while (true) {
+        const pruned = this.store.pruneUsageSnapshotsBatch({
+          cutoff,
+          batchSize: USAGE_SNAPSHOT_PRUNE_BATCH_SIZE,
+        });
+        total += pruned;
+        if (pruned < USAGE_SNAPSHOT_PRUNE_BATCH_SIZE) break;
+        await this.yieldToServeLoop();
+      }
+      this.logUsageSnapshotPrune(total);
+      return total;
+    })();
+    this.usageSnapshotPrunePromise = promise;
+    const clear = () => {
+      if (this.usageSnapshotPrunePromise === promise) this.usageSnapshotPrunePromise = null;
+    };
+    void promise.then(clear, clear);
+    return promise;
   }
 
   // -------------------------------------------------------------------------
@@ -1202,13 +1301,22 @@ export class ModelDeckService {
       await this.refreshClaudeProfileMetadata(account).catch(() => {});
       try {
         const snapshots = await this.fetchClaude({ claudeConfigDir: account.profileRef, profilesDir: this.claudeProfilesDir });
+        this.rememberClaudeCredentialExpiry(account.id, snapshots);
         for (const snapshot of snapshots) this.store.recordUsage(account.id, snapshot);
         refreshedSnapshots.set(account.id, snapshots);
         return { accountId: account.id, ok: true, snapshotCount: snapshots.length };
       } catch (error) {
+        this.claudeCredentialExpiries.delete(account.id);
         return { accountId: account.id, ok: false, error: error.message };
       }
     }));
+    const enabledIds = new Set(accounts.map((account) => account.id));
+    for (const accountId of [...this.claudeCredentialExpiries.keys()]) {
+      if (!enabledIds.has(accountId)) this.claudeCredentialExpiries.delete(accountId);
+    }
+    for (const accountId of [...this.claudePreExpiryAttemptedExpiries.keys()]) {
+      if (!enabledIds.has(accountId)) this.claudePreExpiryAttemptedExpiries.delete(accountId);
+    }
     this.updateClaudeWeeklyFingerprints(accounts, refreshedSnapshots);
     this.recordAccountRefreshResults(results);
     return results;
@@ -1246,10 +1354,12 @@ export class ModelDeckService {
         claudeConfigDir: account.profileRef,
         profilesDir: this.claudeProfilesDir,
       });
+      this.rememberClaudeCredentialExpiry(account.id, snapshots);
       for (const snapshot of snapshots) this.store.recordUsage(account.id, snapshot);
       refreshedSnapshots.set(account.id, snapshots);
       result = { accountId: account.id, ok: true, snapshotCount: snapshots.length };
     } catch (error) {
+      this.claudeCredentialExpiries.delete(account.id);
       result = { accountId: account.id, ok: false, error: error.message };
     }
     const enabled = this.store.listAccounts()
@@ -1257,6 +1367,22 @@ export class ModelDeckService {
     this.updateClaudeWeeklyFingerprints(enabled, refreshedSnapshots);
     this.recordAccountRefreshResults([result]);
     return result;
+  }
+
+  rememberClaudeCredentialExpiry(accountId, snapshots) {
+    const expiresAt = snapshots?.expiresAt;
+    if (typeof expiresAt === 'number' && Number.isFinite(expiresAt) && expiresAt > 0) {
+      this.claudeCredentialExpiries.set(accountId, expiresAt);
+    } else {
+      this.claudeCredentialExpiries.delete(accountId);
+    }
+  }
+
+  claudePreExpiryRenewalEligible(expiresAt, timestamp = this.now()) {
+    return typeof expiresAt === 'number'
+      && Number.isFinite(expiresAt)
+      && expiresAt > timestamp
+      && expiresAt - timestamp <= CLAUDE_RENEWAL_PRE_EXPIRY_WINDOW_MS;
   }
 
   async refreshClaudeProfileMetadata(account) {
@@ -1471,24 +1597,27 @@ export class ModelDeckService {
     return account;
   }
 
-  // Issue #99: which sign-in mechanism actually steers where the Claude
-  // credential lands, decided from the installed CLI version.
+  // Issue #99: historical version-based flow selection for steering where a
+  // Claude credential lands.
   //   'config-dir'  (< 2.1.216): CLAUDE_CONFIG_DIR +
   //     CLAUDE_SECURESTORAGE_CONFIG_DIR scope the Keychain entry, so an
   //     env-scoped login lands in the profile's own slot.
-  //   'activation'  (>= 2.1.216): credentials key off realpath(~/.claude)
-  //     regardless of environment. The only known-good steering (validated
-  //     2026-07-21) is activating the target profile FIRST — so ~/.claude
-  //     resolves to it — then running a plain `claude /login`. A fake-HOME
-  //     variant does NOT work: claude treats it as a fresh install and
-  //     resets the profile's .claude.json.
+  //   'activation'  (>= 2.1.216): affected releases key credentials off
+  //     realpath(~/.claude) regardless of environment. Activate the target
+  //     profile FIRST, then run a plain `claude /login`. A fake-HOME variant
+  //     does NOT work: claude treats it as a fresh install and resets the
+  //     profile's .claude.json.
+  // Claude later reverted the resolved-home behavior without a dependable
+  // version boundary. Keep this conservative, compatible selection: the
+  // activation path remains valid with the shell's active-profile pins, and
+  // guessing a second transition would re-expose affected intermediate CLIs.
   // An undetectable version fails toward 'activation': that flow steers
   // correctly on every known version, while 'config-dir' silently
-  // cross-wires accounts on current CLIs.
-  async claudeLoginFlow() {
+  // cross-wires accounts on the affected releases.
+  async claudeLoginFlow(claudeExecutable = this.claudePath) {
     let version;
     try {
-      version = await this.installedToolVersion(this.claudePath);
+      version = await this.installedToolVersion(claudeExecutable);
     } catch {
       return 'activation';
     }
@@ -1507,12 +1636,19 @@ export class ModelDeckService {
     if (!account.enabled) throw new Error('account is disabled');
     if (account.provider === 'claude') {
       const profileRef = managedClaudeProfile(account.profileRef, this.claudeProfilesDir);
-      const flow = await this.claudeLoginFlow();
+      // Issue #300: Terminal inherits the user's PATH, which may resolve a
+      // different bare `claude` than the daemon probed. Resolve through the
+      // daemon's PATH first, dereference the result, then use that exact file
+      // for both the version decision and the command served to Terminal.
+      const claudeExecutable = await this.realpath(
+        await this.toolExecutablePath(this.claudePath),
+      );
+      const flow = await this.claudeLoginFlow(claudeExecutable);
       if (flow === 'activation') {
         // Issue #99 fix direction 1: the caller must activate this account
         // first (requiresActivation) so ~/.claude resolves to the target
         // profile, then run the plain login below — no env override, because
-        // the environment no longer steers credential storage. Verify the
+        // the environment is not sufficient on affected releases. Verify the
         // identity while the target is still active; only then optionally
         // restore the previously active account.
         return {
@@ -1520,10 +1656,10 @@ export class ModelDeckService {
           account,
           flow,
           requiresActivation: true,
-          command: this.claudePath,
+          command: claudeExecutable,
           args: ['/login'],
           env: {},
-          preview: `${shellQuote(this.claudePath)} /login`,
+          preview: `${shellQuote(claudeExecutable)} /login`,
         };
       }
       return {
@@ -1531,13 +1667,13 @@ export class ModelDeckService {
         account,
         flow,
         requiresActivation: false,
-        command: this.claudePath,
+        command: claudeExecutable,
         args: ['auth', 'login'],
         // Issue #66: both vars pinned to the same canonical profile path so
         // the login session cannot pair one profile's storage with another's
         // credential scope.
         env: { CLAUDE_CONFIG_DIR: profileRef, CLAUDE_SECURESTORAGE_CONFIG_DIR: profileRef },
-        preview: `CLAUDE_CONFIG_DIR=${shellQuote(profileRef)} CLAUDE_SECURESTORAGE_CONFIG_DIR=${shellQuote(profileRef)} ${shellQuote(this.claudePath)} auth login`,
+        preview: `CLAUDE_CONFIG_DIR=${shellQuote(profileRef)} CLAUDE_SECURESTORAGE_CONFIG_DIR=${shellQuote(profileRef)} ${shellQuote(claudeExecutable)} auth login`,
       };
     }
     const profileRef = managedCodexProfile(account.profileRef, this.codexProfilesDir);
@@ -1560,6 +1696,18 @@ export class ModelDeckService {
     const result = account.provider === 'claude'
       ? await this.readClaudeAuth({ claudePath: this.claudePath, claudeConfigDir: account.profileRef, profilesDir: this.claudeProfilesDir })
       : await this.readCodexAuth({ binary: this.codexPath, codexHome: account.profileRef, profilesDir: this.codexProfilesDir });
+    let verifyHint;
+    if (account.provider === 'claude' && !result.authenticated) {
+      // Best effort only: a denied/unavailable Keychain diagnostic must not
+      // turn an ordinary signed-out result into a verification error.
+      const slots = await this.claudeCredentialKeychainSlotState({
+        claudeConfigDir: account.profileRef,
+        platform: this.platform,
+      }).catch(() => null);
+      if (slots?.profileScoped === false && slots.unscoped === true) {
+        verifyHint = CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT;
+      }
+    }
     // Issue #99 fix direction 2 (the #65 blind spot's enforcement teeth):
     // compare the read-back identity against the intended account BEFORE
     // persisting anything. On mismatch, refuse: persisting would launder the
@@ -1628,6 +1776,7 @@ export class ModelDeckService {
       account: saved,
       authenticated: Boolean(result.authenticated),
       identity: (result.authenticated && (result.identity || saved.identity)) || null,
+      ...(verifyHint ? { verifyHint } : {}),
     };
   }
 
@@ -1783,6 +1932,7 @@ export class ModelDeckService {
     const metadata = {
       ...account.metadata,
       claudeRenewal: {
+        ...account.metadata?.claudeRenewal,
         attempts,
         lastAttempt: attempt,
       },
@@ -1799,6 +1949,38 @@ export class ModelDeckService {
       metadata,
     });
     return attempt;
+  }
+
+  recordClaudePreExpiryAttempt(accountId, at = new Date(this.now()).toISOString()) {
+    const account = this.store.getAccount(accountId);
+    if (!account) return;
+    const metadata = {
+      ...account.metadata,
+      claudeRenewal: {
+        ...account.metadata?.claudeRenewal,
+        // This is when ModelDeck acted, not when the credential expires. It
+        // is safe to persist alongside the existing renewal attempt times.
+        lastPreExpiryAttemptAt: at,
+      },
+    };
+    this.store.saveAccount({
+      id: account.id,
+      provider: account.provider,
+      label: account.label,
+      identity: account.identity,
+      purpose: account.purpose,
+      profileRef: account.profileRef,
+      color: account.color,
+      enabled: account.enabled,
+      metadata,
+    });
+  }
+
+  claudePreExpiryAttemptedForLifetime(account, expiresAt, timestamp = this.now()) {
+    const attemptedAt = Date.parse(account?.metadata?.claudeRenewal?.lastPreExpiryAttemptAt);
+    return Number.isFinite(attemptedAt)
+      && attemptedAt <= timestamp
+      && attemptedAt >= expiresAt - CLAUDE_RENEWAL_PRE_EXPIRY_WINDOW_MS;
   }
 
   renewalAttemptAllowed(account) {
@@ -1989,12 +2171,13 @@ export class ModelDeckService {
     return /(?:model.*(?:invalid|unknown|not found|unsupported|does not exist)|invalid.*--model|--model.*(?:invalid|unknown))/i.test(output);
   }
 
-  async probeClaudeRenewal(account) {
+  async probeClaudeRenewal(account, previousExpiresAt = null) {
     try {
       const snapshots = await this.fetchClaude({
         claudeConfigDir: account.profileRef,
         profilesDir: this.claudeProfilesDir,
       });
+      this.rememberClaudeCredentialExpiry(account.id, snapshots);
       for (const snapshot of snapshots) this.store.recordUsage(account.id, snapshot);
       this.updateClaudeWeeklyFingerprints(
         this.store.listAccounts().filter((item) => item.provider === 'claude' && item.enabled),
@@ -2002,10 +2185,14 @@ export class ModelDeckService {
       );
       this.authPresenceCache.delete(`claude:${account.profileRef}`);
       this.recordAccountRefreshResults([{ accountId: account.id, ok: true, snapshotCount: snapshots.length }]);
-      return { ok: true, expired: false };
+      const renewed = previousExpiresAt == null
+        || (typeof snapshots.expiresAt === 'number' && snapshots.expiresAt > previousExpiresAt);
+      return { ok: renewed, expired: false, valid: true };
     } catch (error) {
+      this.claudeCredentialExpiries.delete(account.id);
       return {
         ok: false,
+        valid: false,
         expired: SIGN_IN_REQUIRED_ERROR_PATTERN.test(error.message)
           && SIGN_IN_EXPIRED_ERROR_PATTERN.test(error.message),
       };
@@ -2044,15 +2231,18 @@ export class ModelDeckService {
     await fs.promises.unlink(this.claudeActiveLink);
   }
 
-  async finishClaudeRenewal(account, at, renewalPath) {
+  async finishClaudeRenewal(account, at, renewalPath, previousExpiresAt = null) {
+    const failureDetail = previousExpiresAt == null
+      ? 'Claude did not refresh this account’s expired stored sign-in.'
+      : 'Claude did not refresh this account’s stored sign-in.';
     let result = {
       at,
       outcome: 'failed',
       mechanism: 'auth-status',
-      detail: 'Claude did not refresh this account’s expired stored sign-in.',
+      detail: failureDetail,
       path: renewalPath,
     };
-    let verified = await this.probeClaudeRenewal(account);
+    let verified = await this.probeClaudeRenewal(account, previousExpiresAt);
     if (verified.ok) {
       return {
         at,
@@ -2062,7 +2252,10 @@ export class ModelDeckService {
         path: renewalPath,
       };
     }
-    if (!verified.expired) return result;
+    // Post-expiry keeps its existing fallback trigger. Pre-expiry must also
+    // continue when the credential is valid but its lifetime did not advance;
+    // a merely successful usage request is not renewal evidence in that case.
+    if (!verified.expired && !(previousExpiresAt != null && verified.valid)) return result;
 
     result.mechanism = 'invoke';
     try {
@@ -2076,7 +2269,7 @@ export class ModelDeckService {
         }
       }
     }
-    verified = await this.probeClaudeRenewal(account);
+    verified = await this.probeClaudeRenewal(account, previousExpiresAt);
     if (verified.ok) {
       result = {
         at,
@@ -2089,14 +2282,16 @@ export class ModelDeckService {
     return result;
   }
 
-  async performClaudeFlipRenewal(account, at) {
+  async performClaudeFlipRenewal(account, at, previousExpiresAt = null) {
     let previous;
     let activated = false;
     let result = {
       at,
       outcome: 'failed',
       mechanism: null,
-      detail: 'Claude did not refresh this account’s expired stored sign-in.',
+      detail: previousExpiresAt == null
+        ? 'Claude did not refresh this account’s expired stored sign-in.'
+        : 'Claude did not refresh this account’s stored sign-in.',
       path: 'flip',
     };
     try {
@@ -2126,7 +2321,7 @@ export class ModelDeckService {
         // The provider command is only a trigger. Its exit status is never
         // renewal evidence; the target profile's probe below is authoritative.
       }
-      result = await this.finishClaudeRenewal(account, at, 'flip');
+      result = await this.finishClaudeRenewal(account, at, 'flip', previousExpiresAt);
     } catch (error) {
       if (error?.code === 'claude-renewal-restore-unsafe') {
         result.detail = 'ModelDeck could not safely verify the previously active Claude profile, so renewal was not attempted.';
@@ -2152,7 +2347,7 @@ export class ModelDeckService {
     return result;
   }
 
-  async performClaudeRenewal(accountId) {
+  async performClaudeRenewal(accountId, { preExpiryExpiresAt = null } = {}) {
     const account = this.store.getAccount(accountId);
     if (account && account.provider !== 'claude') {
       throw new Error('Claude renewal provider mismatch: this account is not a Claude account.');
@@ -2170,8 +2365,22 @@ export class ModelDeckService {
     } catch {
       return decided('signin-required', null, 'This account requires an explicit Claude sign-in; automatic renewal was not attempted.');
     }
-    if (this.signinReason(account, authState) !== 'expired') {
+    const preExpiry = preExpiryExpiresAt != null;
+    const preExpiryAuthorized = preExpiry
+      && this.claudeCredentialExpiries.get(accountId) === preExpiryExpiresAt
+      && this.claudePreExpiryRenewalEligible(preExpiryExpiresAt)
+      && authState === 'ok';
+    if ((!preExpiry && this.signinReason(account, authState) !== 'expired')
+      || (preExpiry && !preExpiryAuthorized)) {
       return decided('signin-required', null, 'This account requires an explicit Claude sign-in; automatic renewal was not attempted.');
+    }
+    if (preExpiry) {
+      // Ownership and the fresh in-window evidence have both been rechecked
+      // inside the renewal lock. Only now consume this token lifetime; doing
+      // it in scheduler selection lets a concurrent manual renewal steal the
+      // lock after the marker is written but before any attempt starts.
+      this.recordClaudePreExpiryAttempt(account.id, at);
+      this.claudePreExpiryAttemptedExpiries.set(account.id, preExpiryExpiresAt);
     }
 
     const override = await this.claudeAuthOverrideState(account.profileRef);
@@ -2193,7 +2402,7 @@ export class ModelDeckService {
     }
     if (claudeRenewalIdentityMatches(latestAccount, reportedIdentity)) {
       this.promoteSeededClaudeIdentity(account.id, account.profileRef, reportedIdentity);
-      const result = await this.finishClaudeRenewal(latestAccount, at, 'no-flip');
+      const result = await this.finishClaudeRenewal(latestAccount, at, 'no-flip', preExpiryExpiresAt);
       return this.recordClaudeRenewalAttempt(accountId, result);
     }
 
@@ -2221,11 +2430,11 @@ export class ModelDeckService {
       return decided('failed', null, 'ModelDeck could not confirm that Claude was idle, so renewal was not attempted.', { path: 'flip', identityDecline });
     }
 
-    const result = await this.performClaudeFlipRenewal(latestAccount, at);
+    const result = await this.performClaudeFlipRenewal(latestAccount, at, preExpiryExpiresAt);
     return this.recordClaudeRenewalAttempt(accountId, { ...result, identityDecline });
   }
 
-  async renewClaudeAccount(accountId) {
+  async renewClaudeAccount(accountId, renewalOptions) {
     if (this.claudeRenewalPromise) throw new ClaudeRenewalConflictError();
     const account = this.store.getAccount(accountId);
     if (account?.provider === 'claude'
@@ -2237,7 +2446,7 @@ export class ModelDeckService {
         detail: 'This account has reached the Claude renewal limit for the last 24 hours; try again later.',
       });
     }
-    const promise = this.withClaudeActivationLock(() => this.performClaudeRenewal(accountId));
+    const promise = this.withClaudeActivationLock(() => this.performClaudeRenewal(accountId, renewalOptions));
     this.claudeRenewalPromise = promise;
     this.claudeRenewalAccountId = account?.provider === 'claude' ? accountId : null;
     try {
@@ -2339,22 +2548,38 @@ export class ModelDeckService {
   async runScheduledClaudeRenewals(refresh) {
     const currentSettings = this.store.getSettings();
     if (!currentSettings.autoRefreshEnabled || !currentSettings.autoRenewEnabled || this.claudeRenewalPromise) return [];
-    const candidates = refresh?.claude?.profiles?.filter((item) => !item.ok
-      && SIGN_IN_REQUIRED_ERROR_PATTERN.test(item.error)
-      && SIGN_IN_EXPIRED_ERROR_PATTERN.test(item.error)) || [];
+    const candidates = (refresh?.claude?.profiles || []).flatMap((item) => {
+      const expired = !item.ok
+        && SIGN_IN_REQUIRED_ERROR_PATTERN.test(item.error)
+        && SIGN_IN_EXPIRED_ERROR_PATTERN.test(item.error);
+      if (expired) return [{ item, preExpiryExpiresAt: null }];
+      const preExpiryExpiresAt = this.claudeCredentialExpiries.get(item.accountId);
+      return item.ok === true && this.claudePreExpiryRenewalEligible(preExpiryExpiresAt)
+        ? [{ item, preExpiryExpiresAt }]
+        : [];
+    });
     const outcomes = [];
     for (const candidate of candidates) {
       const settings = this.store.getSettings();
       if (!settings.autoRefreshEnabled || !settings.autoRenewEnabled) break;
-      const account = this.store.getAccount(candidate.accountId);
+      const account = this.store.getAccount(candidate.item.accountId);
       if (!account || account.provider !== 'claude' || !account.enabled || !this.renewalAttemptAllowed(account)) continue;
+      if (candidate.preExpiryExpiresAt != null) {
+        if (this.claudePreExpiryAttemptedExpiries.get(account.id) === candidate.preExpiryExpiresAt
+          || this.claudePreExpiryAttemptedForLifetime(account, candidate.preExpiryExpiresAt)) continue;
+      }
       try {
-        const renew = await this.renewClaudeAccount(account.id);
+        const renewalOptions = candidate.preExpiryExpiresAt == null
+          ? undefined
+          : { preExpiryExpiresAt: candidate.preExpiryExpiresAt };
+        const renew = await this.renewClaudeAccount(account.id, renewalOptions);
         outcomes.push({ accountId: account.id, ...renew });
         await this.refreshClaudeAccount(account.id);
       } catch (error) {
         if (error?.statusCode === 409) break;
-        console.error(`[modeldeck] scheduled Claude renewal failed: ${error?.message || error}`);
+        // The caught error may someday carry scheduler context. Keep this log
+        // fixed so a credential-derived expiry can never be copied verbatim.
+        console.error('[modeldeck] scheduled Claude renewal failed');
       }
     }
     return outcomes;
@@ -2560,7 +2785,11 @@ export class ModelDeckService {
     const account = this.store.getAccount(accountId);
     await this.accountDetachProfile(account);
     const deleted = this.store.deleteAccount(accountId);
-    if (deleted) this.accountRefreshErrors.delete(accountId);
+    if (deleted) {
+      this.accountRefreshErrors.delete(accountId);
+      this.claudeCredentialExpiries.delete(accountId);
+      this.claudePreExpiryAttemptedExpiries.delete(accountId);
+    }
     if (deleted && account?.isDefault) this.invalidateToolProbe();
     if (deleted) await this.accountProfileSetChanged();
     return deleted;
@@ -3367,10 +3596,11 @@ export class ModelDeckService {
         ? compareSemver(claude.version, CLAUDE_SECURESTORAGE_MIN_VERSION) >= 0
         : false;
       this.claudeSecureStorageSupported = claude.secureStorageScopingSupported;
-      // Issue #99 (natural fallout of the same version read): which
-      // mechanism scopes CREDENTIAL storage on the installed CLI.
-      // 'resolved-home' means env-scoped sign-ins are broken and login
-      // guidance must be activation-driven; null when not installed.
+      // Issue #99 compatibility field: the historical mechanism inferred by
+      // the login-flow boundary. Upstream later reverted the behavior without
+      // a dependable version transition, so this now describes ModelDeck's
+      // conservative flow choice rather than claiming current CLI internals;
+      // null when not installed.
       claude.credentialScoping = claude.version
         ? (compareSemver(claude.version, CLAUDE_RESOLVED_HOME_CREDENTIALS_MIN_VERSION) >= 0
           ? 'resolved-home'
@@ -3479,7 +3709,22 @@ export class ModelDeckService {
 
   worstCapacity(options = {}) {
     const settings = this.store.getSettings();
-    return evaluateWorstCapacity(this.store.latestUsage(), this.store.listAccounts(), {
+    // Issue #264 (bonus fix): mark accounts whose remembered refresh error
+    // says they CANNOT refresh (sign-in required / Keychain denied — the
+    // same patterns accountAuthState keys on) so evaluateWorstCapacity can
+    // keep their frozen rows out of the headline while still counting rows
+    // a live session keeps fresh (statusline captures). Presentation-only:
+    // the remembered error itself is untouched, so signinReason and renewal
+    // candidacy are exactly what they were.
+    const accounts = this.store.listAccounts().map((account) => {
+      const lastError = this.accountRefreshErrors.get(account.id);
+      const authFlagged = Boolean(lastError && (
+        SIGN_IN_REQUIRED_ERROR_PATTERN.test(lastError.message)
+        || KEYCHAIN_DENIED_ERROR_PATTERN.test(lastError.message)
+      ));
+      return authFlagged ? { ...account, authFlagged } : account;
+    });
+    return evaluateWorstCapacity(this.store.latestUsage(), accounts, {
       thresholdPercent: settings.notificationThresholdPercent,
       criticalPercent: options.criticalPercent ?? 10,
       now: options.now ?? this.now(),

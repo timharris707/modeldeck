@@ -37,6 +37,15 @@ export function evaluateWorstCapacity(usage, accounts, options = {}) {
   const thresholdPercent = Number(options.thresholdPercent ?? 25);
   const criticalPercent = Number(options.criticalPercent ?? 10);
   const now = Number(options.now ?? Date.now());
+  // Issue #264 (bonus fix): an account that cannot refresh (`authFlagged`,
+  // set by the caller from the remembered sign-in / Keychain refresh errors)
+  // freezes its stored percentages — the same account Availability Health
+  // counts as zero capacity must not own the headline number on data it can
+  // no longer update. Its rows count only while FRESH (a live session's
+  // statusline captures keep them fresh; that account is honestly usable).
+  // Default 30 min matches the app's AvailabilityHealth.defaultStaleAfter so
+  // the headline and the health verdict key on the same freshness rule.
+  const flaggedMaxAgeMs = Number(options.flaggedMaxAgeMinutes ?? 30) * 60_000;
   const accountById = new Map(accounts.map((account) => [account.id, account]));
   const excluded = [];
   const rows = [];
@@ -47,6 +56,13 @@ export function evaluateWorstCapacity(usage, accounts, options = {}) {
     if (!account || !account.enabled) {
       excluded.push({ accountId: entry.accountId, scope: entry.scope, reason: account ? 'account disabled' : 'account not found' });
       continue;
+    }
+    if (account.authFlagged) {
+      const observed = Date.parse(entry.observedAt || 0);
+      if (!Number.isFinite(observed) || now - observed > flaggedMaxAgeMs) {
+        excluded.push({ accountId: entry.accountId, scope: entry.scope, reason: 'usage frozen while the account cannot refresh' });
+        continue;
+      }
     }
     if (!isSpendScope(entry.scope)) hasNonSpendScope = true;
     if (entry.usedPercent == null) {

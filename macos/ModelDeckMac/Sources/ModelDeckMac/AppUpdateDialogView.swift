@@ -142,9 +142,17 @@ struct AppUpdateDialogView: View {
                 Button("Hide") { onDismiss() }
                     .help("Closes this dialog. The update keeps going; progress stays visible in the deck and in Settings → General.")
             case .installedPendingRelaunch:
+                // Issue #303: the staged status never renders without its
+                // one-click follow-through — Restart primary, Later merely
+                // closes the dialog (the staged update stays offered via the
+                // deck badge and the Settings row).
                 Spacer()
-                Button("OK") { onDismiss() }
+                Button("Later") { onDismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Restart to Update") { installModel.updateNow() }
                     .keyboardShortcut(.defaultAction)
+                    .help(AppUpdateInstallModel.restartActionHelp)
+                    .accessibilityLabel("Restart ModelDeck to finish updating")
             case .failed:
                 if let releaseURL = dialog.releaseURL {
                     Button("Release Notes") { openURL(releaseURL) }

@@ -100,10 +100,11 @@ public struct AvailabilityExclusion: Equatable, Sendable {
     }
 }
 
-/// The upcoming reset that restores the most points — "the next big reset"
-/// Tim's YELLOW advice schedules heavy runs after. Restored points are
-/// measured from the account's CURRENT level (a from-now approximation;
-/// further drain before the reset only makes the real infusion bigger).
+/// The soonest upcoming reset that materially relieves the pool (issue
+/// #310) — the "Next relief" Tim's YELLOW advice schedules heavy runs
+/// after. Restored points are measured from the account's CURRENT level
+/// (a from-now approximation; further drain before the reset only makes
+/// the real infusion bigger).
 public struct AvailabilityNextReset: Equatable, Sendable {
     public var accountLabel: String
     public var date: Date
@@ -460,17 +461,33 @@ public enum AvailabilityHealthEngine {
         var unknownTiers: [String] = []
         for account in state.accounts where DeckProvider.from(account.provider) == provider {
             guard account.enabled else { continue }
+            // Issue #264: inclusion keys on DATA AGE, not authState. A
+            // flagged account whose live session is producing fresh
+            // server-truth (statusline captures, #174) is real capacity and
+            // must count; the auth flag stays untouched on the account so
+            // renewal candidacy and the card notice keep their own stories.
+            // `duplicate-token` is the one hard authState exclusion left:
+            // two profiles holding the SAME login would double-count one
+            // subscription's capacity no matter how fresh the data is.
+            // When a flagged account's data is missing or stale, the
+            // exclusion reports the AUTH reason ("sign in needed"), not the
+            // generic staleness line — the flag is why the data froze, and
+            // the health detail should keep saying so.
+            var flaggedAuthReason: String?
             if let auth = account.authState?.lowercased(), auth != "ok" {
-                excluded.append(AvailabilityExclusion(
-                    label: account.label, reason: authReason(auth)
-                ))
-                continue
+                if auth == "duplicate-token" {
+                    excluded.append(AvailabilityExclusion(
+                        label: account.label, reason: authReason(auth)
+                    ))
+                    continue
+                }
+                flaggedAuthReason = authReason(auth)
             }
             let rows = snapshotsByAccount[account.id] ?? []
             let snapshot = driverSnapshot(for: provider, in: rows, generalWeekly: generalWeekly)
             guard let snapshot else {
                 excluded.append(AvailabilityExclusion(
-                    label: account.label, reason: "no weekly usage data"
+                    label: account.label, reason: flaggedAuthReason ?? "no weekly usage data"
                 ))
                 continue
             }
@@ -480,7 +497,7 @@ public enum AvailabilityHealthEngine {
                   now.timeIntervalSince(observed) <= staleAfter
             else {
                 excluded.append(AvailabilityExclusion(
-                    label: account.label, reason: "usage data is stale"
+                    label: account.label, reason: flaggedAuthReason ?? "usage data is stale"
                 ))
                 continue
             }
@@ -687,27 +704,42 @@ public enum AvailabilityHealthEngine {
         return lower
     }
 
-    // MARK: - Next big reset
+    // MARK: - Next relief
 
-    /// The upcoming reset restoring the most points (ties break soonest);
-    /// nil when the pool is empty.
+    /// A reset is MATERIAL relief when it restores at least this fraction
+    /// of the largest restoration any upcoming reset offers. Issue #310:
+    /// the row's job is "when does real capacity come back?", so a
+    /// near-full account's token refill must not hijack it — but among
+    /// comparably sized reliefs, the SOONEST one is the answer.
+    public static let materialReliefFraction = 0.5
+
+    /// The soonest upcoming reset that materially relieves the pool; nil
+    /// when the pool is empty.
+    ///
+    /// Issue #310 (supersedes the #235 "biggest reset" selection this row
+    /// carried under its old name): magnitude-first ordering told Tim to
+    /// wait until Sunday for +1,980 pts while a +1,960-pt reset landed a
+    /// full day earlier. Relief comes from drained accounts, so the
+    /// candidates are ALL pool accounts — no usable/eligibility filter —
+    /// ranked soonest-first among those clearing the materiality bar
+    /// (ties break toward the larger restoration).
     public static func nextBigReset(
         _ accounts: [AvailabilityPoolAccount],
         now: Date
     ) -> AvailabilityNextReset? {
-        accounts
-            .map { account in
-                AvailabilityNextReset(
-                    accountLabel: account.label,
-                    date: now.addingTimeInterval(max(account.hoursToReset, 0) * 3600),
-                    restoredPoints: account.capacityPoints - account.remainingPoints
-                )
-            }
+        let candidates = accounts.map { account in
+            AvailabilityNextReset(
+                accountLabel: account.label,
+                date: now.addingTimeInterval(max(account.hoursToReset, 0) * 3600),
+                restoredPoints: account.capacityPoints - account.remainingPoints
+            )
+        }
+        let threshold = materialReliefFraction * (candidates.map(\.restoredPoints).max() ?? 0)
+        return candidates
+            .filter { $0.restoredPoints >= threshold }
             .sorted { lhs, rhs in
-                if lhs.restoredPoints != rhs.restoredPoints {
-                    return lhs.restoredPoints > rhs.restoredPoints
-                }
-                return lhs.date < rhs.date
+                if lhs.date != rhs.date { return lhs.date < rhs.date }
+                return lhs.restoredPoints > rhs.restoredPoints
             }
             .first
     }

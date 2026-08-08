@@ -297,20 +297,23 @@ struct ProxyPoolModelTests {
         // the new attempt's state, and overwrite it. The two attempts return
         // DIFFERENT outcomes here so the winner is unambiguous: if the
         // abandoned attempt writes, the note reads "Already in the pool".
-        var release: (() -> Void)?
-        let stream = AsyncStream<Void> { continuation in
-            release = { continuation.finish() }
-        }
         let manager = ProxyManagerStub()
         manager.queuedJoins = [
             .success(ProxyPoolJoin(proxyPool: "member", alreadyMember: true)),  // abandoned
             .success(ProxyPoolJoin(proxyPool: "member")),                       // live
         ]
-        manager.firstJoinGate = (stream, release ?? {})
+        manager.parksFirstJoin = true
         let model = ProxyPoolModel(manager: manager, stateProvider: StateStub())
         let a = account(proxyPool: "absent")
 
-        model.beginJoin(account: a)              // attempt 1 — parked in the gate
+        model.beginJoin(account: a)              // attempt 1 — heads for the gate
+        // Issue #311: the attempts' tasks run their stub calls concurrently
+        // off the main actor, so attempt 1 must have TAKEN its queued outcome
+        // and parked before anything else moves — otherwise attempt 2 can win
+        // the race to queuedJoins[0] and complete with (or park on) the
+        // abandoned attempt's outcome.
+        while !manager.firstJoinParked { await Task.yield() }
+        let abandoned = model.joinTasks[a.id]    // held: cancelJoinWait drops it
         model.cancelJoinWait(accountID: a.id)    // user stops waiting
         #expect(model.presentation(for: a)?.display == .note(ProxyPool.joinWaitStoppedText))
 
@@ -319,9 +322,8 @@ struct ProxyPoolModelTests {
         #expect(model.presentation(for: a)?.display
             == .note("Added to the proxy pool — a routing weight arrives with the next rebalance."))
 
-        release?()                                // attempt 1 finally resumes
-        await Task.yield()
-        await Task.yield()
+        manager.releaseFirstJoin()               // attempt 1 finally resumes
+        await abandoned?.value                   // and runs to the end
 
         // The abandoned attempt must not have overwritten the live result.
         #expect(model.presentation(for: a)?.display
@@ -677,13 +679,37 @@ private final class ProxyManagerStub: ProxyPoolManaging, @unchecked Sendable {
 
     private let join: JoinResult
     private let routing: RoutingResult
-    private(set) var joinedIDs: [String] = []
+    private let lock = NSLock()
+    private var _joinedIDs: [String] = []
+    var joinedIDs: [String] { lock.withLock { _joinedIDs } }
     private(set) var routingCalls: [(String, Bool)] = []
-    /// Optional gate: when set, the FIRST join suspends here until released,
-    /// so a test can model a task still in flight while a second attempt
-    /// starts (CodeRabbit, PR #285).
-    var firstJoinGate: (stream: AsyncStream<Void>, release: () -> Void)?
+
+    /// Optional gate: when true, the FIRST join takes its queued outcome and
+    /// parks — atomically, under the lock — until `releaseFirstJoin()`, so a
+    /// test can model a task still in flight while a second attempt starts
+    /// (CodeRabbit, PR #285). The park is a held continuation, deliberately
+    /// IMMUNE to task cancellation: the abandoned attempt must genuinely
+    /// stay in flight until the test releases it. The AsyncStream park this
+    /// replaces ended the instant `cancelJoinWait` cancelled the task, which
+    /// let the two attempts race for the queued outcomes (issue #311).
+    var parksFirstJoin = false
     private var gateConsumed = false
+    private var gateReleased = false
+    private var gateContinuation: CheckedContinuation<Void, Never>?
+    private var _firstJoinParked = false
+    /// True once the first join holds its outcome and is parked in the gate
+    /// — the test's cue that a second attempt can no longer race it.
+    var firstJoinParked: Bool { lock.withLock { _firstJoinParked } }
+
+    func releaseFirstJoin() {
+        let held: CheckedContinuation<Void, Never>? = lock.withLock {
+            gateReleased = true
+            let held = gateContinuation
+            gateContinuation = nil
+            return held
+        }
+        held?.resume()
+    }
 
     init(
         join: JoinResult = .success(ProxyPoolJoin()),
@@ -695,15 +721,30 @@ private final class ProxyManagerStub: ProxyPoolManaging, @unchecked Sendable {
 
     /// Per-attempt results, consumed in order; falls back to `join` when
     /// exhausted. Lets a test tell an abandoned attempt's write apart from
-    /// the live one's (CodeRabbit, PR #285).
+    /// the live one's (CodeRabbit, PR #285). Set before the first attempt
+    /// starts; consumed under the lock.
     var queuedJoins: [JoinResult] = []
 
     func joinProxyPool(accountID: String) async throws -> ProxyPoolJoin {
-        joinedIDs.append(accountID)
-        let outcome = queuedJoins.isEmpty ? join : queuedJoins.removeFirst()
-        if let gate = firstJoinGate, !gateConsumed {
-            gateConsumed = true
-            for await _ in gate.stream { break }
+        // Take the outcome and claim the gate in ONE critical section —
+        // dequeue order and park order can never disagree (issue #311).
+        let (outcome, park): (JoinResult, Bool) = lock.withLock {
+            _joinedIDs.append(accountID)
+            let outcome = queuedJoins.isEmpty ? join : queuedJoins.removeFirst()
+            let park = parksFirstJoin && !gateConsumed
+            if park { gateConsumed = true }
+            return (outcome, park)
+        }
+        if park {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let resumeNow: Bool = lock.withLock {
+                    _firstJoinParked = true
+                    if gateReleased { return true }
+                    gateContinuation = continuation
+                    return false
+                }
+                if resumeNow { continuation.resume() }
+            }
         }
         switch outcome {
         case .success(let value): return value

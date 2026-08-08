@@ -16,6 +16,12 @@ const MATCHING_STATUS = JSON.stringify({ email: TARGET_EMAIL, accountUuid: TARGE
 // Issue #251: promise-first busy copy, pinned verbatim.
 const BUSY_DETAIL = 'Will renew automatically at the next quiet moment — a Claude session is running right now.';
 
+function snapshotsExpiringAt(expiresAt) {
+  const snapshots = SNAPSHOTS.map((snapshot) => ({ ...snapshot }));
+  Object.defineProperty(snapshots, 'expiresAt', { value: expiresAt, enumerable: false });
+  return snapshots;
+}
+
 function fixture(options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-renewal-'));
   const profilesDir = path.join(root, 'profiles');
@@ -151,6 +157,15 @@ test('renewal preconditions return distinct decided outcomes without invoking Cl
       const renew = await data.service.renewClaudeAccount(data.target.id);
       assert.equal(renew.outcome, 'signin-required');
       assert.equal(renew.mechanism, null);
+      assert.equal(data.calls.length, 0);
+    } finally { data.close(); }
+  });
+
+  await t.test('a healthy token cannot enter renewal without scheduler-private pre-expiry evidence', async () => {
+    const data = fixture();
+    try {
+      const renew = await data.service.renewClaudeAccount(data.target.id);
+      assert.equal(renew.outcome, 'signin-required');
       assert.equal(data.calls.length, 0);
     } finally { data.close(); }
   });
@@ -790,6 +805,212 @@ test('renewal waits for an in-flight manual activation before flipping the profi
     await activation;
     assert.equal((await renewal).outcome, 'renewed');
     assert.equal(data.calls.length, 2);
+  } finally { data.close(); }
+});
+
+test('scheduled pre-expiry renewal requires the credential lifetime to advance (issue #265)', async () => {
+  const timestamp = Date.parse('2026-08-08T12:00:00Z');
+  const originalExpiresAt = timestamp + 40 * 60_000;
+  const renewedExpiresAt = timestamp + 8 * 60 * 60_000;
+  let probes = 0;
+  const data = fixture({
+    serviceOptions: {
+      now: () => timestamp,
+      fetchClaude: async () => {
+        probes += 1;
+        return snapshotsExpiringAt(probes === 1 ? originalExpiresAt : renewedExpiresAt);
+      },
+    },
+  });
+  try {
+    data.service.rememberClaudeCredentialExpiry(
+      data.target.id,
+      snapshotsExpiringAt(originalExpiresAt),
+    );
+    const refresh = { claude: { profiles: [{ accountId: data.target.id, ok: true, snapshotCount: 1 }] } };
+
+    const outcomes = await data.service.runScheduledClaudeRenewals(refresh);
+    assert.equal(outcomes.length, 1);
+    assert.equal(outcomes[0].outcome, 'renewed');
+    assert.equal(outcomes[0].mechanism, 'invoke');
+    assert.equal(outcomes[0].path, 'no-flip');
+    assert.deepEqual(data.calls.map((call) => call.args), [
+      ['auth', 'status', '--json'],
+      ['-p', 'ok', '--model', 'claude-haiku-4-5-20251001'],
+    ]);
+    assert.equal(probes, 3, 'unchanged verification, post-invoke proof, and scheduler refresh');
+    assert.deepEqual(data.store.getAccount(data.target.id).metadata.claudeRenewal.attempts, [
+      new Date(timestamp).toISOString(),
+    ]);
+  } finally { data.close(); }
+});
+
+test('scheduled renewal selects valid tokens only inside the 45-minute pre-expiry window', async () => {
+  const timestamp = Date.parse('2026-08-08T12:00:00Z');
+  let renewals = 0;
+  const data = fixture({ serviceOptions: { now: () => timestamp } });
+  try {
+    data.service.renewClaudeAccount = async () => {
+      renewals += 1;
+      return { at: new Date(timestamp).toISOString(), outcome: 'busy', mechanism: null, detail: BUSY_DETAIL };
+    };
+    data.service.refreshClaudeAccount = async () => {};
+    const refresh = { claude: { profiles: [{ accountId: data.target.id, ok: true, snapshotCount: 1 }] } };
+
+    data.service.rememberClaudeCredentialExpiry(data.target.id, snapshotsExpiringAt(timestamp + 45 * 60_000 + 1));
+    assert.deepEqual(await data.service.runScheduledClaudeRenewals(refresh), []);
+    data.service.rememberClaudeCredentialExpiry(data.target.id, snapshotsExpiringAt(timestamp));
+    assert.deepEqual(await data.service.runScheduledClaudeRenewals(refresh), []);
+    data.service.rememberClaudeCredentialExpiry(data.target.id, snapshotsExpiringAt(timestamp + 45 * 60_000));
+    const outcomes = await data.service.runScheduledClaudeRenewals(refresh);
+
+    assert.equal(renewals, 1);
+    assert.equal(outcomes.length, 1);
+    assert.equal(outcomes[0].outcome, 'busy');
+  } finally { data.close(); }
+});
+
+test('pre-expiry renewal attempts at most once per token lifetime, including across restart memory loss', async () => {
+  let timestamp = Date.parse('2026-08-08T12:00:00Z');
+  const data = fixture({
+    statusOutput: JSON.stringify({ email: 'other@example.invalid' }),
+    serviceOptions: {
+      now: () => timestamp,
+      listProviderProcesses: async () => ['claude'],
+    },
+  });
+  try {
+    data.service.refreshClaudeAccount = async () => {};
+    const refresh = { claude: { profiles: [{ accountId: data.target.id, ok: true, snapshotCount: 1 }] } };
+    const firstExpiresAt = timestamp + 40 * 60_000;
+    data.service.rememberClaudeCredentialExpiry(data.target.id, snapshotsExpiringAt(firstExpiresAt));
+
+    let outcomes = await data.service.runScheduledClaudeRenewals(refresh);
+    assert.equal(outcomes[0].outcome, 'busy');
+    assert.equal(data.calls.length, 1);
+    timestamp += 5 * 60_000;
+    data.service.claudePreExpiryAttemptedExpiries.clear();
+    await data.service.runScheduledClaudeRenewals(refresh);
+    assert.equal(data.calls.length, 1, 'persisted action time preserves the floor after process memory is lost');
+
+    timestamp += 8 * 60 * 60_000;
+    const nextExpiresAt = timestamp + 40 * 60_000;
+    data.service.rememberClaudeCredentialExpiry(data.target.id, snapshotsExpiringAt(nextExpiresAt));
+    outcomes = await data.service.runScheduledClaudeRenewals(refresh);
+    assert.equal(outcomes[0].outcome, 'busy');
+    assert.equal(data.calls.length, 2, 'a later token lifetime receives its own attempt');
+  } finally { data.close(); }
+});
+
+test('a renewal conflict does not consume an unattempted pre-expiry lifetime', async () => {
+  const timestamp = Date.parse('2026-08-08T12:00:00Z');
+  const data = fixture({ serviceOptions: { now: () => timestamp } });
+  try {
+    const priorExpiresAt = timestamp + 35 * 60_000;
+    const targetExpiresAt = timestamp + 40 * 60_000;
+    data.service.rememberClaudeCredentialExpiry(data.prior.id, snapshotsExpiringAt(priorExpiresAt));
+    data.service.rememberClaudeCredentialExpiry(data.target.id, snapshotsExpiringAt(targetExpiresAt));
+    data.service.refreshClaudeAccount = async () => {};
+    const originalRenew = data.service.renewClaudeAccount.bind(data.service);
+    let calls = 0;
+    data.service.renewClaudeAccount = async (...args) => {
+      calls += 1;
+      if (calls === 1) {
+        data.service.claudeRenewalPromise = Promise.resolve();
+        return { at: new Date(timestamp).toISOString(), outcome: 'busy', mechanism: null, detail: BUSY_DETAIL };
+      }
+      return originalRenew(...args);
+    };
+    const refresh = { claude: { profiles: [
+      { accountId: data.prior.id, ok: true, snapshotCount: 1 },
+      { accountId: data.target.id, ok: true, snapshotCount: 1 },
+    ] } };
+
+    await data.service.runScheduledClaudeRenewals(refresh);
+    assert.equal(calls, 2);
+    assert.equal(data.service.claudePreExpiryAttemptedExpiries.has(data.target.id), false);
+    assert.equal(
+      data.store.getAccount(data.target.id).metadata.claudeRenewal?.lastPreExpiryAttemptAt,
+      undefined,
+    );
+  } finally {
+    data.service.claudeRenewalPromise = null;
+    data.close();
+  }
+});
+
+test('pre-expiry renewal still honors the 30-minute backoff and six-per-day cap', async (t) => {
+  await t.test('backoff blocks without consuming the token-lifetime floor', async () => {
+    let timestamp = Date.parse('2026-08-08T12:00:00Z');
+    let renewals = 0;
+    const data = fixture({ serviceOptions: { now: () => timestamp } });
+    try {
+      data.service.recordClaudeRenewalAttempt(data.target.id, {
+        at: new Date(timestamp - 5 * 60_000).toISOString(),
+        outcome: 'failed', mechanism: 'invoke', detail: 'fixture',
+      });
+      data.service.renewClaudeAccount = async () => {
+        renewals += 1;
+        return { at: new Date(timestamp).toISOString(), outcome: 'busy', mechanism: null, detail: BUSY_DETAIL };
+      };
+      data.service.refreshClaudeAccount = async () => {};
+      const expiresAt = timestamp + 40 * 60_000;
+      data.service.rememberClaudeCredentialExpiry(data.target.id, snapshotsExpiringAt(expiresAt));
+      const refresh = { claude: { profiles: [{ accountId: data.target.id, ok: true, snapshotCount: 1 }] } };
+
+      await data.service.runScheduledClaudeRenewals(refresh);
+      assert.equal(renewals, 0);
+      assert.equal(data.store.getAccount(data.target.id).metadata.claudeRenewal.lastPreExpiryAttemptAt, undefined);
+      timestamp += 25 * 60_000;
+      await data.service.runScheduledClaudeRenewals(refresh);
+      assert.equal(renewals, 1, 'the candidate remains eligible when backoff reaches 30 minutes');
+    } finally { data.close(); }
+  });
+
+  await t.test('daily cap blocks without consuming the token-lifetime floor', async () => {
+    const timestamp = Date.parse('2026-08-08T12:00:00Z');
+    let renewals = 0;
+    const data = fixture({ serviceOptions: { now: () => timestamp } });
+    try {
+      for (const hoursAgo of [23, 20, 16, 12, 8, 4]) {
+        data.service.recordClaudeRenewalAttempt(data.target.id, {
+          at: new Date(timestamp - hoursAgo * 60 * 60_000).toISOString(),
+          outcome: 'failed', mechanism: 'invoke', detail: 'fixture',
+        });
+      }
+      data.service.renewClaudeAccount = async () => { renewals += 1; };
+      data.service.rememberClaudeCredentialExpiry(data.target.id, snapshotsExpiringAt(timestamp + 40 * 60_000));
+      const refresh = { claude: { profiles: [{ accountId: data.target.id, ok: true, snapshotCount: 1 }] } };
+
+      await data.service.runScheduledClaudeRenewals(refresh);
+      assert.equal(renewals, 0);
+      assert.equal(data.store.getAccount(data.target.id).metadata.claudeRenewal.lastPreExpiryAttemptAt, undefined);
+    } finally { data.close(); }
+  });
+});
+
+test('credential-derived expiry is absent from renewal state and scheduled logs', async (t) => {
+  const timestamp = Date.parse('2026-08-08T12:00:00Z');
+  const expiresAt = timestamp + 37 * 60_000 + 123;
+  const logs = [];
+  t.mock.method(console, 'error', (...args) => logs.push(args.join(' ')));
+  const data = fixture({ serviceOptions: { now: () => timestamp } });
+  try {
+    data.service.renewClaudeAccount = async () => {
+      throw new Error(`fixture failure ${expiresAt} ${new Date(expiresAt).toISOString()}`);
+    };
+    data.service.rememberClaudeCredentialExpiry(data.target.id, snapshotsExpiringAt(expiresAt));
+    const refresh = { claude: { profiles: [{ accountId: data.target.id, ok: true, snapshotCount: 1 }] } };
+
+    await data.service.runScheduledClaudeRenewals(refresh);
+    const serializedState = JSON.stringify(await data.service.state());
+    const serializedRefresh = JSON.stringify(refresh);
+    for (const serialized of [serializedState, serializedRefresh, logs.join('\n')]) {
+      assert.doesNotMatch(serialized, new RegExp(String(expiresAt)));
+      assert.doesNotMatch(serialized, new RegExp(new Date(expiresAt).toISOString().replaceAll('.', '\\.')));
+    }
+    assert.doesNotMatch(serializedState, /"expiresAt"/);
+    assert.deepEqual(logs, ['[modeldeck] scheduled Claude renewal failed']);
   } finally { data.close(); }
 });
 

@@ -203,7 +203,7 @@ export function parseClaudeUsage(payload) {
   if (!usage || typeof usage !== 'object' || Array.isArray(usage)) {
     throw new Error('Claude usage output did not contain usage windows');
   }
-  const ignored = new Set(['extra_usage', 'extraUsage', 'plan', 'organization', 'account', 'status', 'limits']);
+  const ignored = new Set(['extra_usage', 'extraUsage', 'plan', 'organization', 'account', 'status', 'limits', 'expiresAt']);
   const snapshots = [];
   const limits = [data?.limits, usage?.limits].find(Array.isArray);
   if (limits) parseLimitEntries(limits, snapshots);
@@ -258,6 +258,13 @@ export function parseClaudeUsage(payload) {
     }
   }
   if (!unique.length) throw new Error('Claude usage output did not contain usage windows');
+  const expiresAt = number(data?.expiresAt);
+  if (expiresAt != null && expiresAt > 0) {
+    // Credential-derived and scheduler-only: callers can read the additive
+    // field, while JSON serialization (including every API response) sees a
+    // plain snapshots array and cannot expose the timestamp.
+    Object.defineProperty(unique, 'expiresAt', { value: expiresAt, enumerable: false });
+  }
   return unique;
 }
 

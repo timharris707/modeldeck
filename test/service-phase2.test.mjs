@@ -4,7 +4,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../src/db.mjs';
-import { ModelDeckService } from '../src/service.mjs';
+import {
+  CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT,
+  ModelDeckService,
+} from '../src/service.mjs';
 import { codexDeadCredentialError } from '../src/adapters/codex.mjs';
 
 function fixture(options = {}) {
@@ -790,12 +793,48 @@ test('a leftover profile directory falls through to a suffixed home instead of d
   } finally { data.close(); }
 });
 
-// Issue #99: Claude Code >= 2.1.216 keys Keychain credential storage off the
-// resolved ~/.claude, ignoring CLAUDE_CONFIG_DIR — the login spec must select
-// its flow from the installed CLI version.
+// Issue #99's historical boundary still selects the conservative login flow;
+// issue #300 additionally pins that decision to the exact served executable.
 test('Claude login specs are version-aware (issue #99)', async (t) => {
-  await t.test('pre-2.1.216 keeps the env-scoped spec', async () => {
+  await t.test('a bare command resolves once and pins the probed realpath in the served command', async () => {
+    const calls = [];
+    let daemonPath;
+    let canonicalPath;
     const data = fixture({
+      claudePath: 'claude',
+      exec: async (binary, args) => {
+        calls.push({ binary, args });
+        if (binary === '/usr/bin/which') return { stdout: `${daemonPath}\n` };
+        assert.equal(binary, canonicalPath);
+        assert.deepEqual(args, ['--version']);
+        return { stdout: 'Claude Code 2.1.221' };
+      },
+    });
+    try {
+      const toolDir = path.join(data.root, 'Claude Code');
+      canonicalPath = path.join(toolDir, 'claude-real');
+      daemonPath = path.join(data.root, 'daemon-bin', 'claude');
+      fs.mkdirSync(toolDir, { recursive: true });
+      fs.mkdirSync(path.dirname(daemonPath), { recursive: true });
+      fs.writeFileSync(canonicalPath, '#!/bin/sh\n', { mode: 0o700 });
+      fs.symlinkSync(canonicalPath, daemonPath);
+
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      const spec = await data.service.loginSpec(account.id);
+
+      assert.equal(path.isAbsolute(spec.command), true);
+      assert.equal(spec.command, fs.realpathSync(canonicalPath));
+      assert.equal(calls.find((call) => call.args[0] === '--version').binary, spec.command);
+      assert.equal(spec.preview, `'${spec.command}' /login`);
+      assert.equal(spec.flow, 'activation');
+    } finally { data.close(); }
+  });
+
+  await t.test('pre-2.1.216 keeps the env-scoped spec', async () => {
+    const claudeExecutable = '/fixture/bin/claude';
+    const data = fixture({
+      claudePath: claudeExecutable,
+      realpath: async (value) => value,
       exec: async (_binary, args) => ({ stdout: args[0] === '--version' ? 'Claude Code 2.1.215' : '' }),
     });
     try {
@@ -807,13 +846,18 @@ test('Claude login specs are version-aware (issue #99)', async (t) => {
       const real = fs.realpathSync(data.firstHome);
       assert.deepEqual(spec.env, { CLAUDE_CONFIG_DIR: real, CLAUDE_SECURESTORAGE_CONFIG_DIR: real });
       assert.match(spec.preview, /CLAUDE_CONFIG_DIR=/);
+      assert.equal(spec.command, claudeExecutable);
+      assert.match(spec.preview, /'\/fixture\/bin\/claude' auth login$/);
       assert.doesNotMatch(spec.preview, /logout/);
     } finally { data.close(); }
   });
 
   await t.test('2.1.216 and later drive sign-in through activation', async () => {
     for (const version of ['2.1.216', '2.2.0', '3.0.1']) {
+      const claudeExecutable = '/fixture/bin/claude';
       const data = fixture({
+        claudePath: claudeExecutable,
+        realpath: async (value) => value,
         exec: async (_binary, args) => ({ stdout: args[0] === '--version' ? `Claude Code ${version}` : '' }),
       });
       try {
@@ -822,7 +866,7 @@ test('Claude login specs are version-aware (issue #99)', async (t) => {
         assert.equal(spec.flow, 'activation');
         assert.equal(spec.requiresActivation, true);
         assert.deepEqual(spec.args, ['/login']);
-        // No env override: the environment no longer steers credentials.
+        // No command-level env override: activation steers affected releases.
         assert.deepEqual(spec.env, {});
         assert.doesNotMatch(spec.preview, /CLAUDE_CONFIG_DIR|CLAUDE_SECURESTORAGE_CONFIG_DIR/);
         assert.match(spec.preview, /\/login$/);
@@ -832,12 +876,18 @@ test('Claude login specs are version-aware (issue #99)', async (t) => {
   });
 
   await t.test('an undetectable version fails toward the activation flow', async () => {
-    const data = fixture({ exec: async () => { throw new Error('claude is not installed'); } });
+    const claudeExecutable = '/fixture/bin/claude';
+    const data = fixture({
+      claudePath: claudeExecutable,
+      realpath: async (value) => value,
+      exec: async () => { throw new Error('version is unreadable'); },
+    });
     try {
       const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
       const spec = await data.service.loginSpec(account.id);
       assert.equal(spec.flow, 'activation');
       assert.equal(spec.requiresActivation, true);
+      assert.equal(spec.command, claudeExecutable);
     } finally { data.close(); }
   });
 
@@ -907,6 +957,38 @@ test('Claude verify refuses a read-back identity that contradicts the account', 
       assert.equal(data.store.getAccount(account.id).identity, 'user@example.invalid');
     } finally { data.close(); }
   });
+
+  await t.test('an unauthenticated profile reports a credential in Claude\'s plain Keychain slot', async () => {
+    let slotProbe;
+    const data = fixture({
+      readClaudeAuth: async () => ({ authenticated: false, identity: null }),
+      claudeCredentialKeychainSlotState: async (input) => {
+        slotProbe = input;
+        return { profileScoped: false, unscoped: true };
+      },
+    });
+    try {
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      const result = await data.service.verifyAccount(account.id);
+      assert.equal(result.authenticated, false);
+      assert.equal(result.verifyHint, CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT);
+      assert.deepEqual(slotProbe, { claudeConfigDir: data.firstHome, platform: 'linux' });
+      assert.equal(data.store.getAccount(account.id).metadata.verifyHint, undefined);
+    } finally { data.close(); }
+  });
+
+  await t.test('a failed slot diagnostic preserves the ordinary unauthenticated result', async () => {
+    const data = fixture({
+      readClaudeAuth: async () => ({ authenticated: false, identity: null }),
+      claudeCredentialKeychainSlotState: async () => { throw new Error('Keychain unavailable'); },
+    });
+    try {
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      const result = await data.service.verifyAccount(account.id);
+      assert.equal(result.authenticated, false);
+      assert.equal(result.verifyHint, undefined);
+    } finally { data.close(); }
+  });
 });
 
 // Issue #99, fix direction 4 fallout: the tool probe names which mechanism
@@ -933,7 +1015,7 @@ test('tool probe reports the Claude credential-scoping mechanism', async (t) => 
     } finally { data.close(); }
   });
 
-  await t.test('resolved-home from 2.1.216 on', async () => {
+  await t.test('historical resolved-home classifier from 2.1.216 on', async () => {
     const data = probeFixture('2.1.216');
     try {
       assert.equal((await data.service.probeTools()).tools.claude.credentialScoping, 'resolved-home');
@@ -968,6 +1050,34 @@ test('Claude refresh isolates per-profile failures and never rotates accounts', 
     ]);
     assert.equal(data.store.getAccount(first.id).isDefault, true);
     assert.equal(data.store.getAccount(second.id).isDefault, false);
+  } finally { data.close(); }
+});
+
+test('Claude refresh keeps credential expiry private while threading it to the scheduler (issue #265)', async () => {
+  const expiresAt = Date.parse('2097-06-05T04:03:02.100Z');
+  const data = fixture({
+    claudeCredentialsPresent: async () => true,
+    fetchClaude: async () => {
+      const snapshots = [{ scope: 'weekly', usedPercent: 15, source: 'fixture' }];
+      Object.defineProperty(snapshots, 'expiresAt', { value: expiresAt, enumerable: false });
+      return snapshots;
+    },
+  });
+  try {
+    const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+    const results = await data.service.refreshClaude();
+    assert.deepEqual(results, [{ accountId: account.id, ok: true, snapshotCount: 1 }]);
+    assert.equal(data.service.claudeCredentialExpiries.get(account.id), expiresAt);
+
+    for (const payload of [results, await data.service.state()]) {
+      const serialized = JSON.stringify(payload);
+      assert.doesNotMatch(serialized, new RegExp(String(expiresAt)));
+      assert.doesNotMatch(serialized, /"expiresAt"/);
+    }
+    data.service.claudePreExpiryAttemptedExpiries.set(account.id, expiresAt);
+    assert.equal(await data.service.deleteAccount(account.id), true);
+    assert.equal(data.service.claudeCredentialExpiries.has(account.id), false);
+    assert.equal(data.service.claudePreExpiryAttemptedExpiries.has(account.id), false);
   } finally { data.close(); }
 });
 

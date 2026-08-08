@@ -89,8 +89,8 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
     cliproxyBaseUrl: CLIPROXY_BASE_URL,
     daemonGitCommit: GIT_COMMIT,
     // DEMO/DEV ONLY (issue #129): seeded fixture snapshots are authoritative —
-    // provider refresh becomes a no-op and nothing is ever scheduled. Set by
-    // scripts/demo-daemon.sh for screenshot instances; never in production.
+    // provider refresh becomes a no-op and its scheduler never arms. Local
+    // database maintenance remains independent. Set only by demo-daemon.sh.
     demoFixtures: process.env.MODELDECK_DEMO_FIXTURES === '1',
   });
   const { token: sessionToken, source: tokenSource } = resolveMutationToken({ token: mutationToken });
@@ -312,13 +312,19 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
     tokenSource,
     listen(callback) {
       return server.listen(port, host, () => {
+        // Retention is daemon maintenance, not provider polling: start it even
+        // when auto-refresh is disabled or the daemon serves demo fixtures.
+        ownedService.startUsageSnapshotRetention?.();
         ownedService.startAutoRefresh();
         callback?.();
       });
     },
-    close() {
+    async close() {
       ownedService.stopAutoRefresh();
-      return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      await Promise.all([
+        ownedService.stopUsageSnapshotRetention?.() || Promise.resolve(),
+        new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+      ]);
     },
   };
 }

@@ -54,9 +54,9 @@ public final class AddAccountModel: ObservableObject {
     /// Non-fatal step 3 problem (e.g. the first usage pull failed). The flow
     /// still completes; the deck will fill in on the next refresh.
     @Published public private(set) var completionWarning: String?
-    /// Issue #99: true when the daemon's login spec required activating the
-    /// new profile before the sign-in (Claude Code >= 2.1.216 keys
-    /// credentials off the resolved ~/.claude). The sheet explains the flip.
+    /// Issue #99: true when the daemon's conservative login spec required
+    /// activating the new profile before the sign-in. The sheet explains the
+    /// flip; the daemon owns version-specific flow selection.
     @Published public private(set) var didActivateForLogin = false
 
     /// Issue #99: the provider's previously active account, captured before
@@ -113,9 +113,9 @@ public final class AddAccountModel: ObservableObject {
             ))
             account = created
             let login = try await onboarding.loginCommand(accountID: created.id)
-            // Issue #99: on current Claude Code the credential lands in
-            // whichever profile ~/.claude resolves to, so the daemon's spec
-            // demands activating the new profile BEFORE the plain login.
+            // Issue #99: the daemon's selected flow demands activating the
+            // new profile BEFORE the plain login so affected Claude versions
+            // land the credential against the intended profile.
             // The prior active account is captured first (best effort) so
             // a successful flow can put it back.
             if login.needsActivationFirst {
@@ -196,7 +196,8 @@ public final class AddAccountModel: ObservableObject {
             return false
         }
         guard verification.authenticated else {
-            lastError = "This profile isn't signed in yet. Finish the provider's login in Terminal, then try again."
+            lastError = verification.verifyHint
+                ?? "This profile isn't signed in yet. Finish the provider's login in Terminal, then try again."
             return false
         }
         // Issue #99: the daemon refused the sign-in because the resulting

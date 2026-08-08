@@ -32,7 +32,12 @@ import {
   readClaudeRateLimitTier,
   readClaudeProfileIdentity,
 } from '../src/adapters/claude.mjs';
-import { claudeCredentialServiceName, claudeCredentialsPresent } from '../src/adapters/claude-keychain.mjs';
+import {
+  CLAUDE_KEYCHAIN_SERVICE,
+  claudeCredentialKeychainSlotState,
+  claudeCredentialServiceName,
+  claudeCredentialsPresent,
+} from '../src/adapters/claude-keychain.mjs';
 import { main as probeClaudeUsage, readClaudeCredentials, runProbeCli, KEYCHAIN_DENIED_ERROR, TOKEN_INVALIDATED_ERROR } from '../src/adapters/claude-usage-probe.mjs';
 import { extractIdentity } from '../src/adapters/identity.mjs';
 import { createProviderProfileHelpers } from '../src/adapters/provider-profile.mjs';
@@ -62,6 +67,14 @@ test('parses native Claude standard and model-scoped usage windows', () => {
 test('parses serialized Claude JSON and rejects output without usage', () => {
   assert.equal(parseClaudeUsage(JSON.stringify(claudeUsageFixture))[2].scope, 'weekly');
   assert.throws(() => parseClaudeUsage('Signed in successfully'), /not valid JSON/);
+});
+
+test('threads probe credential expiry on a non-serialized usage carrier (issue #265)', () => {
+  const expiresAt = Date.parse('2099-01-02T03:04:05.000Z');
+  const parsed = parseClaudeUsage({ ...claudeUsageFixture, expiresAt });
+  assert.equal(parsed.expiresAt, expiresAt);
+  assert.equal(Object.prototype.propertyIsEnumerable.call(parsed, 'expiresAt'), false);
+  assert.doesNotMatch(JSON.stringify(parsed), new RegExp(String(expiresAt)));
 });
 
 // Issue #28: the `limits` array shape — kind-tagged session / weekly_all /
@@ -344,6 +357,53 @@ test('Claude credential presence checks Keychain metadata then legacy file fallb
   assert.equal(bothMiss, false);
 });
 
+test('Claude credential slot diagnostic distinguishes the plain Keychain service without reading it', async () => {
+  const calls = [];
+  const state = await claudeCredentialKeychainSlotState({
+    claudeConfigDir: '/profiles/selected',
+    platform: 'darwin',
+    homeDirectory: '/Users/fixture',
+    userInfo: () => ({ username: 'fixture-user' }),
+    runSecurity: async (...args) => {
+      calls.push(args);
+      const service = args[1][args[1].indexOf('-s') + 1];
+      if (service !== CLAUDE_KEYCHAIN_SERVICE) {
+        const error = new Error('not found');
+        error.code = 44;
+        throw error;
+      }
+    },
+  });
+
+  assert.deepEqual(state, { profileScoped: false, unscoped: true });
+  assert.deepEqual(calls.map((call) => call[1]), [
+    ['find-generic-password', '-s', 'Claude Code-credentials-d2719532', '-a', 'fixture-user'],
+    ['find-generic-password', '-s', 'Claude Code-credentials', '-a', 'fixture-user'],
+  ]);
+  assert.ok(calls.every((call) => !call[1].includes('-w')));
+  assert.ok(calls.every((call) => call[2].env.USER === 'fixture-user'));
+  assert.ok(calls.every((call) => call[2].timeout === 2_000));
+});
+
+test('Claude credential slot diagnostic suppresses absence claims on Keychain errors', async () => {
+  await assert.rejects(
+    claudeCredentialKeychainSlotState({
+      claudeConfigDir: '/profiles/selected',
+      platform: 'darwin',
+      homeDirectory: '/Users/fixture',
+      userInfo: () => ({ username: 'fixture-user' }),
+      runSecurity: async (_binary, args) => {
+        const service = args[args.indexOf('-s') + 1];
+        if (service === CLAUDE_KEYCHAIN_SERVICE) return;
+        const error = new Error('Keychain unavailable');
+        error.code = 1;
+        throw error;
+      },
+    }),
+    /Keychain unavailable/,
+  );
+});
+
 test('usage credentials fall back to an injected macOS Keychain lookup', async () => {
   const calls = [];
   const credentials = await readClaudeCredentials({
@@ -464,6 +524,51 @@ test('readable but unparseable Keychain value is a credential problem, never key
     },
   }), /sign in explicitly before refreshing/);
   assert.equal(metadataProbes, 0);
+});
+
+test('successful usage probe emits normalized expiresAt without emitting credentials (issue #265)', async () => {
+  const expiresAtSeconds = 4_102_444_800;
+  const written = [];
+  let authorization;
+  await probeClaudeUsage({
+    env: { CLAUDE_CONFIG_DIR: '/profiles/selected' },
+    stdout: { write: (chunk) => written.push(chunk) },
+    readFile: async () => JSON.stringify({
+      claudeAiOauth: {
+        accessToken: 'fixture-oauth-token-never-emitted',
+        expiresAt: expiresAtSeconds,
+      },
+    }),
+    fetcher: async (url, options) => {
+      authorization = options.headers.Authorization;
+      return {
+        ok: true,
+        text: async () => JSON.stringify(claudeUsageFixture),
+      };
+    },
+  });
+  assert.equal(authorization, 'Bearer fixture-oauth-token-never-emitted');
+  assert.equal(written.length, 1);
+  const output = written[0];
+  assert.equal(JSON.parse(output).expiresAt, expiresAtSeconds * 1000);
+  assert.doesNotMatch(output, /fixture-oauth-token-never-emitted/);
+});
+
+test('probe never promotes a provider-owned expiresAt without credential expiry evidence', async () => {
+  const providerExpiresAt = Date.parse('2096-05-04T03:02:01.000Z');
+  const written = [];
+  await probeClaudeUsage({
+    env: { CLAUDE_CONFIG_DIR: '/profiles/selected' },
+    stdout: { write: (chunk) => written.push(chunk) },
+    readFile: async () => JSON.stringify({
+      claudeAiOauth: { accessToken: 'fixture-oauth-token' },
+    }),
+    fetcher: async () => ({
+      ok: true,
+      text: async () => JSON.stringify({ ...claudeUsageFixture, expiresAt: providerExpiresAt }),
+    }),
+  });
+  assert.equal(Object.hasOwn(JSON.parse(written[0]), 'expiresAt'), false);
 });
 
 // Issue #114: the SEA daemon dispatches the probe through src/server.mjs's

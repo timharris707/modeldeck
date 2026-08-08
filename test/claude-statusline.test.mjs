@@ -278,6 +278,54 @@ test('a newer capture supersedes an older probe row', async () => {
   assert.equal(weekly.usedPercent, 55);
 });
 
+// Issue #264 — the presentation/candidacy split. Statusline captures record
+// fresh server-truth for an account whose stored sign-in is still flagged
+// expired. Candidacy: the remembered refresh error MUST survive ingest (it
+// is what keeps signinReason "expired" and renewal firing). Presentation:
+// the same account's frozen rows must not own the worst-capacity headline
+// while stale, and must count again the moment a capture is fresh.
+test('issue #264: ingest keeps renewal candidacy while freshness governs the headline', async () => {
+  const { store, service, accountA, accountB, writeCapture } = makeFixture();
+  const idleError = 'stored OAuth credentials have expired; sign in explicitly before refreshing';
+  service.recordAccountRefreshResults([
+    { accountId: accountA.id, ok: false, error: idleError },
+    { accountId: accountB.id, ok: false, error: idleError },
+  ]);
+  const now = Date.parse('2026-07-24T12:05:00.000Z');
+  // Account A: a live session's capture, observed 5 minutes ago — heavier
+  // usage than anything else on the deck.
+  writeCapture(accountA, CAPTURE('2026-07-24T12:00:00.000Z', 97, 90));
+  await service.ingestClaudeStatuslineCaptures();
+  // Account B: frozen rows from hours before the flag.
+  store.recordUsage(accountB.id, {
+    scope: '5-hour', usedPercent: 99, resetsAt: '2026-07-24T14:00:00.000Z',
+    observedAt: '2026-07-24T06:00:00.000Z', source: 'claude-oauth-api',
+  });
+
+  // Candidacy unchanged: ingest never touched the remembered error, so the
+  // account still reads signin-required/expired and renewal stays offered.
+  const accounts = await service.accountsWithAuthState();
+  const a = accounts.find((account) => account.id === accountA.id);
+  assert.equal(a.authState, 'signin-required');
+  assert.equal(a.signinReason, 'expired');
+  assert.equal(a.renew.available, true);
+  assert.ok(a.lastRefreshError);
+
+  // Presentation: A's FRESH capture rows own the headline (1% left on the
+  // 5-hour window); B's frozen rows are excluded with the honest reason.
+  const worst = service.worstCapacity({ now });
+  assert.equal(worst.worst.accountId, accountA.id);
+  assert.equal(worst.worst.remainingPercent, 3);
+  assert.deepEqual(
+    worst.excluded.filter((entry) => entry.accountId === accountB.id),
+    [{ accountId: accountB.id, scope: '5-hour', reason: 'usage frozen while the account cannot refresh' }],
+  );
+
+  // The renewal gate itself still sees "expired" — the exact condition
+  // performClaudeRenewal requires before it will attempt anything.
+  assert.equal(service.signinReason(a, a.authState), 'expired');
+});
+
 test('malformed or absent capture files are silently skipped', async () => {
   const { store, service, accountA, statuslineDir } = makeFixture();
   fs.mkdirSync(statuslineDir, { recursive: true });

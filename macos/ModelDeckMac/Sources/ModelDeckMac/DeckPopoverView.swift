@@ -57,6 +57,15 @@ struct DeckPopoverView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
+            // ── Header info space ─────────────────────────────────────────
+            // Issue #302 (Tim): "anything that gets put into that space, I
+            // would like it to be dismissible. We don't need the extra noise
+            // again." Standing informational lines rendered here MUST carry
+            // the shared `DismissibleHeaderNotice` affordance and persist
+            // their dismissal (DeckPopoverModel.DeckHeaderNotice, per-kind).
+            // The only exceptions are live self-clearing state (daemon
+            // unreachable, install progress, launch-at-login errors) and
+            // flows that own the surface (the setup card).
             menuBarSourceLine
             stagedUpdateBanner
             connectionBanner
@@ -212,14 +221,26 @@ struct DeckPopoverView: View {
     /// states the mode's selection rule. Rendered only while the menu bar
     /// is actually showing a percent — a hidden number needs no explaining,
     /// and the icon-only / health modes keep their clean chrome.
+    /// Issue #302 (Tim, 2026-08-08): dismissible like everything else in
+    /// this space — dismissed means gone, permanently (per-kind, persisted
+    /// in `DeckPopoverModel`). No information is lost: the same account /
+    /// window story lives on in the source row's checkmark tooltip (#131,
+    /// #249).
     @ViewBuilder
     private var menuBarSourceLine: some View {
-        if let line = statusModel.menuBarNumberSourceLine {
-            Text(line.text)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .help(line.tooltip)
+        if let line = statusModel.menuBarNumberSourceLine,
+           !deckModel.isHeaderNoticeDismissed(.menuBarSource) {
+            DismissibleHeaderNotice(
+                dismissHelp: "Dismiss — the source row's checkmark tooltip keeps this explanation",
+                dismissAccessibilityLabel: "Dismiss menu bar source caption",
+                onDismiss: { deckModel.dismissHeaderNotice(.menuBarSource) }
+            ) {
+                Text(line.text)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help(line.tooltip)
+            }
         }
     }
 
@@ -336,7 +357,17 @@ struct DeckPopoverView: View {
     @ViewBuilder
     private var stagedUpdateBanner: some View {
         if case .prompting(let version) = stagedPromptModel.state {
-            HStack(spacing: 8) {
+            // Issue #302: the bare 9pt "xmark" didn't read as a dismiss
+            // control ("I wouldn't even know that it's a dismiss X") — the
+            // banner now carries the shared header dismiss affordance.
+            // Dismissal semantics are UNCHANGED from #241: banner → passive
+            // badge (staged-invisible is the #241 bug), which is that
+            // decision's own locked design, not a #302 residual-chrome case.
+            DismissibleHeaderNotice(
+                dismissHelp: "Dismiss — a small badge stays in the header until you restart",
+                dismissAccessibilityLabel: "Dismiss update prompt",
+                onDismiss: { stagedPromptModel.dismissPrompt() }
+            ) {
                 Image(systemName: "arrow.triangle.2.circlepath")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
@@ -350,16 +381,6 @@ struct DeckPopoverView: View {
                 .controlSize(.small)
                 .help("Quit, install v\(version), and reopen ModelDeck — the same one-click path as Update Now")
                 .accessibilityLabel("Restart ModelDeck to finish updating")
-                Button {
-                    stagedPromptModel.dismissPrompt()
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Dismiss — a small badge stays in the header until you restart")
-                .accessibilityLabel("Dismiss update prompt")
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
@@ -421,6 +442,18 @@ struct DeckPopoverView: View {
                     .font(.caption)
                     .foregroundStyle(installStatusIsFailure ? .red : .secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                // Issue #303: unreachable while the #241 prompt/badge owns
+                // the staged phase (the branch above yields), but the
+                // staged-status-never-without-an-action contract holds even
+                // if that ownership ever slips.
+                if let restart = AppUpdateInstallModel.restartActionTitle(
+                    for: appUpdateInstallModel.phase
+                ) {
+                    Button(restart) { appUpdateInstallModel.updateNow() }
+                        .controlSize(.small)
+                        .help(AppUpdateInstallModel.restartActionHelp)
+                        .accessibilityLabel("Restart ModelDeck to finish updating")
+                }
             }
         }
     }
@@ -457,29 +490,20 @@ struct DeckPopoverView: View {
             // Issue #269 (Tim, 2026-08-06): informational, not actionable, so
             // it must be acknowledgeable — it used to sit at the top of the
             // deck for the whole session after being read once.
-            HStack(spacing: 4) {
+            // Issue #302: same shared dismiss affordance as the rest of the
+            // header info space (the 8pt tertiary "xmark" was the least
+            // legible of the three). Dismissal stays launch-scoped — the
+            // notice itself only exists for the launch that re-registered
+            // (see `dismissReregisterNotice`), so there is nothing to
+            // persist.
+            DismissibleHeaderNotice(
+                dismissHelp: "Dismiss",
+                dismissAccessibilityLabel: "Dismiss background service notice",
+                onDismiss: { setupModel.dismissReregisterNotice() }
+            ) {
                 Text("Background service updated to match this app version.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
-                Button {
-                    setupModel.dismissReregisterNotice()
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 8, weight: .semibold))
-                        .foregroundStyle(.tertiary)
-                        // Small glyph, comfortable target. `.frame` then a
-                        // plain Rectangle centres the region on the glyph.
-                        // `Rectangle().size(16, 16)` looks equivalent and is
-                        // not: it re-anchors at the incoming rect's ORIGIN,
-                        // so the target ran ~7pt right and ~8pt DOWN of the
-                        // glyph with zero margin above or left, and spilled
-                        // outside the button's layout bounds (measured in
-                        // review, PR #271).
-                        .frame(width: 16, height: 16)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Dismiss background service notice")
             }
         }
         if let launchAtLoginError = launchAtLoginModel.lastError {
@@ -545,6 +569,7 @@ struct DeckPopoverView: View {
                             menuBarSourceAccountID: sourceID,
                             menuBarSourceTooltip: sourceTooltip,
                             staleness: { statusModel.cardStaleness(for: $0) },
+                            signInRecovery: { statusModel.signInRecovery(for: $0) },
                             renewPresentation: { renewModel.presentation(for: $0.account) },
                             onRenewNow: { row in
                                 Task { await renewModel.renew(account: row.account) }
@@ -578,6 +603,7 @@ struct DeckPopoverView: View {
                             menuBarSourceTooltip: sourceTooltip,
                             isExpanded: deckModel.isExpanded(row.id),
                             staleness: statusModel.cardStaleness(for: row),
+                            signInRecovery: statusModel.signInRecovery(for: row),
                             renew: renewModel.presentation(for: row.account),
                             onRenewNow: {
                                 Task { await renewModel.renew(account: row.account) }
@@ -643,6 +669,18 @@ struct DeckPopoverView: View {
         guard statusModel.connection == .connected,
               let state = statusModel.deckState else { return false }
         return !deckModel.isDeckEmpty(state: state)
+    }
+
+    /// Issue #315: the zero-weight filter toggle renders only where it can
+    /// do something — a populated deck on a machine whose accounts carry
+    /// proxy weights — OR whenever the persisted filter is ON, so the
+    /// control that hid rows can always bring them back.
+    private var showsZeroWeightToggle: Bool {
+        guard let state = statusModel.deckState, !deckModel.isDeckEmpty(state: state) else {
+            return false
+        }
+        return DeckPopoverModel.offersZeroWeightToggle(state: state)
+            || deckModel.hideZeroWeightAccounts
     }
 
     /// Issue #235: one Availability Health evaluation per provider column,
@@ -783,13 +821,43 @@ struct DeckPopoverView: View {
             // window. Hidden in the floating deck itself — the window's
             // close button (or the placeholder's Reattach) is the way back.
             if !isFloating, let onDetach {
-                Button {
-                    onDetach()
-                } label: {
-                    Image(systemName: "macwindow.on.rectangle")
-                }
-                .help(FloatingDeckModel.detachHelp)
-                .accessibilityLabel(FloatingDeckModel.detachAccessibilityLabel)
+                // Issue #315 fix: the detach control shipped (#295) with the
+                // default bordered button chrome — against the #283 rule
+                // every other footer icon follows. Same bare-glyph component
+                // as + and refresh; help and accessibility copy unchanged.
+                DeckFooterIconButton(
+                    systemImage: "macwindow.on.rectangle",
+                    name: FloatingDeckModel.detachName,
+                    help: FloatingDeckModel.detachHelp,
+                    accessibilityLabel: FloatingDeckModel.detachAccessibilityLabel,
+                    action: onDetach
+                )
+            }
+            // Issue #315: hide/show zero-weight accounts. Purely visual —
+            // routing, health, refresh, renewal, and the menu bar never
+            // consult it (pinned by tests). Bare glyph per #283; the glyph
+            // shows the CURRENT mode (eye = everything visible, eye.slash =
+            // zero-weight rows hidden), and the unchanged column count
+            // ("7 accounts" over fewer rows) is the quiet hint while
+            // filtering. Offered only where weights exist (pool machines),
+            // with a persisted ON as the escape hatch.
+            if showsZeroWeightToggle {
+                DeckFooterIconButton(
+                    systemImage: deckModel.hideZeroWeightAccounts ? "eye.slash" : "eye",
+                    name: deckModel.hideZeroWeightAccounts
+                        ? "Show zero-weight accounts"
+                        : "Hide zero-weight accounts",
+                    help: deckModel.hideZeroWeightAccounts
+                        ? "Accounts showing routing weight 0 are hidden from the deck. "
+                            + "They still count for routing, health, and the menu bar."
+                        : "Hide accounts showing routing weight 0 from the deck. "
+                            + "Display only — nothing about routing or refresh changes.",
+                    accessibilityLabel: deckModel.hideZeroWeightAccounts
+                        ? "Show zero-weight accounts"
+                        : "Hide zero-weight accounts",
+                    accessibilityHint: "Visual filter only; hidden accounts keep working",
+                    action: { deckModel.toggleZeroWeightFilter() }
+                )
             }
             if showsFooterAddAccount {
                 // Issue #226: growing the pool never requires the Settings
@@ -901,6 +969,10 @@ struct DeckColumnView: View {
     /// the column stays free of the status model (interval + clock live
     /// there). Defaults to no markers for previews/tests.
     var staleness: (DeckAccountRow) -> DeckFreshness.CardStaleness? = { _ in nil }
+    /// Issue #264: per-row clocked sign-in notice, same seam as
+    /// `staleness`. The default keeps the row's clock-free derivation for
+    /// previews/tests.
+    var signInRecovery: (DeckAccountRow) -> DeckFreshness.SignInRecovery? = { $0.signInRecovery }
     /// Issue #176: per-row renew state + action, supplied by the popover so
     /// the column stays free of the renew model (same seam shape as
     /// `staleness`). Defaults render nothing for previews/tests.
@@ -963,6 +1035,7 @@ struct DeckColumnView: View {
                         menuBarSourceTooltip: menuBarSourceTooltip,
                         isExpanded: deckModel.isExpanded(row.id),
                         staleness: staleness(row),
+                        signInRecovery: signInRecovery(row),
                         renew: renewPresentation(row),
                         onRenewNow: { onRenewNow(row) },
                         onDismissRenewOutcome: { onDismissRenewOutcome(row) },
@@ -1040,6 +1113,11 @@ struct DeckAccountRowView: View {
     /// ~2x the effective refresh interval — the card then carries a visible
     /// warning-tinted age line so fossil data can never pass as fresh.
     var staleness: DeckFreshness.CardStaleness? = nil
+    /// Issue #264: the clocked sign-in notice (the `.liveIdle` tone needs
+    /// the popover's clock + interval, which live in the status model — the
+    /// same seam as `staleness`). Nil falls back to the row's clock-free
+    /// derivation so previews/tests render unchanged.
+    var signInRecovery: DeckFreshness.SignInRecovery? = nil
     /// Issue #176: this account's renew rendering state (nil = no renew
     /// affordance: healthy, signed out, Codex, or a pre-#176 daemon), and
     /// the action that runs the daemon's guarded renew op. Plain values so
@@ -1290,15 +1368,21 @@ struct DeckAccountRowView: View {
                 }
                 .foregroundStyle(kind == .busy ? Color.primary : Color.secondary)
                 .help(text)
-            } else if let recovery = row.signInRecovery {
+            } else if let recovery = signInRecovery ?? row.signInRecovery {
                 let warningID = DeckWarningID(topic: .signInRequired, elementID: row.id)
                 Button {
                     deckModel.toggleWarning(warningID)
                 } label: {
                     HStack(spacing: 4) {
-                        Image(systemName: recovery.tone == .idle
-                            ? "moon.zzz"
-                            : "person.crop.circle.badge.exclamationmark")
+                        // Issue #264: the live tone trades the sleeping moon
+                        // for a radio glyph — the account is in use and its
+                        // numbers are current; only the stored sign-in is
+                        // still renewing in the background.
+                        Image(systemName: recovery.tone == .signedOut
+                            ? "person.crop.circle.badge.exclamationmark"
+                            : recovery.tone == .liveIdle
+                                ? "dot.radiowaves.left.and.right"
+                                : "moon.zzz")
                             .font(.system(size: 9, weight: .semibold))
                         Text(recovery.text)
                             .font(.system(size: 10))
@@ -1310,9 +1394,9 @@ struct DeckAccountRowView: View {
                             // explanation and the tooltip.
                             .lineLimit(1)
                     }
-                    .foregroundStyle(recovery.tone == .idle
-                        ? Color.secondary
-                        : severityColor(.warning))
+                    .foregroundStyle(recovery.tone == .signedOut
+                        ? severityColor(.warning)
+                        : Color.secondary)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)

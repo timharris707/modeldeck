@@ -111,3 +111,54 @@ test('a rate-limit scope with unavailable usage still blocks the spend fallback'
   assert.equal(result.status, 'unknown');
   assert.equal(result.notify, false);
 });
+
+// Issue #264 (bonus fix): an account that cannot refresh (`authFlagged`,
+// set by the service from the remembered sign-in / Keychain refresh errors)
+// freezes its stored percentages — the same account Availability Health
+// counts as zero capacity must not own the headline on data it can no
+// longer update. Its rows count only while FRESH (a live session's
+// statusline captures keep them fresh).
+test('issue #264: frozen rows of auth-flagged accounts never own the headline', () => {
+  const roster = [
+    { id: 'flagged', label: 'Frozen', provider: 'claude', enabled: true, authFlagged: true },
+    { id: 'healthy', label: 'Healthy', provider: 'claude', enabled: true },
+  ];
+  const frozenRow = { accountId: 'flagged', scope: '5-hour', usedPercent: 97, remainingPercent: 3, resetsAt: null, observedAt: '2026-07-19T15:00:00.000Z' };
+  const healthyRow = { accountId: 'healthy', scope: '5-hour', usedPercent: 60, remainingPercent: 40, resetsAt: null, observedAt: '2026-07-19T17:59:00.000Z' };
+
+  // Frozen (3 hours old at `now`): the flagged 3% loses the headline.
+  let result = evaluateWorstCapacity([frozenRow, healthyRow], roster, { now });
+  assert.equal(result.worst.accountId, 'healthy');
+  assert.equal(result.worst.remainingPercent, 40);
+  assert.deepEqual(result.excluded, [
+    { accountId: 'flagged', scope: '5-hour', reason: 'usage frozen while the account cannot refresh' },
+  ]);
+
+  // Fresh (statusline capture one minute ago): the flagged account is
+  // honestly usable and its 3% is the real headline.
+  result = evaluateWorstCapacity([
+    { ...frozenRow, observedAt: '2026-07-19T17:59:00.000Z' },
+    healthyRow,
+  ], roster, { now });
+  assert.equal(result.worst.accountId, 'flagged');
+  assert.equal(result.worst.remainingPercent, 3);
+  assert.deepEqual(result.excluded, []);
+
+  // Unparseable observedAt on a flagged account is frozen, not fresh.
+  result = evaluateWorstCapacity([
+    { ...frozenRow, observedAt: null },
+    healthyRow,
+  ], roster, { now });
+  assert.equal(result.worst.accountId, 'healthy');
+
+  // An UNFLAGGED account keeps its stored percents in the headline no
+  // matter the age — only accounts that cannot refresh lose frozen rows.
+  result = evaluateWorstCapacity([
+    { ...frozenRow, accountId: 'healthy', observedAt: '2026-07-17T15:00:00.000Z' },
+  ], roster, { now });
+  assert.equal(result.worst.remainingPercent, 3);
+
+  // The freshness window is configurable (additive option).
+  result = evaluateWorstCapacity([frozenRow, healthyRow], roster, { now, flaggedMaxAgeMinutes: 6 * 60 });
+  assert.equal(result.worst.accountId, 'flagged');
+});

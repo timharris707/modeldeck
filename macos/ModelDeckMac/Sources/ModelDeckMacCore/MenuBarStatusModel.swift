@@ -413,7 +413,7 @@ public final class MenuBarStatusModel: ObservableObject {
                     IconDebugLog.log("evaluator worst=\(String(describing: worst))")
                 } catch {
                     IconDebugLog.log("evaluator FAILED (\(error)); falling back to client calc")
-                    worst = WorstRemainingCalculator.worstRemaining(in: state)
+                    worst = WorstRemainingCalculator.worstRemaining(in: state, now: clock())
                     IconDebugLog.log("fallback worst=\(String(describing: worst))")
                 }
             } else {
@@ -439,7 +439,7 @@ public final class MenuBarStatusModel: ObservableObject {
     public func apply(deckState state: DeckState) {
         stateGeneration += 1
         deckState = state
-        let worst = WorstRemainingCalculator.worstRemaining(in: state)
+        let worst = WorstRemainingCalculator.worstRemaining(in: state, now: clock())
         worstRemaining = worst
         hasLoadedOnce = true
         recomputeIconState()
@@ -627,5 +627,15 @@ public final class MenuBarStatusModel: ObservableObject {
         // Issue #90: same effective-cadence basis as the footer — the cap
         // slowing refresh must never falsely mark cards stale.
         row.staleness(now: now ?? clock(), autoRefreshInterval: stalenessInterval)
+    }
+
+    /// Issue #264: the sign-in notice for one deck card, computed against
+    /// the same effective cadence as `cardStaleness` — the `.idle` tone
+    /// upgrades to `.liveIdle` while the account's data is fresh (a running
+    /// session's statusline captures), instead of claiming the data is
+    /// paused. The one clock decides both the stale marker and this tone,
+    /// so a card can never say "live" and "stale" at once.
+    public func signInRecovery(for row: DeckAccountRow, now: Date? = nil) -> DeckFreshness.SignInRecovery? {
+        row.signInRecovery(now: now ?? clock(), autoRefreshInterval: stalenessInterval)
     }
 }

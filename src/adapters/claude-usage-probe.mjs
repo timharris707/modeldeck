@@ -40,14 +40,14 @@ function finiteNumber(value) {
   return typeof parsed === 'number' && Number.isFinite(parsed) ? parsed : null;
 }
 
-function accessToken(credentials) {
+function oauthAccess(credentials) {
   const oauth = credentials?.claudeAiOauth ?? credentials?.oauth ?? credentials;
   const token = oauth?.accessToken ?? oauth?.access_token;
   if (typeof token !== 'string' || !token) throw new Error('stored OAuth credentials are unavailable; sign in explicitly before refreshing');
   const rawExpiresAt = finiteNumber(oauth?.expiresAt ?? oauth?.expires_at);
   const expiresAt = rawExpiresAt && rawExpiresAt < 10_000_000_000 ? rawExpiresAt * 1000 : rawExpiresAt;
   if (expiresAt && expiresAt <= Date.now()) throw new Error('stored OAuth credentials have expired; sign in explicitly before refreshing');
-  return token;
+  return { token, expiresAt };
 }
 
 export async function readClaudeCredentials({
@@ -108,13 +108,19 @@ export async function readClaudeCredentials({
   }
 }
 
-export async function main({ env = process.env, fetcher = globalThis.fetch, ...credentialOptions } = {}) {
+export async function main({
+  env = process.env,
+  fetcher = globalThis.fetch,
+  stdout = process.stdout,
+  ...credentialOptions
+} = {}) {
   const profile = env.CLAUDE_CONFIG_DIR;
   const credentials = await readClaudeCredentials({ profile, ...credentialOptions });
+  const { token, expiresAt } = oauthAccess(credentials);
   const response = await fetcher('https://api.anthropic.com/api/oauth/usage', {
     method: 'GET',
     headers: {
-      Authorization: `Bearer ${accessToken(credentials)}`,
+      Authorization: `Bearer ${token}`,
       'anthropic-beta': 'oauth-2025-04-20',
       Accept: 'application/json',
       // Generic user agents land in a stricter 429 bucket on this endpoint.
@@ -132,8 +138,20 @@ export async function main({ env = process.env, fetcher = globalThis.fetch, ...c
     throw new Error(`provider returned HTTP ${response.status}`);
   }
   const text = await response.text();
-  JSON.parse(text);
-  process.stdout.write(text);
+  const payload = JSON.parse(text);
+  // Issue #265: the parent needs the credential lifetime only long enough to
+  // decide whether this still-valid token is close enough to renew. Keep the
+  // provider payload shape and add the normalized millisecond timestamp at
+  // its root; the adapter consumes it into a deliberately non-serialized
+  // in-memory field before anything reaches service state.
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    // Never mistake a provider-owned field with the same spelling for local
+    // credential evidence. The output field exists only when it came from
+    // the credential object read above.
+    if (expiresAt != null) payload.expiresAt = expiresAt;
+    else delete payload.expiresAt;
+  }
+  stdout.write(JSON.stringify(payload));
 }
 
 // Issue #114: the ONE probe CLI error shape, shared by both launch modes.

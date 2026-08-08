@@ -107,11 +107,10 @@ public final class AccountSignInModel: ObservableObject {
     /// and run it in Terminal. A failed Terminal launch is not fatal — the
     /// command stays available for relaunch.
     ///
-    /// Issue #99: when the daemon's spec says `requiresActivation` (Claude
-    /// Code >= 2.1.216 keys credentials off the resolved ~/.claude), the
-    /// flow activates the target account first — after capturing the
-    /// previously active one for restore — and only then opens Terminal
-    /// with the plain login.
+    /// Issue #99: when the daemon's conservative spec says
+    /// `requiresActivation`, the flow activates the target account first —
+    /// after capturing the previously active one for restore — and only then
+    /// opens Terminal with the plain login.
     ///
     /// Every post-await write re-checks the phase first: if the user
     /// cancelled while the daemon call was in flight, the late result is
@@ -333,7 +332,8 @@ public final class AccountSignInModel: ObservableObject {
         guard phases[account.id] == .verifying else { return false }
         guard verification.authenticated else {
             phases[account.id] = .awaitingSignIn(command: command)
-            errors[account.id] = "Still signed out. Finish the provider's login in Terminal, then verify again."
+            errors[account.id] = verification.verifyHint
+                ?? "Still signed out. Finish the provider's login in Terminal, then verify again."
             return false
         }
         // Issue #99: the daemon refused the sign-in — the resulting identity

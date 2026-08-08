@@ -22,6 +22,12 @@ function now() {
   return new Date().toISOString();
 }
 
+// Issue #181: feature consumers need only the newest row per (account, scope),
+// but keep a wide history window as a conservative operational/debugging
+// margin. The newest row is protected independently of age for idle accounts.
+export const USAGE_SNAPSHOT_RETENTION_DAYS = 90;
+export const USAGE_SNAPSHOT_PRUNE_BATCH_SIZE = 500;
+
 export const DEFAULT_SETTINGS = Object.freeze({
   autoRefreshEnabled: true,
   // Issue #176: expired Claude OAuth credentials may be renewed through the
@@ -218,6 +224,10 @@ export class Store {
       -- than scanning the whole history on every /api/state poll.
       CREATE INDEX IF NOT EXISTS usage_account_scope_observed
         ON usage_snapshots(account_id, scope, observed_at DESC, id DESC);
+      -- Issue #181: retention discovers globally expired rows by observation
+      -- time. The account-leading indexes cannot range-search that predicate.
+      CREATE INDEX IF NOT EXISTS usage_observed
+        ON usage_snapshots(observed_at, id);
 
       CREATE TABLE IF NOT EXISTS launch_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -404,6 +414,37 @@ export class Store {
       snapshot.stale ? 1 : 0,
       JSON.stringify(snapshot.detail || {}),
     );
+  }
+
+  /// Delete at most one bounded batch of expired history while always keeping
+  /// the newest observation for every (account, scope). Candidate discovery is
+  /// a range walk over usage_observed; the newer-row guard is served by the
+  /// existing latest-row covering index. DELETE resolves only selected ids.
+  pruneUsageSnapshotsBatch({ cutoff, batchSize = USAGE_SNAPSHOT_PRUNE_BATCH_SIZE }) {
+    const cutoffMs = typeof cutoff === 'string' ? Date.parse(cutoff) : NaN;
+    if (!Number.isFinite(cutoffMs) || new Date(cutoffMs).toISOString() !== cutoff) {
+      throw new Error('usage snapshot prune cutoff must be a canonical ISO timestamp');
+    }
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > USAGE_SNAPSHOT_PRUNE_BATCH_SIZE) {
+      throw new Error(`usage snapshot prune batchSize must be an integer from 1 to ${USAGE_SNAPSHOT_PRUNE_BATCH_SIZE}`);
+    }
+    return this.db.prepare(`
+      DELETE FROM usage_snapshots
+      WHERE id IN (
+        SELECT old.id
+        FROM usage_snapshots AS old INDEXED BY usage_observed
+        WHERE old.observed_at < ?
+          AND EXISTS (
+            SELECT 1
+            FROM usage_snapshots AS newer INDEXED BY usage_account_scope_observed
+            WHERE newer.account_id = old.account_id
+              AND newer.scope = old.scope
+              AND (newer.observed_at, newer.id) > (old.observed_at, old.id)
+          )
+        ORDER BY old.observed_at, old.id
+        LIMIT ?
+      )
+    `).run(cutoff, batchSize).changes;
   }
 
   /// Issue #174: the newest stored row for one (account, scope) — the

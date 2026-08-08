@@ -74,6 +74,9 @@ public final class FloatingDeckModel: ObservableObject {
     public static let placeholderTitle = "The deck is floating on your desktop."
     public static let bringToFrontTitle = "Bring to Front"
     public static let reattachTitle = "Reattach to Menu Bar"
+    /// Issue #315: the detach control renders as a bare footer glyph (the
+    /// #283 rule), whose tooltip leads with the button's NAME — this is it.
+    public static let detachName = "Float the deck"
     /// The detach control's tooltip — states the whole contract, including
     /// the way back.
     public static let detachHelp = "Move the deck into a floating window that "

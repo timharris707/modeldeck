@@ -390,6 +390,16 @@ public enum DeckFreshness {
         public enum Tone: Equatable, Sendable {
             case signedOut
             case idle
+            /// Issue #264: idle-flagged BUT currently producing fresh
+            /// server-truth — a running session's statusline captures are
+            /// keeping this account's numbers current while its stored
+            /// sign-in is still marked expired (and ModelDeck's auto-renew
+            /// keeps firing in the background). Only the clocked
+            /// `signInRecovery(for:newestObservedAt:now:autoRefreshInterval:)`
+            /// derivation produces this tone; the clock-free variant never
+            /// does, so age-blind surfaces (footer breakdown, Settings
+            /// roster) keep their existing idle story.
+            case liveIdle
         }
 
         public var text: String
@@ -418,6 +428,13 @@ public enum DeckFreshness {
     /// automatically on next use, so the data is paused, not broken. The
     /// same one-click sign-in path stays for "fresh data now".
     static let idleSignInDetail = "This account's stored sign-in expired while idle, so its usage data is paused. Using the account again renews the sign-in automatically — or sign in now from Settings → Accounts to refresh right away."
+
+    /// Issue #264: the live lead — the stored sign-in is still marked
+    /// expired, but a running session is reporting current usage
+    /// (server-truth statusline captures), so the numbers on the card are
+    /// live, not paused. ModelDeck's automatic renewal keeps working in the
+    /// background; the same one-click sign-in path stays for doing it now.
+    static let liveIdleSignInDetail = "A running session is reporting this account's current usage, so its numbers are live. Its stored sign-in still needs renewal — ModelDeck keeps renewing it automatically in the background, or sign in now from Settings → Accounts."
 
     /// Claude-only context (issue #114 root cause): Claude Code ≥ 2.1.216
     /// renews only the ACTIVE account's stored sign-in, so every other
@@ -464,6 +481,52 @@ public enum DeckFreshness {
             tooltip: detail,
             accessibilityLabel: "\(text) — \(detail)",
             tone: tone
+        )
+    }
+
+    /// Issue #264 — the clocked derivation: presentation split from renewal
+    /// candidacy. Statusline captures (#174) record server-truth usage for
+    /// an account whose stored sign-in is still flagged expired; the flag
+    /// must SURVIVE (it is what keeps `performClaudeRenewal` firing), but
+    /// the card must stop claiming "Idle — renews on next use" over numbers
+    /// a live session updated seconds ago. When the `.idle` tone's account
+    /// has an observation inside the deck's own staleness rule (the same
+    /// 2×-interval basis as `cardStaleness`), the notice upgrades to the
+    /// `.liveIdle` tone — same slot, same footprint, same click-through and
+    /// one-click sign-in path (Tim's #149 directive: one affordance, tone
+    /// splits only). Every other case returns the clock-free derivation
+    /// unchanged, including the `.signedOut` alarm: a genuinely missing
+    /// sign-in stays an alarm even while old data sits on the card.
+    public static func signInRecovery(
+        for account: DeckAccount,
+        newestObservedAt: Date?,
+        now: Date,
+        autoRefreshInterval: TimeInterval
+    ) -> SignInRecovery? {
+        guard let base = signInRecovery(for: account) else { return nil }
+        guard base.tone == .idle,
+              let newestObservedAt,
+              !isStale(observedAt: newestObservedAt, now: now, autoRefreshInterval: autoRefreshInterval)
+        else { return base }
+        // Same composition as the base derivation: lead, Claude structural
+        // context, then the honest last-refresh-error line (the error is
+        // exactly WHY the account is still flagged — hiding it would make
+        // the live state look like a cleared flag, which it is not).
+        var detail = liveIdleSignInDetail
+        if account.provider == "claude" {
+            detail += " \(signInRecoveryClaudeDetail)"
+        }
+        if let message = account.lastRefreshError?.message, !message.isEmpty {
+            detail += " Last refresh failed: \(message)"
+        }
+        // Terse like both existing tones (the PR #150 one-line contract);
+        // the full story lives in the tooltip/explanation body.
+        let text = "Live — renews automatically"
+        return SignInRecovery(
+            text: text,
+            tooltip: detail,
+            accessibilityLabel: "\(text) — \(detail)",
+            tone: .liveIdle
         )
     }
 }

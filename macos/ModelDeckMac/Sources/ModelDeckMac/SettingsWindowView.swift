@@ -300,6 +300,13 @@ struct AccountsSettingsPane: View {
             // Issue #174: present only when the daemon reported the opt-in
             // state (Claude accounts on a statusline-capable daemon).
             statuslineInstalled: account.claudeStatusline?.installed,
+            // Issue #194: the visible capture control's own in-flight state.
+            isStatuslineBusy: accountsModel.statuslineBusyAccountID == account.id,
+            // CodeRabbit PR #304: while ANY roster mutation is in flight the
+            // model rejects further capture clicks, so every row's capture
+            // control disables — never an enabled control whose click is
+            // silently swallowed (the #100 lesson).
+            isRosterMutationInFlight: accountsModel.busyAccountID != nil,
             onSetStatusline: { enabled in
                 Task { await accountsModel.setStatuslineCapture(account: account, enabled: enabled) }
             },
@@ -592,6 +599,13 @@ struct AccountRosterRow: View {
     /// Issue #174: the daemon-reported statusline capture opt-in state for
     /// Claude accounts. Nil (Codex accounts, old daemons) renders no control.
     var statuslineInstalled: Bool?
+    /// Issue #194: true while THIS row's statusline install/uninstall is in
+    /// flight — the visible capture control shows its spinner.
+    var isStatuslineBusy: Bool = false
+    /// CodeRabbit PR #304: true while ANY account's roster mutation (edit /
+    /// remove / capture) is in flight — the model serializes mutations, so
+    /// every row's capture control disables rather than swallowing clicks.
+    var isRosterMutationInFlight: Bool = false
     /// Enables (true) or disables (false) statusline capture for this profile.
     var onSetStatusline: ((Bool) -> Void)?
     /// Issue #279: this row's proxy pool + routing state. Nil renders NOTHING
@@ -664,8 +678,17 @@ struct AccountRosterRow: View {
                     }
                 }
                 Spacer()
+                // Issue #194: statusline capture (#174) as a VISIBLE row
+                // control — it was hidden in the hover-only ⋯ menu and sat
+                // uninstalled for a week on Tim's machine; the ⋯ toggle
+                // stays as the second path.
+                statuslineCaptureControl
                 signInControls
-                if isBusy || isActivating {
+                // Issue #194: the capture control shows its OWN spinner, so
+                // the generic busy spinner yields while a statusline
+                // install/uninstall is the in-flight mutation (never two
+                // spinners on one row).
+                if (isBusy && !isStatuslineBusy) || isActivating {
                     ProgressView().controlSize(.small)
                 }
                 // Issue #61 semantics kept: the selected row shows Complete
@@ -789,16 +812,18 @@ struct AccountRosterRow: View {
         if let statuslineInstalled, let onSetStatusline {
             Divider()
             Toggle(
-                "Capture usage from Claude Code statusline",
+                StatuslineCaptureControl.menuToggleLabel,
                 isOn: Binding(
                     get: { statuslineInstalled },
                     set: { onSetStatusline($0) }
                 )
             )
             .disabled(isBusy)
+            // Issue #194: pinned #174 copy, single-sourced with the
+            // visible row control so the two paths can't drift.
             .help(statuslineInstalled
-                ? "ModelDeck updates this account's usage from Claude Code's statusline data whenever the profile is in use. Turning this off restores the profile's previous statusline configuration."
-                : "Adds a small statusline step to this profile that records Claude's own rate-limit numbers whenever the account is in use — no credentials, no extra API calls. Any statusline you already use keeps working unchanged.")
+                ? StatuslineCaptureControl.installedHelp
+                : StatuslineCaptureControl.enableHelp)
         }
         // Issue #279: leaving the pool is not ModelDeck's operation, but
         // UNROUTING is — it's the reversible half, and the ⋯ menu is where
@@ -813,6 +838,55 @@ struct AccountRosterRow: View {
         }
         Button("Remove…", role: .destructive, action: onRemove)
             .disabled(isBusy)
+    }
+
+    /// Issue #194: the VISIBLE statusline-capture control (#174's biggest
+    /// accuracy mechanism, previously reachable only through the hover ⋯
+    /// menu). Selection lives in `StatuslineCaptureControl.display` — Claude
+    /// rows with a daemon-reported `claudeStatusline` state only; a nil
+    /// state (Codex, old daemon) renders nothing, the established skew
+    /// precedent. Off → a small discoverable action button; on → a quiet
+    /// green confirmation pill (the #118/#149 chip family); in flight → the
+    /// row's spinner ON the control. Both states click through to the same
+    /// install/uninstall endpoints as the ⋯ toggle; errors surface through
+    /// the pane's existing `lastError` line, calm copy from the daemon.
+    @ViewBuilder
+    private var statuslineCaptureControl: some View {
+        switch StatuslineCaptureControl.display(for: account, isBusy: isStatuslineBusy) {
+        case .busy:
+            ProgressView()
+                .controlSize(.small)
+                .accessibilityLabel("Updating statusline capture for \(account.label)")
+        case .enable:
+            Button(StatuslineCaptureControl.enableLabel) { onSetStatusline?(true) }
+                .controlSize(.small)
+                .disabled(isBusy || isRosterMutationInFlight || isActivating
+                    || isActivationInFlight || onSetStatusline == nil)
+                .help(StatuslineCaptureControl.enableHelp)
+                .accessibilityLabel("Turn on statusline capture for \(account.label)")
+        case .installed:
+            Button {
+                onSetStatusline?(false)
+            } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 8, weight: .semibold))
+                    Text(StatuslineCaptureControl.installedLabel)
+                        .font(.system(size: 10, weight: .medium))
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2.5)
+                .background(Capsule().fill(Color.green.opacity(0.16)))
+                .foregroundStyle(.green)
+            }
+            .buttonStyle(.plain)
+            .disabled(isBusy || isRosterMutationInFlight || isActivating
+                || isActivationInFlight || onSetStatusline == nil)
+            .help(StatuslineCaptureControl.installedHelp)
+            .accessibilityLabel("Statusline capture is on for \(account.label) — click to turn off")
+        case nil:
+            EmptyView()
+        }
     }
 
     /// Issue #279: "In pool · routed" and, when the account has earned one,
@@ -1802,10 +1876,24 @@ struct GeneralSettingsPane: View {
         if appUpdateInstallModel.isBusy {
             AppUpdateInstallProgressView(installModel: appUpdateInstallModel)
         } else if let status = AppUpdateInstallModel.statusText(for: appUpdateInstallModel.phase) {
-            Text(status)
-                .font(.caption)
-                .foregroundStyle(installFailed ? .red : .secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            // Issue #303 (Tim's 0.3.24→0.3.25 field report): THIS caption is
+            // where he read "installs the next time ModelDeck relaunches"
+            // and found nothing to click — he quit the app by hand. A staged
+            // status never renders without its one-click follow-through.
+            HStack(spacing: 8) {
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(installFailed ? .red : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let restart = AppUpdateInstallModel.restartActionTitle(
+                    for: appUpdateInstallModel.phase
+                ) {
+                    Button(restart) { appUpdateInstallModel.updateNow() }
+                        .controlSize(.small)
+                        .help(AppUpdateInstallModel.restartActionHelp)
+                        .accessibilityLabel("Restart ModelDeck to finish updating")
+                }
+            }
         }
     }
 

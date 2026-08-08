@@ -125,6 +125,69 @@ public enum AppUpdateCheckOutcomePolicy {
     public static func onBlockedExplicitStart() -> AppUpdateInstallPhase {
         .failed(message: blockedStartMessage)
     }
+
+    /// Issue #303 — what a blocked explicit start (`canCheckForUpdates ==
+    /// false`) means depends on WHY the updater is busy. When a background
+    /// session has already staged an install (Tim's 0.3.24→0.3.25 path),
+    /// the session holding the updater is the very update the user is
+    /// trying to finish — "An update is already in progress, try again"
+    /// is a shrug where a restart was promised. The driver keeps the click
+    /// alive and starts the user-initiated session the moment the updater
+    /// frees up; only a blocked start with NOTHING staged keeps the honest
+    /// #165 blocked message.
+    public enum BlockedExplicitStartResolution: Equatable, Sendable {
+        /// A staged install exists: retry `beginInstall()` when
+        /// `canCheckForUpdates` flips true (bounded wait; on timeout the
+        /// driver falls back to `reportBlocked`'s message — never a silent
+        /// stuck "Checking…", which was #163's bug).
+        case retryWhenUpdaterIdle
+        /// Nothing staged — present `blockedStartMessage` (#165).
+        case reportBlocked
+    }
+
+    public static func onBlockedExplicitStart(
+        stagedVersion: String?
+    ) -> BlockedExplicitStartResolution {
+        stagedVersion != nil ? .retryWhenUpdaterIdle : .reportBlocked
+    }
+}
+
+/// Issue #303 (CodeRabbit, PR #307) — ONE absolute deadline per deferred
+/// restart request. The driver's wait loop can re-enter itself (the retry's
+/// `beginInstall()` may find the updater blocked again); a per-task budget
+/// would restart the clock on every re-entry, letting repeated transitions
+/// hold the model in `.checking` indefinitely. This budget arms on the
+/// FIRST deferral and every re-entry reuses the same deadline; only
+/// resolution (session started, superseded, or expiry → the honest blocked
+/// message) clears it for the next restart request. Pure and clock-injected
+/// so tests pin the re-entry arithmetic.
+public struct AppUpdateStagedRetryBudget: Sendable {
+    /// The whole restart request's wait window, across all re-entries.
+    public static let window: TimeInterval = 10
+
+    public private(set) var deadline: Date?
+
+    public init() {}
+
+    /// (Re-)entry into the deferred wait: arms on first use, REUSES the
+    /// armed deadline on re-entry — never extends it.
+    public mutating func armIfNeeded(now: Date) -> Date {
+        if let deadline { return deadline }
+        let armed = now.addingTimeInterval(Self.window)
+        deadline = armed
+        return armed
+    }
+
+    /// True once the armed deadline has passed — the driver must stop
+    /// waiting and present the blocked message. False when unarmed.
+    public func isExpired(now: Date) -> Bool {
+        guard let deadline else { return false }
+        return now >= deadline
+    }
+
+    /// The request resolved (session started, superseded, or expiry
+    /// reported) — the NEXT restart click gets a fresh window.
+    public mutating func clear() { deadline = nil }
 }
 
 /// Seam the app target's Sparkle driver implements. All methods are fire-and
@@ -158,6 +221,16 @@ public final class AppUpdateInstallModel: ObservableObject {
     /// starts). The dialog's Cancel button renders from this.
     @Published public private(set) var canCancel: Bool = false
     private var cancelHandler: (() -> Void)?
+
+    /// Issue #303 — the last version Sparkle reported as staged
+    /// (`.installedPendingRelaunch`). Sticky for the process lifetime once
+    /// set: a staged install stays staged through later phase traffic
+    /// (`updateNow()`'s `.checking`, a failed resume, background re-checks)
+    /// until this process quits and the installer applies it. The driver
+    /// reads it to tell "blocked because MY staged update holds the
+    /// updater" (retry when idle) from "blocked, nothing staged" (#165's
+    /// honest message).
+    public private(set) var stagedVersion: String?
 
     private let defaults: UserDefaults
     /// Nil in builds without a Sparkle-configured bundle (dev builds, and
@@ -219,6 +292,9 @@ public final class AppUpdateInstallModel: ObservableObject {
     /// extraction starts (issue #163).
     public func report(_ phase: AppUpdateInstallPhase) {
         self.phase = phase
+        if case .installedPendingRelaunch(let version) = phase {
+            stagedVersion = version // #303: sticky — see the property doc
+        }
         switch phase {
         case .checking, .downloading:
             break // an offered cancellation stays valid through these
@@ -293,6 +369,23 @@ public final class AppUpdateInstallModel: ObservableObject {
             return message
         }
     }
+
+    /// Issue #303 — the one-click follow-through that must sit NEXT TO the
+    /// staged status text on every surface that renders it. Tim's field
+    /// report: the settings row said "installs the next time ModelDeck
+    /// relaunches" with nothing to click, so he quit the app by hand. The
+    /// contract: wherever `statusText` announces `.installedPendingRelaunch`,
+    /// the view renders a button with this title wired to `updateNow()` —
+    /// nil for every other phase (no stray restart buttons).
+    nonisolated public static func restartActionTitle(for phase: AppUpdateInstallPhase) -> String? {
+        if case .installedPendingRelaunch = phase { return "Restart to Update" }
+        return nil
+    }
+
+    /// Shared tooltip for the #303 restart action (same promise as the deck
+    /// banner's Restart: the #163 explicit quit→install→relaunch path).
+    nonisolated public static let restartActionHelp =
+        "Quits, installs the downloaded update, and reopens ModelDeck — no manual quit needed."
 
     /// Determinate progress for the dialog's bar, when Sparkle reports one
     /// (download with a known content length; extraction). Nil = show an

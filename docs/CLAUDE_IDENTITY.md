@@ -1,13 +1,13 @@
 # Claude identity switching
 
 ModelDeck switches two separate pieces of Claude state. The `~/.claude`
-symlink selects the profile home. `CLAUDE_SECURESTORAGE_CONFIG_DIR` tells
-Claude Code to select the Keychain entry scoped to that profile's real path
-— **on CLI versions before 2.1.216 only; see the next section**. Claude Code
-itself creates and manages those entries; ModelDeck never reads, copies, or
-writes credential values.
+symlink selects the profile home. On env-keyed Claude Code releases,
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` tells Claude Code to select the Keychain
+entry scoped to that profile's real path. Claude Code itself creates and
+manages those entries; ModelDeck never reads, copies, or writes credential
+values.
 
-## Claude Code ≥ 2.1.216: credentials follow the resolved active home (issue #99)
+## The historical 2.1.216 credential transition (issues #99 and #300)
 
 Claude Code 2.1.216 changed credential scoping: `claude /login` writes the
 credential to the Keychain service derived from the **resolved (realpath)
@@ -18,12 +18,18 @@ splits its own brain: the target profile's `.claude.json` claims the new
 identity while the token actually overwrote the ACTIVE profile's credential
 slot (the issue #65 blind spot, now a guaranteed outcome).
 
-Consequences, verified live on 2026-07-21:
+Claude Code later reverted that resolved-home behavior somewhere in the
+2.1.217–2.1.224 range, so current releases accept env-keyed logins again.
+There is no dependable version-only boundary for the revert. ModelDeck keeps
+the historical 2.1.216 activation gate as a conservative compatibility
+choice instead of guessing which intermediate builds are affected.
+
+Consequences on affected builds, verified live on 2026-07-21:
 
 - The old per-profile sign-in guidance (`CLAUDE_CONFIG_DIR=<profile> claude
-  auth login`) is **broken** on ≥ 2.1.216 — it silently cross-wires
+  auth login`) is **broken** — it silently cross-wires
   accounts. Do not use it there.
-- The only known-good steering mechanism is the real `~/.claude` flip:
+- The conservative steering mechanism is the real `~/.claude` flip:
   **activate the target account in ModelDeck first** (the symlink then
   resolves to its profile), run a plain `claude /login`, and verify the
   identity **while the target is still active**. Only then optionally
@@ -33,14 +39,16 @@ Consequences, verified live on 2026-07-21:
   install and resets the profile's `.claude.json`.
 
 ModelDeck automates this: the daemon detects the installed CLI version and,
-from 2.1.216 on, issues activation-driven login specs
+from the historical 2.1.216 boundary on, issues activation-driven login specs
 (`GET /api/accounts/:id/login` returns `flow: "activation"` and
 `requiresActivation: true` with a plain `claude /login` command). Both app
 sign-in flows (add-account and the roster's "Sign in again") activate the
 target, run the login, verify, and restore the previously active account
 after verification passes. When the version cannot be detected, ModelDeck
-assumes the new behavior — the activation-driven flow steers correctly on
-every known version, while the env-scoped flow cross-wires on current ones.
+also chooses the activation-driven flow. Issue #300 additionally resolves
+the daemon's `claude` through its own PATH and realpath before probing, then
+serves that exact canonical path to Terminal, so flow selection and execution
+cannot silently use different installations.
 
 Enforcement (the teeth for the #65 blind spot): after any sign-in ModelDeck
 drives or instructs, `POST /api/accounts/:id/verify` compares the read-back
@@ -48,8 +56,17 @@ identity against the account's recorded identity. On disagreement it
 **refuses** — nothing is recorded, the response carries
 `identityMismatch: { expected, actual }`, and the app surfaces it as a
 failure with the target left active so a corrective `/login` lands in the
-right slot. `GET /api/tools` reports which regime the installed CLI is in
-(`credentialScoping: "config-dir" | "resolved-home"`).
+right slot. An unauthenticated verify that finds the plain Keychain service
+present while the profile-scoped service is absent carries a fixed,
+non-secret `verifyHint`; the app shows it only in the manual verify flow, and
+it is never persisted or copied into `/api/state`.
+
+For compatibility, `GET /api/tools` retains the historical classifier
+(`credentialScoping: "config-dir" | "resolved-home"`). It now describes the
+flow ModelDeck selects, not a claim about current Claude Code internals.
+One edge: when version parsing fails, login conservatively selects the
+activation flow while `credentialScoping` stays `null` — the classifier
+does not always describe the selected flow.
 
 ## Session pinning (issue #66)
 
