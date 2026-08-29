@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { STATUSLINE_SEA_COMMAND } from '../src/adapters/claude-statusline.mjs';
+import { GROK_SEA_PROBE_COMMAND } from '../src/adapters/grok.mjs';
 import {
   bootstrapDaemonStderr,
   maintainDaemonErrorLog,
@@ -258,11 +259,33 @@ test('daemon stderr bootstrap leaves internal SEA helper stderr attached to its 
   assert.equal(fs.existsSync(logPath), false);
 });
 
+test('daemon stderr bootstrap leaves Grok SEA helper stderr attached without touching the log', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-stderr-grok-helper-'));
+  const logPath = path.join(root, 'modeldeck.err.log');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  let execCalls = 0;
+
+  const redirected = bootstrapDaemonStderr({
+    logPath,
+    enabled: true,
+    argv: ['/placeholder/modeldeckd', GROK_SEA_PROBE_COMMAND],
+    env: {},
+    execPath: '/placeholder/modeldeckd',
+    pid: 42,
+    execve: () => { execCalls += 1; },
+  });
+
+  assert.equal(redirected, false);
+  assert.equal(execCalls, 0);
+  assert.equal(fs.existsSync(logPath), false);
+});
+
 test('daemon stderr bypass pins the complete internal SEA command set', async () => {
   const { INTERNAL_SEA_COMMANDS } = await import('../src/daemon-error-log.mjs');
   assert.ok(INTERNAL_SEA_COMMANDS instanceof Set);
   assert.deepEqual([...INTERNAL_SEA_COMMANDS].sort(), [
     'modeldeck-internal-claude-usage-probe',
+    GROK_SEA_PROBE_COMMAND,
     STATUSLINE_SEA_COMMAND,
   ].sort());
 });

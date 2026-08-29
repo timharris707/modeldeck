@@ -8,6 +8,7 @@ const BOOTSTRAP_PID_ENV = 'MODELDECK_DAEMON_STDERR_BOOTSTRAP_PID';
 export const INTERNAL_SEA_COMMANDS = new Set([
   'modeldeck-internal-claude-usage-probe',
   'modeldeck-internal-claude-statusline',
+  'modeldeck-internal-grok-usage-probe',
 ]);
 const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
 const O_NONBLOCK = fs.constants.O_NONBLOCK || 0;
