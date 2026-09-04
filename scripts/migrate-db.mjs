@@ -36,8 +36,19 @@ function defaultTarget() {
     || path.join(os.homedir(), 'Library', 'Application Support', 'ModelDeck', 'modeldeck.sqlite');
 }
 
+const COUNT_QUERIES = {
+  accounts: 'SELECT COUNT(*) AS n FROM accounts',
+  projects: 'SELECT COUNT(*) AS n FROM projects',
+  usage_snapshots: 'SELECT COUNT(*) AS n FROM usage_snapshots',
+  launch_events: 'SELECT COUNT(*) AS n FROM launch_events',
+  transcript_subagents: 'SELECT COUNT(*) AS n FROM transcript_subagents',
+  transcript_requests: 'SELECT COUNT(*) AS n FROM transcript_requests',
+};
+
 function count(db, table) {
-  return Number(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n);
+  const sql = COUNT_QUERIES[table];
+  if (!sql) throw new Error(`invalid table name: ${table}`);
+  return Number(db.prepare(sql).get().n);
 }
 
 function hasTable(db, table) {
