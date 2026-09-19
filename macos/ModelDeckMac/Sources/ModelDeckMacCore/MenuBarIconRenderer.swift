@@ -44,6 +44,18 @@ public enum MenuBarIconRenderer {
         .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
     }
 
+    /// Issue #685 — the staged-update mark: a 3 pt dot in the glyph's empty
+    /// top-right corner (the top bar is 12 wide of 16, so the corner is
+    /// clear), drawn while a downloaded update waits for a restart — the
+    /// exact condition behind the #241 deck banner / badge. Deliberately
+    /// quiet: secondary-label tone, never one of the health colours, and
+    /// nothing at all for "available but not staged". Nil when no mark
+    /// draws. Pure so tests assert the decision, not pixels.
+    public static func stagedMarkRect(updateStaged: Bool) -> NSRect? {
+        guard updateStaged else { return nil }
+        return NSRect(x: 13, y: 12.5, width: 3, height: 3)
+    }
+
     /// The single image the MenuBarExtra label shows for a given icon state:
     /// the template glyph when plain; a non-template composite of glyph +
     /// colored percent at warning/critical. Non-template because a template
@@ -51,14 +63,19 @@ public enum MenuBarIconRenderer {
     /// half keeps adapting to the bar's appearance because it is drawn in
     /// dynamic `NSColor.labelColor`, which resolves against the current
     /// appearance each time the (drawing-handler-backed) image is drawn.
-    public static func labelImage(for state: MenuBarIconState) -> NSImage {
+    /// `updateStaged` (issue #685) adds the staged-update mark to whichever
+    /// image results.
+    public static func labelImage(for state: MenuBarIconState, updateStaged: Bool = false) -> NSImage {
+        let mark = stagedMarkRect(updateStaged: updateStaged)
         // Issue #235: health mode composites a shape-coded status dot (not
         // a percent) beside the glyph — its own path so the percent
         // grammar stays untouched.
         if case .health(let provider, let verdict) = state {
-            return healthLabelImage(provider: provider, verdict: verdict)
+            return healthLabelImage(provider: provider, verdict: verdict, mark: mark)
         }
-        guard let label = state.percentLabel else { return deckGlyph }
+        guard let label = state.percentLabel else {
+            return mark.map(stagedDeckGlyph) ?? deckGlyph
+        }
         let color: NSColor
         switch state {
         case .critical:
@@ -81,8 +98,14 @@ public enum MenuBarIconRenderer {
             // imply health text renders gold.
             return deckGlyph
         }
-        return composite(text: label, color: color, accessibility: "ModelDeck \(label)")
+        return composite(
+            text: label, color: color, mark: mark,
+            accessibility: "ModelDeck \(label)" + (mark == nil ? "" : stagedAccessibilitySuffix)
+        )
     }
+
+    /// Appended to the accessibility description whenever the mark draws.
+    static let stagedAccessibilitySuffix = ", update ready to install"
 
     /// Issue #235: the health-mode label — the template-drawn deck glyph
     /// plus a small FULL-COLOR status dot (Tim's design call: color is
@@ -100,7 +123,8 @@ public enum MenuBarIconRenderer {
     /// readable on the highlight tint as on both bar appearances.
     public static func healthLabelImage(
         provider: DeckProvider,
-        verdict: AvailabilityVerdict?
+        verdict: AvailabilityVerdict?,
+        mark: NSRect? = nil
     ) -> NSImage {
         let dotSize: CGFloat = 8
         let size = NSSize(
@@ -116,11 +140,37 @@ public enum MenuBarIconRenderer {
         let image = NSImage(size: size, flipped: false) { _ in
             drawDeckBars(fill: .labelColor)
             drawVerdictDot(verdict, in: dotRect)
+            if let mark { drawStagedMark(in: mark, fill: .secondaryLabelColor) }
             return true
         }
         image.isTemplate = false
         image.accessibilityDescription = "ModelDeck \(provider.displayName) availability "
             + (verdict?.displayWord.lowercased() ?? "unknown")
+            + (mark == nil ? "" : stagedAccessibilitySuffix)
+        return image
+    }
+
+    /// Issue #685: the staged-update dot. In the template glyph it draws as
+    /// a partial-alpha mask (the menu bar tints it like the bars, lighter);
+    /// in the non-template composites it draws in dynamic
+    /// secondaryLabelColor — quiet on both bar appearances, never a health
+    /// colour.
+    private static func drawStagedMark(in rect: NSRect, fill: NSColor) {
+        fill.setFill()
+        NSBezierPath(ovalIn: rect).fill()
+    }
+
+    /// The template glyph with the staged-update mark (issue #685). Built
+    /// per call (the mark's presence is state), unlike the shared
+    /// `deckGlyph` singleton the plain state returns by identity.
+    private static func stagedDeckGlyph(mark: NSRect) -> NSImage {
+        let image = NSImage(size: glyphSize, flipped: false) { _ in
+            drawDeckBars(fill: .black)
+            drawStagedMark(in: mark, fill: NSColor.black.withAlphaComponent(0.55))
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = "ModelDeck" + stagedAccessibilitySuffix
         return image
     }
 
@@ -150,7 +200,9 @@ public enum MenuBarIconRenderer {
     /// flatten the tint; the glyph half keeps adapting because it draws in
     /// dynamic `NSColor.labelColor`, resolved per draw of the
     /// drawing-handler-backed image.
-    private static func composite(text: String, color: NSColor, accessibility: String) -> NSImage {
+    private static func composite(
+        text: String, color: NSColor, mark: NSRect? = nil, accessibility: String
+    ) -> NSImage {
         let attributed = NSAttributedString(string: text, attributes: [
             .font: percentFont,
             .foregroundColor: color,
@@ -164,6 +216,7 @@ public enum MenuBarIconRenderer {
         let image = NSImage(size: size, flipped: false) { _ in
             drawDeckBars(fill: .labelColor)
             attributed.draw(at: NSPoint(x: textX, y: (size.height - textSize.height) / 2))
+            if let mark { drawStagedMark(in: mark, fill: .secondaryLabelColor) }
             return true
         }
         image.isTemplate = false

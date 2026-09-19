@@ -352,13 +352,15 @@ struct AppUpdateProgressDialogTests {
 
     // MARK: No-update-found routing by origin (issue #170)
 
-    @Test func explicitNoUpdateFoundPresentsThePinnedFeedMessage() {
+    @Test func explicitNoUpdateFoundPresentsThePinnedMessage() {
         // Sparkle's showUpdateNotFoundWithError during an explicit session
-        // (Update Now offered by the GitHub check, appcast disagrees) must
-        // land visibly, never spin or vanish.
+        // must land visibly, never spin or vanish. Issue #685 retired the
+        // "feed disagrees with the GitHub check" copy (one feed now); the
+        // callback stays reachable (a pulled release, a too-old macOS) and
+        // keeps #170's rule with honest copy.
         let outcome = AppUpdateCheckOutcomePolicy.onUpdateNotFound(mode: .userInitiated)
         #expect(outcome == .failed(
-            message: "The update feed has no newer version yet. Try again later."))
+            message: "Nothing to install — Sparkle found no update for this Mac. Try again later."))
     }
 
     @Test func backgroundNoUpdateFoundStaysCompletelySilent() {

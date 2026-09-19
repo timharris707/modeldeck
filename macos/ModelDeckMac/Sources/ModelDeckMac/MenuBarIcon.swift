@@ -16,8 +16,13 @@ struct MenuBarIconView: View {
     /// With @ObservedObject inside the label view, every `iconState`
     /// publish invalidates the label itself.
     @ObservedObject var statusModel: MenuBarStatusModel
+    /// Issue #685: the staged-update mark follows the #241 prompt model —
+    /// the same object whose state shows the deck banner or badge — so the
+    /// icon and the deck can never disagree about "waiting for a restart".
+    @ObservedObject var stagedPromptModel: AppUpdateStagedPromptModel
 
     private var state: MenuBarIconState { statusModel.iconState }
+    private var updateStaged: Bool { stagedPromptModel.stagedVersion != nil }
 
     var body: some View {
         let _ = IconDebugLog.log("label body render: state=\(state) percentLabel=\(String(describing: state.percentLabel))")
@@ -29,8 +34,8 @@ struct MenuBarIconView: View {
         // rendering "3%", button.image was still the bare 16pt glyph. The
         // label must be exactly one image; the renderer composites
         // glyph + colored percent.
-        Image(nsImage: MenuBarIconRenderer.labelImage(for: state))
-            .accessibilityLabel(accessibilityText)
+        Image(nsImage: MenuBarIconRenderer.labelImage(for: state, updateStaged: updateStaged))
+            .accessibilityLabel(accessibilityText + (updateStaged ? ", update ready to install" : ""))
     }
 
     /// Issue #249: "Studio's 5-hour limit" — the account AND window feeding

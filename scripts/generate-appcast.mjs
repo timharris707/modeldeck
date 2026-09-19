@@ -22,13 +22,14 @@
 //     --dmg dist/ModelDeck-0.3.2.dmg \
 //     --url  https://github.com/timharris707/modeldeck/releases/download/v0.3.2/ModelDeck-0.3.2.dmg \
 //     --release-notes-url https://github.com/timharris707/modeldeck/releases/tag/v0.3.2 \
+//     [--release-notes-file docs/release-notes/0.3.2.md]  (issue #685: embedded as <description>)
 //     --sign-update /path/to/sign_update \
 //     [--key-file /path/to/TEST-key]   (tests only — real key stays in Keychain)
 //     [--pub-date "Wed, 22 Jul 2026 12:00:00 +0000"]  (injectable for tests)
 //     [--min-system 14.0] \
 //     --out dist/appcast.xml
 import { execFileSync } from "node:child_process";
-import { statSync, writeFileSync, existsSync, realpathSync } from "node:fs";
+import { statSync, writeFileSync, existsSync, realpathSync, readFileSync } from "node:fs";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 
@@ -62,6 +63,7 @@ export function parseArgs(argv) {
     ["--dmg", "dmg"],
     ["--url", "url"],
     ["--release-notes-url", "releaseNotesUrl"],
+    ["--release-notes-file", "releaseNotesFile"],
     ["--sign-update", "signUpdate"],
     ["--key-file", "keyFile"],
     ["--pub-date", "pubDate"],
@@ -118,6 +120,13 @@ function xmlEscape(text) {
     .replaceAll('"', "&quot;");
 }
 
+/// CDATA carries the release notes verbatim (markdown is full of `&`, `<`
+/// and `>`); the one sequence CDATA cannot contain is its own terminator,
+/// which is split across two sections.
+function cdata(text) {
+  return `<![CDATA[${String(text).replaceAll("]]>", "]]]]><![CDATA[>")}]]>`;
+}
+
 /// Pure appcast rendering — the shape under test.
 export function renderAppcast({
   version,
@@ -127,10 +136,17 @@ export function renderAppcast({
   signature,
   pubDate,
   releaseNotesUrl,
+  description,
   minSystem = "14.0",
 }) {
   const notes = releaseNotesUrl
     ? `\n            <sparkle:releaseNotesLink>${xmlEscape(releaseNotesUrl)}</sparkle:releaseNotesLink>`
+    : "";
+  // Issue #685: the release notes body rides the appcast as <description>,
+  // so the app reads version, notes, and link from the ONE feed Sparkle
+  // installs from. Absent when no notes file was given (pre-#685 shape).
+  const body = description !== undefined && description !== null
+    ? `\n            <description>${cdata(description)}</description>`
     : "";
   return `<?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
@@ -138,7 +154,7 @@ export function renderAppcast({
         <title>ModelDeck</title>
         <item>
             <title>ModelDeck ${xmlEscape(version)}</title>
-            <pubDate>${xmlEscape(pubDate)}</pubDate>${notes}
+            <pubDate>${xmlEscape(pubDate)}</pubDate>${notes}${body}
             <sparkle:version>${xmlEscape(build)}</sparkle:version>
             <sparkle:shortVersionString>${xmlEscape(version)}</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>${xmlEscape(minSystem)}</sparkle:minimumSystemVersion>
@@ -162,6 +178,12 @@ function main() {
     fail(error.message);
   }
   if (!existsSync(args.dmg)) fail(`DMG not found: ${args.dmg}`);
+  if (args.releaseNotesFile && !existsSync(args.releaseNotesFile)) {
+    fail(`release notes file not found: ${args.releaseNotesFile}`);
+  }
+  const description = args.releaseNotesFile
+    ? readFileSync(args.releaseNotesFile, "utf8")
+    : undefined;
   const dmgSize = statSync(args.dmg).size;
   let signed;
   try {
@@ -180,6 +202,7 @@ function main() {
     signature: signed.signature,
     pubDate: args.pubDate ?? new Date().toUTCString().replace("GMT", "+0000"),
     releaseNotesUrl: args.releaseNotesUrl,
+    description,
     minSystem: args.minSystem ?? "14.0",
   });
   writeFileSync(args.out, xml);

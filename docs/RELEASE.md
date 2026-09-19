@@ -275,6 +275,15 @@ tripped over a silent exit here before that was added).
 for an existing DMG (also the test hook — `MD_SPARKLE_KEY_FILE` may inject
 the fake fixture key for tests, never for real releases).
 
+Since issue #685 the appcast is the app's ONLY update feed: the in-app check
+("Check for App Updates", the 4-hourly automatic check) reads the same
+`appcast.xml` Sparkle installs from, taking the version, the release page
+link, and the release notes from it — the GitHub API is no longer consulted.
+The release script embeds `docs/release-notes/<version>.md` as the item's
+`<description>` (`--release-notes-file`), which is what the update dialog
+renders; a version without that file still gets an appcast, just with no
+notes in the dialog.
+
 ## Publishing
 
 Attach **all three** build outputs to a GitHub Release for the version tag:

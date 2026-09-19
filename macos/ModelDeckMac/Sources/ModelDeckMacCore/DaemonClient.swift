@@ -149,6 +149,13 @@ public struct DaemonClient: Sendable {
         try await get("/api/health")
     }
 
+    /// Issue #678: `GET /api/health` under an explicit request timeout, for
+    /// the post-update restart poll (1 s). The default `health()` keeps the
+    /// 5 s the #660 busy/down distinction depends on.
+    public func health(timeout: TimeInterval) async throws -> DaemonHealth {
+        try await get("/api/health", timeout: timeout)
+    }
+
     /// Issue #660: the data reads get room for a daemon that is alive but
     /// slow (state reads of 4–36 s were measured live, #658); `/api/health`
     /// keeps the short default so "slow" and "down" stay distinguishable.

@@ -1,9 +1,11 @@
+import CryptoKit
 import Foundation
 
 // Issue #96 — one-DMG app half. The app owns the lifecycle of the bundled
 // daemon (Contents/Resources/daemon/modeldeckd, staged by release-dmg.sh):
 // first-run consent → SMAppService registration → Keychain mutation token →
-// re-register on MDGitCommit drift → graceful coexistence with a legacy
+// in-place restart on MDGitCommit drift, re-register as its fallback (#678,
+// decision 0041) → graceful coexistence with a legacy
 // scripts/install-launch-agent.sh install.
 //
 // Everything side-effectful lives behind the protocols below so the state
@@ -60,6 +62,30 @@ public protocol LegacyAgentInspecting: Sendable {
 /// registered, for the drift comparison on later launches.
 public protocol RegistrationMarkerStore: AnyObject, Sendable {
     var registeredCommit: String? { get set }
+    /// Issue #678 (review of PR #687): the fingerprint of the agent plist
+    /// this app last registered — `DaemonAgentPlistFingerprint`. A changed
+    /// service definition (a PATH entry, ThrottleInterval) is retained by
+    /// `kickstart -k` while the new binary still starts and reports its new
+    /// commit, so commit verification alone can never see it; only this
+    /// comparison can. nil = never recorded (installs from before #678).
+    var registeredPlistFingerprint: String? { get set }
+}
+
+/// Issue #678: a stable fingerprint of the bundled launchd agent plist. The
+/// hash covers the PARSED property list re-serialized canonically, not the
+/// file bytes: every commit to the plist since #96 changed comments only, and
+/// a comment or whitespace edit must not force a re-register. A key or value
+/// change does. nil when the data is not a property list dictionary.
+public enum DaemonAgentPlistFingerprint {
+    public static func fingerprint(ofPlistData data: Data) -> String? {
+        guard let object = try? PropertyListSerialization.propertyList(from: data, format: nil),
+              let dictionary = object as? [String: Any],
+              let canonical = try? PropertyListSerialization.data(
+                  fromPropertyList: dictionary, format: .xml, options: 0
+              )
+        else { return nil }
+        return SHA256.hash(data: canonical).map { String(format: "%02x", $0) }.joined()
+    }
 }
 
 /// One decoded `/api/health` answer. "The daemon answered but predates
@@ -83,6 +109,35 @@ public struct DaemonProbeSnapshot: Equatable, Sendable {
 public protocol DaemonReachabilityProbing: Sendable {
     /// A single `/api/health` round-trip: nil iff the daemon didn't answer.
     func probeDaemon() async -> DaemonProbeSnapshot?
+    /// Issue #678: the same round-trip with an explicit request timeout. The
+    /// post-update restart polls with a short one so a daemon that is being
+    /// replaced fails fast; every other caller keeps the default.
+    func probeDaemon(timeout: TimeInterval) async -> DaemonProbeSnapshot?
+}
+
+public extension DaemonReachabilityProbing {
+    /// Fakes that only model reachability ignore the timeout.
+    func probeDaemon(timeout: TimeInterval) async -> DaemonProbeSnapshot? {
+        await probeDaemon()
+    }
+}
+
+/// Issue #678: the launch-scoped hand-off from the Sparkle relaunch to the
+/// next launch's reconciliation. The updater records "an update relaunch is
+/// in progress" immediately before the app terminates; the next launch
+/// consumes it (read clears it) and, when the commit really did move, skips
+/// the `launchctl print` probe and goes straight to the restart.
+public protocol UpdateRelaunchMarking: Sendable {
+    func recordRelaunch()
+    /// True iff a relaunch was recorded since the last consume. Clears it.
+    func consumeRelaunchMarker() -> Bool
+}
+
+/// No marker at all — today's path (dev builds, tests that don't model it).
+public struct NoUpdateRelaunchMarker: UpdateRelaunchMarking {
+    public init() {}
+    public func recordRelaunch() {}
+    public func consumeRelaunchMarker() -> Bool { false }
 }
 
 /// launchd-level control of our SMAppService agent, below the SMAppService
@@ -190,6 +245,12 @@ public protocol LaunchdServiceControlling: Sendable {
     /// AND removes the stale job record that references the old bundle.
     /// Best-effort: booting out an absent service is already the goal state.
     func bootOutService() async
+    /// Issue #678: `launchctl kickstart -k gui/<uid>/<label>` — SIGTERM the
+    /// running process and respawn it from the job record launchd already
+    /// holds. Touches neither the SMAppService registration nor its Login
+    /// Items approval (decision 0041). Best-effort like bootout: the caller
+    /// verifies through the running daemon's self-report, never the exit code.
+    func restartService() async
 }
 
 // MARK: - Bundle manifest
@@ -236,9 +297,21 @@ public enum DaemonSetupDecision: Equatable, Sendable {
     /// The existing "Daemon unreachable" banner covers the dev workflow;
     /// first-run UI stays out of the way.
     case bundledServiceUnavailable
+    /// The bundled agent plist's fingerprint differs from the one this app
+    /// last registered — the service DEFINITION changed, not just the
+    /// binary. launchd respawns from the job record it already holds, so a
+    /// kickstart would run the new binary under the old settings and every
+    /// commit check would pass (review of PR #687). Only a full
+    /// unregister/register applies the new definition.
+    case driftReregister(bundled: String)
     /// The registered service's recorded MDGitCommit differs from the
-    /// bundle's manifest — replace the registration.
-    case driftReregister(recorded: String?, bundled: String)
+    /// bundle's manifest while the plist fingerprint matches — an ordinary
+    /// app update. Issue #678 / decision 0041: restart the process in place
+    /// (`kickstart -k`) so launchd spawns the new bundle's binary; the
+    /// registration is not touched. The full unregister/register runs only
+    /// as the fallback when the restarted daemon does not self-report the
+    /// bundled commit within the wait.
+    case driftRestart(recorded: String?, bundled: String)
     /// SMAppService claims `.enabled` but the launchd gui domain has no such
     /// service (observed live after a manual bootout, and the end state of
     /// the 0.3.13→0.3.15 stale-record incident once the old process died:
@@ -283,14 +356,19 @@ public enum DaemonSetupDecision: Equatable, Sendable {
 ///    while nothing answers AND the bundled binary verifies → forced repair
 ///    (issue #514). Ahead of drift: the plain re-register the drift rule
 ///    would run is exactly what failed to recover the live incident;
-/// 2. registered + commit drift → re-register (even while running: the
-///    running daemon is the OLD build);
-/// 3. registered + answering, but the running process self-reports a build
+/// 2. registered but absent from launchd AND not answering → wedged
+///    (register() would no-op; needs the forced repair). Ahead of drift
+///    since #678: kickstarting a job launchd cannot find is a guaranteed
+///    wait for nothing, and the repair is what drift's own fallback would
+///    reach anyway. A daemon that IS answering without a launchd job is a
+///    hand-started dev daemon — leave it alone, same courtesy as rule 5;
+/// 2b. registered + the agent plist fingerprint moved → re-register (the
+///    definition changed; a restart would keep the old settings). A missing
+///    recorded fingerprint is not drift — it is recorded on this launch;
+/// 3. registered + commit drift → restart in place (even while running: the
+///    running daemon is the OLD build); the re-register is its fallback;
+/// 4. registered + answering, but the running process self-reports a build
 ///    other than the bundle's → forced restart (the marker can't see this);
-/// 4. registered but absent from launchd AND not answering → wedged
-///    (register() would no-op; needs the forced repair). A daemon that IS
-///    answering without a launchd job is a hand-started dev daemon — leave
-///    it alone, same courtesy as rule 5;
 /// 5. reachable → running;
 /// 6. legacy plist present → never install over it;
 /// 7. registration status → approval / retry / first-run consent.
@@ -302,7 +380,9 @@ public func decideDaemonSetup(
     legacyPresent: Bool,
     recordedCommit: String?,
     bundledCommit: String?,
-    bundledDaemon: BundledDaemonVerification
+    bundledDaemon: BundledDaemonVerification,
+    recordedPlistFingerprint: String? = nil,
+    bundledPlistFingerprint: String? = nil
 ) -> DaemonSetupDecision {
     guard hostSignatureAllowsServiceManagement else {
         return .hostSignatureStandDown
@@ -320,14 +400,18 @@ public func decideDaemonSetup(
        bundledDaemon == .valid {
         return .staleLaunchConstraintRepair(bundled: bundledCommit)
     }
+    if registration == .enabled, launchdService == .notFound, probe == nil {
+        return .wedgedServiceRepair(bundled: bundledCommit)
+    }
+    if registration == .enabled, let recordedPlistFingerprint, let bundledPlistFingerprint,
+       recordedPlistFingerprint != bundledPlistFingerprint {
+        return .driftReregister(bundled: bundledCommit)
+    }
     if registration == .enabled, recordedCommit != bundledCommit {
-        return .driftReregister(recorded: recordedCommit, bundled: bundledCommit)
+        return .driftRestart(recorded: recordedCommit, bundled: bundledCommit)
     }
     if registration == .enabled, let probe, probe.runningCommit != bundledCommit {
         return .staleDaemonRestart(running: probe.runningCommit, bundled: bundledCommit)
-    }
-    if registration == .enabled, launchdService == .notFound, probe == nil {
-        return .wedgedServiceRepair(bundled: bundledCommit)
     }
     if probe != nil { return .running }
     if legacyPresent { return .legacyInstalledNotRunning }
@@ -340,8 +424,9 @@ public func decideDaemonSetup(
 
 // MARK: - Post-re-register verification
 
-/// What probing the daemon AFTER a re-register concluded. Pure output of
-/// `verifyDaemonAfterReregister`.
+/// What probing the daemon AFTER a restart or re-register concluded. Pure
+/// output of `verifyDaemonAfterReregister`; since #678 the same check gates
+/// every rung of the ladder (kickstart → re-register → bootout).
 public enum ReregisterVerification: Equatable, Sendable {
     /// The running daemon self-reports the bundle's commit — the update took.
     case verified
@@ -450,8 +535,16 @@ public final class DaemonSetupModel: ObservableObject {
         /// consulted ONLY on the spawn-rejected path (it hashes the whole
         /// binary, so it must never run on the ordinary launch path).
         public var bundledDaemon: any BundledDaemonVerifying
+        /// Issue #678: the Sparkle relaunch hand-off (decision 0041). Defaults
+        /// to "no marker", which is exactly today's path — the fail-safe
+        /// direction, unlike the host-signature flag below.
+        public var updateRelaunchMarker: any UpdateRelaunchMarking
         /// MDGitCommit from the bundle's daemon manifest; nil in dev builds.
         public var bundledCommit: String?
+        /// Issue #678: `DaemonAgentPlistFingerprint` of the bundled agent
+        /// plist; nil when the bundle has none (dev builds), which disables
+        /// the plist-drift comparison and nothing else.
+        public var bundledPlistFingerprint: String?
         /// Issue #486: whether the running app's code signature qualifies it
         /// to manage the service (production-style signature — never ad-hoc,
         /// has a Team ID). False turns the whole feature off, exactly like a
@@ -467,10 +560,14 @@ public final class DaemonSetupModel: ObservableObject {
             probe: any DaemonReachabilityProbing,
             launchdControl: any LaunchdServiceControlling,
             bundledDaemon: any BundledDaemonVerifying,
+            updateRelaunchMarker: any UpdateRelaunchMarking = NoUpdateRelaunchMarker(),
             bundledCommit: String?,
+            bundledPlistFingerprint: String? = nil,
             hostSignatureAllowsServiceManagement: Bool
         ) {
             self.bundledDaemon = bundledDaemon
+            self.updateRelaunchMarker = updateRelaunchMarker
+            self.bundledPlistFingerprint = bundledPlistFingerprint
             self.registrar = registrar
             self.tokenStore = tokenStore
             self.legacyAgent = legacyAgent
@@ -492,8 +589,11 @@ public final class DaemonSetupModel: ObservableObject {
     /// Drives the Settings takeover section — independent of `phase`, since
     /// the legacy agent can be present while its daemon is happily running.
     @Published public private(set) var legacyAgentPresent = false
-    /// Set when a drift re-register happened this launch; the UI notes it
-    /// subtly ("Background service updated to match this app version").
+    /// Set when a re-register (unregister → register) happened this launch;
+    /// the UI notes it subtly ("Background service updated to match this app
+    /// version"). Issue #678: a clean in-place restart sets nothing — the
+    /// deck simply shows the new build — so this fires only when the
+    /// fallback rungs actually ran (decision 0041).
     @Published public private(set) var didReregisterForUpdate = false
 
     /// Issue #269: the user has read the re-register notice and dismissed it.
@@ -536,13 +636,29 @@ public final class DaemonSetupModel: ObservableObject {
 
     // MARK: Launch
 
-    public func evaluateOnLaunch() async {
+    /// Returns whether the evaluation ended with the bundled daemon VERIFIED
+    /// answering (review of PR #687, round 2): `.running`, or a repair rung
+    /// whose wait saw the daemon come up. Explicitly false for the
+    /// stand-downs (`.hostSignatureStandDown`, `.bundledServiceUnavailable`)
+    /// even though they share the `.quiet` phase — the phase says "nothing
+    /// for this surface to show", not "the service is up", and the launch
+    /// follow-up read must key on the latter only.
+    @discardableResult
+    public func evaluateOnLaunch() async -> Bool {
         phase = .checking
         legacyAgentPresent = deps.legacyAgent.isLegacyAgentPresent()
         let registration = deps.registrar.status
+        // Issue #678: a Sparkle relaunch that really did move the commit is
+        // an ordinary update — go straight to the restart without spending a
+        // launchctl spawn on the probe. Consumed on every evaluation (launch-
+        // scoped by contract); a marker WITHOUT drift takes today's path so a
+        // wedged or spawn-rejected job on a same-commit relaunch is still seen.
+        let relaunchExpected = deps.updateRelaunchMarker.consumeRelaunchMarker()
+        let recordedCommit = deps.marker.registeredCommit
+        let expectsDrift = relaunchExpected && recordedCommit != deps.bundledCommit
         // Only consulted for the enabled-but-wedged / spawn-rejected checks;
         // skip the launchctl spawn on the paths that can't be either.
-        let launchdService = registration == .enabled
+        let launchdService = registration == .enabled && !expectsDrift
             ? await deps.launchdControl.probeService() : .loaded
         let decision = decideDaemonSetup(
             hostSignatureAllowsServiceManagement: deps.hostSignatureAllowsServiceManagement,
@@ -551,30 +667,53 @@ public final class DaemonSetupModel: ObservableObject {
             registration: registration,
             launchdService: launchdService,
             legacyPresent: legacyAgentPresent,
-            recordedCommit: deps.marker.registeredCommit,
+            recordedCommit: recordedCommit,
             bundledCommit: deps.bundledCommit,
             // Issue #514: hashing the bundled binary is only worth doing —
             // and only meaningful — once launchd has actually rejected it.
             bundledDaemon: launchdService == .spawnFailed
-                ? await deps.bundledDaemon.verifyBundledDaemon() : .unavailable
+                ? await deps.bundledDaemon.verifyBundledDaemon() : .unavailable,
+            recordedPlistFingerprint: deps.marker.registeredPlistFingerprint,
+            bundledPlistFingerprint: deps.bundledPlistFingerprint
         )
+        // Issue #678: an install from before the fingerprint existed. The
+        // registered definition IS this bundle's plist (unchanged in every
+        // release since #96), so record it now instead of forcing a
+        // re-register; from here on a real definition change is visible.
+        if registration == .enabled, deps.hostSignatureAllowsServiceManagement,
+           deps.marker.registeredPlistFingerprint == nil {
+            deps.marker.registeredPlistFingerprint = deps.bundledPlistFingerprint
+        }
         switch decision {
-        case .hostSignatureStandDown, .bundledServiceUnavailable, .running:
+        case .hostSignatureStandDown, .bundledServiceUnavailable:
             phase = .quiet
+            return false
+        case .running:
+            phase = .quiet
+            return true
         case .needsConsent:
             phase = .consentNeeded
+            return false
         case .awaitingApproval:
             phase = .awaitingApproval
+            return false
         case .registeredNotRunning:
             phase = .startingUp
+            return false
         case .legacyInstalledNotRunning:
             phase = .legacyNotRunning
-        case .driftReregister(_, let bundled):
+            return false
+        case .driftReregister(let bundled):
             await reregister(bundledCommit: bundled)
+        case .driftRestart(_, let bundled):
+            await restartForDrift(bundledCommit: bundled)
         case .wedgedServiceRepair(let bundled), .staleDaemonRestart(_, let bundled),
              .staleLaunchConstraintRepair(let bundled):
             await forceRestartService(bundledCommit: bundled)
         }
+        // On the repair rungs `.quiet` is only ever set by a wait that saw
+        // the daemon answer (`waitForDaemon`), so here it does mean up.
+        return phase == .quiet
     }
 
     /// User clicked Install on the first-run consent card (or the Settings
@@ -651,6 +790,14 @@ public final class DaemonSetupModel: ObservableObject {
 
     // MARK: Internals
 
+    /// The one place the marker advances: the commit this app just
+    /// registered (or verified running), and the fingerprint of the plist
+    /// that registration carries (#678).
+    private func recordRegistration(commit: String?) {
+        deps.marker.registeredCommit = commit
+        deps.marker.registeredPlistFingerprint = deps.bundledPlistFingerprint
+    }
+
     private func install() async {
         // #486 belt-and-braces: the consent surface never shows for an
         // untrusted host signature, but no code path may register anyway.
@@ -678,14 +825,14 @@ public final class DaemonSetupModel: ObservableObject {
             try deps.registrar.register()
         } catch {
             if deps.registrar.status == .requiresApproval {
-                deps.marker.registeredCommit = deps.bundledCommit
+                recordRegistration(commit: deps.bundledCommit)
                 phase = .awaitingApproval
                 return
             }
             phase = .failed("Couldn't register the background service: \(error.localizedDescription)")
             return
         }
-        deps.marker.registeredCommit = deps.bundledCommit
+        recordRegistration(commit: deps.bundledCommit)
         if deps.registrar.status == .requiresApproval {
             phase = .awaitingApproval
             return
@@ -693,6 +840,40 @@ public final class DaemonSetupModel: ObservableObject {
         _ = await waitForDaemon()
     }
 
+    /// Issue #678: the health-probe timeout while waiting for a kickstarted
+    /// daemon. 1 s, not the client's 5 s default — the old process is being
+    /// replaced, so an unanswered probe should fail fast: 10 × (1 s + 0.5 s)
+    /// ≈ 15 s worst case instead of ≈ 55 s. Nothing else uses this.
+    public static let restartProbeTimeout: TimeInterval = 1
+
+    /// Rung 1 of the post-update ladder (decision 0041): restart the process
+    /// in place and ask it what build it is. A restart that yields the
+    /// bundled commit is the whole update — marker advanced, no banner,
+    /// registration and Login Items approval untouched. Anything else (a
+    /// stale answer, or nothing answering within the short wait) falls to
+    /// today's re-register, whose own verification still escalates to the
+    /// bootout exactly once. The phase stays `.checking` throughout the
+    /// restart wait: a plain update is not a setup state and shows no card.
+    private func restartForDrift(bundledCommit: String) async {
+        guard deps.hostSignatureAllowsServiceManagement else {
+            phase = .quiet
+            return
+        }
+        await deps.launchdControl.restartService()
+        let snapshot = await waitForDaemon(
+            probeTimeout: Self.restartProbeTimeout, keepPhaseWhileWaiting: true
+        )
+        switch verifyDaemonAfterReregister(probe: snapshot, bundledCommit: bundledCommit) {
+        case .verified:
+            recordRegistration(commit: bundledCommit)
+        case .staleProcessNeedsRestart, .unreachable:
+            await reregister(bundledCommit: bundledCommit)
+        }
+    }
+
+    /// Rung 2: the unregister → register round-trip. Since #678 it is the
+    /// fallback for a restart that did not take (and the #185 missing-binary
+    /// repair's mechanism), no longer the first move on every update.
     private func reregister(bundledCommit: String) async {
         guard deps.hostSignatureAllowsServiceManagement else {
             phase = .quiet
@@ -708,7 +889,7 @@ public final class DaemonSetupModel: ObservableObject {
             // flipping to requiresApproval — that's a user gate, not a
             // failure.
             if deps.registrar.status == .requiresApproval {
-                deps.marker.registeredCommit = bundledCommit
+                recordRegistration(commit: bundledCommit)
                 didReregisterForUpdate = true
                 phase = .awaitingApproval
                 return
@@ -716,7 +897,7 @@ public final class DaemonSetupModel: ObservableObject {
             phase = .failed("Couldn't update the background service: \(error.localizedDescription)")
             return
         }
-        deps.marker.registeredCommit = bundledCommit
+        recordRegistration(commit: bundledCommit)
         didReregisterForUpdate = true
         // The unregister/register round-trip can revoke Login Items
         // approval; polling a daemon that isn't allowed to start would just
@@ -796,7 +977,7 @@ public final class DaemonSetupModel: ObservableObject {
             try deps.registrar.register()
         } catch {
             if deps.registrar.status == .requiresApproval {
-                deps.marker.registeredCommit = bundledCommit
+                recordRegistration(commit: bundledCommit)
                 didReregisterForUpdate = true
                 phase = .awaitingApproval
                 return
@@ -804,7 +985,7 @@ public final class DaemonSetupModel: ObservableObject {
             phase = .failed("Couldn't restart the background service: \(error.localizedDescription)")
             return
         }
-        deps.marker.registeredCommit = bundledCommit
+        recordRegistration(commit: bundledCommit)
         didReregisterForUpdate = true
         if deps.registrar.status == .requiresApproval {
             phase = .awaitingApproval
@@ -815,18 +996,61 @@ public final class DaemonSetupModel: ObservableObject {
 
     /// Polls until the daemon answers, returning the answering probe
     /// snapshot so callers can verify the build WITHOUT a second request.
+    /// Issue #678: `probeTimeout` overrides the probe's default request
+    /// timeout (the restart rung passes `restartProbeTimeout`; every other
+    /// caller keeps the default), and `keepPhaseWhileWaiting` leaves the
+    /// phase alone instead of showing the starting-up card.
     @discardableResult
-    private func waitForDaemon() async -> DaemonProbeSnapshot? {
-        phase = .startingUp
+    private func waitForDaemon(
+        probeTimeout: TimeInterval? = nil,
+        keepPhaseWhileWaiting: Bool = false
+    ) async -> DaemonProbeSnapshot? {
+        if !keepPhaseWhileWaiting { phase = .startingUp }
         for attempt in 0..<startupProbeAttempts {
             if attempt > 0 { await startupProbeDelay() }
-            if let snapshot = await deps.probe.probeDaemon() {
+            let snapshot: DaemonProbeSnapshot?
+            if let probeTimeout {
+                snapshot = await deps.probe.probeDaemon(timeout: probeTimeout)
+            } else {
+                snapshot = await deps.probe.probeDaemon()
+            }
+            if let snapshot {
                 phase = .quiet
                 return snapshot
             }
         }
-        // Still starting (or failing); leave the retry affordance up.
-        phase = .startingUp
+        // Still starting (or failing); leave the retry affordance up — unless
+        // the caller owns the phase (the restart rung falls back on its own).
+        if !keepPhaseWhileWaiting { phase = .startingUp }
         return nil
+    }
+}
+
+// MARK: - Launch ordering (issue #678)
+
+/// The app's launch sequence used to run the daemon reconciliation to
+/// completion BEFORE the first state read, so every update held the deck on a
+/// setup card for the whole restart chain. Decision 0041: the two start
+/// together. The old daemon answers the first read while it is being
+/// replaced; the next refresh picks up the new build. Kept in Core so the
+/// ordering is a tested primitive rather than an accident of the app's
+/// `.task` body.
+public enum LaunchReconciliation {
+    /// Runs both to completion, concurrently; neither waits for the other to
+    /// start. Then, when `reconcile` reports the daemon verified up, runs
+    /// `read` ONCE more (review of PR #687): the first read can hit
+    /// connection-refused in the gap while the old process is going down,
+    /// and with automatic refresh off nothing else would ever read again —
+    /// the deck would sit on "unreachable" next to a healthy new daemon.
+    /// The follow-up waits for both sides so it never collides with a first
+    /// read still in flight (`refresh()` drops overlapping calls).
+    public static func runAlongsideFirstRead(
+        reconcile: @escaping @Sendable () async -> Bool,
+        read: @escaping @Sendable () async -> Void
+    ) async {
+        async let reconciliation: Bool = reconcile()
+        async let firstRead: Void = read()
+        let (daemonVerifiedUp, _) = await (reconciliation, firstRead)
+        if daemonVerifiedUp { await read() }
     }
 }

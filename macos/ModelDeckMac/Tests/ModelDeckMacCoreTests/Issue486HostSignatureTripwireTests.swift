@@ -38,6 +38,7 @@ private final class TripwireLegacyAgent: LegacyAgentInspecting, @unchecked Senda
 
 private final class TripwireMarker: RegistrationMarkerStore, @unchecked Sendable {
     var registeredCommit: String?
+    var registeredPlistFingerprint: String?
 }
 
 private final class TripwireProbe: DaemonReachabilityProbing, @unchecked Sendable {
@@ -49,8 +50,10 @@ private final class TripwireProbe: DaemonReachabilityProbing, @unchecked Sendabl
 private final class TripwireLaunchdControl: LaunchdServiceControlling, @unchecked Sendable {
     var probeResult: LaunchdServiceProbe = .loaded
     var bootOutCalls = 0
+    var restartCalls = 0
     func probeService() async -> LaunchdServiceProbe { probeResult }
     func bootOutService() async { bootOutCalls += 1 }
+    func restartService() async { restartCalls += 1 }
 }
 
 /// A perfectly verified bundled daemon — the #514 repair's precondition, so
@@ -152,6 +155,7 @@ final class Issue486ModelTripwireTests: XCTestCase {
         XCTAssertEqual(registrar.registerCalls, 0, "TRIPWIRE #486: register() reached from an untrusted build", file: file, line: line)
         XCTAssertEqual(registrar.unregisterCalls, 0, file: file, line: line)
         XCTAssertEqual(launchd.bootOutCalls, 0, file: file, line: line)
+        XCTAssertEqual(launchd.restartCalls, 0, "TRIPWIRE #486/#678: kickstart reached from an untrusted build", file: file, line: line)
         XCTAssertEqual(tokenStore.createCalls, 0, file: file, line: line)
         XCTAssertEqual(self.marker.registeredCommit, marker, file: file, line: line)
     }

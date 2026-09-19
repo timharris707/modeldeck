@@ -130,12 +130,21 @@ $SPARKLE_ONE_TIME_HELP"
   if [[ -n "${MD_SPARKLE_KEY_FILE:-}" ]]; then
     key_args=(--key-file "$MD_SPARKLE_KEY_FILE")
   fi
+  # Issue #685: the release notes ride the appcast as <description>, so the
+  # app's update check and Sparkle read the same feed. A version without a
+  # notes file still gets an appcast — just without notes.
+  local notes_args=()
+  local notes_file="$REPO_ROOT/docs/release-notes/$version.md"
+  if [[ -f "$notes_file" ]]; then
+    notes_args=(--release-notes-file "$notes_file")
+  fi
   node "$REPO_ROOT/scripts/generate-appcast.mjs" \
     --version "$version" \
     --build "$build" \
     --dmg "$dmg" \
     --url "https://github.com/timharris707/modeldeck/releases/download/v$version/ModelDeck-$version.dmg" \
     --release-notes-url "https://github.com/timharris707/modeldeck/releases/tag/v$version" \
+    "${notes_args[@]+"${notes_args[@]}"}" \
     --sign-update "$sign_update" \
     "${key_args[@]+"${key_args[@]}"}" \
     --out "$out" \

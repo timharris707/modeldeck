@@ -172,6 +172,88 @@ test('renderAppcast escapes XML special characters', () => {
   assert.doesNotMatch(xml, /releaseNotesLink/); // optional and absent here
 });
 
+// Issue #685 — TRIPWIRE appcast-description-cdata. The app's update check
+// now reads the appcast (not the GitHub API), so the release notes must ride
+// the feed as <description>, verbatim markdown inside CDATA — and a run
+// without --release-notes-file must emit no <description> at all (the
+// pre-#685 shape the decoder treats as "no notes").
+test('appcast-description-cdata: --release-notes-file embeds the notes as CDATA', (t) => {
+  const dir = tmpdir(t);
+  const dmg = writeDmg(dir, 4096);
+  const stub = writeSignUpdateStub(dir);
+  const notes = path.join(dir, '0.9.9.md');
+  fs.writeFileSync(notes,
+    '# ModelDeck 0.9.9\n\n**Bold lead.** Fixes a < b && c > d.\n\n- one\n- two\n');
+  const out = path.join(dir, 'appcast.xml');
+  const result = runScript([
+    '--version', '0.9.9', '--build', '512', '--dmg', dmg,
+    '--url', 'https://github.com/timharris707/modeldeck/releases/download/v0.9.9/ModelDeck-0.9.9.dmg',
+    '--release-notes-url', 'https://github.com/timharris707/modeldeck/releases/tag/v0.9.9',
+    '--release-notes-file', notes,
+    '--sign-update', stub, '--key-file', fakeKeyFile,
+    '--pub-date', 'Wed, 22 Jul 2026 12:00:00 +0000',
+    '--out', out,
+  ]);
+  assert.equal(result.status, 0, result.stderr);
+  const xml = fs.readFileSync(out, 'utf8');
+  // Verbatim markdown, CDATA-wrapped: no entity escaping inside.
+  assert.match(xml, /<description><!\[CDATA\[# ModelDeck 0\.9\.9\n\n\*\*Bold lead\.\*\* Fixes a < b && c > d\.\n\n- one\n- two\n\]\]><\/description>/);
+  assert.doesNotMatch(xml, /&lt;|&amp;&amp;/);
+  // The link stays alongside the body — both, never one or the other.
+  assert.match(xml, /<sparkle:releaseNotesLink>https:\/\/github\.com\/timharris707\/modeldeck\/releases\/tag\/v0\.9\.9<\/sparkle:releaseNotesLink>/);
+  // Signature/length untouched by the new field.
+  assert.match(xml, /length="4096"/);
+  assert.match(xml, new RegExp(`sparkle:edSignature="${FAKE_SIGNATURE}"`));
+});
+
+test('appcast-description-cdata: no --release-notes-file means no <description>', (t) => {
+  const dir = tmpdir(t);
+  const dmg = writeDmg(dir, 4096);
+  const stub = writeSignUpdateStub(dir);
+  const out = path.join(dir, 'appcast.xml');
+  const result = runScript([
+    '--version', '0.9.9', '--build', '512', '--dmg', dmg,
+    '--url', 'https://example.invalid/ModelDeck.dmg',
+    '--release-notes-url', 'https://github.com/timharris707/modeldeck/releases/tag/v0.9.9',
+    '--sign-update', stub, '--key-file', fakeKeyFile,
+    '--out', out,
+  ]);
+  assert.equal(result.status, 0, result.stderr);
+  const xml = fs.readFileSync(out, 'utf8');
+  assert.doesNotMatch(xml, /<description>/);
+  assert.match(xml, /<sparkle:releaseNotesLink>/);
+});
+
+test('appcast-description-cdata: a "]]>" inside the notes cannot break out of the CDATA', () => {
+  const xml = renderAppcast({
+    version: '1.0.0', build: '1',
+    url: 'https://example.invalid/a.dmg',
+    length: 10, signature: 'sig',
+    pubDate: 'Wed, 22 Jul 2026 12:00:00 +0000',
+    description: 'before ]]> after',
+  });
+  assert.match(xml, /<description><!\[CDATA\[before \]\]\]\]><!\[CDATA\[> after\]\]><\/description>/);
+  // Exactly one closing sequence per CDATA section; the payload's own is split.
+  assert.equal((xml.match(/\]\]>/g) || []).length, 2);
+});
+
+test('appcast-description-cdata: a missing notes file fails loudly, writes nothing', (t) => {
+  const dir = tmpdir(t);
+  const dmg = writeDmg(dir);
+  const stub = writeSignUpdateStub(dir);
+  const out = path.join(dir, 'appcast.xml');
+  const result = runScript([
+    '--version', '0.9.9', '--build', '512', '--dmg', dmg,
+    '--url', 'https://example.invalid/ModelDeck.dmg',
+    '--release-notes-file', path.join(dir, 'nope.md'),
+    '--sign-update', stub, '--key-file', fakeKeyFile,
+    '--out', out,
+  ]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /release notes file not found/);
+  assert.equal(fs.existsSync(out), false);
+});
+
 test('edSignature seam parses the real tool output shape', (t) => {
   const dir = tmpdir(t);
   const dmg = writeDmg(dir, 2048);

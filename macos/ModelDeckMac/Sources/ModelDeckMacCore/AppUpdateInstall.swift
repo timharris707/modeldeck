@@ -95,11 +95,17 @@ public enum AppUpdateRelaunchPolicy {
 /// tests pin the split: an EXPLICIT user-initiated session always lands on a
 /// visible phase, a BACKGROUND session stays silent. The driver applies the
 /// returned phase verbatim; nil means "report nothing".
+///
+/// Issue #685: the check that offers Update Now reads the same appcast
+/// Sparkle installs from, so the old "the feed disagrees with the GitHub
+/// check" outcome and its copy are gone. Sparkle can still answer "nothing
+/// to install" to an explicit click (a release pulled between the two
+/// reads, or one this Mac's macOS is too old for), and #170's rule holds:
+/// that click lands on a visible phase, never a stuck "Checking…".
 public enum AppUpdateCheckOutcomePolicy {
-    /// Explicit Update Now, but Sparkle's appcast re-check disagrees with
-    /// the GitHub check that offered the button (rare) — say so, never spin.
-    public static let feedNoNewerVersionMessage =
-        "The update feed has no newer version yet. Try again later."
+    /// Explicit Update Now, Sparkle found nothing to install.
+    public static let nothingToInstallMessage =
+        "Nothing to install — Sparkle found no update for this Mac. Try again later."
     /// Explicit click while `SPUUpdater.canCheckForUpdates` says no (a
     /// session is already running) — issue #165's fix for the silent no-op;
     /// pinned here so the presentation can never quietly drift away.
@@ -113,7 +119,7 @@ public enum AppUpdateCheckOutcomePolicy {
     ) -> AppUpdateInstallPhase? {
         switch mode {
         case .userInitiated:
-            return .failed(message: feedNoNewerVersionMessage)
+            return .failed(message: nothingToInstallMessage)
         case .background:
             // Background checks that find nothing stay silent exactly as
             // always — no phase change, no dialog, tomorrow retries.

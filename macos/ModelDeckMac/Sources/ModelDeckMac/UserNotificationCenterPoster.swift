@@ -7,61 +7,35 @@ import ModelDeckMacCore
 /// the user declines, posts become silent no-ops (the coordinator still
 /// tracks levels so nothing spams if they later enable notifications in
 /// System Settings).
+///
+/// Issue #685: every banner is stamped with its kind (`categoryIdentifier`)
+/// so a click on it can be routed — see `UserNotificationClickDelegate`.
+/// Identifiers, kinds, and sound rules live in Core
+/// (`UserNotificationRequestSpec`) where they are pinned by tests.
 struct UserNotificationCenterPoster: UserNotificationPosting {
     func post(_ alert: UsageAlert) async {
-        await deliverBanner(
-            // One identifier per level: a newer banner for the same level
-            // replaces the old one instead of stacking. An alert that carries
-            // its own identity key (issue #377's model drops — several can be
-            // live at once, all .critical) coalesces on that instead, so it
-            // neither replaces nor is replaced by a usage banner.
-            identifier: alert.identityKey.map { "modeldeck.\($0)" }
-                ?? "modeldeck.usage.level-\(alert.level.rawValue)",
-            title: alert.title,
-            body: alert.body,
-            sound: alert.level == .critical ? .default : nil
-        )
+        await deliverBanner(.usage(alert))
     }
 }
 
-/// Issue #60: banner for the automatic update check — same lazy
-/// authorization path as usage banners; silent, and one fixed identifier so
-/// a newer release banner replaces a stale one.
+/// Issue #60: banner for the automatic update check.
 struct AppUpdateNotificationPoster {
     func post(_ notification: AppUpdateNotification) async {
-        await deliverBanner(
-            identifier: "modeldeck.appupdate.available",
-            title: notification.title,
-            body: notification.body,
-            sound: nil
-        )
+        await deliverBanner(.updateAvailable(notification))
     }
 }
 
 /// Issue #241: banner for a background update that finished staging —
-/// "ModelDeck <version> is ready, restart to finish". Its own identifier so
-/// it replaces itself per version but never clobbers the availability
-/// banner above (availability and readiness are different events; both may
-/// be pending in Notification Center at once).
+/// "ModelDeck <version> is ready, restart to finish".
 struct AppUpdateStagedNotificationPoster {
     func post(_ notification: AppUpdateNotification) async {
-        await deliverBanner(
-            identifier: "modeldeck.appupdate.staged",
-            title: notification.title,
-            body: notification.body,
-            sound: nil
-        )
+        await deliverBanner(.updateStaged(notification))
     }
 }
 
 /// Shared delivery: lazy authorization on the first banner, silent no-op
 /// when declined or when running unbundled.
-private func deliverBanner(
-    identifier: String,
-    title: String,
-    body: String,
-    sound: UNNotificationSound?
-) async {
+private func deliverBanner(_ spec: UserNotificationRequestSpec) async {
     // UNUserNotificationCenter requires a real app bundle; from a bare
     // `swift run` binary it throws an Objective-C exception. Same guard
     // philosophy as LaunchAtLogin: bundle-only features stay quiet in
@@ -75,9 +49,11 @@ private func deliverBanner(
     }
     guard status == .authorized || status == .provisional else { return }
     let content = UNMutableNotificationContent()
-    content.title = title
-    content.body = body
-    content.sound = sound
-    let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
+    content.title = spec.title
+    content.body = spec.body
+    content.sound = spec.sound ? .default : nil
+    // Issue #685: the kind the click delegate routes on.
+    content.categoryIdentifier = spec.kind.rawValue
+    let request = UNNotificationRequest(identifier: spec.identifier, content: content, trigger: nil)
     try? await center.add(request)
 }

@@ -45,15 +45,22 @@ final class SparkleUpdateDriver: NSObject, AppUpdateInstalling {
         return SparkleUpdateDriver(installModel: installModel, bundle: bundle)
     }
 
+    /// Issue #678: SPUUpdater holds its delegate weakly; the driver owns it.
+    private let relaunchDelegate: RelaunchMarkingUpdaterDelegate
+
     private init?(installModel: AppUpdateInstallModel, bundle: Bundle) {
         let userDriver = OneClickUserDriver(installModel: installModel)
         self.userDriver = userDriver
         self.installModel = installModel
+        let relaunchDelegate = RelaunchMarkingUpdaterDelegate(
+            marker: UserDefaultsUpdateRelaunchMarker()
+        )
+        self.relaunchDelegate = relaunchDelegate
         self.updater = SPUUpdater(
             hostBundle: bundle,
             applicationBundle: bundle,
             userDriver: userDriver,
-            delegate: nil
+            delegate: relaunchDelegate
         )
         super.init()
         // Our daily checker schedules; Sparkle's own timer stays off (also
@@ -151,6 +158,26 @@ final class SparkleUpdateDriver: NSObject, AppUpdateInstalling {
 
     func setAutomaticInstallEnabled(_ enabled: Bool) {
         updater.automaticallyDownloadsUpdates = enabled
+    }
+}
+
+/// Issue #678 (decision 0041): the one SPUUpdaterDelegate hook this app
+/// uses. Sparkle calls `updaterWillRelaunchApplication` immediately before
+/// the host terminates for an install-and-relaunch (SPUCoreBasedUpdateDriver,
+/// `installerWillFinishInstallationAndRelaunch:`), while the OLD bundle is
+/// still on disk — so nothing here restarts the daemon (it would respawn the
+/// old build). It records intent only; the next launch's reconciliation
+/// consumes the marker and goes straight to the in-place restart. The #163
+/// force-quit path in OneClickUserDriver is untouched.
+final class RelaunchMarkingUpdaterDelegate: NSObject, SPUUpdaterDelegate {
+    private let marker: any UpdateRelaunchMarking
+
+    init(marker: any UpdateRelaunchMarking) {
+        self.marker = marker
+    }
+
+    func updaterWillRelaunchApplication(_ updater: SPUUpdater) {
+        marker.recordRelaunch()
     }
 }
 
@@ -314,10 +341,10 @@ extension OneClickUserDriver: SPUUserDriver {
         nonisolated(unsafe) let acknowledgement = acknowledgement
         MainActor.assumeIsolated {
             // Issue #170: the no-update-found callback routes through the
-            // core policy by session origin — explicit sessions present the
-            // feed-disagreement message (the GitHub check offered the button,
-            // Sparkle's re-check disagrees; rare), background sessions stay
-            // silent exactly as always.
+            // core policy by session origin — explicit sessions land on a
+            // visible phase (#685: the check reads the same appcast, so this
+            // is rarer still — a pulled release or a too-old macOS),
+            // background sessions stay silent exactly as always.
             if let phase = AppUpdateCheckOutcomePolicy.onUpdateNotFound(mode: policyMode) {
                 report(phase)
             }

@@ -79,6 +79,7 @@ private final class FakeLegacyAgent: LegacyAgentInspecting, @unchecked Sendable 
 
 private final class FakeMarker: RegistrationMarkerStore, @unchecked Sendable {
     var registeredCommit: String?
+    var registeredPlistFingerprint: String?
 }
 
 private final class FakeProbe: DaemonReachabilityProbing, @unchecked Sendable {
@@ -116,14 +117,23 @@ private final class FakeBundledDaemon: BundledDaemonVerifying, @unchecked Sendab
 private final class FakeLaunchdControl: LaunchdServiceControlling, @unchecked Sendable {
     var probeResult: LaunchdServiceProbe = .loaded
     var bootOutCalls = 0
+    var restartCalls = 0
     /// Models the real-world effect of the bootout (e.g. the stale process
     /// dies and the next registration starts the NEW build).
     var onBootOut: (() -> Void)?
+    /// Issue #678: models the effect of `kickstart -k` — by default the
+    /// relaunched process is the NEW build (the ordinary update); tests that
+    /// exercise the fallback ladder leave the daemon stale here.
+    var onRestart: (() -> Void)?
     func probeService() async -> LaunchdServiceProbe { probeResult }
     func bootOutService() async {
         bootOutCalls += 1
         probeResult = .notFound
         onBootOut?()
+    }
+    func restartService() async {
+        restartCalls += 1
+        onRestart?()
     }
 }
 
@@ -196,11 +206,12 @@ final class DaemonSetupDecisionTests: XCTestCase {
     }
 
     func testDriftWinsEvenWhileRunning() {
-        // The running daemon is the OLD build; re-register replaces it.
+        // The running daemon is the OLD build; the in-place restart (#678)
+        // replaces the process, not the registration.
         XCTAssertEqual(
             decide(reachable: true, runningCommit: "old", registration: .enabled,
                    recordedCommit: "old", bundledCommit: "new"),
-            .driftReregister(recorded: "old", bundled: "new")
+            .driftRestart(recorded: "old", bundled: "new")
         )
     }
 
@@ -208,7 +219,7 @@ final class DaemonSetupDecisionTests: XCTestCase {
         XCTAssertEqual(
             decide(reachable: false, registration: .enabled,
                    recordedCommit: nil, bundledCommit: "new"),
-            .driftReregister(recorded: nil, bundled: "new")
+            .driftRestart(recorded: nil, bundled: "new")
         )
     }
 
@@ -267,13 +278,69 @@ final class DaemonSetupDecisionTests: XCTestCase {
         )
     }
 
+    func testChangedPlistFingerprintDecidesReregisterEvenWithMatchingCommit() {
+        // Review of PR #687: a changed service definition is retained by a
+        // kickstart while the new binary reports its new commit, so the
+        // fingerprint — not the commit — decides the full re-register.
+        XCTAssertEqual(
+            decideDaemonSetup(
+                hostSignatureAllowsServiceManagement: true,
+                probe: DaemonProbeSnapshot(runningCommit: "new"),
+                registration: .enabled, launchdService: .loaded, legacyPresent: false,
+                recordedCommit: "new", bundledCommit: "new", bundledDaemon: .unavailable,
+                recordedPlistFingerprint: "v0", bundledPlistFingerprint: "v1"
+            ),
+            .driftReregister(bundled: "new")
+        )
+        XCTAssertEqual(
+            decideDaemonSetup(
+                hostSignatureAllowsServiceManagement: true,
+                probe: nil,
+                registration: .enabled, launchdService: .loaded, legacyPresent: false,
+                recordedCommit: "old", bundledCommit: "new", bundledDaemon: .unavailable,
+                recordedPlistFingerprint: "v0", bundledPlistFingerprint: "v1"
+            ),
+            .driftReregister(bundled: "new"),
+            "the definition change outranks the commit change"
+        )
+    }
+
+    func testMissingFingerprintOnEitherSideNeverForcesAReregister() {
+        // nil recorded (pre-#678 install) or nil bundled (dev build without
+        // an agent plist): the comparison stands down; commit drift decides.
+        for (recorded, bundled) in [(nil, "v1"), ("v0", nil), (nil, nil)] as [(String?, String?)] {
+            XCTAssertEqual(
+                decideDaemonSetup(
+                    hostSignatureAllowsServiceManagement: true,
+                    probe: nil,
+                    registration: .enabled, launchdService: .loaded, legacyPresent: false,
+                    recordedCommit: "old", bundledCommit: "new", bundledDaemon: .unavailable,
+                    recordedPlistFingerprint: recorded, bundledPlistFingerprint: bundled
+                ),
+                .driftRestart(recorded: "old", bundled: "new")
+            )
+        }
+    }
+
     func testDriftStillWinsOverStaleness() {
-        // Drift re-register runs first; its own verification escalates to
-        // the forced restart if the process survives.
+        // The drift restart runs first; its own verification falls back to
+        // the re-register and then the forced restart if the process survives.
         XCTAssertEqual(
             decide(reachable: true, runningCommit: nil, registration: .enabled,
                    recordedCommit: "old", bundledCommit: "new"),
-            .driftReregister(recorded: "old", bundled: "new")
+            .driftRestart(recorded: "old", bundled: "new")
+        )
+    }
+
+    func testWedgeOutranksDriftSince678() {
+        // Enabled, launchd has no such job, nothing answering, AND the commit
+        // moved: kickstarting a job launchd cannot find would wait ~15 s for
+        // nothing. The wedge repair is what drift's fallback reaches anyway.
+        XCTAssertEqual(
+            decide(reachable: false, registration: .enabled,
+                   launchdService: .notFound,
+                   recordedCommit: "old", bundledCommit: "new"),
+            .wedgedServiceRepair(bundled: "new")
         )
     }
 
@@ -526,12 +593,44 @@ final class DaemonSetupModelTests: XCTestCase {
 
     // Drift
 
-    func testDriftReregistersReplacesAndNotes() async {
+    /// Issue #678: the ordinary update. The daemon answers the launch probe
+    /// as the OLD build (`runningCommit: "old"`) and, once kickstarted, as
+    /// the new one.
+    private func arrangeDriftWhereTheRestartTakes() {
         registrar.statusValue = .enabled
         marker.registeredCommit = "old"
-        probe = FakeProbe([true]) // running old build; still drift
+        probe = FakeProbe([true], runningCommit: "old")
+        launchd.onRestart = { [probe] in probe.runningCommit = "new" }
+    }
+
+    /// The pre-#678 shape: the restart does not change what answers (the
+    /// stale process survives the kickstart), so the fallback ladder runs.
+    private func arrangeDriftWhereTheRestartDoesNotTake() {
+        registrar.statusValue = .enabled
+        marker.registeredCommit = "old"
+        probe = FakeProbe([true], runningCommit: "old")
+        // register() (the fallback) is what finally starts the new build.
+        registrar.onRegister = { [probe] in probe.runningCommit = "new" }
+    }
+
+    func testDriftRestartsInPlaceAndStaysSilent() async {
+        arrangeDriftWhereTheRestartTakes()
         let model = makeModel()
         await model.evaluateOnLaunch()
+        XCTAssertEqual(launchd.restartCalls, 1)
+        XCTAssertEqual(registrar.unregisterCalls, 0, "#678: a plain update never touches the registration")
+        XCTAssertEqual(registrar.registerCalls, 0)
+        XCTAssertEqual(launchd.bootOutCalls, 0)
+        XCTAssertEqual(marker.registeredCommit, "new")
+        XCTAssertFalse(model.didReregisterForUpdate, "a clean restart shows no banner")
+        XCTAssertEqual(model.phase, .quiet)
+    }
+
+    func testDriftFallsBackToReregisterAndNotesWhenTheRestartDoesNotTake() async {
+        arrangeDriftWhereTheRestartDoesNotTake()
+        let model = makeModel()
+        await model.evaluateOnLaunch()
+        XCTAssertEqual(launchd.restartCalls, 1)
         XCTAssertEqual(registrar.unregisterCalls, 1)
         XCTAssertEqual(registrar.registerCalls, 1)
         XCTAssertEqual(marker.registeredCommit, "new")
@@ -546,9 +645,7 @@ final class DaemonSetupModelTests: XCTestCase {
     // session after being read once.
 
     func testDismissingClearsTheReregisterNotice() async {
-        registrar.statusValue = .enabled
-        marker.registeredCommit = "old"
-        probe = FakeProbe([true])
+        arrangeDriftWhereTheRestartDoesNotTake()
         let model = makeModel()
         await model.evaluateOnLaunch()
         XCTAssertTrue(model.didReregisterForUpdate)
@@ -569,9 +666,7 @@ final class DaemonSetupModelTests: XCTestCase {
         // The dismissal acknowledges ONE event, not the category. This is why
         // it is per-launch and not persisted: persisting would silence the
         // NEXT update's notice, which the user has never seen.
-        registrar.statusValue = .enabled
-        marker.registeredCommit = "old"
-        probe = FakeProbe([true])
+        arrangeDriftWhereTheRestartDoesNotTake()
         let model = makeModel()
         await model.evaluateOnLaunch()
         model.dismissReregisterNotice()
@@ -582,7 +677,11 @@ final class DaemonSetupModelTests: XCTestCase {
         // — it would read as controlling this second evaluation while doing
         // nothing. The captured [true] repeats forever, which is what this
         // test wants. To vary reachability, mutate the captured instance.
+        // The second drift's restart does not take either (the process keeps
+        // answering "new" against a bundle that is still "new" — so make the
+        // marker the drifting part and keep the running commit stale).
         marker.registeredCommit = "older-still"
+        probe.runningCommit = "old"
         await model.evaluateOnLaunch()
         XCTAssertTrue(
             model.didReregisterForUpdate,
@@ -604,16 +703,18 @@ final class DaemonSetupModelTests: XCTestCase {
     // Stale-process verification + forced restart (2026-08-02 incident)
 
     func testStaleSurvivorAfterDriftReregisterGetsBootedOut() async {
-        // The incident replay: upgrade drift triggers re-register, the BTM
-        // layer no-ops, and the 0.3.13 process (which doesn't self-report a
-        // commit) keeps answering. Verification must catch it and escalate
-        // to the launchd bootout; only then does the NEW build start.
+        // The incident replay: upgrade drift, the kickstart does not take
+        // (#678 rung 1), the re-register no-ops at the BTM layer (rung 2),
+        // and the 0.3.13 process (which doesn't self-report a commit) keeps
+        // answering. Verification must catch it and escalate to the launchd
+        // bootout; only then does the NEW build start.
         registrar.statusValue = .enabled
         marker.registeredCommit = "old"
         probe = FakeProbe([true], runningCommit: nil)
         launchd.onBootOut = { [probe] in probe.runningCommit = "new" }
         let model = makeModel()
         await model.evaluateOnLaunch()
+        XCTAssertEqual(launchd.restartCalls, 1)
         XCTAssertEqual(launchd.bootOutCalls, 1)
         XCTAssertEqual(registrar.unregisterCalls, 2, "drift replace, then the forced re-register")
         XCTAssertEqual(registrar.registerCalls, 2)
@@ -623,10 +724,10 @@ final class DaemonSetupModelTests: XCTestCase {
         XCTAssertEqual(model.phase, .quiet)
     }
 
-    func testVerifiedReregisterNeverTouchesLaunchd() async {
-        registrar.statusValue = .enabled
-        marker.registeredCommit = "old"
-        probe = FakeProbe([true], runningCommit: "new")
+    func testVerifiedReregisterNeverBootsOut() async {
+        // The restart leaves the process stale; the fallback re-register
+        // takes. Verification passes at rung 2 — no bootout.
+        arrangeDriftWhereTheRestartDoesNotTake()
         let model = makeModel()
         await model.evaluateOnLaunch()
         XCTAssertEqual(launchd.bootOutCalls, 0)
@@ -658,6 +759,7 @@ final class DaemonSetupModelTests: XCTestCase {
         probe = FakeProbe([true], runningCommit: nil)
         let model = makeModel()
         await model.evaluateOnLaunch()
+        XCTAssertEqual(launchd.restartCalls, 1, "#678: exactly one kickstart, never a loop")
         XCTAssertEqual(launchd.bootOutCalls, 1)
         XCTAssertEqual(model.phase, .failed(DaemonSetupModel.staleDaemonAfterRestartMessage))
     }
@@ -792,13 +894,12 @@ final class DaemonSetupModelTests: XCTestCase {
     }
 
     func testDriftReregisterLandingInRequiresApprovalRoutesToApprovalNotStartingUp() async {
-        // The unregister/register round-trip can revoke Login Items
-        // approval; the model must send the user to System Settings instead
-        // of polling a daemon that isn't allowed to start.
-        registrar.statusValue = .enabled
+        // The unregister/register round-trip (the #678 FALLBACK, when the
+        // restart does not take) can revoke Login Items approval; the model
+        // must send the user to System Settings instead of polling a daemon
+        // that isn't allowed to start.
+        arrangeDriftWhereTheRestartDoesNotTake()
         registrar.statusAfterRegister = .requiresApproval
-        marker.registeredCommit = "old"
-        probe = FakeProbe([true])
         let model = makeModel()
         await model.evaluateOnLaunch()
         XCTAssertEqual(model.phase, .awaitingApproval)
@@ -815,8 +916,10 @@ final class DaemonSetupModelTests: XCTestCase {
         registrar.registerError = TestError()
         registrar.errorLeavesStatus = .requiresApproval
         marker.registeredCommit = "old"
+        // Nothing answers: the restart cannot be verified, so the fallback runs.
         let model = makeModel()
         await model.evaluateOnLaunch()
+        XCTAssertEqual(launchd.restartCalls, 1)
         XCTAssertEqual(model.phase, .awaitingApproval)
         XCTAssertEqual(marker.registeredCommit, "new")
         XCTAssertTrue(model.didReregisterForUpdate)
@@ -1013,10 +1116,11 @@ final class KeychainPromptCoachingTests: XCTestCase {
 
     func testDriftReregisterNeverActivatesCoaching() async {
         // A same-signature update keeps its Keychain ACL entries — coaching
-        // there would cry wolf.
+        // there would cry wolf. Nothing answers the launch probe or the
+        // restart wait; the fallback re-register brings the daemon up.
         registrar.statusValue = .enabled
         marker.registeredCommit = "old"
-        probe = FakeProbe([false, true])
+        probe = FakeProbe([false, false, false, false, true])
         let model = makeModel(bundledCommit: "new")
         await model.evaluateOnLaunch()
         XCTAssertTrue(model.didReregisterForUpdate)

@@ -208,6 +208,7 @@ public enum LegacyAgentRemoval {
 /// for the launch-time drift comparison.
 public final class UserDefaultsRegistrationMarker: RegistrationMarkerStore, @unchecked Sendable {
     public static let key = "modeldeck.daemon.registeredCommit"
+    public static let plistFingerprintKey = "modeldeck.daemon.registeredPlistFingerprint"
     private let defaults: UserDefaults
 
     public init(defaults: UserDefaults = .standard) {
@@ -217,6 +218,23 @@ public final class UserDefaultsRegistrationMarker: RegistrationMarkerStore, @unc
     public var registeredCommit: String? {
         get { defaults.string(forKey: Self.key) }
         set { defaults.set(newValue, forKey: Self.key) }
+    }
+
+    public var registeredPlistFingerprint: String? {
+        get { defaults.string(forKey: Self.plistFingerprintKey) }
+        set { defaults.set(newValue, forKey: Self.plistFingerprintKey) }
+    }
+}
+
+extension DaemonAgentPlistFingerprint {
+    /// The agent plist release-dmg.sh stages at
+    /// Contents/Library/LaunchAgents — the file SMAppService registers.
+    public static func load(from bundle: Bundle) -> String? {
+        let url = bundle.bundleURL
+            .appendingPathComponent("Contents/Library/LaunchAgents")
+            .appendingPathComponent(SMAppServiceAgentRegistrar.plistName)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return fingerprint(ofPlistData: data)
     }
 }
 
@@ -230,6 +248,40 @@ extension DaemonClient: DaemonReachabilityProbing {
     public func probeDaemon() async -> DaemonProbeSnapshot? {
         guard let health = try? await health() else { return nil }
         return DaemonProbeSnapshot(runningCommit: health.MDGitCommit)
+    }
+
+    /// Issue #678: the same round-trip under the caller's request timeout
+    /// (the post-update restart polls with 1 s; nothing else passes one).
+    public func probeDaemon(timeout: TimeInterval) async -> DaemonProbeSnapshot? {
+        guard let health = try? await health(timeout: timeout) else { return nil }
+        return DaemonProbeSnapshot(runningCommit: health.MDGitCommit)
+    }
+}
+
+// MARK: - Update relaunch marker (issue #678)
+
+/// UserDefaults-backed hand-off from the Sparkle relaunch to the next
+/// launch's reconciliation (decision 0041). Launch-scoped by construction:
+/// the ONLY reader clears it, so a marker can never outlive the launch that
+/// consumes it — a relaunch that never came (the install failed, the user
+/// force-quit) is consumed harmlessly on whatever launch comes next, where
+/// "expected drift" without actual drift takes the ordinary path.
+public final class UserDefaultsUpdateRelaunchMarker: UpdateRelaunchMarking, @unchecked Sendable {
+    public static let key = "modeldeck.update.relaunchInProgress"
+    private let defaults: UserDefaults
+
+    public init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    public func recordRelaunch() {
+        defaults.set(true, forKey: Self.key)
+    }
+
+    public func consumeRelaunchMarker() -> Bool {
+        let recorded = defaults.bool(forKey: Self.key)
+        defaults.removeObject(forKey: Self.key)
+        return recorded
     }
 }
 
@@ -264,6 +316,22 @@ public struct LaunchctlDaemonServiceController: LaunchdServiceControlling {
         // non-zero and that's already the goal state. The caller always
         // verifies the outcome through the running daemon's self-report.
         _ = await Self.runLaunchctl(["bootout", "gui/\(getuid())/\(Self.label)"])
+    }
+
+    /// Issue #678: measured on throwaway labels (decision 0041): `kickstart
+    /// -k` SIGTERMs the running process, SIGKILLs it after ~5 s if it will
+    /// not exit, honors the plist's 10 s `ThrottleInterval`, and the client
+    /// returns only once the replacement has been spawned. The deadline
+    /// covers all of that so the caller's short health polling never starts
+    /// while the OLD process can still answer. Exit code deliberately
+    /// ignored — the running daemon's self-report is the only verdict.
+    public static let restartDeadline: TimeInterval = 15
+
+    public func restartService() async {
+        _ = await Self.runLaunchctl(
+            ["kickstart", "-k", "gui/\(getuid())/\(Self.label)"],
+            deadline: Self.restartDeadline
+        )
     }
 
     /// Serializes exactly one resume of the continuation across the three
@@ -471,7 +539,9 @@ extension DaemonSetupModel.Dependencies {
             probe: client,
             launchdControl: LaunchctlDaemonServiceController(),
             bundledDaemon: BundledDaemonSignature(bundle: bundle),
+            updateRelaunchMarker: UserDefaultsUpdateRelaunchMarker(),
             bundledCommit: DaemonBundleManifest.load(from: bundle)?.MDGitCommit,
+            bundledPlistFingerprint: DaemonAgentPlistFingerprint.load(from: bundle),
             hostSignatureAllowsServiceManagement:
                 HostCodeSignature.currentProcessAllowsServiceManagement()
         )

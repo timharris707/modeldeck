@@ -39,6 +39,9 @@ struct ModelDeckMacApp: App {
     /// Keeps the SPUUpdater alive for the app's lifetime (the install model
     /// holds it weakly on purpose — the seam must never own Sparkle).
     private let sparkleDriver: SparkleUpdateDriver?
+    /// Issue #685: the notification-click router. The center holds its
+    /// delegate weakly, so the app owns it for the process lifetime.
+    private let notificationClickDelegate: UserNotificationClickDelegate
     @StateObject private var notifications: UsageNotificationCoordinator
     /// Issue #377: mid-session model drops post through the same banner seam.
     @StateObject private var modelDropNotifications: ModelDropNotificationCoordinator
@@ -161,10 +164,11 @@ struct ModelDeckMacApp: App {
         // for the guarded op and relays the disclosed outcome calmly.
         let sharedScopeModel = SharedScopeModel(controller: client, stateProvider: client)
         let toolUpdateModel = ToolUpdateModel(updater: client)
-        // Issue #33: the app's own update check against the PUBLIC repo's
-        // GitHub releases feed. Strictly separate from CLI updates; no
-        // self-replacing installer (that's issue #16's signed DMG work).
-        let appUpdateModel = AppUpdateModel(checker: GitHubReleaseChecker())
+        // Issue #33: the app's own update check. Strictly separate from CLI
+        // updates. Issue #685: it reads the SAME appcast Sparkle installs
+        // from (SUFeedURL when the bundle has one), so the check and the
+        // install can never disagree about whether an update exists.
+        let appUpdateModel = AppUpdateModel(checker: AppcastReleaseChecker())
         // Issue #121 (Tim directive 2026-07-22): Sparkle 2 one-click install.
         // The driver exists only when the bundle carries SUFeedURL +
         // SUPublicEDKey (release-dmg.sh stamps the key) — dev builds and
@@ -613,6 +617,21 @@ struct ModelDeckMacApp: App {
         self.floatingDeckController = floatingDeckController
         _floatingDeckModel = StateObject(wrappedValue: floatingDeckModel)
 
+        // Issue #685: notifications are clickable. Set once at app start.
+        // The staged-update banner runs the SAME Restart the deck banner
+        // runs (#241 → #303 hand-off); a usage banner opens the deck.
+        let notificationClickDelegate = UserNotificationClickDelegate(
+            onRestartToUpdate: { appUpdateStagedPrompt.restartNow() },
+            onOpenDeck: {
+                DeckOpener.openDeck(
+                    floatingModel: floatingDeckModel,
+                    floatingController: floatingDeckController
+                )
+            }
+        )
+        notificationClickDelegate.install()
+        self.notificationClickDelegate = notificationClickDelegate
+
         _statusModel = StateObject(wrappedValue: statusModel)
         _deckModel = StateObject(wrappedValue: deckModel)
         _settingsSync = StateObject(wrappedValue: settingsSync)
@@ -704,7 +723,7 @@ struct ModelDeckMacApp: App {
             // label frozen at its launch-time render (.plain) because
             // MenuBarExtra label invalidation doesn't reliably reach
             // value-type dependencies captured up here.
-            MenuBarIconView(statusModel: statusModel)
+            MenuBarIconView(statusModel: statusModel, stagedPromptModel: appUpdateStagedPrompt)
                 .task {
                     IconDebugLog.log("label .task fired; starting initial refresh")
                     contextMenuController.install()
@@ -714,11 +733,26 @@ struct ModelDeckMacApp: App {
                     if floatingDeckModel.isDetached {
                         floatingDeckController.show(activate: false)
                     }
-                    // Issue #96: evaluate the bundled-service state before
-                    // the first refresh so a true first run shows the
-                    // consent card, not a bare "daemon unreachable".
-                    await daemonSetupModel.evaluateOnLaunch()
-                    // Issue #421: after the daemon, before the first refresh.
+                    // Issue #96: evaluate the bundled-service state so a true
+                    // first run shows the consent card, not a bare "daemon
+                    // unreachable". Issue #678 (decision 0041): it no longer
+                    // BLOCKS the first state read — the two run together, so
+                    // an ordinary update shows the old daemon's data at once
+                    // and, once the service is verified up, one more read
+                    // lands the recovered daemon on the deck even if the
+                    // first read hit the restart gap (review of PR #687).
+                    // The card still owns the header for genuine setup states.
+                    if IconDebugLog.enabled {
+                        Self.dumpStatusWindows(tag: "pre-refresh")
+                    }
+                    await LaunchReconciliation.runAlongsideFirstRead(
+                        // The explicit verified-up result, never the phase:
+                        // `.quiet` also covers the stand-downs (review of
+                        // PR #687, round 2).
+                        reconcile: { await daemonSetupModel.evaluateOnLaunch() },
+                        read: { await statusModel.refresh() }
+                    )
+                    // Issue #421: after the daemon reconciliation.
                     // Starts the bundled proxy — or refuses loudly when one
                     // is already answering — then watches for a crash.
                     // Issue #422: NEVER silent-on. The lifecycle only runs
@@ -741,10 +775,6 @@ struct ModelDeckMacApp: App {
                     // Issue #60: honors the stored preference; no-op when
                     // automatic checks are off.
                     appUpdateAutoChecker.start()
-                    if IconDebugLog.enabled {
-                        Self.dumpStatusWindows(tag: "pre-refresh")
-                    }
-                    await statusModel.refresh()
                     if IconDebugLog.enabled {
                         try? await Task.sleep(nanoseconds: 2_000_000_000)
                         Self.dumpStatusWindows(tag: "post-refresh+2s")

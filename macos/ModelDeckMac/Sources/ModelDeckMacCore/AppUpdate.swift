@@ -15,16 +15,18 @@ import FoundationNetworking
 // links to the GitHub release page and the user installs by hand.
 
 /// The newest published release of the PUBLIC repo
-/// (github.com/timharris707/modeldeck).
+/// (github.com/timharris707/modeldeck), as the appcast describes it (#685).
 public struct AppReleaseInfo: Equatable, Sendable {
     /// Normalized version ("0.3.0", tag "v" prefix stripped).
     public var version: String
-    /// The release's human page — what "View Release" opens.
+    /// The release's human page — what "View Release" opens. From the
+    /// appcast's `sparkle:releaseNotesLink`.
     public var url: URL
     /// Issue #675: the release's markdown body — the contents of
-    /// docs/release-notes/<version>.md as GitHub publishes it. nil when the
-    /// feed carries no body (older releases), which every surface treats as
-    /// "no notes to show", never as a failure.
+    /// docs/release-notes/<version>.md. Issue #685: read from the appcast
+    /// item's `<description>`; nil when the feed carries none (an appcast
+    /// built before #685), which every surface treats as "no notes to
+    /// show", never as a failure.
     public var notes: String?
 
     public init(version: String, url: URL, notes: String? = nil) {
@@ -56,79 +58,103 @@ public enum AppReleaseNotes {
     }
 }
 
-/// Failures from the releases feed. Its own error domain on purpose — the
-/// GitHub check is not daemon traffic, so it never borrows
+/// Failures from the update feed. Its own error domain on purpose — the
+/// feed check is not daemon traffic, so it never borrows
 /// `DaemonClientError` (PR #44 review note).
 public enum AppReleaseCheckError: Error, Equatable, Sendable {
-    /// The feed answered with something that isn't a decodable release.
+    /// The feed answered with something that isn't a decodable appcast.
     case invalidResponse
-    /// A non-2xx, non-404 HTTP answer (404 means "no releases yet" and is
-    /// surfaced as nil, not an error).
+    /// A non-2xx HTTP answer. Issue #685: 404 is an error too — the appcast
+    /// lives on the newest release, so "not found" means the feed is
+    /// broken, not "no releases yet" (that is an EMPTY appcast).
     case httpStatus(Int)
 }
 
-/// Seam for the release feed; `GitHubReleaseChecker` conforms, tests stub it.
+/// Seam for the update feed; `AppcastReleaseChecker` conforms, tests stub it.
 public protocol AppReleaseChecking: Sendable {
-    /// The latest published release, or nil when the feed exists but has no
-    /// releases yet (the public repo may 404 until the first release ships —
-    /// that is the honest "no releases" case, not an error).
+    /// The newest published release, or nil when the feed exists but lists
+    /// no releases (an empty appcast channel — the honest "no releases"
+    /// case, not an error).
     func latestRelease() async throws -> AppReleaseInfo?
 }
 
-/// Checks the GitHub releases feed of the public repo. Read-only GET against
-/// api.github.com; no token, no mutation, no daemon involvement.
-public struct GitHubReleaseChecker: AppReleaseChecking {
-    /// `GET /repos/{owner}/{repo}/releases/latest` for the PUBLIC repo.
+/// Issue #685: reads the SAME Sparkle appcast the installer uses, so the
+/// check that offers "Update Now" and the install that follows can never
+/// disagree about whether an update exists. Read-only GET; no token, no
+/// mutation, no daemon involvement. Version, notes, and release page all
+/// come from the appcast item (`AppcastDecoder`).
+public struct AppcastReleaseChecker: AppReleaseChecking {
+    /// The stable appcast redirect — GitHub serves the newest release's
+    /// `appcast.xml` asset. Same value as `SUFeedURL` in Support/Info.plist.
     public static let defaultFeedURL =
-        URL(string: "https://api.github.com/repos/timharris707/modeldeck/releases/latest")!
+        URL(string: "https://github.com/timharris707/modeldeck/releases/latest/download/appcast.xml")!
+
+    /// The bundle's `SUFeedURL` when present (a release build), else the
+    /// constant above (dev builds) — one URL for the check and the install.
+    public static func feedURL(bundle: Bundle = .main) -> URL {
+        if let raw = bundle.object(forInfoDictionaryKey: "SUFeedURL") as? String,
+           let url = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+           url.scheme != nil {
+            return url
+        }
+        return defaultFeedURL
+    }
 
     private let feedURL: URL
     private let transport: any HTTPDataTransport
+    /// The macOS this process runs on (CodeRabbit, PR #686): items the
+    /// feed marks as needing a newer macOS are not offered — Sparkle would
+    /// refuse them at install time. Injectable so tests pin the filter.
+    private let runningSystem: OperatingSystemVersion
 
     public init(
-        feedURL: URL = GitHubReleaseChecker.defaultFeedURL,
-        transport: any HTTPDataTransport = URLSession.shared
+        feedURL: URL = AppcastReleaseChecker.feedURL(),
+        transport: any HTTPDataTransport = URLSession.shared,
+        runningSystem: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
     ) {
         self.feedURL = feedURL
         self.transport = transport
-    }
-
-    private struct ReleaseBody: Decodable {
-        var tagName: String
-        var htmlUrl: String
-        /// Issue #675: optional on purpose — a release with no body is a
-        /// release without notes, not a broken feed answer.
-        var body: String?
-
-        enum CodingKeys: String, CodingKey {
-            case tagName = "tag_name"
-            case htmlUrl = "html_url"
-            case body
-        }
+        self.runningSystem = runningSystem
     }
 
     public func latestRelease() async throws -> AppReleaseInfo? {
         var request = URLRequest(url: feedURL)
         request.httpMethod = "GET"
         request.timeoutInterval = 15
-        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        // Never a cached copy: a release published minutes ago must be seen
+        // by the next check, and the redirect target changes per release.
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         let (data, response) = try await transport.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw AppReleaseCheckError.invalidResponse
         }
-        // 404: the repo has no published release yet (expected until the
-        // first public release) — that's "nothing to offer", not a failure.
-        if http.statusCode == 404 { return nil }
         guard (200..<300).contains(http.statusCode) else {
             throw AppReleaseCheckError.httpStatus(http.statusCode)
         }
-        guard let body = try? JSONDecoder().decode(ReleaseBody.self, from: data),
-              let url = URL(string: body.htmlUrl) else {
+        let newest: AppcastItem?
+        do {
+            newest = try AppcastDecoder.newestItem(from: data, runningSystem: runningSystem)
+        } catch {
             throw AppReleaseCheckError.invalidResponse
         }
-        let version = AppVersion.normalized(tag: body.tagName)
-        guard !version.isEmpty else { throw AppReleaseCheckError.invalidResponse }
-        return AppReleaseInfo(version: version, url: url, notes: body.body)
+        // No installable item: the feed is fine, but nothing is published —
+        // or nothing this Mac's macOS can run, which is the same answer.
+        guard let item = newest else { return nil }
+        guard let release = Self.releaseInfo(for: item) else {
+            throw AppReleaseCheckError.invalidResponse
+        }
+        return release
+    }
+
+    /// Pure mapping from an appcast item to the app's release shape. The
+    /// release page falls back to the tag page for an item without a
+    /// `releaseNotesLink` (release-dmg.sh always writes one).
+    public static func releaseInfo(for item: AppcastItem) -> AppReleaseInfo? {
+        let version = AppVersion.normalized(tag: item.shortVersionString)
+        guard !version.isEmpty else { return nil }
+        let url = item.releaseNotesLink
+            ?? URL(string: "https://github.com/timharris707/modeldeck/releases/tag/v\(version)")!
+        return AppReleaseInfo(version: version, url: url, notes: item.description)
     }
 }
 
@@ -309,8 +335,8 @@ public struct AppUpdateNotification: Equatable, Sendable {
 }
 
 /// Issue #60 — the Settings → General "Check for updates automatically"
-/// toggle. Periodic check against the same public GitHub releases feed as
-/// the manual check (never any other endpoint), a few hours between checks
+/// toggle. Periodic check against the same appcast as the manual check
+/// (never any other endpoint; #685), a few hours between checks
 /// per the app's restraint bar (#241 tightened it from daily) — never a
 /// tight loop. The preference is app-local (UserDefaults), like Launch at
 /// Login: the daemon never stores it.
@@ -337,8 +363,8 @@ public final class AppUpdateAutoChecker: ObservableObject {
     /// menu-bar app, so a once-daily check lost every race against a
     /// same-day release — Tim's install checked at ~07:30 and never saw a
     /// version shipped that afternoon before he updated by hand. Still
-    /// restrained: at most six feed GETs a day against the public releases
-    /// endpoint, and only while the auto-check toggle is on.
+    /// restrained: at most six feed GETs a day against the appcast, and only
+    /// while the auto-check toggle is on.
     nonisolated public static let checkInterval: TimeInterval = 4 * 60 * 60
     /// The scheduler wakes hourly to ask "is the check due yet?" —
     /// cheap clock math only; the feed is hit at most once per interval.

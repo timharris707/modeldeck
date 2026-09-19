@@ -80,6 +80,7 @@ private final class WedgeLegacyAgent: LegacyAgentInspecting, @unchecked Sendable
 
 private final class WedgeMarker: RegistrationMarkerStore, @unchecked Sendable {
     var registeredCommit: String?
+    var registeredPlistFingerprint: String?
 }
 
 /// Reachability, as the wedge produces it: nothing answers until a bootout
@@ -110,6 +111,11 @@ private final class WedgeLaunchdControl: LaunchdServiceControlling, @unchecked S
         probeResults = [.notFound]
         onBootOut?()
     }
+    /// Issue #678: a kickstart against a spawn-rejected job changes nothing
+    /// (launchd still refuses to exec the binary) — which is exactly why the
+    /// #514 repair must outrank the drift restart.
+    var restartCalls = 0
+    func restartService() async { restartCalls += 1 }
 }
 
 private final class WedgeBundledDaemon: BundledDaemonVerifying, @unchecked Sendable {
@@ -226,7 +232,7 @@ final class Issue514DecisionTripwireTests: XCTestCase {
         XCTAssertEqual(decide(bundledDaemon: .unavailable), .registeredNotRunning)
         XCTAssertEqual(
             decide(recordedCommit: "old", bundledDaemon: .invalid),
-            .driftReregister(recorded: "old", bundled: "new")
+            .driftRestart(recorded: "old", bundled: "new")
         )
     }
 
@@ -343,15 +349,17 @@ final class Issue514RepairTripwireTests: XCTestCase {
 
     func testReregisterThatLeavesTheJobSpawnRejectedEscalatesOnceInTheSameLaunch() async {
         // Timing variant: at evaluation the job had not yet tried to spawn
-        // (`.loaded`), so drift ran its plain re-register — and the service
-        // still cannot start. The verification tail must ask launchd again
-        // rather than parking on "starting…" under the "service updated"
-        // notice, and must do so exactly once.
+        // (`.loaded`), so drift ran its restart (#678), nothing answered,
+        // the fallback re-register ran — and the service still cannot start.
+        // The verification tail must ask launchd again rather than parking
+        // on "starting…" under the "service updated" notice, and must do so
+        // exactly once.
         marker.registeredCommit = "old"
         launchd.probeResults = [.loaded, .spawnFailed]
         bootoutHealsTheService()
         let model = makeModel()
         await model.evaluateOnLaunch()
+        XCTAssertEqual(launchd.restartCalls, 1)
         XCTAssertEqual(launchd.bootOutCalls, 1)
         XCTAssertEqual(registrar.unregisterCalls, 2, "drift replace, then the forced repair")
         XCTAssertEqual(registrar.registerCalls, 2)
@@ -359,12 +367,14 @@ final class Issue514RepairTripwireTests: XCTestCase {
     }
 
     func testAStillDeadServiceNeverLoopsBootouts() async {
-        // The repair didn't take (nothing ever answers): one bootout, then
-        // the visible starting-up state with its retry affordance.
+        // The repair didn't take (nothing ever answers): one kickstart, one
+        // bootout, then the visible starting-up state with its retry
+        // affordance.
         marker.registeredCommit = "old"
         launchd.probeResults = [.loaded, .spawnFailed]
         let model = makeModel()
         await model.evaluateOnLaunch()
+        XCTAssertEqual(launchd.restartCalls, 1)
         XCTAssertEqual(launchd.bootOutCalls, 1)
         XCTAssertEqual(model.phase, .startingUp)
     }

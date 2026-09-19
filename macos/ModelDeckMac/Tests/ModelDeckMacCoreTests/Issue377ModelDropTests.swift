@@ -177,15 +177,29 @@ struct ModelDropTests {
 
     @Test("the poster honours the alert's identity and keeps the usage fallback")
     func posterUsesIdentityKey() throws {
-        let source = try String(
+        // Issue #685 moved the identifier rule from the app-target poster
+        // into Core (UserNotificationRequestSpec.usage) so it is unit-tested
+        // directly; the poster now delivers whatever the spec says. Scan the
+        // rule where it lives, and pin that the poster still goes through it.
+        let spec = try String(
+            contentsOf: Self.packageRoot.appendingPathComponent("Sources/ModelDeckMacCore/UserNotificationRouting.swift"),
+            encoding: .utf8
+        )
+        #expect(spec.contains("alert.identityKey"))
+        #expect(
+            spec.contains("modeldeck.usage.level-\\(alert.level.rawValue)"),
+            "usage replacement semantics survive"
+        )
+        let poster = try String(
             contentsOf: Self.packageRoot.appendingPathComponent("Sources/ModelDeckMac/UserNotificationCenterPoster.swift"),
             encoding: .utf8
         )
-        #expect(source.contains("alert.identityKey"))
-        #expect(
-            source.contains("modeldeck.usage.level-\\(alert.level.rawValue)"),
-            "usage replacement semantics survive"
-        )
+        #expect(poster.contains(".usage(alert)"), "the poster derives its request from the Core spec")
+        let drop = UserNotificationRequestSpec.usage(
+            UsageAlert(level: .critical, title: "T", body: "B", identityKey: "modeldrop.placeholder"))
+        #expect(drop.identifier == "modeldeck.modeldrop.placeholder")
+        let usage = UserNotificationRequestSpec.usage(UsageAlert(level: .warning, title: "T", body: "B"))
+        #expect(usage.identifier == "modeldeck.usage.level-1")
     }
 
     static var packageRoot: URL {

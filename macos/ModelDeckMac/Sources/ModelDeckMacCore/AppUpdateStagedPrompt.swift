@@ -138,10 +138,11 @@ public final class AppUpdateStagedPromptModel: ObservableObject {
 
     // MARK: Copy (single source for banner, notification, and badge popover)
 
-    /// The user-notification announcing readiness. Notifications aren't
-    /// click-actionable in this app (no UNUserNotificationCenter delegate),
-    /// so the body points at the deck's Restart — and names the always-true
-    /// fallback (quit and reopen) for users who never open the deck.
+    /// The user-notification announcing readiness. Issue #685: clicking it
+    /// runs the same Restart as the deck banner (the app's notification
+    /// delegate routes by kind); the body still points at the deck's
+    /// Restart and names the always-true fallback (quit and reopen) for
+    /// users who dismiss it instead.
     nonisolated public static func notification(version: String) -> AppUpdateNotification {
         AppUpdateNotification(
             title: "ModelDeck \(version) is ready",

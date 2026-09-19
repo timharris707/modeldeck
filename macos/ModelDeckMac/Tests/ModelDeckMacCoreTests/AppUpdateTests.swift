@@ -3,8 +3,8 @@ import Testing
 @testable import ModelDeckMacCore
 
 // Issue #33 — app version derivation and the "Check for App Updates" state
-// machine (GitHub releases feed of the public repo; link-out only, no
-// self-replacing updater — that's issue #16's signed DMG work).
+// machine. Issue #685: the feed is the Sparkle appcast (the same one the
+// installer reads), no longer the GitHub API.
 
 @Suite("App version (issue #33)")
 struct AppVersionTests {
@@ -128,61 +128,108 @@ struct AppUpdateModelTests {
     }
 }
 
-@Suite("GitHub release checker (issue #33)")
-struct GitHubReleaseCheckerTests {
-    @Test func decodesTagAndReleasePage() async throws {
-        let transport = StubTransport(stubs: [.init(status: 200, body: #"""
-        {"tag_name": "v0.3.0", "html_url": "https://github.com/timharris707/modeldeck/releases/tag/v0.3.0", "name": "ModelDeck 0.3.0"}
-        """#)])
-        let checker = GitHubReleaseChecker(transport: transport)
+/// A single-item appcast the way scripts/generate-appcast.mjs renders it
+/// (placeholder version, fake signature). `description` nil = the
+/// pre-#685 shape.
+func appcastXML(
+    version: String, description: String? = nil, link: Bool = true, minimumSystemVersion: String = "14.0"
+) -> String {
+    let notesLink = link
+        ? "\n            <sparkle:releaseNotesLink>https://github.com/timharris707/modeldeck/releases/tag/v\(version)</sparkle:releaseNotesLink>"
+        : ""
+    let body = description.map { "\n            <description><![CDATA[\($0)]]></description>" } ?? ""
+    return """
+    <?xml version="1.0" encoding="utf-8"?>
+    <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+        <channel>
+            <title>ModelDeck</title>
+            <item>
+                <title>ModelDeck \(version)</title>
+                <pubDate>Wed, 22 Jul 2026 12:00:00 +0000</pubDate>\(notesLink)\(body)
+                <sparkle:version>512</sparkle:version>
+                <sparkle:shortVersionString>\(version)</sparkle:shortVersionString>
+                <sparkle:minimumSystemVersion>\(minimumSystemVersion)</sparkle:minimumSystemVersion>
+                <enclosure
+                    url="https://github.com/timharris707/modeldeck/releases/download/v\(version)/ModelDeck-\(version).dmg"
+                    length="4096"
+                    type="application/octet-stream"
+                    sparkle:edSignature="FAKEsigFAKEsig00=="
+                />
+            </item>
+        </channel>
+    </rss>
+    """
+}
+
+let emptyAppcastXML = """
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+    <channel>
+        <title>ModelDeck</title>
+    </channel>
+</rss>
+"""
+
+@Suite("Appcast release checker (issues #33, #685)")
+struct AppcastReleaseCheckerTests {
+    @Test func decodesVersionNotesAndReleasePageFromTheAppcast() async throws {
+        let transport = StubTransport(stubs: [.init(status: 200, body: appcastXML(
+            version: "0.3.0",
+            description: "# ModelDeck 0.3.0\n\nA lead paragraph.\n\n**Something changed.** And here is why."
+        ))])
+        let checker = AppcastReleaseChecker(transport: transport)
         let release = try await checker.latestRelease()
         #expect(release?.version == "0.3.0")
         #expect(release?.url.absoluteString == "https://github.com/timharris707/modeldeck/releases/tag/v0.3.0")
+        #expect(release?.notes?.hasPrefix("# ModelDeck 0.3.0") == true)
+        #expect(release?.notes?.contains("**Something changed.**") == true)
         // Read-only public GET — the daemon's mutation token never leaves
         // localhost, so it must not appear here.
         #expect(transport.requests.first?.value(forHTTPHeaderField: "x-modeldeck-token") == nil)
     }
 
-    // Issue #675: the release body is what the update dialog now reads out
-    // loud, so the feed has to carry it — and a release published without one
-    // is still a perfectly good release.
-    @Test func decodesTheReleaseBodyAsNotes() async throws {
-        let transport = StubTransport(stubs: [.init(status: 200, body: #"""
-        {"tag_name": "v1.1.12", "html_url": "https://github.com/timharris707/modeldeck/releases/tag/v1.1.12", "body": "# ModelDeck 1.1.12\n\nA lead paragraph.\n\n**Something changed.** And here is why."}
-        """#)])
-        let release = try await GitHubReleaseChecker(transport: transport).latestRelease()
-        #expect(release?.notes?.hasPrefix("# ModelDeck 1.1.12") == true)
-        #expect(release?.notes?.contains("**Something changed.**") == true)
+    @Test func checksTheSameFeedSparkleInstallsFrom() async throws {
+        let transport = StubTransport(stubs: [.init(status: 200, body: appcastXML(version: "0.3.0"))])
+        _ = try await AppcastReleaseChecker(transport: transport).latestRelease()
+        #expect(transport.requests.first?.url == AppcastReleaseChecker.defaultFeedURL)
+        #expect(AppcastReleaseChecker.defaultFeedURL.absoluteString
+            == "https://github.com/timharris707/modeldeck/releases/latest/download/appcast.xml")
     }
 
-    @Test func aReleaseWithoutABodyStillDecodes() async throws {
-        let transport = StubTransport(stubs: [.init(status: 200, body: #"""
-        {"tag_name": "v0.3.0", "html_url": "https://github.com/timharris707/modeldeck/releases/tag/v0.3.0"}
-        """#)])
-        let release = try await GitHubReleaseChecker(transport: transport).latestRelease()
+    // A pre-#685 appcast (no <description>) is still a perfectly good
+    // release — just one with no notes to read.
+    @Test func anAppcastWithoutADescriptionStillDecodes() async throws {
+        let transport = StubTransport(stubs: [.init(status: 200, body: appcastXML(version: "0.3.0"))])
+        let release = try await AppcastReleaseChecker(transport: transport).latestRelease()
         #expect(release?.version == "0.3.0")
         #expect(release?.notes == nil)
     }
 
-    @Test func notFoundMeansNoReleasesYet() async throws {
-        let transport = StubTransport(stubs: [.init(status: 404, body: #"{"message": "Not Found"}"#)])
-        let release = try await GitHubReleaseChecker(transport: transport).latestRelease()
+    @Test func anEmptyChannelMeansNoReleasesYet() async throws {
+        let transport = StubTransport(stubs: [.init(status: 200, body: emptyAppcastXML)])
+        let release = try await AppcastReleaseChecker(transport: transport).latestRelease()
         #expect(release == nil)
     }
 
-    // The feed has its own error domain (PR #44 review note) — GitHub
-    // failures never masquerade as daemon client errors.
+    // The feed has its own error domain (PR #44 review note) — feed
+    // failures never masquerade as daemon client errors. #685: a 404 is a
+    // broken feed now (the appcast lives on the newest release), not "no
+    // releases yet".
     @Test func serverErrorThrowsFeedDomainError() async {
         let transport = StubTransport(stubs: [.init(status: 500, body: "oops")])
         await #expect(throws: AppReleaseCheckError.httpStatus(500)) {
-            _ = try await GitHubReleaseChecker(transport: transport).latestRelease()
+            _ = try await AppcastReleaseChecker(transport: transport).latestRelease()
+        }
+        let missing = StubTransport(stubs: [.init(status: 404, body: "Not Found")])
+        await #expect(throws: AppReleaseCheckError.httpStatus(404)) {
+            _ = try await AppcastReleaseChecker(transport: missing).latestRelease()
         }
     }
 
     @Test func malformedBodyThrowsFeedDomainError() async {
         let transport = StubTransport(stubs: [.init(status: 200, body: #"{"unexpected": true}"#)])
         await #expect(throws: AppReleaseCheckError.invalidResponse) {
-            _ = try await GitHubReleaseChecker(transport: transport).latestRelease()
+            _ = try await AppcastReleaseChecker(transport: transport).latestRelease()
         }
     }
 }
