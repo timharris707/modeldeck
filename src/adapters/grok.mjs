@@ -82,9 +82,12 @@ export function parseGrokBilling(payload) {
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
     throw new Error('Grok usage output did not contain a credit usage percent');
   }
-  const billing = (data.billing && typeof data.billing === 'object' && !Array.isArray(data.billing))
-    ? data.billing
-    : data;
+  // The live `GET /billing?format=credits` reply nests the percent and period
+  // under `config` (public issue #9, confirmed against the real endpoint);
+  // `billing` and the bare object are the earlier guesses, still accepted.
+  const carriesPercent = (value) => value && typeof value === 'object' && !Array.isArray(value)
+    && (value.credit_usage_percent != null || value.creditUsagePercent != null);
+  const billing = [data.config, data.billing].find(carriesPercent) ?? data;
   const percent = number(billing.credit_usage_percent ?? billing.creditUsagePercent);
   if (percent == null) throw new Error('Grok usage output did not contain a credit usage percent');
   const period = billing.current_period ?? billing.currentPeriod ?? null;

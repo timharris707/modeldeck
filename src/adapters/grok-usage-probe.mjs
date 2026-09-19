@@ -36,18 +36,43 @@ function text(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
-/// The stored credential's shape is not pinned by any public schema (the
-/// feasibility spike deliberately never opened a real `auth.json`), so every
-/// plausible nesting and spelling is accepted and anything else is reported
-/// as "sign in" rather than crashing the refresh pass.
+function isObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+/// Expiry as epoch milliseconds, or null. The real file stores an ISO string
+/// (`"expires_at": "2026-09-16T02:20:15.967754Z"`); the earlier guesses were
+/// epoch seconds or milliseconds, and all three are still accepted.
+function expiryMs(value) {
+  const numeric = finiteNumber(value);
+  if (numeric != null) return numeric < 10_000_000_000 ? numeric * 1000 : numeric;
+  const parsed = typeof value === 'string' ? Date.parse(value) : NaN;
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/// Where a token may live. The real `~/.grok/auth.json` (public issue #9,
+/// shape confirmed by two reporters against the current Grok Build CLI) has
+/// exactly one top-level key, `<issuer-url>::<client-id>` — for example
+/// `https://auth.x.ai::<uuid>` — and the bearer token sits under `key` inside
+/// it. The fixed roots below predate that and are kept so an older or future
+/// layout still parses.
+function tokenRoots(credentials) {
+  const roots = [credentials?.oauth, credentials?.tokens, credentials?.auth, credentials];
+  if (isObject(credentials)) {
+    for (const [name, value] of Object.entries(credentials)) {
+      if (/^https?:\/\/.+::.+$/.test(name)) roots.push(value);
+    }
+  }
+  return roots.filter(isObject);
+}
+
+/// Anything that does not carry a token is reported as "sign in" rather than
+/// crashing the refresh pass.
 export function grokAccess(credentials) {
-  const roots = [credentials?.oauth, credentials?.tokens, credentials?.auth, credentials]
-    .filter((value) => value && typeof value === 'object' && !Array.isArray(value));
-  for (const root of roots) {
-    const token = text(root.accessToken ?? root.access_token ?? root.token);
+  for (const root of tokenRoots(credentials)) {
+    const token = text(root.accessToken ?? root.access_token ?? root.token ?? root.key);
     if (!token) continue;
-    const raw = finiteNumber(root.expiresAt ?? root.expires_at);
-    const expiresAt = raw && raw < 10_000_000_000 ? raw * 1000 : raw;
+    const expiresAt = expiryMs(root.expiresAt ?? root.expires_at);
     if (expiresAt && expiresAt <= Date.now()) throw new Error(GROK_EXPIRED_ERROR);
     return {
       token,

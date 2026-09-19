@@ -814,3 +814,56 @@ test('TRIPWIRE grok-counts-as-an-active-session — the pause/cap discipline see
   t.after(() => { service.stopAutoRefresh(); store.close(); });
   assert.deepEqual((await service.listProviderProcesses()).sort(), ['codex', 'grok']);
 });
+
+// ---------------------------------------------------------------------------
+// Public issue #9 — the REAL file and endpoint shapes, as reported by two
+// users against the current Grok Build CLI (keys real, values placeholders).
+// Everything above this line was written against guessed shapes; these two
+// tests pin the observed ones so the probe can never regress to "sign in"
+// against a freshly logged-in CLI.
+
+const REAL_AUTH_JSON = {
+  'https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828': {
+    key: 'placeholder-jwt',
+    auth_mode: 'oidc',
+    user_id: 'placeholder-user',
+    email: 'placeholder@example.invalid',
+    refresh_token: 'placeholder-refresh',
+    expires_at: '2999-01-01T00:00:00.000000Z',
+  },
+};
+
+test('TRIPWIRE grok-real-auth-shape — the issuer::client-id entry with the token under `key` is read', async (t) => {
+  const home = grokHome(t, REAL_AUTH_JSON);
+  const access = grokAccess(await readGrokCredentials({ home }));
+  assert.equal(access.token, 'placeholder-jwt');
+  assert.equal(access.userId, 'placeholder-user');
+  assert.equal(access.expiresAt, Date.parse('2999-01-01T00:00:00.000000Z'));
+});
+
+test('an ISO expires_at in the past on the real shape reports expiry, not a sign-out', () => {
+  const expired = structuredClone(REAL_AUTH_JSON);
+  Object.values(expired)[0].expires_at = '2020-01-01T00:00:00Z';
+  assert.throws(() => grokAccess(expired), new RegExp(GROK_EXPIRED_ERROR));
+});
+
+test('TRIPWIRE grok-real-billing-shape — the percent and period nested under `config` parse', () => {
+  const [snapshot] = parseGrokBilling({
+    config: {
+      currentPeriod: {
+        type: 'USAGE_PERIOD_TYPE_WEEKLY',
+        start: '2026-09-14T00:00:00.000Z',
+        end: '2026-09-21T00:00:00.000Z',
+      },
+      creditUsagePercent: 5.0,
+    },
+  });
+  assert.equal(snapshot.scope, 'weekly');
+  assert.equal(snapshot.usedPercent, 5);
+  assert.equal(snapshot.resetsAt, '2026-09-21T00:00:00.000Z');
+});
+
+test('an empty config envelope beside a billing envelope does not shadow it (CodeRabbit, PR #671)', () => {
+  const [snapshot] = parseGrokBilling({ config: {}, billing: { creditUsagePercent: 5 } });
+  assert.equal(snapshot.usedPercent, 5);
+});
