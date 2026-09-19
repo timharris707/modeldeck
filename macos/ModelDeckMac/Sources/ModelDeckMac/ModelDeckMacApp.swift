@@ -86,9 +86,10 @@ struct ModelDeckMacApp: App {
             // Issue #72: the popover's manual Refresh asks the daemon for a
             // real provider poll so the footer's data age visibly restarts.
             usageRefresher: client,
-            // Issue #503: the deck's time-to-dry line reads the daemon's
-            // #497 forecast — the app's only source for a dry time (0034).
-            forecastProvider: client,
+            // Issue #660: after a timed-out data read, one short health
+            // probe decides "busy" (daemon alive, deck keeps its data)
+            // versus "unreachable" (orange banner).
+            healthProbe: client,
             // Issue #260: the burn window survives relaunch, so a
             // self-announcing update (#241) can no longer blank the burst
             // signal mid-run and snap the verdict back to GREEN.
@@ -328,7 +329,7 @@ struct ModelDeckMacApp: App {
             }
         }
         // Every fresh daemon state feeds the notification transition check.
-        statusModel.onStateUpdate = { [weak notifications, weak modelDropNotifications, weak statusModel, weak deckModel, weak daemonSetupModel, weak appUpdateStagedPrompt] worst, state in
+        statusModel.onStateUpdate = { [weak notifications, weak modelDropNotifications, weak statusModel, weak deckModel, weak daemonSetupModel, weak appUpdateStagedPrompt, weak proxyReloginModel] worst, state in
             Task { @MainActor [weak notifications] in
                 await notifications?.evaluate(worst: worst, state: state)
             }
@@ -377,7 +378,16 @@ struct ModelDeckMacApp: App {
                     // Issue #241: the staged-update badge's Restart popover
                     // is released once the badge itself is gone (restart
                     // clicked, or the staged phase cleared).
-                    updateBadgeVisible: appUpdateStagedPrompt?.isBadgeVisible ?? false
+                    updateBadgeVisible: appUpdateStagedPrompt?.isBadgeVisible ?? false,
+                    // Issue #542: the card's credential indicator is an
+                    // anchor too — without this its open explanation would
+                    // be dismissed by the very next state the deck reads.
+                    proxyCredentialBroken: { row in
+                        proxyReloginModel?.presentation(
+                            for: row.account,
+                            routedFailures: ProxyRelogin.routedFailures(for: row.account, in: state)
+                        )?.credentialIsBroken == true
+                    }
                 )
             }
             // Issue #185: a daemon running from a since-deleted bundle keeps

@@ -176,11 +176,13 @@ struct Issue539SoftRepairedBannerTests {
         let account = member()
         stale.begin(account: account)
         await stale.tasks[account.id]?.value
-        #expect(stale.errors[account.id] == expired)
+        // Issue #542: named target, daemon sentence verbatim after it.
+        #expect(stale.errors[account.id] == "Placeholder Sub (Claude): \(expired)")
         #expect(stale.presentation(for: account, routedFailures: repaired)?.display
             == .action(prominent: false))
         // …while an unrepaired streak still shows it.
-        #expect(stale.presentation(for: account, routedFailures: alert())?.display == .error(expired))
+        #expect(stale.presentation(for: account, routedFailures: alert())?.display
+            == .error("Placeholder Sub (Claude): \(expired)"))
 
         // An outcome from AFTER the repair is real news and is not suppressed.
         let unreachable = "CLIProxyAPI did not answer. Make sure the proxy is running, then try again."
@@ -188,7 +190,7 @@ struct Issue539SoftRepairedBannerTests {
         fresh.begin(account: account)
         await fresh.tasks[account.id]?.value
         #expect(fresh.presentation(for: account, routedFailures: repaired)?.display
-            == .error(unreachable))
+            == .error("Placeholder Sub (Claude): \(unreachable)"))
     }
 
     /// A sign-in that is actually RUNNING still shows its progress and its
@@ -205,7 +207,10 @@ struct Issue539SoftRepairedBannerTests {
         // MainActor test awaits, so the row is observed mid-flight.
         model.begin(account: account)
         let starting = model.presentation(for: account, routedFailures: repaired)
-        #expect(starting?.display == .running(text: ProxyRelogin.startingText, canCancel: false))
+        #expect(starting?.display == .running(
+            text: ProxyRelogin.startingText(label: account.label, providerName: "Claude"),
+            canCancel: false
+        ))
         #expect(starting?.display.isRunning == true)
         // And the settled soft state is NOT running, so the gate has two sides.
         model.tasks[account.id]?.cancel()
@@ -233,19 +238,23 @@ struct Issue539SoftRepairedBannerTests {
         #expect(model.phase(for: account.id) == .awaitingBrowser)
 
         let waiting = model.presentation(for: account, routedFailures: repaired)
-        #expect(waiting?.display == .running(text: ProxyRelogin.awaitingBrowserText, canCancel: true))
+        #expect(waiting?.display == .running(
+            text: ProxyRelogin.awaitingBrowserText(label: account.label, providerName: "Claude"),
+            canCancel: true
+        ))
         // Still no offer to FIX — there is nothing to fix; only the running
         // flow speaks.
         #expect(waiting?.credentialIsBroken == false)
 
-        model.cancel(accountID: account.id)
+        model.cancel(account: account)
         #expect(model.phase(for: account.id) == nil)
         #expect(model.tasks[account.id] == nil)
-        #expect(model.notes[account.id] == ProxyRelogin.cancelledText)
+        #expect(model.notes[account.id]
+            == ProxyRelogin.cancelledText(label: account.label, providerName: "Claude"))
         // The cancellation is news from AFTER the repair, so the soft state
         // does not swallow it.
         #expect(model.presentation(for: account, routedFailures: repaired)?.display
-            == .note(ProxyRelogin.cancelledText))
+            == .note(ProxyRelogin.cancelledText(label: account.label, providerName: "Claude")))
     }
 
     /// Issue #539 must not swallow news the user has not seen. A failed state
@@ -264,7 +273,7 @@ struct Issue539SoftRepairedBannerTests {
         let model = makeModel(failingWith: expired, refreshFails: refreshFails, now: { clock.now })
         model.begin(account: account)
         await model.tasks[account.id]?.value
-        #expect(model.errors[account.id] == expired)
+        #expect(model.errors[account.id] == "Placeholder Sub (Claude): \(expired)")
         // …and a state re-read that fails AFTER it appends its own line.
         clock.set(afterRepair)
         refreshFails.turnOn()

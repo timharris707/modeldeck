@@ -147,6 +147,11 @@ function readOnlyDatabaseImage(dbPath) {
 // margin. The newest row is protected independently of age for idle accounts.
 export const USAGE_SNAPSHOT_RETENTION_DAYS = 90;
 export const USAGE_SNAPSHOT_PRUNE_BATCH_SIZE = 500;
+// Keep usage indexes hot across reads of multi-gigabyte databases (64 MiB).
+const SQLITE_PAGE_CACHE_KIB = 65_536;
+export const OTEL_QUARANTINE_RETENTION_DAYS = 7;
+export const OTEL_QUARANTINE_MAX_ROWS = 50_000;
+export const OTEL_QUARANTINE_PRUNE_BATCH_SIZE = 500;
 export const REQUEST_USAGE_RETENTION_DAYS = 400;
 export const REQUEST_USAGE_PRUNE_BATCH_SIZE = 500;
 // Raw history retains the newest rows; truncated=true means older matching
@@ -906,12 +911,12 @@ export class Store {
     if (readOnly) {
       this.db = new DatabaseSync(':memory:');
       this.db.deserialize(readOnlyDatabaseImage(dbPath));
-      this.db.exec('PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;');
+      this.db.exec(`PRAGMA query_only = ON; PRAGMA busy_timeout = 5000; PRAGMA cache_size = -${SQLITE_PAGE_CACHE_KIB};`);
       return;
     }
     if (dbPath !== ':memory:') fs.mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(dbPath);
-    this.db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
+    this.db.exec(`PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA cache_size = -${SQLITE_PAGE_CACHE_KIB};`);
     this.migrate();
     if (dbPath !== ':memory:') {
       fs.chmodSync(path.dirname(dbPath), 0o700);
@@ -1892,6 +1897,33 @@ export class Store {
     `).run(cutoff, batchSize).changes;
   }
 
+  /// Walk receipts newest-id first, keeping at most the newest 50k unexpired
+  /// rows. Carry the cursor/count between batches so both reads and deletes
+  /// are bounded, without building an index over the existing raw-JSON backlog.
+  pruneOtelQuarantineBatch({ cutoff, beforeId = null, retained = 0, batchSize = OTEL_QUARANTINE_PRUNE_BATCH_SIZE }) {
+    const cutoffMs = typeof cutoff === 'string' ? Date.parse(cutoff) : NaN;
+    if (!Number.isFinite(cutoffMs) || new Date(cutoffMs).toISOString() !== cutoff) {
+      throw new Error('OTLP quarantine prune cutoff must be a canonical ISO timestamp');
+    }
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > OTEL_QUARANTINE_PRUNE_BATCH_SIZE) {
+      throw new Error(`OTLP quarantine prune batchSize must be an integer from 1 to ${OTEL_QUARANTINE_PRUNE_BATCH_SIZE}`);
+    }
+    const rows = this.db.prepare(`
+      SELECT id, received_at FROM otel_quarantine
+      ${beforeId == null ? '' : 'WHERE id < ?'}
+      ORDER BY id DESC LIMIT ?
+    `).all(...(beforeId == null ? [batchSize] : [beforeId, batchSize]));
+    const expiredIds = [];
+    for (const row of rows) {
+      if (row.received_at < cutoff || retained >= OTEL_QUARANTINE_MAX_ROWS) expiredIds.push(row.id);
+      else retained += 1;
+    }
+    const deleted = expiredIds.length === 0 ? 0 : this.db.prepare(`
+      DELETE FROM otel_quarantine WHERE id IN (${expiredIds.map(() => '?').join(',')})
+    `).run(...expiredIds).changes;
+    return { deleted, scanned: rows.length, beforeId: rows.at(-1)?.id ?? beforeId, retained };
+  }
+
   /// Issue #174: the newest stored row for one (account, scope) — the
   /// statusline ingest's record-if-newer guard reads this before inserting.
   /// Same ordering contract as latestUsage: newest observed_at wins, insert
@@ -1911,20 +1943,26 @@ export class Store {
   // just by inserting later. Ties (identical observed_at) keep the previous
   // max-id behavior.
   latestUsage() {
-    // Correlated-subquery form so the usage_account_scope_observed covering
-    // index serves each (account, scope)'s newest row directly — the
-    // window-function form full-scanned the table (PR #177 review). Same
-    // contract: newest observed_at wins, id breaks ties.
-    const rows = this.db.prepare(`
-      SELECT u.* FROM usage_snapshots u
-      WHERE u.id = (
-        SELECT u2.id FROM usage_snapshots u2
-        WHERE u2.account_id = u.account_id AND u2.scope = u.scope
-        ORDER BY u2.observed_at DESC, u2.id DESC LIMIT 1
-      )
-      ORDER BY u.account_id, u.scope
-    `).all();
-    return rows.map(usageRow);
+    // Seek past each scope's entire history for the known accounts. Keep the
+    // account equality separate: SQLite's tuple > seek still visits every row
+    // equal to the previous pair before advancing (as does SELECT DISTINCT).
+    const firstScope = this.db.prepare(`
+      SELECT scope FROM usage_snapshots WHERE account_id = ?
+      ORDER BY scope LIMIT 1
+    `);
+    const nextScope = this.db.prepare(`
+      SELECT scope FROM usage_snapshots WHERE account_id = ? AND scope > ?
+      ORDER BY scope LIMIT 1
+    `);
+    const rows = [];
+    for (const account of this.db.prepare('SELECT id FROM accounts ORDER BY id').all()) {
+      let pair = firstScope.get(account.id);
+      while (pair) {
+        rows.push(this.latestUsageRow(account.id, pair.scope));
+        pair = nextScope.get(account.id, pair.scope);
+      }
+    }
+    return rows;
   }
 
   usageHistory({ accountId, scope, since, until, bucket = 'raw' } = {}) {

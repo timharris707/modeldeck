@@ -236,6 +236,101 @@ test('codex-profiles-migration-populated-destination-never-merges-or-overwrites'
   assert.deepEqual(fs.readdirSync(data.legacyDir), ['first', 'second']);
 });
 
+function processInspection(processes, { openFiles = '', psError, psOutput, environmentOnly = false } = {}) {
+  return async (bin, args) => {
+    if (bin === '/usr/bin/pgrep') {
+      assert.deepEqual(args, ['-x', 'codex']);
+      return { stdout: processes.map((_, index) => String(index + 1)).join('\n'), stderr: '' };
+    }
+    if (bin === '/bin/ps') {
+      const environment = args.includes('-E');
+      if (!environmentOnly || environment) {
+        if (psError) throw psError;
+        if (psOutput !== undefined) return { stdout: psOutput, stderr: '' };
+      }
+      const process = processes[Number(args.at(-1)) - 1];
+      assert.deepEqual(args, environment
+        ? ['-ww', '-E', '-o', 'command=', '-p', args.at(-1)]
+        : ['-ww', '-o', 'comm=', '-p', args.at(-1)]);
+      return { stdout: `${environment ? process.command : process.executable}\n`, stderr: '' };
+    }
+    assert.equal(bin, '/usr/sbin/lsof');
+    if (openFiles) return { stdout: openFiles, stderr: '' };
+    throw { code: 1, stdout: '', stderr: '' };
+  };
+}
+
+const chatgptCodex = {
+  executable: '/Applications/ChatGPT.app/Contents/Resources/codex',
+  command: '/Applications/ChatGPT.app/Contents/Resources/codex app-server --listen stdio://',
+};
+
+test('codex-profiles-migration-chatgpt-only-proceeds-without-health-warning', async (t) => {
+  const exec = processInspection(Array(4).fill(chatgptCodex));
+  assert.equal(await legacyCodexProfilesInUse('/dummy/legacy', exec), false);
+  const data = fixture(t, { isLegacyInUse: (legacyDir) => legacyCodexProfilesInUse(legacyDir, exec) });
+  const { app } = await startup(data);
+  assert.equal((await health(app)).warning, undefined);
+  assert.equal(fs.readlinkSync(data.activeLink), path.join(data.profilesDir, 'first'));
+});
+
+test('codex-profiles-migration-real-cli-defers', async () => {
+  for (const executable of ['/opt/homebrew/bin/codex', '/Users/dummy/.npm/bin/codex']) {
+    assert.equal(await legacyCodexProfilesInUse('/dummy/legacy', processInspection([
+      { executable, command: `${executable} exec dummy` },
+    ])), true);
+  }
+});
+
+test('codex-profiles-migration-chatgpt-and-cli-defers', async () => {
+  assert.equal(await legacyCodexProfilesInUse('/dummy/legacy', processInspection([
+    chatgptCodex, { executable: '/opt/homebrew/bin/codex', command: '/opt/homebrew/bin/codex exec dummy' },
+  ])), true);
+});
+
+test('codex-profiles-migration-bundled-codex-sibling-path-does-not-defer', async () => {
+  for (const command of [
+    `${chatgptCodex.command} CODEX_HOME=/dummy/legacy-backup/first`,
+    `${chatgptCodex.command} CODEX_HOME=/dummy/legacyold`,
+  ]) {
+    assert.equal(await legacyCodexProfilesInUse('/dummy/legacy', processInspection([
+      { ...chatgptCodex, command },
+    ])), false);
+  }
+  assert.equal(await legacyCodexProfilesInUse('/dummy/legacy', processInspection([
+    { ...chatgptCodex, command: `${chatgptCodex.command} CODEX_HOME=/dummy/legacy` },
+  ])), true);
+});
+
+test('codex-profiles-migration-bundled-codex-legacy-references-still-defer', async () => {
+  assert.equal(await legacyCodexProfilesInUse('/dummy/legacy', processInspection([
+    { ...chatgptCodex, command: `${chatgptCodex.command} CODEX_HOME=/dummy/legacy/first` },
+  ])), true);
+  assert.equal(await legacyCodexProfilesInUse('/dummy/legacy', processInspection([
+    chatgptCodex,
+  ], { openFiles: 'p1\n' })), true);
+  const executable = '/Applications/Dummy App.app/Contents/Frameworks/Helper.framework/codex';
+  assert.equal(await legacyCodexProfilesInUse('/dummy/legacy', processInspection([
+    { executable, command: `${executable} app-server` },
+  ])), false);
+});
+
+test('codex-profiles-migration-ps-errors-and-garbage-fail-closed', async () => {
+  for (const options of [
+    { psError: { code: 1, stdout: '', stderr: '' } },
+    { psError: { code: 'ENOENT' } },
+    { psOutput: 'garbage' },
+    { psOutput: '' },
+    { psOutput: `${chatgptCodex.executable}\ngarbage` },
+  ]) {
+    for (const environmentOnly of [false, true]) {
+      await assert.rejects(legacyCodexProfilesInUse('/dummy/legacy', processInspection([chatgptCodex], {
+        ...options, environmentOnly,
+      })), /process inspection unavailable/);
+    }
+  }
+});
+
 test('codex-profiles-migration-lsof-errors-and-ambiguous-results-fail-closed', async () => {
   const noMatch = () => { throw { code: 1, stdout: '', stderr: '' }; };
   const idle = async (bin, args) => {
@@ -253,6 +348,7 @@ test('codex-profiles-migration-lsof-errors-and-ambiguous-results-fail-closed', a
   // CODEX_HOME pinned by environment, cwd elsewhere) still defers the move.
   assert.equal(await legacyCodexProfilesInUse('/dummy/legacy', async (bin) => {
     if (bin === '/usr/bin/pgrep') return { stdout: '4242\n', stderr: '' };
+    if (bin === '/bin/ps') return { stdout: '/opt/homebrew/bin/codex\n', stderr: '' };
     noMatch();
   }), true);
   for (const exec of [

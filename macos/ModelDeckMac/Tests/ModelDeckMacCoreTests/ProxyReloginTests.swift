@@ -128,12 +128,22 @@ struct ProxyReloginDerivationTests {
     }
 
     @Test func settledTextPrefersTheDaemonsOwnFailureSentence() {
-        #expect(ProxyRelogin.settledText(phase: .succeeded, detail: nil) == ProxyRelogin.succeededText)
-        #expect(ProxyRelogin.settledText(phase: .cancelled, detail: nil) == ProxyRelogin.cancelledText)
-        #expect(ProxyRelogin.settledText(phase: .failed, detail: "CLIProxyAPI could not finish the sign-in: bad state")
-            == "CLIProxyAPI could not finish the sign-in: bad state")
-        #expect(ProxyRelogin.settledText(phase: .failed, detail: nil) == ProxyRelogin.failedFallbackText)
-        #expect(ProxyRelogin.settledText(phase: .failed, detail: "") == ProxyRelogin.failedFallbackText)
+        // Issue #542: the settled sentences name the subscription they
+        // settled for; the daemon's own failure detail still wins outright.
+        #expect(ProxyRelogin.settledText(phase: .succeeded, detail: nil, label: "Studio", providerName: "Claude")
+            == ProxyRelogin.succeededText(label: "Studio", providerName: "Claude"))
+        #expect(ProxyRelogin.settledText(phase: .cancelled, detail: nil, label: "Studio", providerName: "Claude")
+            == "Sign-in for Studio (Claude) stopped. Nothing changed.")
+        #expect(ProxyRelogin.settledText(
+            phase: .failed,
+            detail: "CLIProxyAPI could not finish the sign-in: bad state",
+            label: "Studio",
+            providerName: "Claude"
+        ) == "Studio (Claude): CLIProxyAPI could not finish the sign-in: bad state")
+        #expect(ProxyRelogin.settledText(phase: .failed, detail: nil, label: "Studio", providerName: "Claude")
+            == "Studio (Claude): \(ProxyRelogin.failedFallbackText)")
+        #expect(ProxyRelogin.settledText(phase: .failed, detail: "", label: "Studio", providerName: "Claude")
+            == "Studio (Claude): \(ProxyRelogin.failedFallbackText)")
     }
 
     @Test func theConfirmationDisclosesBothSurprises() {
@@ -173,7 +183,7 @@ struct ProxyReloginFlowTests {
         #expect(browser.opened.map(\.absoluteString) == ["https://provider.invalid/authorize?code_challenge=x"])
         #expect(manager.startedIDs == [broken.id])
         #expect(model.phase(for: broken.id) == nil)
-        #expect(model.notes[broken.id] == ProxyRelogin.succeededText)
+        #expect(model.notes[broken.id] == ProxyRelogin.succeededText(label: broken.label, providerName: "Claude"))
         #expect(model.errors[broken.id] == nil)
     }
 
@@ -213,7 +223,10 @@ struct ProxyReloginFlowTests {
         await model.tasks[broken.id]?.value
 
         #expect(model.phase(for: broken.id) == nil)
-        #expect(model.errors[broken.id] == "CLIProxyAPI could not finish the sign-in: unknown or expired state")
+        // Issue #542: the sentence names its subscription and then gets out of
+        // the way — the daemon's own reason survives verbatim after the target.
+        #expect(model.errors[broken.id]
+            == "Studio (Claude): CLIProxyAPI could not finish the sign-in: unknown or expired state")
         #expect(model.notes[broken.id] == nil)
     }
 
@@ -288,10 +301,11 @@ struct ProxyReloginFlowTests {
 
         model.begin(account: broken)
         while model.phase(for: broken.id) != .awaitingBrowser { await Task.yield() }
-        model.cancel(accountID: broken.id)
+        model.cancel(account: broken)
 
         #expect(model.phase(for: broken.id) == nil)
-        #expect(model.notes[broken.id] == ProxyRelogin.cancelledText)
+        #expect(model.notes[broken.id]
+            == ProxyRelogin.cancelledText(label: broken.label, providerName: "Claude"))
         while manager.cancelledIDs.isEmpty { await Task.yield() }
         #expect(manager.cancelledIDs == [broken.id])
     }
@@ -309,8 +323,9 @@ struct ProxyReloginFlowTests {
 
         model.begin(account: broken)
         while model.phase(for: broken.id) != .awaitingBrowser { await Task.yield() }
-        model.cancel(accountID: broken.id)
-        #expect(model.notes[broken.id] == ProxyRelogin.cancelledText)
+        model.cancel(account: broken)
+        #expect(model.notes[broken.id]
+            == ProxyRelogin.cancelledText(label: broken.label, providerName: "Claude"))
 
         // TWO queued answers: cancel() does not synchronize with the
         // abandoned task, so a stale poll already in flight can consume one
@@ -326,7 +341,7 @@ struct ProxyReloginFlowTests {
         await model.tasks[broken.id]?.value
 
         // The second attempt's outcome stands, uncontaminated.
-        #expect(model.notes[broken.id] == ProxyRelogin.succeededText)
+        #expect(model.notes[broken.id] == ProxyRelogin.succeededText(label: broken.label, providerName: "Claude"))
         #expect(model.errors[broken.id] == nil)
     }
 
@@ -482,10 +497,14 @@ struct ProxyReloginPresentationTests {
         model.begin(account: broken)
         while model.phase(for: broken.id) != .awaitingBrowser { await Task.yield() }
         #expect(model.presentation(for: broken)?.display
-            == .running(text: ProxyRelogin.awaitingBrowserText, canCancel: true))
-        model.cancel(accountID: broken.id)
+            == .running(
+                text: ProxyRelogin.awaitingBrowserText(label: broken.label, providerName: "Claude"),
+                canCancel: true
+            ))
+        model.cancel(account: broken)
         // …then the unread outcome, ahead of the action that is still armed.
-        #expect(model.presentation(for: broken)?.display == .note(ProxyRelogin.cancelledText))
+        #expect(model.presentation(for: broken)?.display
+            == .note(ProxyRelogin.cancelledText(label: broken.label, providerName: "Claude")))
     }
 }
 

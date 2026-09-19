@@ -613,7 +613,10 @@ struct DeckPopoverView: View {
                         proxyReloginModel.presentation(for: $0, routedFailures: alert)
                     },
                     onFixSignIn: { account in proxyReloginModel.begin(account: account) },
-                    onStop: { proxyReloginModel.cancel(accountID: alert.accountId) }
+                    // Issue #542: the stopped sentence names its subscription,
+                    // so the cancel takes the account. Nil account means the
+                    // banner is mid-refresh skew and renders no Stop at all.
+                    onStop: { if let account { proxyReloginModel.cancel(account: account) } }
                 )
             }
         }
@@ -670,6 +673,17 @@ struct DeckPopoverView: View {
                 .font(.caption)
                 .foregroundStyle(.orange)
                 .help(message)
+        } else if case .busy = statusModel.connection {
+            // Issue #660: alive but slow is not down — one gray line, no
+            // triangle, no repair path; the cards keep their last data.
+            TimelineView(.periodic(from: .now, by: 30)) { context in
+                let text = statusModel.busyStatusText(now: context.date) ?? "Daemon busy"
+                Text(text)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("The daemon is answering but its usage read is taking longer than a minute. The deck keeps refreshing on its normal schedule.")
+                    .accessibilityLabel(text)
+            }
         }
         if setupModel.didReregisterForUpdate {
             // Drift re-register happened this launch — note it subtly.
@@ -772,7 +786,6 @@ struct DeckPopoverView: View {
                             menuBarSourceTooltip: sourceTooltip,
                             staleness: { statusModel.cardStaleness(for: $0) },
                             signInRecovery: { statusModel.signInRecovery(for: $0) },
-                            forecast: { statusModel.exhaustionForecast(for: $0) },
                             renewPresentation: { renewModel.presentation(for: $0.account) },
                             onRenewNow: { row in
                                 Task { await renewModel.renew(account: row.account) }
@@ -789,7 +802,15 @@ struct DeckPopoverView: View {
                             },
                             onRelaunchSignIn: { signInModel.relaunch(accountID: $0.id) },
                             onCancelSignIn: { signInModel.cancel(accountID: $0.id) },
-                            onDismissSignInError: { signInModel.dismissError(accountID: $0.id) }
+                            onDismissSignInError: { signInModel.dismissError(accountID: $0.id) },
+                            // Issue #542: the card reads the SAME repair
+                            // presentation the pool banner and the Settings
+                            // row read — one derivation, three surfaces.
+                            proxyRelogin: { proxyReloginModel.presentation(
+                                for: $0.account,
+                                routedFailures: ProxyRelogin.routedFailures(for: $0.account, in: state)
+                            ) },
+                            onFixProxySignIn: { proxyReloginModel.begin(account: $0.account) }
                         )
                         .frame(maxWidth: .infinity, alignment: .topLeading)
                     }
@@ -807,7 +828,6 @@ struct DeckPopoverView: View {
                             isExpanded: deckModel.isExpanded(row.id),
                             staleness: statusModel.cardStaleness(for: row),
                             signInRecovery: statusModel.signInRecovery(for: row),
-                            forecast: statusModel.exhaustionForecast(for: row),
                             renew: renewModel.presentation(for: row.account),
                             onRenewNow: {
                                 Task { await renewModel.renew(account: row.account) }
@@ -822,7 +842,14 @@ struct DeckPopoverView: View {
                             },
                             onRelaunchSignIn: { signInModel.relaunch(accountID: row.id) },
                             onCancelSignIn: { signInModel.cancel(accountID: row.id) },
-                            onDismissSignInError: { signInModel.dismissError(accountID: row.id) }
+                            onDismissSignInError: { signInModel.dismissError(accountID: row.id) },
+                            // Issue #542: same presentation the two-column
+                            // layout passes — both layouts, one derivation.
+                            proxyRelogin: proxyReloginModel.presentation(
+                                for: row.account,
+                                routedFailures: ProxyRelogin.routedFailures(for: row.account, in: state)
+                            ),
+                            onFixProxySignIn: { proxyReloginModel.begin(account: row.account) }
                         ) {
                             withAnimation(.easeOut(duration: 0.15)) {
                                 deckModel.toggleExpansion(of: row.id)
@@ -875,7 +902,7 @@ struct DeckPopoverView: View {
     /// disables its button — so retained stale state must not keep the
     /// affordance up while the daemon is down.
     private var showsFooterAddAccount: Bool {
-        guard statusModel.connection == .connected,
+        guard statusModel.connection.daemonAnswered,
               let state = statusModel.deckState else { return false }
         return !deckModel.isDeckEmpty(state: state)
     }
@@ -1471,10 +1498,6 @@ struct DeckColumnView: View {
     /// `staleness`. The default keeps the row's clock-free derivation for
     /// previews/tests.
     var signInRecovery: (DeckAccountRow) -> DeckFreshness.SignInRecovery? = { $0.signInRecovery }
-    /// Issue #503: per-row time-to-dry estimate, same seam as `staleness`
-    /// (the daemon forecast and the clock live in the status model). The
-    /// default shows no dry time for previews/tests.
-    var forecast: (DeckAccountRow) -> ExhaustionForecastPresentation? = { _ in nil }
     /// Issue #176: per-row renew state + action, supplied by the popover so
     /// the column stays free of the renew model (same seam shape as
     /// `staleness`). Defaults render nothing for previews/tests.
@@ -1492,6 +1515,11 @@ struct DeckColumnView: View {
     var onRelaunchSignIn: (DeckAccountRow) -> Void = { _ in }
     var onCancelSignIn: (DeckAccountRow) -> Void = { _ in }
     var onDismissSignInError: (DeckAccountRow) -> Void = { _ in }
+    /// Issue #542: per-row proxy-credential state + the repair action, same
+    /// seam shape as `renewPresentation`. Defaults render nothing for
+    /// previews/tests.
+    var proxyRelogin: (DeckAccountRow) -> ProxyReloginRowPresentation? = { _ in nil }
+    var onFixProxySignIn: (DeckAccountRow) -> Void = { _ in }
 
     /// Issue #458: the header's aggregate "% left", or nil when nothing in
     /// this column can be summed honestly. Staleness rides the SAME per-row
@@ -1594,7 +1622,6 @@ struct DeckColumnView: View {
                         isExpanded: deckModel.isExpanded(row.id),
                         staleness: staleness(row),
                         signInRecovery: signInRecovery(row),
-                        forecast: forecast(row),
                         renew: renewPresentation(row),
                         onRenewNow: { onRenewNow(row) },
                         onDismissRenewOutcome: { onDismissRenewOutcome(row) },
@@ -1603,7 +1630,9 @@ struct DeckColumnView: View {
                         onVerifySignIn: { onVerifySignIn(row) },
                         onRelaunchSignIn: { onRelaunchSignIn(row) },
                         onCancelSignIn: { onCancelSignIn(row) },
-                        onDismissSignInError: { onDismissSignInError(row) }
+                        onDismissSignInError: { onDismissSignInError(row) },
+                        proxyRelogin: proxyRelogin(row),
+                        onFixProxySignIn: { onFixProxySignIn(row) }
                     ) {
                         withAnimation(.easeOut(duration: 0.15)) {
                             deckModel.toggleExpansion(of: row.id)
@@ -1685,11 +1714,6 @@ struct DeckAccountRowView: View {
     /// same seam as `staleness`). Nil falls back to the row's clock-free
     /// derivation so previews/tests render unchanged.
     var signInRecovery: DeckFreshness.SignInRecovery? = nil
-    /// Issue #503: this row's time-to-dry estimate, derived by the status
-    /// model from the daemon's #497 forecast (same injected-plain-value seam
-    /// as `staleness`). Nil renders NOTHING — "no forecast" is a real state
-    /// and the row never guesses a time.
-    var forecast: ExhaustionForecastPresentation? = nil
     /// Issue #176: this account's renew rendering state (nil = no renew
     /// affordance: healthy, signed out, Codex, or a pre-#176 daemon), and
     /// the action that runs the daemon's guarded renew op. Plain values so
@@ -1714,6 +1738,15 @@ struct DeckAccountRowView: View {
     /// that failed to start); mid-flow errors clear via the flow's own
     /// actions instead.
     var onDismissSignInError: (() -> Void)? = nil
+    /// Issue #542: this member's proxy-credential state — the SAME
+    /// `proxyReloginModel.presentation(for:routedFailures:)` the pool banner
+    /// and the Settings row read, so the card cannot reach a calmer verdict
+    /// than they do. Plain values + a callback, the `renew`/`signInPhase`
+    /// seam: the card stays free of the repair model (the popover observes
+    /// it). Nil — no proxy on this machine, or nothing to say — renders
+    /// nothing at all.
+    var proxyRelogin: ProxyReloginRowPresentation? = nil
+    var onFixProxySignIn: (() -> Void)? = nil
     let onToggle: () -> Void
     /// Issue #118: the "Sign in again…" action opens the Settings window
     /// (Accounts pane, via the model's routed selection) — the environment
@@ -1812,6 +1845,34 @@ struct DeckAccountRowView: View {
         deckModel.requestDuplicateRelogin(for: row)
     }
 
+    /// Issue #542 — the card's credential indicator renders ONLY on a
+    /// verdict of broken, by either measure the shared derivation accepts
+    /// (the proxy's recorded `error`, or a routed-failure streak). The gate
+    /// lives in Core so the tripwire tests the thing the card runs.
+    private var brokenProxyCredential: ProxyReloginRowPresentation? {
+        ProxyRelogin.cardIndicator(proxyRelogin)
+    }
+
+    private var proxyCredentialWarningID: DeckWarningID {
+        DeckWarningID(topic: .proxyCredential, elementID: row.id)
+    }
+
+    /// Whether the repair is actually armed for this member — the popover
+    /// offers its button on exactly this condition, so a repair the daemon
+    /// says it cannot run never renders a dead control.
+    private var proxyRepairIsArmed: Bool {
+        guard case .action(let prominent)? = brokenProxyCredential?.display else { return false }
+        return prominent && onFixProxySignIn != nil
+    }
+
+    /// Dismiss the explanation, then start the repair — the #196/#176
+    /// ordering: a presented-warning slot left set on a vanished anchor
+    /// re-presents the popover the moment the anchor returns.
+    private func fixProxySignIn() {
+        deckModel.setWarningPresented(proxyCredentialWarningID, false)
+        onFixProxySignIn?()
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Button(action: onToggle) {
@@ -1825,12 +1886,9 @@ struct DeckAccountRowView: View {
             // explicit parent label suppresses the child markers' labels, so
             // the duplicate-token warning is folded in here as well. The
             // derivation lives in Core (DeckAccountRow) where it is tested.
-            // Issue #503: the time-to-dry caption is another child of this
-            // suppressed subtree — folded into the same Core derivation.
             .accessibilityLabel(row.accessibilityLabel(
                 showsIdentity: showsIdentity,
-                isMenuBarSource: isMenuBarSource,
-                forecast: forecast
+                isMenuBarSource: isMenuBarSource
             ))
             .accessibilityHint(isExpanded ? "Collapse usage windows" : "Expand usage windows")
             // Issue #113 (CodeRabbit): the row button's explicit label
@@ -1849,6 +1907,18 @@ struct DeckAccountRowView: View {
                     // popover's "Re-log in…" button offers.
                     Button("Re-log in this profile") {
                         beginDuplicateRelogin()
+                    }
+                }
+                // Issue #542: same contract for the credential indicator —
+                // the row button's explicit label suppresses the marker's
+                // own element, so the explanation and the repair are named
+                // actions here.
+                if brokenProxyCredential != nil {
+                    Button("Show proxy sign-in explanation") {
+                        deckModel.toggleWarning(proxyCredentialWarningID)
+                    }
+                    if proxyRepairIsArmed {
+                        Button("Fix sign-in") { fixProxySignIn() }
                     }
                 }
             }
@@ -2323,6 +2393,21 @@ struct DeckAccountRowView: View {
                     // its live weight routes only other models.
                     ProxyWeightBadge(presentation: weight)
                 }
+                if let broken = brokenProxyCredential {
+                    // Issue #542: the card's own word on a dead proxy
+                    // sign-in, sitting right beside the ⑂ weight it
+                    // explains — Tim's 2026-09-17 question was "why does
+                    // this card have no weight and why is nothing asking me
+                    // to sign in?". Deck space is sacred (#537), so this
+                    // adds a glyph and never a row; the whole story lives
+                    // in the popover it opens.
+                    ProxyCredentialMarkerView(
+                        account: row.account,
+                        presentation: broken,
+                        isExplaining: deckModel.warningBinding(proxyCredentialWarningID),
+                        onFix: fixProxySignIn
+                    )
+                }
                 Spacer(minLength: 8)
                 // Issue #33 amendment: the headline percent only exists
                 // while collapsed — expanded rows carry their own numbers.
@@ -2371,24 +2456,8 @@ struct DeckAccountRowView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            // Issue #503: time-to-dry — ONE quiet caption in the deck's
-            // existing caption voice, and only when the daemon actually has a
-            // forecast. No forecast renders no line at all (never "unknown",
-            // never a guessed time); decision 0019's estimate marker rides
-            // inline in the text, with the basis window, measured pace, and
-            // carryover caveat in the tooltip.
-            //
-            // Rendered in BOTH states deliberately: it is an account-level
-            // fact, not a per-window one, and the row's VoiceOver label
-            // speaks it unconditionally — a collapsed-only line would let
-            // speech claim a dry time the expanded card doesn't show.
-            if let forecast {
-                Text(forecast.rowText)
-                    .font(DeckType.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .help(forecast.tooltip)
-            }
+            // Issue #665 (Tim): the #503 "Est. dry" caption is gone — it
+            // took a line on every card and never changed a decision.
         }
     }
 
@@ -3117,6 +3186,87 @@ struct DuplicateTokenMarkerView: View {
                     WarningExplanationView(explanation: explanation)
                 }
             }
+    }
+}
+
+/// Issue #542 — the deck card's proxy-credential indicator. Two live
+/// incidents made the case: a repair running with nothing naming its account
+/// (2026-08-19), and a credential the proxy killed before any request could
+/// fail, which left the card reading "100% left · ⑂ 0" with no reason
+/// (2026-09-17). The `key.slash` glyph is the one the Settings row already
+/// uses, and the verdict behind it is the SAME presentation both other
+/// surfaces read.
+///
+/// Built on the `DuplicateTokenMarkerView` idiom, including its hard-won
+/// rule: NOT a Button. The marker sits inside the card's expand/collapse
+/// Button, and nested SwiftUI Buttons are unsupported — a tap gesture on the
+/// deepest view is the supported shape of "clickable region inside a
+/// clickable row".
+struct ProxyCredentialMarkerView: View {
+    let account: DeckAccount
+    let presentation: ProxyReloginRowPresentation
+    var isExplaining: Binding<Bool>
+    let onFix: () -> Void
+
+    /// Whether the repair is armed. The popover offers its one button on
+    /// exactly this condition — the Settings row's gate, so neither surface
+    /// can show a fix the other hides (#515/#516).
+    private var isArmed: Bool {
+        guard case .action(let prominent) = presentation.display else { return false }
+        return prominent
+    }
+
+    var body: some View {
+        marker
+            // The glyph alone is a ~10 pt target; pad the hit area so clicks
+            // land. 15 pt matches the title row's text height, so the row's
+            // vertical rhythm is unchanged — the card must not grow.
+            .frame(width: 15, height: 15)
+            .contentShape(Rectangle())
+            .onTapGesture { isExplaining.wrappedValue.toggle() }
+            .help(presentation.credentialText ?? ProxyRelogin.indicatorLead(for: account))
+            .accessibilityLabel(ProxyRelogin.indicatorAccessibilityLabel(
+                for: account,
+                presentation: presentation
+            ))
+            .accessibilityAction { isExplaining.wrappedValue.toggle() }
+            .popover(isPresented: isExplaining, arrowEdge: .bottom) {
+                let explanation = DeckWarningExplanation.proxyCredential(
+                    for: account,
+                    presentation: presentation
+                )
+                if isArmed {
+                    SignInExplanationView(
+                        explanation: explanation,
+                        actionTitle: ProxyRelogin.actionTitle,
+                        actionHelp: ProxyRelogin.confirmation(label: account.label),
+                        actionAccessibilityLabel: "Fix the proxy sign-in for \(account.label)",
+                        onSignInAgain: onFix
+                    )
+                } else {
+                    // Nothing to arm — a repair already running, a settled
+                    // outcome, or one the proxy says it cannot start. The
+                    // explanation body already carries that sentence, so the
+                    // popover explains instead of offering a dead control.
+                    WarningExplanationView(explanation: explanation)
+                }
+            }
+    }
+
+    @ViewBuilder
+    private var marker: some View {
+        if presentation.display.isRunning {
+            // A sign-in is in flight for this member: the slot shows that it
+            // is working, and the running sentence (which names the account
+            // and provider since #542) stays in the popover.
+            ProgressView()
+                .controlSize(.mini)
+                .scaleEffect(0.6)
+        } else {
+            Image(systemName: "key.slash")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(severityColor(.warning))
+        }
     }
 }
 

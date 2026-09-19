@@ -149,15 +149,20 @@ public struct DaemonClient: Sendable {
         try await get("/api/health")
     }
 
+    /// Issue #660: the data reads get room for a daemon that is alive but
+    /// slow (state reads of 4–36 s were measured live, #658); `/api/health`
+    /// keeps the short default so "slow" and "down" stay distinguishable.
+    static let dataReadTimeout: TimeInterval = 60
+
     /// `GET /api/state` — accounts + latest usage snapshots.
     public func state() async throws -> DeckState {
-        try await get("/api/state")
+        try await get("/api/state", timeout: Self.dataReadTimeout)
     }
 
     /// `GET /api/capacity/worst` — the daemon's own worst-remaining
     /// evaluation (issue #45: primary source for the menu bar icon).
     public func worstCapacity() async throws -> CapacityWorstReport {
-        try await get("/api/capacity/worst")
+        try await get("/api/capacity/worst", timeout: Self.dataReadTimeout)
     }
 
     /// `GET /api/usage/exhaustion-forecast` — the daemon's reset-aware
@@ -165,7 +170,7 @@ public struct DaemonClient: Sendable {
     /// #497). Decision 0034: this endpoint is the app's ONLY source of a dry
     /// time; nothing here inspects live harness state.
     public func exhaustionForecast() async throws -> ExhaustionForecast {
-        try await get("/api/usage/exhaustion-forecast")
+        try await get("/api/usage/exhaustion-forecast", timeout: Self.dataReadTimeout)
     }
 
     /// `GET /api/session` — fetches the daemon's mutation token. The server
@@ -723,10 +728,10 @@ public struct DaemonClient: Sendable {
         return request
     }
 
-    private func get<Response: Decodable>(_ path: String) async throws -> Response {
+    private func get<Response: Decodable>(_ path: String, timeout: TimeInterval = 5) async throws -> Response {
         var request = URLRequest(url: configuration.baseURL.appendingPathComponent(path))
         request.httpMethod = "GET"
-        request.timeoutInterval = 5
+        request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         return try await send(request)
     }

@@ -110,7 +110,8 @@ public enum DashboardWindowState {
         bundledServiceAvailable: Bool
     ) -> DashboardWindowPhase {
         switch connection {
-        case .connected:
+        // Issue #660: a slow daemon is still serving; the dashboard stays up.
+        case .connected, .busy:
             return .live(dashboardURL)
         case .unknown, .unreachable:
             return .daemonDown(

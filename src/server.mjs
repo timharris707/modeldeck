@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { setImmediate as yieldToServeLoop } from 'node:timers/promises';
 import { isSea } from 'node:sea';
 import { fileURLToPath } from 'node:url';
 import packageMetadata from '../package.json' with { type: 'json' };
@@ -9,7 +10,7 @@ import { scopeFindings } from './diagnostician.mjs';
 import { ModelDeckService } from './service.mjs';
 import { readLaneRuns, tagSessionsWithLaneRuns } from './lane-manifest.mjs';
 import { resolveMutationToken } from './token.mjs';
-import { parseOtlpLogs, parseOtlpMetrics } from './otel-ingest.mjs';
+import { OTEL_INGEST_BATCH_SIZE, parseOtlpLogs, parseOtlpMetrics } from './otel-ingest.mjs';
 import { usageEstimateReport } from './usage-estimate.mjs';
 import {
   activityBreakdownReport, attributionReport, costReport, exhaustionForecastReport,
@@ -131,6 +132,13 @@ function otlpJsonOnly(req) {
   throw error;
 }
 
+async function ingestOtelBatches(records, insert, yieldLoop) {
+  for (let offset = 0; offset < records.length; offset += OTEL_INGEST_BATCH_SIZE) {
+    insert(records.slice(offset, offset + OTEL_INGEST_BATCH_SIZE));
+    await yieldLoop();
+  }
+}
+
 export function createApp({
   store, service, host = HOST, port = PORT, mutationToken,
   // Issue #347: read-only lane manifest used to tag sessions with an issue.
@@ -192,14 +200,15 @@ export function createApp({
         // by default plus confined by the global loopback peer check above.
         if (!ownedStore.getSettings().otelReceiverEnabled) return json(res, 404, { error: 'not found' });
         otlpJsonOnly(req);
+        const yieldLoop = ownedService.yieldToServeLoop || yieldToServeLoop;
         const parsed = otlpKind === 'metrics'
-          ? parseOtlpMetrics(await body(req))
-          : parseOtlpLogs(await body(req));
-        ownedStore.ingestOtelQuarantine(parsed.quarantine);
+          ? await parseOtlpMetrics(await body(req), { yieldToServeLoop: yieldLoop })
+          : await parseOtlpLogs(await body(req), { yieldToServeLoop: yieldLoop });
+        await ingestOtelBatches(parsed.quarantine, (records) => ownedStore.ingestOtelQuarantine(records), yieldLoop);
         if (otlpKind === 'metrics') {
-          ownedStore.ingestOtelMetrics(parsed.records);
+          await ingestOtelBatches(parsed.records, (records) => ownedStore.ingestOtelMetrics(records), yieldLoop);
         } else {
-          ownedStore.ingestOtelEvents(parsed.records);
+          await ingestOtelBatches(parsed.records, (records) => ownedStore.ingestOtelEvents(records), yieldLoop);
         }
         const rejectedKey = otlpKind === 'metrics' ? 'rejectedDataPoints' : 'rejectedLogRecords';
         // Keep the response valid OTLP/JSON: int64 fields are JSON strings,

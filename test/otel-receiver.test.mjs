@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { performance } from 'node:perf_hooks';
 import { Readable } from 'node:stream';
 import { Store } from '../src/db.mjs';
 import { createApp } from '../src/server.mjs';
@@ -21,9 +22,15 @@ function appFixture(t, enabled = true) {
   return { store, app: createApp({ store, service, host: '127.0.0.1', port: 3867 }) };
 }
 
-async function post(app, route, payload, contentType = 'application/json', remoteAddress = '127.0.0.1') {
+function post(app, route, payload, contentType = 'application/json', remoteAddress = '127.0.0.1') {
+  return request(app, route, payload, { contentType, remoteAddress });
+}
+
+async function request(app, route, payload = '', {
+  method = 'POST', contentType = 'application/json', remoteAddress = '127.0.0.1',
+} = {}) {
   const request = Readable.from([Buffer.from(payload)]);
-  request.method = 'POST';
+  request.method = method;
   request.url = route;
   request.headers = { host: '127.0.0.1:3867', 'content-type': contentType };
   request.socket = { remoteAddress };
@@ -37,8 +44,82 @@ async function post(app, route, payload, contentType = 'application/json', remot
     end(chunk = '') { responseBody += chunk; finish(); },
   };
   await Promise.all([app.server.listeners('request')[0](request, response), finished]);
-  return { status, headers, body: JSON.parse(responseBody) };
+  return { status, headers, body: JSON.parse(responseBody), text: responseBody };
 }
+
+test('health answers during large OTLP quarantine and event inserts with byte-identical responses', async (t) => {
+  const { store, app } = appFixture(t);
+  const logRecords = Array.from({ length: 4_000 }, (_, index) => ({
+    timeUnixNano: String(1786278900000000000n + BigInt(index) * 1_000_000n),
+    body: { stringValue: index % 2 ? 'api_request' : `unknown-placeholder-${index}` },
+  }));
+  const payload = JSON.stringify({ resourceLogs: [{ scopeLogs: [{ logRecords }] }] });
+  assert.ok(Buffer.byteLength(payload) < 1_000_000);
+  let finished = false;
+  const probes = [];
+  for (const method of ['ingestOtelQuarantine', 'ingestOtelEvents']) {
+    const original = store[method].bind(store);
+    let inserted = 0;
+    store[method] = (records) => {
+      if (inserted === 0) {
+        const started = performance.now();
+        probes.push(new Promise((resolve) => setImmediate(resolve)).then(async () => ({
+          health: await request(app, '/api/health', '', { method: 'GET' }),
+          elapsed: performance.now() - started,
+          inserted,
+          finished,
+        })));
+      }
+      const result = original(records);
+      inserted += result.inserted;
+      return result;
+    };
+  }
+  const result = await post(app, '/otlp/v1/logs', payload).then((response) => {
+    finished = true;
+    return response;
+  });
+  const checks = await Promise.all(probes);
+  assert.equal(checks.length, 2);
+  for (const check of checks) {
+    assert.equal(check.health.status, 200);
+    assert.equal(check.health.body.ok, true);
+    assert.ok(check.elapsed < 750, `health waited ${check.elapsed.toFixed(1)} ms`);
+    assert.ok(check.inserted > 0 && check.inserted < 2_000, 'health must run between committed insert batches');
+    assert.equal(check.finished, false, 'health must answer while the OTLP request is in flight');
+  }
+  t.diagnostic(`health during quarantine/event inserts: ${checks.map((check) => check.elapsed.toFixed(1)).join('/')} ms`);
+  assert.equal(result.status, 200);
+  assert.equal(result.text, '{"partialSuccess":{"rejectedLogRecords":"2000","errorMessage":"2000 unrecognized OTLP record(s) quarantined"}}');
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM otel_quarantine').get().count, 2_000);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM otel_events').get().count, 2_000);
+});
+
+test('health answers while a near-limit OTLP logs body is still being parsed', async (t) => {
+  const { store, app } = appFixture(t);
+  const payload = JSON.stringify({
+    resourceLogs: [{ scopeLogs: [{ logRecords: Array.from({ length: 250_000 }, () => ({})) }] }],
+  });
+  assert.ok(Buffer.byteLength(payload) < 1_000_000);
+  let insertStarted = false;
+  const original = store.ingestOtelQuarantine.bind(store);
+  store.ingestOtelQuarantine = (records) => { insertStarted = true; return original(records); };
+  const started = performance.now();
+  const flight = post(app, '/otlp/v1/logs', payload);
+  let result;
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    const health = await request(app, '/api/health', '', { method: 'GET' });
+    const elapsed = performance.now() - started;
+    assert.equal(health.status, 200);
+    assert.equal(health.body.ok, true);
+    assert.ok(elapsed < 750, `health waited ${elapsed.toFixed(1)} ms for OTLP parsing`);
+    assert.equal(insertStarted, false, 'parsing must yield before all 250000 records are normalized');
+    t.diagnostic(`health during 250000-record parse: ${elapsed.toFixed(1)} ms`);
+  } finally { result = await flight; }
+  assert.equal(result.text, '{"partialSuccess":{"rejectedLogRecords":"250000","errorMessage":"250000 unrecognized OTLP record(s) quarantined"}}');
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM otel_quarantine').get().count, 1, 'duplicate receipts still deduplicate across batches');
+});
 
 test('OTLP receiver defaults off and presents its routes as not found', async (t) => {
   const { store, app } = appFixture(t, false);

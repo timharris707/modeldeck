@@ -23,17 +23,17 @@ public protocol UsageRefreshing: Sendable {
 
 extension DaemonClient: UsageRefreshing {}
 
-/// Issue #503: seam for the daemon's exhaustion forecast
-/// (`GET /api/usage/exhaustion-forecast`, issue #497). `DaemonClient`
-/// conforms; tests stub it. Optional at the model's boundary, so a daemon
-/// without the endpoint simply leaves deck rows with no dry time.
-public protocol ExhaustionForecastProviding: Sendable {
-    func usageExhaustionForecast() async throws -> ExhaustionForecast
+/// Issue #660: the short liveness probe (`GET /api/health`, 5 s) a refresh
+/// runs after a data read times out, to tell a slow daemon from a dead one.
+/// `DaemonClient` conforms; tests stub it. Optional at the model's boundary:
+/// without a probe every timeout still reads as unreachable.
+public protocol DaemonHealthProbing: Sendable {
+    func probeHealth() async throws
 }
 
-extension DaemonClient: ExhaustionForecastProviding {
-    public func usageExhaustionForecast() async throws -> ExhaustionForecast {
-        try await exhaustionForecast()
+extension DaemonClient: DaemonHealthProbing {
+    public func probeHealth() async throws {
+        _ = try await health()
     }
 }
 
@@ -61,7 +61,21 @@ public final class MenuBarStatusModel: ObservableObject {
     public enum ConnectionStatus: Equatable, Sendable {
         case unknown
         case connected
+        /// Issue #660: the daemon answers `/api/health` but a data read timed
+        /// out. The deck keeps showing its last state; nothing is down.
+        case busy(since: Date)
         case unreachable(String)
+
+        /// True whenever the daemon answered this refresh — connected, or
+        /// alive-but-slow. Surfaces that only care "is the daemon up" (the
+        /// dashboard window, the footer's Add Subscription) key on this so
+        /// `.busy` is never rendered like down.
+        public var daemonAnswered: Bool {
+            switch self {
+            case .connected, .busy: return true
+            case .unknown, .unreachable: return false
+            }
+        }
     }
 
     @Published public private(set) var connection: ConnectionStatus = .unknown
@@ -75,12 +89,6 @@ public final class MenuBarStatusModel: ObservableObject {
     /// Full daemon state for the popover deck; nil before the first
     /// successful load or when no state provider was supplied.
     @Published public private(set) var deckState: DeckState?
-    /// Issue #503: the daemon's exhaustion forecast, refreshed with the deck
-    /// state. Nil whenever no forecast provider was supplied, the daemon
-    /// doesn't serve the endpoint, or the last read failed — and nil means
-    /// deck rows show no dry time at all, never a placeholder guess.
-    @Published public private(set) var exhaustionForecast: ExhaustionForecast?
-
     public var thresholds: UsageThresholds {
         didSet { recomputeIconState() }
     }
@@ -249,7 +257,7 @@ public final class MenuBarStatusModel: ObservableObject {
 
     /// True once any state has landed (refresh success or `apply`); gates
     /// the `.loading` placeholder (issue #58).
-    private var hasLoadedOnce = false
+    public private(set) var hasLoadedOnce = false
 
     private func recomputeIconState() {
         // Issue #229: "None — icon only" hides the number entirely —
@@ -427,9 +435,8 @@ public final class MenuBarStatusModel: ObservableObject {
     /// Issue #72: the manual-Refresh provider poll; nil keeps every refresh
     /// a cheap cached read (pre-#72 behavior).
     private let usageRefresher: (any UsageRefreshing)?
-    /// Issue #503: nil keeps every refresh forecast-free (previews/tests and
-    /// pre-#497 daemons).
-    private let forecastProvider: (any ExhaustionForecastProviding)?
+    /// Issue #660: nil makes every timeout read as unreachable (pre-#660).
+    private let healthProbe: (any DaemonHealthProbing)?
     private let clock: @Sendable () -> Date
     private var autoRefreshTask: Task<Void, Never>?
 
@@ -437,7 +444,7 @@ public final class MenuBarStatusModel: ObservableObject {
         evaluator: any UsageEvaluating,
         stateProvider: (any DeckStateProviding)? = nil,
         usageRefresher: (any UsageRefreshing)? = nil,
-        forecastProvider: (any ExhaustionForecastProviding)? = nil,
+        healthProbe: (any DaemonHealthProbing)? = nil,
         thresholds: UsageThresholds = .default,
         clock: @escaping @Sendable () -> Date = { Date() },
         // Issue #260: nil keeps the pre-#260 in-memory window (tests).
@@ -446,7 +453,7 @@ public final class MenuBarStatusModel: ObservableObject {
         self.evaluator = evaluator
         self.stateProvider = stateProvider
         self.usageRefresher = usageRefresher
-        self.forecastProvider = forecastProvider
+        self.healthProbe = healthProbe
         self.thresholds = thresholds
         self.clock = clock
         self.burnWindowStore = burnWindowStore
@@ -525,8 +532,6 @@ public final class MenuBarStatusModel: ObservableObject {
                 worst = try await evaluator.evaluateWorstRemaining()
             }
             guard generation == stateGeneration else { return }
-            await loadExhaustionForecast(generation: generation)
-            guard generation == stateGeneration else { return }
             worstRemaining = worst
             hasLoadedOnce = true
             recomputeIconState()
@@ -537,29 +542,39 @@ public final class MenuBarStatusModel: ObservableObject {
         } catch {
             guard generation == stateGeneration else { return }
             IconDebugLog.log("refresh FAILED: \(error)")
-            connection = .unreachable(error.localizedDescription)
+            let classified = await classifyFailure(error)
+            // The health probe suspended; a verified apply(deckState:) that
+            // landed meanwhile owns the connection now (CodeRabbit, #662).
+            guard generation == stateGeneration else { return }
+            connection = classified
         }
     }
 
-    /// Issue #503: the forecast read, folded into the same refresh as the
-    /// deck state. Deliberately never fatal to a refresh — a daemon without
-    /// the #497 endpoint, or a failed read, clears the forecast so rows fall
-    /// back to showing NOTHING rather than an aging estimate.
-    private func loadExhaustionForecast(generation: Int) async {
-        guard let forecastProvider else { return }
-        let loaded = try? await forecastProvider.usageExhaustionForecast()
-        guard generation == stateGeneration else { return }
-        if loaded == nil {
-            IconDebugLog.log("exhaustion forecast unavailable; rows show no dry time")
+    /// Issue #660: a timed-out data read is only "unreachable" if the short
+    /// health probe fails too; a daemon that still answers health is busy,
+    /// and the deck keeps its last state under a quiet line. Any other
+    /// transport error (refused, reset) is unreachable without a probe.
+    private func classifyFailure(_ error: Error) async -> ConnectionStatus {
+        guard (error as? URLError)?.code == .timedOut, let healthProbe else {
+            return .unreachable(error.localizedDescription)
         }
-        exhaustionForecast = loaded
+        do {
+            try await healthProbe.probeHealth()
+        } catch {
+            return .unreachable(error.localizedDescription)
+        }
+        if case .busy(let since) = connection { return .busy(since: since) }
+        return .busy(since: clock())
     }
 
-    /// Issue #503: what THIS row renders for time-to-dry, or nil for "no
-    /// forecast" — the popover's single seam, so both deck layouts show the
-    /// same estimate and the VoiceOver label speaks the same phrase.
-    public func exhaustionForecast(for row: DeckAccountRow) -> ExhaustionForecastPresentation? {
-        exhaustionForecast?.presentation(forAccountID: row.account.id, now: clock())
+    /// Issue #660: the deck header's one-line busy notice, plain words, nil
+    /// unless the connection is `.busy`. Ages the last SUCCESSFUL read, so
+    /// "showing data from 11 min ago" is literally how old the cards are.
+    public func busyStatusText(now: Date? = nil) -> String? {
+        guard case .busy = connection else { return nil }
+        guard let lastUpdatedAt else { return "Daemon busy" }
+        let age = DeckFreshness.ageText(observedAt: lastUpdatedAt, now: now ?? clock())
+        return "Daemon busy · showing data from \(age)"
     }
 
     /// Adopt a deck state fetched elsewhere (e.g. the Activate flow's

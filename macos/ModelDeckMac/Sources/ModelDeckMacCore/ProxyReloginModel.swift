@@ -220,11 +220,41 @@ public enum ProxyRelogin {
             + "Nothing changes until you finish it in the browser."
     }
 
-    public static let startingText = "Asking the proxy to start a sign-in…"
-    public static let awaitingBrowserText = "Finish the sign-in in your browser…"
-    public static let succeededText =
-        "Signed in again. The proxy is using this subscription once more."
-    public static let cancelledText = "Sign-in stopped. Nothing changed."
+    // Issue #542 — the repair names its target. On 2026-08-19 the deck said
+    // "Finish the sign-in in your browser…" with a Stop beside it, and with 7
+    // Claude and 4 Codex subscriptions on the deck Tim could not tell WHICH
+    // browser sign-in he was finishing. These are built once, in
+    // `presentation(for:routedFailures:)` and `settle`, so the banner, the
+    // Settings row, and the card's popover all say the same sentence.
+
+    /// This account's provider in display form ("Claude"), or nil when the
+    /// daemon named a provider this build does not know — the sentences then
+    /// drop the provider rather than guess it.
+    public static func providerName(for account: DeckAccount) -> String? {
+        DeckProvider.from(account.provider)?.displayName
+    }
+
+    public static func startingText(label: String, providerName: String?) -> String {
+        guard let providerName else { return "Asking the proxy to start a sign-in for \(label)…" }
+        return "Asking the proxy to start the \(providerName) sign-in for \(label)…"
+    }
+
+    public static func awaitingBrowserText(label: String, providerName: String?) -> String {
+        guard let providerName else { return "Finish the sign-in for \(label) in your browser…" }
+        return "Finish the \(providerName) sign-in for \(label) in your browser…"
+    }
+
+    public static func succeededText(label: String, providerName: String?) -> String {
+        guard let providerName else {
+            return "Signed in \(label) again. The proxy is using this subscription once more."
+        }
+        return "Signed in \(label) again. The proxy is using this \(providerName) subscription once more."
+    }
+
+    public static func cancelledText(label: String, providerName: String?) -> String {
+        "Sign-in for \(target(label: label, providerName: providerName)) stopped. Nothing changed."
+    }
+
     public static let cancelTooltip =
         "Stop the sign-in. The proxy drops it too, so nothing keeps waiting."
     public static let browserOpenFailedText =
@@ -235,15 +265,79 @@ public enum ProxyRelogin {
     public static let failedFallbackText =
         "The sign-in did not complete. Try again."
 
-    public static func settledText(phase: Phase, detail: String?) -> String? {
+    /// The failure sentence names the subscription and then gets out of the
+    /// way: the daemon's own detail is the only thing that says WHAT failed,
+    /// so it rides verbatim after the target, never paraphrased.
+    public static func failedText(
+        detail: String?,
+        label: String,
+        providerName: String?
+    ) -> String {
+        let target = target(label: label, providerName: providerName)
+        guard let detail, !detail.isEmpty else { return "\(target): \(failedFallbackText)" }
+        return "\(target): \(detail)"
+    }
+
+    public static func settledText(
+        phase: Phase,
+        detail: String?,
+        label: String,
+        providerName: String?
+    ) -> String? {
         switch phase {
-        case .succeeded: return succeededText
-        case .cancelled: return cancelledText
-        case .failed:
-            guard let detail, !detail.isEmpty else { return failedFallbackText }
-            return detail
+        case .succeeded: return succeededText(label: label, providerName: providerName)
+        case .cancelled: return cancelledText(label: label, providerName: providerName)
+        case .failed: return failedText(detail: detail, label: label, providerName: providerName)
         default: return nil
         }
+    }
+
+    // MARK: - The card indicator (issue #542)
+    //
+    // Tim, 2026-09-17: a Claude account's refresh token expired, the proxy
+    // marked the credential dead and stopped routing to it BEFORE any request
+    // failed — so no routed-failure streak, no banner — and the card just
+    // showed "100% left · ⑂ 0". Only Settings → Subscriptions said anything.
+    // The card now carries the same verdict, derived from the same
+    // presentation, so it cannot reach a calmer conclusion than Settings.
+
+    /// What the deck card renders, or nil for a card that shows nothing new.
+    /// The verdict is the presentation's own — the SAME one the pool banner
+    /// and the Settings row read — so the card can never be calmer than
+    /// they are. Benched, resting (#634), repaired-pending (#539) and
+    /// transient-overload (#572) members all land on nil here, because
+    /// `credentialIsBroken` already ruled them out.
+    public static func cardIndicator(
+        _ presentation: ProxyReloginRowPresentation?
+    ) -> ProxyReloginRowPresentation? {
+        guard let presentation, presentation.credentialIsBroken else { return nil }
+        return presentation
+    }
+
+    /// "Click AI (Claude)" — the account with its provider, which is the
+    /// whole point: a roster of 11 subscriptions needs both to be findable.
+    public static func target(label: String, providerName: String?) -> String {
+        guard let providerName else { return label }
+        return "\(label) (\(providerName))"
+    }
+
+    /// The indicator's lead phrase. A recorded `error` is the PROXY's own
+    /// verdict that the sign-in expired; a routed-failure streak (#515) on a
+    /// still-"ok" credential only proves it is not working, so it does not
+    /// borrow the stronger claim.
+    public static func indicatorLead(for account: DeckAccount) -> String {
+        credentialIsBroken(account) ? "Proxy sign-in expired" : "Proxy sign-in not working"
+    }
+
+    /// What VoiceOver hears on the card's glyph — the account, its provider,
+    /// and the state, since a `key.slash` says none of the three.
+    public static func indicatorAccessibilityLabel(
+        for account: DeckAccount,
+        presentation: ProxyReloginRowPresentation
+    ) -> String {
+        if case .running(let text, _) = presentation.display { return text }
+        let state = presentation.credentialText ?? indicatorLead(for: account)
+        return "\(target(label: account.label, providerName: providerName(for: account))): \(state)"
     }
 }
 
@@ -363,8 +457,13 @@ public final class ProxyReloginModel: ObservableObject {
         )
         let display: ProxyReloginRowPresentation.Display
         if let phase, phase.isRunning {
+            // Issue #542: built HERE, once, so the banner, the Settings row
+            // and the card's popover cannot grow three versions of it.
+            let provider = ProxyRelogin.providerName(for: account)
             display = .running(
-                text: phase == .starting ? ProxyRelogin.startingText : ProxyRelogin.awaitingBrowserText,
+                text: phase == .starting
+                    ? ProxyRelogin.startingText(label: account.label, providerName: provider)
+                    : ProxyRelogin.awaitingBrowserText(label: account.label, providerName: provider),
                 canCancel: phase == .awaitingBrowser
             )
         } else if let error, !staleOutcome {
@@ -428,9 +527,9 @@ public final class ProxyReloginModel: ObservableObject {
                     return
                 }
                 if phase.isSettled {
-                    self.settle(accountID: accountID, phase: phase, detail: started.detail)
+                    self.settle(account: account, phase: phase, detail: started.detail)
                 } else {
-                    await self.poll(accountID: accountID, generation: generation)
+                    await self.poll(account: account, generation: generation)
                 }
             } catch is CancellationError {
                 return // cancel() already wrote the honest note
@@ -452,7 +551,10 @@ public final class ProxyReloginModel: ObservableObject {
         generations[accountID] == generation && phases[accountID] != nil
     }
 
-    private func poll(accountID: String, generation: Int?) async {
+    /// Issue #542: the ACCOUNT rides through the flow, not just its id — the
+    /// settled sentence names the subscription it belongs to.
+    private func poll(account: DeckAccount, generation: Int?) async {
+        let accountID = account.id
         while true {
             do { try await sleep(pollInterval) } catch { return }
             guard isCurrent(accountID, generation) else { return }
@@ -471,17 +573,23 @@ public final class ProxyReloginModel: ObservableObject {
             guard isCurrent(accountID, generation) else { return }
             let phase = ProxyRelogin.Phase(daemon: state.phase)
             if phase.isSettled {
-                settle(accountID: accountID, phase: phase, detail: state.detail)
+                settle(account: account, phase: phase, detail: state.detail)
                 return
             }
             phases[accountID] = phase
         }
     }
 
-    private func settle(accountID: String, phase: ProxyRelogin.Phase, detail: String?) {
+    private func settle(account: DeckAccount, phase: ProxyRelogin.Phase, detail: String?) {
+        let accountID = account.id
         phases[accountID] = nil
         outcomeAt[accountID] = now()
-        let text = ProxyRelogin.settledText(phase: phase, detail: detail)
+        let text = ProxyRelogin.settledText(
+            phase: phase,
+            detail: detail,
+            label: account.label,
+            providerName: ProxyRelogin.providerName(for: account)
+        )
         if phase == .failed {
             errors[accountID] = text
         } else {
@@ -492,7 +600,11 @@ public final class ProxyReloginModel: ObservableObject {
     /// Stop the sign-in. The daemon asks the PROXY to drop its own pending
     /// session, so this genuinely stops the flow rather than only stopping
     /// our watching of it.
-    public func cancel(accountID: String) {
+    ///
+    /// Issue #542: takes the ACCOUNT, like `poll` and `settle` — the stopped
+    /// sentence names the subscription it stopped.
+    public func cancel(account: DeckAccount) {
+        let accountID = account.id
         guard phases[accountID]?.isRunning == true else { return }
         // Invalidate BEFORE cancelling so a task already past its await
         // cannot overwrite the stopped state (the ProxyPoolModel lesson).
@@ -500,7 +612,10 @@ public final class ProxyReloginModel: ObservableObject {
         let generation = generations[accountID]
         tasks.removeValue(forKey: accountID)?.cancel()
         phases[accountID] = nil
-        notes[accountID] = ProxyRelogin.cancelledText
+        notes[accountID] = ProxyRelogin.cancelledText(
+            label: account.label,
+            providerName: ProxyRelogin.providerName(for: account)
+        )
         outcomeAt[accountID] = now()
         Task { [weak self] in
             guard let self else { return }

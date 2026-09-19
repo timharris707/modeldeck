@@ -33,6 +33,11 @@ public enum DeckWarningTopic: Hashable, Sendable {
     /// presentation slot so the detail popover behaves exactly like every
     /// other click-to-explain affordance.
     case availabilityHealth
+    /// The per-card proxy-credential indicator (issue #542) — the `key.slash`
+    /// glyph beside the ⑂ weight badge, shown when this pool member's proxy
+    /// sign-in is dead by either measure (the proxy's own recorded verdict,
+    /// or a routed-failure streak).
+    case proxyCredential
     /// The header's passive staged-update badge (issue #241) — shown after
     /// the "restart to finish updating" banner is dismissed, so a staged
     /// background update can be ignored but never invisible. Its popover
@@ -148,6 +153,39 @@ public struct DeckWarningExplanation: Equatable, Sendable {
     /// existing text and tooltip.
     public static func cadence(_ notice: MenuBarStatusModel.RefreshCadenceNotice) -> DeckWarningExplanation {
         DeckWarningExplanation(title: notice.text, body: notice.tooltip)
+    }
+
+    /// The card indicator's explanation (issue #542). The title names the
+    /// subscription AND its provider — the 2026-08-19 incident was a repair
+    /// nobody could attribute across 11 subscriptions — and the body is the
+    /// row's own credential sentence plus whatever the presentation is
+    /// already saying: the browser disclosure when a repair is armed, the
+    /// daemon's reason when it cannot run, the running or settled sentence
+    /// when one exists. Every string is an existing, tested one.
+    public static func proxyCredential(
+        for account: DeckAccount,
+        presentation: ProxyReloginRowPresentation
+    ) -> DeckWarningExplanation {
+        let lead = ProxyRelogin.indicatorLead(for: account)
+        let target = ProxyRelogin.target(
+            label: account.label,
+            providerName: ProxyRelogin.providerName(for: account)
+        )
+        let second: String
+        switch presentation.display {
+        case .running(let text, _), .note(let text), .error(let text):
+            second = text
+        case .unavailable(let reason):
+            // Never promise a browser sign-in the proxy has already said it
+            // cannot start (the #396 no-dead-control rule).
+            second = reason
+        case .action, .quiet:
+            second = ProxyRelogin.confirmation(label: account.label)
+        }
+        return DeckWarningExplanation(
+            title: "\(lead) · \(target)",
+            body: "\(presentation.credentialText ?? lead)\n\n\(second)"
+        )
     }
 }
 

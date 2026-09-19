@@ -346,7 +346,7 @@ struct AccountsSettingsPane: View {
                 routedFailures: ProxyRelogin.routedFailures(for: account, in: state)
             ),
             onProxyFixSignIn: { proxyConfirmation = ProxyPoolConfirmation(account: account, action: .fixSignIn) },
-            onProxyCancelRelogin: { proxyReloginModel.cancel(accountID: account.id) },
+            onProxyCancelRelogin: { proxyReloginModel.cancel(account: account) },
             onDismissReloginOutcome: { proxyReloginModel.dismissOutcome(accountID: account.id) },
             // Issue #280: nil unless the account is seeded (or an attempt
             // is still unanswered) — the button lives and dies with the pill.

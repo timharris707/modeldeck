@@ -16,21 +16,54 @@ async function statOrNull(file, io) {
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
 
+/// True when text names the legacy root itself or a path below it; a sibling
+/// such as `<root>-backup` shares the prefix but is not a legacy reference.
+function referencesLegacyDir(text, legacyDir) {
+  const escaped = legacyDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`${escaped}(?:/|$|\\s)`).test(text);
+}
+
 /// Scan all open files/cwds below the old root, including explicitly pinned
 /// CODEX_HOME sessions. Only lsof's unambiguous no-match exit means idle.
 export async function legacyCodexProfilesInUse(legacyDir, exec = execFileAsync) {
-  // CodeRabbit (#650): lsof +D sees open files and working directories, not
-  // a CODEX_HOME pinned by environment. Any running codex process therefore
-  // defers the move outright; the directory scan below catches the rest.
+  // CLI sessions block even without open files. Bundled app servers only
+  // block when they reference the legacy root; lsof also checks their cwd.
+  let pids = [];
   try {
     const running = await exec('/usr/bin/pgrep', ['-x', 'codex'], { timeout: 10_000, maxBuffer: 1_000_000 });
-    if (/^\d+$/m.test(running.stdout || '')) return true;
-    throw new Error('process inspection inconclusive');
+    pids = String(running.stdout || '').trim().split('\n');
+    if (String(running.stderr || '').trim() || !pids.every((pid) => /^[1-9]\d*$/.test(pid))) {
+      throw new Error('process inspection inconclusive');
+    }
   } catch (error) {
     // pgrep exits 1 with no output when nothing matches.
-    if (!(error.code === 1 && !error.signal && !error.killed && !String(error.stdout || '').trim())) {
+    if (!(error.code === 1 && !error.signal && !error.killed && !String(error.stdout || '').trim()
+        && !String(error.stderr || '').trim())) {
       throw new Error('process inspection unavailable');
     }
+  }
+  try {
+    for (const pid of pids) {
+      const result = await exec('/bin/ps', ['-ww', '-o', 'comm=', '-p', pid], { timeout: 10_000, maxBuffer: 1_000_000 });
+      const executable = String(result.stdout || '').trim();
+      if (String(result.stderr || '').trim() || !/^\/[^\r\n]+\/codex$/.test(executable)) {
+        throw new Error('process inspection inconclusive');
+      }
+      if (!/\.app\/Contents\/(?:Resources|Frameworks)\//.test(executable)) return true;
+      // -E includes the launch environment, which lsof cannot inspect.
+      // Never log this output: it may contain credentials.
+      const details = await exec('/bin/ps', ['-ww', '-E', '-o', 'command=', '-p', pid], {
+        timeout: 10_000, maxBuffer: 1_000_000,
+      });
+      const command = String(details.stdout || '').trim();
+      if (String(details.stderr || '').trim() || /[\r\n]/.test(command)
+          || !(command === executable || command.startsWith(`${executable} `))) {
+        throw new Error('process inspection inconclusive');
+      }
+      if (referencesLegacyDir(executable, legacyDir) || referencesLegacyDir(command, legacyDir)) return true;
+    }
+  } catch {
+    throw new Error('process inspection unavailable');
   }
   let result;
   try {

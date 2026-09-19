@@ -70,6 +70,8 @@ import {
   proxyReloginNextPhase,
 } from './proxy-relogin.mjs';
 import {
+  OTEL_QUARANTINE_PRUNE_BATCH_SIZE,
+  OTEL_QUARANTINE_RETENTION_DAYS,
   REQUEST_USAGE_PRUNE_BATCH_SIZE,
   REQUEST_USAGE_RETENTION_DAYS,
   USAGE_SNAPSHOT_PRUNE_BATCH_SIZE,
@@ -988,9 +990,14 @@ export class ModelDeckService {
       });
     this.logRequestUsagePrune = options.logRequestUsagePrune
       || ((count) => console.log(`[modeldeck] request usage pruned: ${count}`));
+    this.logOtelQuarantinePrune = options.logOtelQuarantinePrune
+      || ((count) => {
+        if (count > 0) console.log(`[modeldeck] OTLP quarantine pruned: ${count}`);
+      });
     this.usageSnapshotPruneTimer = null;
     this.usageSnapshotPrunePromise = null;
     this.requestUsagePrunePromise = null;
+    this.otelQuarantinePrunePromise = null;
     this.usageSnapshotPruneStarted = false;
     this.usageSnapshotPruneGeneration = 0;
     this.usageQueueConsumerTimer = null;
@@ -1333,6 +1340,7 @@ export class ModelDeckService {
     await Promise.all([
       (this.usageSnapshotPrunePromise || Promise.resolve()).catch(() => {}),
       (this.requestUsagePrunePromise || Promise.resolve()).catch(() => {}),
+      (this.otelQuarantinePrunePromise || Promise.resolve()).catch(() => {}),
     ]);
   }
 
@@ -1340,6 +1348,7 @@ export class ModelDeckService {
     void Promise.all([
       this.pruneUsageSnapshots(),
       this.pruneRequestUsage(),
+      this.pruneOtelQuarantine(),
     ]).catch((error) => {
       console.error(`[modeldeck] usage retention prune failed: ${error?.message || error}`);
     }).finally(() => {
@@ -1406,6 +1415,35 @@ export class ModelDeckService {
     this.requestUsagePrunePromise = promise;
     const clear = () => {
       if (this.requestUsagePrunePromise === promise) this.requestUsagePrunePromise = null;
+    };
+    void promise.then(clear, clear);
+    return promise;
+  }
+
+  /// Quarantine has no historical timestamp index. Scan at most one batch of
+  /// receipts per turn, including survivors, so upgrading never needs a large
+  /// index build or a single transaction over the old raw-JSON backlog.
+  pruneOtelQuarantine() {
+    if (this.otelQuarantinePrunePromise) return this.otelQuarantinePrunePromise;
+    const cutoff = new Date(this.now() - OTEL_QUARANTINE_RETENTION_DAYS * DAY_MS).toISOString();
+    const promise = (async () => {
+      let total = 0;
+      let cursor = {};
+      try {
+        while (true) {
+          cursor = this.store.pruneOtelQuarantineBatch({ cutoff, ...cursor });
+          total += cursor.deleted;
+          if (cursor.scanned < OTEL_QUARANTINE_PRUNE_BATCH_SIZE) break;
+          await this.yieldToServeLoop();
+        }
+      } finally {
+        this.logOtelQuarantinePrune(total);
+      }
+      return total;
+    })();
+    this.otelQuarantinePrunePromise = promise;
+    const clear = () => {
+      if (this.otelQuarantinePrunePromise === promise) this.otelQuarantinePrunePromise = null;
     };
     void promise.then(clear, clear);
     return promise;

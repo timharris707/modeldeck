@@ -1,4 +1,8 @@
 import crypto from 'node:crypto';
+import { setImmediate as yieldToServeLoop } from 'node:timers/promises';
+
+// Bound both normalization work and synchronous SQLite inserts per serve turn.
+export const OTEL_INGEST_BATCH_SIZE = 250;
 
 const METRIC_NAMES = new Set(['claude_code.token.usage', 'claude_code.cost.usage']);
 const SENSITIVE_KEY = /(email|password|authorization|apikey|accesstoken|refreshtoken|secret)/;
@@ -208,7 +212,7 @@ function metricDataPointCount(value) {
     .reduce((count, kind) => count + (Array.isArray(value[kind]?.dataPoints) ? value[kind].dataPoints.length : 0), 0);
 }
 
-export function parseOtlpMetrics(payload) {
+export async function parseOtlpMetrics(payload, { yieldToServeLoop: yieldLoop = yieldToServeLoop } = {}) {
   if (!isObject(payload) || !Array.isArray(payload.resourceMetrics)) {
     throw invalidPayload('resourceMetrics must be an array');
   }
@@ -216,7 +220,9 @@ export function parseOtlpMetrics(payload) {
   const quarantine = [];
   let unknown = 0;
   let rejectedDataPoints = 0;
+  let processed = 0;
   for (const resourceMetric of payload.resourceMetrics) {
+    if (++processed % OTEL_INGEST_BATCH_SIZE === 0) await yieldLoop();
     if (!isObject(resourceMetric) || !Array.isArray(resourceMetric.scopeMetrics)) {
       unknown += 1;
       rejectedDataPoints += metricDataPointCount(resourceMetric);
@@ -225,6 +231,7 @@ export function parseOtlpMetrics(payload) {
     }
     const resourceAttributes = attributes(resourceMetric.resource?.attributes);
     for (const scopeMetric of resourceMetric.scopeMetrics) {
+      if (++processed % OTEL_INGEST_BATCH_SIZE === 0) await yieldLoop();
       if (!isObject(scopeMetric) || !Array.isArray(scopeMetric.metrics)) {
         unknown += 1;
         rejectedDataPoints += metricDataPointCount(scopeMetric);
@@ -233,6 +240,7 @@ export function parseOtlpMetrics(payload) {
       }
       const scopeAttributes = attributes(scopeMetric.scope?.attributes);
       for (const metric of scopeMetric.metrics) {
+        if (++processed % OTEL_INGEST_BATCH_SIZE === 0) await yieldLoop();
         if (!isObject(metric) || !METRIC_NAMES.has(metric.name)) {
           unknown += 1;
           rejectedDataPoints += metricDataPointCount(metric);
@@ -247,6 +255,7 @@ export function parseOtlpMetrics(payload) {
           continue;
         }
         for (const point of points) {
+          if (++processed % OTEL_INGEST_BATCH_SIZE === 0) await yieldLoop();
           if (!isObject(point)) {
             unknown += 1;
             rejectedDataPoints += 1;
@@ -300,7 +309,7 @@ function logRecordCount(value) {
   return Array.isArray(value.logRecords) ? value.logRecords.length : 0;
 }
 
-export function parseOtlpLogs(payload) {
+export async function parseOtlpLogs(payload, { yieldToServeLoop: yieldLoop = yieldToServeLoop } = {}) {
   if (!isObject(payload) || !Array.isArray(payload.resourceLogs)) {
     throw invalidPayload('resourceLogs must be an array');
   }
@@ -308,7 +317,9 @@ export function parseOtlpLogs(payload) {
   const quarantine = [];
   let unknown = 0;
   let rejectedLogRecords = 0;
+  let processed = 0;
   for (const resourceLog of payload.resourceLogs) {
+    if (++processed % OTEL_INGEST_BATCH_SIZE === 0) await yieldLoop();
     if (!isObject(resourceLog) || !Array.isArray(resourceLog.scopeLogs)) {
       unknown += 1;
       rejectedLogRecords += logRecordCount(resourceLog);
@@ -317,6 +328,7 @@ export function parseOtlpLogs(payload) {
     }
     const resourceAttributes = attributes(resourceLog.resource?.attributes);
     for (const scopeLog of resourceLog.scopeLogs) {
+      if (++processed % OTEL_INGEST_BATCH_SIZE === 0) await yieldLoop();
       if (!isObject(scopeLog) || !Array.isArray(scopeLog.logRecords)) {
         unknown += 1;
         rejectedLogRecords += logRecordCount(scopeLog);
@@ -325,6 +337,7 @@ export function parseOtlpLogs(payload) {
       }
       const scopeAttributes = attributes(scopeLog.scope?.attributes);
       for (const logRecord of scopeLog.logRecords) {
+        if (++processed % OTEL_INGEST_BATCH_SIZE === 0) await yieldLoop();
         if (!isObject(logRecord)) {
           unknown += 1;
           rejectedLogRecords += 1;

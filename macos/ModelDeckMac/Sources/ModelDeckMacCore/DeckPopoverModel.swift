@@ -715,15 +715,9 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     /// no longer render an activation marker, the old ", active" / pending
     /// speech is gone (that state lives in Settings → Accounts); the single
     /// checkmark's "shown in menu bar" meaning is spoken instead.
-    ///
-    /// Issue #503: the time-to-dry caption is a plain `Text` inside the same
-    /// suppressed subtree, so its phrase arrives here as `forecast` — nil
-    /// (no forecast) adds nothing at all, which is exactly what the row
-    /// shows. Same trap as #65/#113/#272, same fix: derive here, test here.
     public func accessibilityLabel(
         showsIdentity: Bool,
-        isMenuBarSource: Bool = false,
-        forecast: ExhaustionForecastPresentation? = nil
+        isMenuBarSource: Bool = false
     ) -> String {
         let identity = showsIdentity
             ? (account.identity.flatMap { $0.isEmpty ? nil : ", \($0)" } ?? "")
@@ -749,9 +743,6 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
                     ? ", benched for Fable routing, weight \(weight.liveWeight) for other models"
                     : ", proxy routing weight \(weight.weight)"
             }
-        }
-        if let forecast {
-            label += ", \(forecast.accessibilityPhrase)"
         }
         return label
     }
@@ -1551,7 +1542,8 @@ public final class DeckPopoverModel: ObservableObject {
         staleness: (DeckAccountRow) -> DeckFreshness.CardStaleness?,
         cadenceNoticeVisible: Bool,
         healthChipProviders: [DeckProvider] = [],
-        updateBadgeVisible: Bool = false
+        updateBadgeVisible: Bool = false,
+        proxyCredentialBroken: (DeckAccountRow) -> Bool = { _ in false }
     ) {
         guard let presented = presentedWarning,
               !Self.liveWarningIDs(
@@ -1559,7 +1551,8 @@ public final class DeckPopoverModel: ObservableObject {
                   staleness: staleness,
                   cadenceNoticeVisible: cadenceNoticeVisible,
                   healthChipProviders: healthChipProviders,
-                  updateBadgeVisible: updateBadgeVisible
+                  updateBadgeVisible: updateBadgeVisible,
+                  proxyCredentialBroken: proxyCredentialBroken
               ).contains(presented)
         else { return }
         presentedWarning = nil
@@ -1583,12 +1576,17 @@ public final class DeckPopoverModel: ObservableObject {
     /// staged-update badge (the dismissed restart prompt), so its Restart
     /// popover is released when the badge goes — restart clicked, or the
     /// staged phase cleared.
+    /// Issue #542: `proxyCredentialBroken` mirrors the card's new
+    /// credential indicator. It rides a closure for the same reason
+    /// `staleness` does — the verdict needs the repair model and the deck's
+    /// routed-failure alerts, neither of which this model holds.
     public static func liveWarningIDs(
         rows: [DeckAccountRow],
         staleness: (DeckAccountRow) -> DeckFreshness.CardStaleness?,
         cadenceNoticeVisible: Bool,
         healthChipProviders: [DeckProvider] = [],
-        updateBadgeVisible: Bool = false
+        updateBadgeVisible: Bool = false,
+        proxyCredentialBroken: (DeckAccountRow) -> Bool = { _ in false }
     ) -> Set<DeckWarningID> {
         var live: Set<DeckWarningID> = [DeckWarningID(topic: .footerFreshness)]
         if cadenceNoticeVisible {
@@ -1612,6 +1610,9 @@ public final class DeckPopoverModel: ObservableObject {
             }
             if staleness(row) != nil {
                 live.insert(DeckWarningID(topic: .staleData, elementID: row.id))
+            }
+            if proxyCredentialBroken(row) {
+                live.insert(DeckWarningID(topic: .proxyCredential, elementID: row.id))
             }
         }
         return live
