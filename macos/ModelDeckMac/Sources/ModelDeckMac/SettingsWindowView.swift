@@ -2047,7 +2047,13 @@ struct GeneralSettingsPane: View {
                 }
                 HStack {
                     Button("Check for App Updates") {
-                        Task { await appUpdateModel.check() }
+                        // Issue #675: explicitCheck(), like the gear menu and
+                        // the context menu since #170 — plain check() no-ops
+                        // when the 4-hourly background check is already in
+                        // flight, which silently dropped this click. The
+                        // dialog it returns is unused here: the inline status
+                        // line below is this surface's feedback.
+                        Task { _ = await appUpdateModel.explicitCheck() }
                     }
                     .disabled(appUpdateModel.isChecking)
                     .help(appUpdateInstallModel.canInstall

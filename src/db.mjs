@@ -1897,6 +1897,19 @@ export class Store {
     `).run(cutoff, batchSize).changes;
   }
 
+  walAutoCheckpointPages() {
+    return this.db.prepare('PRAGMA wal_autocheckpoint').get().wal_autocheckpoint;
+  }
+
+  setWalAutoCheckpointPages(pages) {
+    if (!Number.isInteger(pages) || pages < 0) throw new Error('WAL autocheckpoint pages must be a nonnegative integer');
+    this.db.exec(`PRAGMA wal_autocheckpoint = ${pages}`);
+  }
+
+  checkpointWal() {
+    this.db.exec('PRAGMA wal_checkpoint(PASSIVE)');
+  }
+
   /// Walk receipts newest-id first, keeping at most the newest 50k unexpired
   /// rows. Carry the cursor/count between batches so both reads and deletes
   /// are bounded, without building an index over the existing raw-JSON backlog.

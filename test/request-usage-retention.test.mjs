@@ -148,7 +148,7 @@ test('the existing daily retention schedule prunes request_usage and logs every 
   });
   try {
     service.startUsageSnapshotRetention();
-    await clock.flush();
+    await clock.advance(30_000); // first pass waits for state or the startup deadline
     assert.deepEqual(logs, [1]);
     assert.deepEqual(requestIds(store), ['scheduled-current']);
     assert.equal(clock.timers.size, 1, 'request_usage shares the existing retention timer');

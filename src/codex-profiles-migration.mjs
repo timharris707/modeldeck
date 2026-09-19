@@ -26,6 +26,14 @@ function referencesLegacyDir(text, legacyDir) {
 /// Scan all open files/cwds below the old root, including explicitly pinned
 /// CODEX_HOME sessions. Only lsof's unambiguous no-match exit means idle.
 export async function legacyCodexProfilesInUse(legacyDir, exec = execFileAsync) {
+  return (await legacyCodexProfilesUsage(legacyDir, exec)).inUse;
+}
+
+/// Only executable basenames leave the inspection. Command/environment output
+/// is used solely for the existing blocking decision and is never reported.
+export async function legacyCodexProfilesUsage(legacyDir, exec = execFileAsync) {
+  const holders = new Set();
+  const busy = () => ({ inUse: true, holders: [...holders] });
   // CLI sessions block even without open files. Bundled app servers only
   // block when they reference the legacy root; lsof also checks their cwd.
   let pids = [];
@@ -49,7 +57,10 @@ export async function legacyCodexProfilesInUse(legacyDir, exec = execFileAsync) 
       if (String(result.stderr || '').trim() || !/^\/[^\r\n]+\/codex$/.test(executable)) {
         throw new Error('process inspection inconclusive');
       }
-      if (!/\.app\/Contents\/(?:Resources|Frameworks)\//.test(executable)) return true;
+      if (!/\.app\/Contents\/(?:Resources|Frameworks)\//.test(executable)) {
+        holders.add('codex');
+        continue;
+      }
       // -E includes the launch environment, which lsof cannot inspect.
       // Never log this output: it may contain credentials.
       const details = await exec('/bin/ps', ['-ww', '-E', '-o', 'command=', '-p', pid], {
@@ -60,9 +71,10 @@ export async function legacyCodexProfilesInUse(legacyDir, exec = execFileAsync) 
           || !(command === executable || command.startsWith(`${executable} `))) {
         throw new Error('process inspection inconclusive');
       }
-      if (referencesLegacyDir(executable, legacyDir) || referencesLegacyDir(command, legacyDir)) return true;
+      if (referencesLegacyDir(executable, legacyDir) || referencesLegacyDir(command, legacyDir)) holders.add('codex');
     }
   } catch {
+    if (holders.size) return busy();
     throw new Error('process inspection unavailable');
   }
   let result;
@@ -72,11 +84,28 @@ export async function legacyCodexProfilesInUse(legacyDir, exec = execFileAsync) 
     });
   } catch (error) {
     if (error.code === 1 && !error.signal && !error.killed && !String(error.stdout || '').trim()
-        && !String(error.stderr || '').trim()) return false;
+        && !String(error.stderr || '').trim()) return { inUse: holders.size > 0, holders: [...holders] };
+    if (holders.size) return busy();
     throw new Error('process inspection unavailable');
   }
-  if (String(result.stderr || '').trim()) throw new Error('process inspection incomplete');
-  if (/^p\d+$/m.test(result.stdout || '')) return true;
+  if (String(result.stderr || '').trim()) {
+    if (holders.size) return busy();
+    throw new Error('process inspection incomplete');
+  }
+  const openPids = [...new Set([...String(result.stdout || '').matchAll(/^p(\d+)$/gm)].map((match) => match[1]))];
+  if (openPids.length) {
+    for (const pid of openPids) {
+      try {
+        const detail = await exec('/bin/ps', ['-ww', '-o', 'comm=', '-p', pid], { timeout: 10_000, maxBuffer: 1_000_000 });
+        const executable = String(detail.stdout || '').trim();
+        if (!String(detail.stderr || '').trim() && /^\/[^\r\n]+$/.test(executable)) {
+          holders.add(path.basename(executable));
+        }
+      } catch { /* An unreadable or exited holder still blocks the move. */ }
+    }
+    return busy();
+  }
+  if (holders.size) return busy();
   throw new Error('process inspection inconclusive');
 }
 
@@ -165,12 +194,14 @@ async function replaceLink(link, target, io) {
 /// succeed first. Backups remain inert recovery data, never another CODEX_HOME.
 export async function migrateCodexProfilesDir({
   store, legacyDir, profilesDir, activeLink, dataDir,
-  io = fs.promises, isLegacyInUse = legacyCodexProfilesInUse,
+  io = fs.promises, isLegacyInUse = legacyCodexProfilesUsage,
   uid = process.getuid?.(), now = () => new Date(), log = () => {},
 }) {
   const report = (message) => { try { log(message); } catch { /* Logging cannot affect the transaction. */ } };
   if (!legacyDir) return {};
   let stage = 'checking directories';
+  let processDeferred = false;
+  let holders = [];
   let backupDir;
   let createdDestination = false;
   let markerCreated = false;
@@ -223,9 +254,19 @@ export async function migrateCodexProfilesDir({
       return {};
     }
     const ensureIdle = async () => {
-      if (await isLegacyInUse(legacyDir) !== false) throw new Error('legacy profiles are in use');
+      try {
+        const usage = await isLegacyInUse(legacyDir);
+        // Keep boolean injection compatibility and fail closed on unknown results.
+        if (usage === false || usage?.inUse === false) return;
+        holders = [...new Set((usage?.holders || []).filter((name) => typeof name === 'string'
+          && name && !/[\/\\\r\n\x00-\x1f]/.test(name) && !name.includes('CODEX_HOME')))];
+        throw new Error('legacy profiles are in use');
+      } catch {
+        processDeferred = true;
+        throw new Error('process inspection deferred');
+      }
     };
-    stage = 'checking for running processes (close Codex sessions and retry at next start)';
+    stage = 'checking for running processes';
     await ensureIdle();
     stage = 'validating profile trees';
     const entries = [];
@@ -404,10 +445,15 @@ export async function migrateCodexProfilesDir({
         if (target === legacyDir || within(target, legacyDir)) await io.realpath(activeLink);
       }
     });
-    const warning = `Codex profiles migration failed or deferred while ${stage}. ${rollbackFailed
-      ? 'Rollback incomplete; profile operations are blocked. Preserve the recovery backup in the ModelDeck data directory.'
-      : 'Original account references retained; retry on the next daemon start.'}`;
+    const retryable = processDeferred && !rollbackFailed;
+    const names = holders.slice(0, 5);
+    if (holders.length > 5) names.push(`${holders.length - 5} more`);
+    const waitingOn = names.length ? new Intl.ListFormat('en', { type: 'conjunction' }).format(names) : 'running processes';
+    const warning = retryable ? `Codex profile move is waiting on ${waitingOn}`
+      : `Codex profiles migration failed or deferred while ${stage}. ${rollbackFailed
+        ? 'Rollback incomplete; profile operations are blocked. Preserve the recovery backup in the ModelDeck data directory.'
+        : 'Original account references retained.'}`;
     report(warning);
-    return { warning, blocked: rollbackFailed, ...(!rollbackFailed ? { profilesDir: legacyDir } : {}) };
+    return { warning, holders, retryable, blocked: rollbackFailed, ...(!rollbackFailed ? { profilesDir: legacyDir } : {}) };
   }
 }

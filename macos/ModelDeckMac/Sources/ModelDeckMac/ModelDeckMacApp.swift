@@ -98,7 +98,14 @@ struct ModelDeckMacApp: App {
         // Phase 5: the same loopback client powers Activate (POST) and the
         // post-switch verification read; a verified state is pushed straight
         // into the status model so the badge and icon agree immediately.
-        let deckModel = DeckPopoverModel(activator: client, stateProvider: client)
+        // Issue #677: the same client runs the deferred Codex profile move on
+        // demand, so the header line's "Move now" is a real action rather
+        // than a description of one.
+        let deckModel = DeckPopoverModel(
+            activator: client,
+            stateProvider: client,
+            codexMigrator: client
+        )
         deckModel.onVerifiedState = { [weak statusModel] state in
             statusModel?.apply(deckState: state)
         }
@@ -351,6 +358,10 @@ struct ModelDeckMacApp: App {
                 // a health-mode dot picks up a burst-degraded verdict from
                 // THIS sample, not the next refresh's.
                 statusModel.recordBurnSample(state: state)
+                // Issue #677: the daemon retries the Codex profile move on
+                // its own every ~10 minutes, so every fresh state is also
+                // the newest word on whether it is still waiting.
+                deckModel.applyCodexProfilesMigration(state.codexProfilesMigration)
                 // Issue #228: a fresh daemon state that contradicts a
                 // leftover optimistic activation override clears it — the
                 // deck must never keep a ✓ the daemon disowns once no

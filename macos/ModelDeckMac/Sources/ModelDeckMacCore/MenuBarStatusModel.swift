@@ -570,11 +570,38 @@ public final class MenuBarStatusModel: ObservableObject {
     /// Issue #660: the deck header's one-line busy notice, plain words, nil
     /// unless the connection is `.busy`. Ages the last SUCCESSFUL read, so
     /// "showing data from 11 min ago" is literally how old the cards are.
+    ///
+    /// Issue #675: nil with no successful read behind it. There are no cards
+    /// to explain in that state, and `firstLoadPlaceholderText` is already
+    /// saying the service is busy where the cards would be — a bare "Daemon
+    /// busy" in the header would say it a second time, louder and vaguer.
     public func busyStatusText(now: Date? = nil) -> String? {
         guard case .busy = connection else { return nil }
-        guard let lastUpdatedAt else { return "Daemon busy" }
+        guard let lastUpdatedAt else { return nil }
         let age = DeckFreshness.ageText(observedAt: lastUpdatedAt, now: now ?? clock())
         return "Daemon busy · showing data from \(age)"
+    }
+
+    /// Issue #675: what the deck shows where the cards go before any state
+    /// has arrived this launch. "Connecting to daemon…" is the TRUE unknown —
+    /// no probe has answered yet — and stops being the answer the moment
+    /// health answers: a daemon that is merely slow to hand over data (one
+    /// pruning a backlog right after an update) gets its own plain sentence
+    /// instead of wearing a dead daemon's string for six minutes (Tim, on
+    /// the 1.1.11 first start). `afterUpdate` is the setup model's
+    /// `didReregisterForUpdate` — the same launch re-registered the
+    /// background service for this app version, so the update is why.
+    public func firstLoadPlaceholderText(afterUpdate: Bool = false) -> String {
+        switch connection {
+        case .unknown:
+            return "Connecting to daemon…"
+        case .busy where !hasLoadedOnce:
+            return afterUpdate
+                ? "The background service is busy after the update. The deck will fill in shortly."
+                : "The background service is busy. The deck will fill in shortly."
+        case .busy, .connected, .unreachable:
+            return "No usage data yet."
+        }
     }
 
     /// Adopt a deck state fetched elsewhere (e.g. the Activate flow's

@@ -677,12 +677,57 @@ struct DeckPopoverView: View {
             // Issue #660: alive but slow is not down — one gray line, no
             // triangle, no repair path; the cards keep their last data.
             TimelineView(.periodic(from: .now, by: 30)) { context in
-                let text = statusModel.busyStatusText(now: context.date) ?? "Daemon busy"
-                Text(text)
+                // Issue #675: nothing here when no read has ever landed —
+                // the placeholder where the cards would be is already
+                // saying the service is busy. One message, not two.
+                if let text = statusModel.busyStatusText(now: context.date) {
+                    Text(text)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help("The daemon is answering but its usage read is taking longer than a minute. The deck keeps refreshing on its normal schedule.")
+                        .accessibilityLabel(text)
+                }
+            }
+        }
+        // Issue #677: the Codex profile move the daemon keeps deferring
+        // because something holds the old folder open. One quiet gray line
+        // below the busy line, naming what it is waiting on, with the one
+        // action that can clear it. No triangle and no repair copy: nothing
+        // is broken, and the old "close Codex sessions and retry at next
+        // start" was not something a user with ChatGPT open could do.
+        // Only while the daemon is answering and the setup card is not
+        // already telling the story (#96): retained migration state would
+        // otherwise keep the move button clickable against a daemon that cannot
+        // take the request (CodeRabbit, PR #682).
+        if let migrationLine = deckModel.codexProfilesMigrationLine,
+           statusModel.connection.daemonAnswered,
+           !setupModel.phase.needsPopoverCard {
+            HStack(spacing: 6) {
+                Text(migrationLine)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .help("The daemon is answering but its usage read is taking longer than a minute. The deck keeps refreshing on its normal schedule.")
-                    .accessibilityLabel(text)
+                    .accessibilityLabel(migrationLine)
+                if deckModel.canMoveCodexProfiles {
+                    Button(deckModel.codexProfilesMoveTitle) {
+                        Task { await deckModel.moveCodexProfilesNow() }
+                    }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                    .disabled(deckModel.isMovingCodexProfiles)
+                }
+            }
+        }
+        if deckModel.codexProfilesMovedNoticeVisible {
+            // Issue #677: the move finally ran, said once. Launch-scoped and
+            // never persisted, the same shape as the #269 notice below.
+            DismissibleHeaderNotice(
+                dismissHelp: "Dismiss",
+                dismissAccessibilityLabel: "Dismiss Codex profiles moved notice",
+                onDismiss: { deckModel.dismissCodexProfilesMovedNotice() }
+            ) {
+                Text(CodexProfilesMigrationCopy.movedNotice)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
         }
         if setupModel.didReregisterForUpdate {
@@ -863,10 +908,16 @@ struct DeckPopoverView: View {
                     }
                 }
             }
-        } else if case .unknown = statusModel.connection {
-            placeholder("Connecting to daemon…")
         } else {
-            placeholder("No usage data yet.")
+            // Issue #675: the model owns this copy — it decides between
+            // the connecting line (nothing has answered yet), the
+            // busy-after-update sentence, and the no-data line. The
+            // tripwire keeps those strings out of this file, so a future
+            // edit here cannot reintroduce a placeholder that reads the
+            // same whether the daemon is slow or dead.
+            placeholder(statusModel.firstLoadPlaceholderText(
+                afterUpdate: setupModel.didReregisterForUpdate
+            ))
         }
     }
 

@@ -85,6 +85,9 @@ struct AppUpdateDialogView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if let notes = dialog.releaseNotes {
+                releaseNotesBody(notes)
+            }
         case .checking, .downloading, .extracting, .installing, .relaunching:
             AppUpdateInstallProgressView(installModel: installModel)
         case .installedPendingRelaunch:
@@ -102,6 +105,42 @@ struct AppUpdateDialogView: View {
         }
     }
 
+    /// Issue #675: the release notes read INSIDE the dialog (Tim, after
+    /// 1.1.11/1.1.12: updating "could be a bit more sophisticated"). Scrolls
+    /// under a fixed cap so a long release can never push the buttons off
+    /// screen, and the browser link moves under it. No web view.
+    private func releaseNotesBody(_ notes: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ScrollView {
+                Text(Self.attributedNotes(notes))
+                    .font(.callout)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 220)
+            if let releaseURL = dialog.releaseURL {
+                Button("Open on GitHub") { openURL(releaseURL) }
+                    .buttonStyle(.link)
+                    .controlSize(.small)
+                    .help("Opens the full release page on GitHub.")
+            }
+        }
+    }
+
+    /// Inline-only markdown: bold and links render; list markers and any
+    /// remaining heading stay as the plain text they are rather than
+    /// vanishing. A body that will not parse renders verbatim.
+    static func attributedNotes(_ notes: String) -> AttributedString {
+        (try? AttributedString(
+            markdown: notes,
+            options: AttributedString.MarkdownParsingOptions(
+                interpretedSyntax: .inlineOnlyPreservingWhitespace,
+                failurePolicy: .returnPartiallyParsedIfPossible
+            )
+        )) ?? AttributedString(notes)
+    }
+
     @ViewBuilder
     private var buttons: some View {
         HStack {
@@ -110,7 +149,12 @@ struct AppUpdateDialogView: View {
                 if dialog.offersInstall, let releaseURL = dialog.releaseURL {
                     // Issue #121 (Tim directive 2026-07-22): Update Now
                     // primary; the release page demotes to "Release Notes".
-                    Button("Release Notes") { openURL(releaseURL) }
+                    // Issue #675: when the notes are rendered above, that
+                    // link lives under them as "Open on GitHub" instead —
+                    // one way out to the browser, never two.
+                    if dialog.releaseNotes == nil {
+                        Button("Release Notes") { openURL(releaseURL) }
+                    }
                     Spacer()
                     Button("Cancel") { onDismiss() }
                         .keyboardShortcut(.cancelAction)

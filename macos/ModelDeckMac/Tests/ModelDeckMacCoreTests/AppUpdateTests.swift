@@ -143,6 +143,27 @@ struct GitHubReleaseCheckerTests {
         #expect(transport.requests.first?.value(forHTTPHeaderField: "x-modeldeck-token") == nil)
     }
 
+    // Issue #675: the release body is what the update dialog now reads out
+    // loud, so the feed has to carry it — and a release published without one
+    // is still a perfectly good release.
+    @Test func decodesTheReleaseBodyAsNotes() async throws {
+        let transport = StubTransport(stubs: [.init(status: 200, body: #"""
+        {"tag_name": "v1.1.12", "html_url": "https://github.com/timharris707/modeldeck/releases/tag/v1.1.12", "body": "# ModelDeck 1.1.12\n\nA lead paragraph.\n\n**Something changed.** And here is why."}
+        """#)])
+        let release = try await GitHubReleaseChecker(transport: transport).latestRelease()
+        #expect(release?.notes?.hasPrefix("# ModelDeck 1.1.12") == true)
+        #expect(release?.notes?.contains("**Something changed.**") == true)
+    }
+
+    @Test func aReleaseWithoutABodyStillDecodes() async throws {
+        let transport = StubTransport(stubs: [.init(status: 200, body: #"""
+        {"tag_name": "v0.3.0", "html_url": "https://github.com/timharris707/modeldeck/releases/tag/v0.3.0"}
+        """#)])
+        let release = try await GitHubReleaseChecker(transport: transport).latestRelease()
+        #expect(release?.version == "0.3.0")
+        #expect(release?.notes == nil)
+    }
+
     @Test func notFoundMeansNoReleasesYet() async throws {
         let transport = StubTransport(stubs: [.init(status: 404, body: #"{"message": "Not Found"}"#)])
         let release = try await GitHubReleaseChecker(transport: transport).latestRelease()
@@ -191,6 +212,26 @@ struct AppUpdateDialogTests {
         #expect(dialog?.title == "Version 0.3.0 is available")
         #expect(dialog?.message == "You're running v0.2.0. View the release to download it.")
         #expect(dialog?.releaseURL == releaseURL) // → View Release + Cancel
+    }
+
+    // Issue #675: the notes travel with the dialog, heading stripped, so the
+    // user reads what they are getting before clicking Update Now.
+    @Test func updateAvailableDialogCarriesTheReleaseNotes() {
+        let release = AppReleaseInfo(
+            version: "1.1.12",
+            url: releaseURL,
+            notes: "# ModelDeck 1.1.12\n\nA lead paragraph.\n\n**Bold lead.** Detail."
+        )
+        let dialog = AppUpdateModel.dialog(for: .updateAvailable(release), currentVersion: "1.1.11")
+        #expect(dialog?.releaseNotes == "A lead paragraph.\n\n**Bold lead.** Detail.")
+    }
+
+    @Test func aReleaseWithoutNotesGivesTheDialogNone() {
+        let release = AppReleaseInfo(version: "0.3.0", url: releaseURL)
+        let dialog = AppUpdateModel.dialog(for: .updateAvailable(release), currentVersion: "0.2.0")
+        #expect(dialog?.releaseNotes == nil)
+        // Nothing to read is silent, never an apology in the dialog.
+        #expect(dialog?.message == "You're running v0.2.0. View the release to download it.")
     }
 
     @Test func unavailableDialogKeepsTheHonestMessage() {
@@ -258,17 +299,45 @@ struct AppUpdateAutoCheckerTests {
         )
     }
 
-    @Test func disabledByDefaultAndTogglePersists() {
+    // Issue #675 (Tim, 2026-09-19): ON out of the box. It shipped off, so a
+    // fresh install checked for updates only if someone found the switch.
+    @Test func enabledByDefaultAndTogglePersists() {
         let defaults = freshDefaults()
         let auto = makeChecker(
             checker: StubReleaseChecker(), defaults: defaults,
             clock: TestClock(), log: NotificationLog())
+        #expect(auto.isEnabled)
+        auto.setEnabled(false)
         #expect(!auto.isEnabled)
+        #expect(!defaults.bool(forKey: AppUpdateAutoChecker.enabledDefaultsKey))
         auto.setEnabled(true)
         #expect(auto.isEnabled)
         #expect(defaults.bool(forKey: AppUpdateAutoChecker.enabledDefaultsKey))
-        auto.setEnabled(false)
-        #expect(!defaults.bool(forKey: AppUpdateAutoChecker.enabledDefaultsKey))
+    }
+
+    // TRIPWIRE auto-check-default-on: the default must never overrule a user
+    // who turned automatic checks OFF — that persisted false outlives every
+    // relaunch, and re-enabling it behind their back is the regression.
+    @Test func aStoredOffChoiceSurvivesTheNewDefault() {
+        let defaults = freshDefaults()
+        let first = makeChecker(
+            checker: StubReleaseChecker(), defaults: defaults,
+            clock: TestClock(), log: NotificationLog())
+        first.setEnabled(false)
+        // Next launch, same stored preference.
+        let relaunched = makeChecker(
+            checker: StubReleaseChecker(), defaults: defaults,
+            clock: TestClock(), log: NotificationLog())
+        #expect(!relaunched.isEnabled)
+    }
+
+    @Test func aStoredOnChoiceIsAlsoHonoured() {
+        let defaults = freshDefaults()
+        defaults.set(true, forKey: AppUpdateAutoChecker.enabledDefaultsKey)
+        let auto = makeChecker(
+            checker: StubReleaseChecker(), defaults: defaults,
+            clock: TestClock(), log: NotificationLog())
+        #expect(auto.isEnabled)
     }
 
     @Test func dueRuleIsDailyFromTheLastCheck() {
@@ -284,6 +353,8 @@ struct AppUpdateAutoCheckerTests {
         let auto = makeChecker(
             checker: checker, defaults: freshDefaults(),
             clock: TestClock(), log: NotificationLog())
+        // Issue #675: the toggle now starts ON, so the off case is set here.
+        auto.setEnabled(false)
         await auto.checkIfDue()
         #expect(checker.callCount == 0)
     }
@@ -376,5 +447,35 @@ struct AppUpdateAutoCheckerTests {
             currentVersion: nil
         )
         #expect(!devNote.body.contains("You're running"))
+    }
+}
+
+// Issue #675 — the release body as the dialog shows it.
+@Suite("Release notes for display (issue #675)")
+struct AppReleaseNotesTests {
+    @Test func dropsTheReleaseHeadingTheDialogTitleAlreadyShows() {
+        let raw = "# ModelDeck 1.1.12\n\nThis release fixes the update flow.\n\n- one\n- two"
+        #expect(AppReleaseNotes.forDisplay(raw)
+            == "This release fixes the update flow.\n\n- one\n- two")
+    }
+
+    @Test func aBodyWithNoHeadingIsLeftAlone() {
+        #expect(AppReleaseNotes.forDisplay("Just a paragraph.") == "Just a paragraph.")
+    }
+
+    @Test func windowsLineEndingsAndBlankEdgesAreNormalized() {
+        #expect(AppReleaseNotes.forDisplay("\r\n# ModelDeck 1.0.0\r\n\r\nBody.\r\n\r\n") == "Body.")
+    }
+
+    @Test func nothingToReadIsNil() {
+        #expect(AppReleaseNotes.forDisplay(nil) == nil)
+        #expect(AppReleaseNotes.forDisplay("") == nil)
+        #expect(AppReleaseNotes.forDisplay("   \n\n") == nil)
+        // Heading only: the dialog title already says that much.
+        #expect(AppReleaseNotes.forDisplay("# ModelDeck 1.1.12\n") == nil)
+    }
+
+    @Test func aDeeperHeadingIsNotMistakenForTheTitle() {
+        #expect(AppReleaseNotes.forDisplay("## Fixes\n\nBody.") == "## Fixes\n\nBody.")
     }
 }

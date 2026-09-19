@@ -267,6 +267,40 @@ public struct DaemonClient: Sendable {
         return envelope.clientKeyHelper
     }
 
+    /// `POST /api/codex-profiles/migrate` — run the deferred Codex profile
+    /// move now (issue #677). No body; the daemon answers with exactly one of
+    /// `moved`, `deferred` (plus the holders it found) or `not-needed`. Same
+    /// mutation token header + cookie as every other POST.
+    ///
+    /// The move copies profile trees and rewrites account references, so it
+    /// gets the long read budget rather than the 5 s default. A client-side
+    /// timeout is not a verdict: the daemon finishes (or defers) on its own
+    /// and the next `/api/state` read carries the answer.
+    public func migrateCodexProfiles() async throws -> CodexProfilesMigrationOutcome {
+        struct Envelope: Decodable {
+            var status: String
+            var holders: [String]?
+        }
+        var request = try await authorizedRequest(
+            method: "POST",
+            pathComponents: ["api", "codex-profiles", "migrate"]
+        )
+        request.timeoutInterval = Self.dataReadTimeout
+        let envelope: Envelope = try await send(request)
+        switch envelope.status {
+        case "moved": return .moved
+        case "deferred": return .deferred(holders: envelope.holders ?? [])
+        case "not-needed": return .notNeeded
+        default:
+            // A status this build cannot act on is not a success. Surfacing
+            // it keeps the line up rather than quietly claiming the move ran.
+            throw DaemonClientError.daemonError(
+                message: "The daemon answered with an unknown migration status.",
+                status: 200
+            )
+        }
+    }
+
     /// `GET /api/accounts/:id/client-key-helper` — read-only wiring state,
     /// including a migration that stopped between its two files.
     public func clientKeyHelperWiring(accountID: String) async throws -> ClientKeyHelperWiring {
@@ -780,6 +814,8 @@ private struct DaemonErrorBody: Decodable {
 extension DaemonClient: AccountActivating {}
 
 extension DaemonClient: ManagedProxyReporting {}
+
+extension DaemonClient: CodexProfilesMigrating {}
 
 extension DaemonClient: WorstCapacityProviding {}
 

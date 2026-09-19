@@ -2649,21 +2649,112 @@ public final class DeckPopoverModel: ObservableObject {
     /// the next refresh tick.
     public var onVerifiedState: ((DeckState) -> Void)?
 
+    // MARK: Codex profile move (issue #677)
+
+    /// The holders the move is waiting on, or nil when the deck says
+    /// nothing. Both the daemon's state field and a "Move now" answer reduce
+    /// to this: either the move is still waiting on these (possibly unnamed)
+    /// processes, or there is nothing to tell the user. An empty array is a
+    /// real waiting state with no names, not a quiet one.
+    @Published private var codexWaitingHolders: [String]?
+    /// True while the POST is in flight. The button is disabled and reads
+    /// "Moving…" for as long as this holds.
+    @Published public private(set) var isMovingCodexProfiles = false
+    /// The last "Move now" refusal or transport failure, shown after the
+    /// waiting sentence. One at a time: a new attempt clears it.
+    @Published private var codexMoveFailure: String?
+    /// The launch-scoped "Codex profiles moved." line, raised only by a
+    /// successful "Move now". Deliberately not persisted and never raised
+    /// from a `done` state read: the daemon reports `done` for the rest of
+    /// its life, and the deck has nothing left to say about it.
+    @Published public private(set) var codexProfilesMovedNoticeVisible = false
+    private var codexMovedNoticeDismissed = false
+
+    /// Adopt the daemon's report from a fresh `/api/state`. A read that lands
+    /// mid-move is ignored: it predates the answer the POST is about to give.
+    public func applyCodexProfilesMigration(_ migration: CodexProfilesMigration?) {
+        guard !isMovingCodexProfiles else { return }
+        switch migration?.status {
+        case .deferred:
+            codexWaitingHolders = migration?.holders ?? []
+        case .done, nil:
+            codexWaitingHolders = nil
+            codexMoveFailure = nil
+        }
+    }
+
+    /// The header's one gray line, or nil when the deck stays quiet.
+    public var codexProfilesMigrationLine: String? {
+        guard let codexWaitingHolders else { return nil }
+        let sentence = CodexProfilesMigrationCopy.waitingSentence(holders: codexWaitingHolders)
+        guard let codexMoveFailure else { return sentence }
+        return "\(sentence) \(codexMoveFailure)"
+    }
+
+    /// Whether the "Move now" button renders at all. It needs a line to sit
+    /// beside and a client to call.
+    public var canMoveCodexProfiles: Bool {
+        codexWaitingHolders != nil && codexMigrator != nil
+    }
+
+    /// The button's title: it says what it is doing while it does it.
+    public var codexProfilesMoveTitle: String {
+        isMovingCodexProfiles
+            ? CodexProfilesMigrationCopy.movingTitle
+            : CodexProfilesMigrationCopy.moveNowTitle
+    }
+
+    /// Run the move now. One attempt at a time; the daemon is the authority
+    /// on what happened, so every branch here just adopts its answer.
+    public func moveCodexProfilesNow() async {
+        guard let codexMigrator, codexWaitingHolders != nil, !isMovingCodexProfiles else { return }
+        isMovingCodexProfiles = true
+        codexMoveFailure = nil
+        defer { isMovingCodexProfiles = false }
+        do {
+            switch try await codexMigrator.migrateCodexProfiles() {
+            case .moved:
+                codexWaitingHolders = nil
+                if !codexMovedNoticeDismissed { codexProfilesMovedNoticeVisible = true }
+            case .deferred(let holders):
+                codexWaitingHolders = holders
+            case .notNeeded:
+                codexWaitingHolders = nil
+            }
+        } catch {
+            // The line stays: the move is still waiting, and the reason
+            // belongs next to the thing it failed to do.
+            codexMoveFailure = CodexProfilesMigrationCopy.failure(error.localizedDescription)
+        }
+    }
+
+    /// Dismiss the moved notice for this launch. It never comes back, the
+    /// same shape as the #269 background-service notice.
+    public func dismissCodexProfilesMovedNotice() {
+        codexProfilesMovedNoticeVisible = false
+        codexMovedNoticeDismissed = true
+    }
+
     public var thresholds: UsageThresholds
     private let defaults: UserDefaults
     private let activator: (any AccountActivating)?
     private let stateProvider: (any DeckStateProviding)?
+    /// Issue #677: nil leaves the waiting line readable with no action, the
+    /// honest state for a build with no daemon connection.
+    private let codexMigrator: (any CodexProfilesMigrating)?
 
     public init(
         thresholds: UsageThresholds = .default,
         defaults: UserDefaults = .standard,
         activator: (any AccountActivating)? = nil,
-        stateProvider: (any DeckStateProviding)? = nil
+        stateProvider: (any DeckStateProviding)? = nil,
+        codexMigrator: (any CodexProfilesMigrating)? = nil
     ) {
         self.thresholds = thresholds
         self.defaults = defaults
         self.activator = activator
         self.stateProvider = stateProvider
+        self.codexMigrator = codexMigrator
         self.changeTracker = DeckChangeTracker(defaults: defaults)
         self.layout = defaults.string(forKey: Self.layoutDefaultsKey)
             .flatMap(DeckLayout.init(rawValue:)) ?? .twoColumn

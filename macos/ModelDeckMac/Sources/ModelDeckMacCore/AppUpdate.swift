@@ -21,10 +21,38 @@ public struct AppReleaseInfo: Equatable, Sendable {
     public var version: String
     /// The release's human page — what "View Release" opens.
     public var url: URL
+    /// Issue #675: the release's markdown body — the contents of
+    /// docs/release-notes/<version>.md as GitHub publishes it. nil when the
+    /// feed carries no body (older releases), which every surface treats as
+    /// "no notes to show", never as a failure.
+    public var notes: String?
 
-    public init(version: String, url: URL) {
+    public init(version: String, url: URL, notes: String? = nil) {
         self.version = version
         self.url = url
+        self.notes = notes
+    }
+}
+
+/// Issue #675: the release body as the update dialog renders it. The feed's
+/// markdown opens with its own "# ModelDeck 1.1.12" heading and the dialog
+/// title already names the version, so a leading level-1 heading is dropped;
+/// blank edges go with it. nil for a release with nothing to read.
+public enum AppReleaseNotes {
+    public static func forDisplay(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        var lines = raw
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .components(separatedBy: "\n")
+        while let first = lines.first, first.trimmingCharacters(in: .whitespaces).isEmpty {
+            lines.removeFirst()
+        }
+        if let first = lines.first, first.hasPrefix("# ") {
+            lines.removeFirst()
+        }
+        let text = lines.joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
     }
 }
 
@@ -68,10 +96,14 @@ public struct GitHubReleaseChecker: AppReleaseChecking {
     private struct ReleaseBody: Decodable {
         var tagName: String
         var htmlUrl: String
+        /// Issue #675: optional on purpose — a release with no body is a
+        /// release without notes, not a broken feed answer.
+        var body: String?
 
         enum CodingKeys: String, CodingKey {
             case tagName = "tag_name"
             case htmlUrl = "html_url"
+            case body
         }
     }
 
@@ -96,7 +128,7 @@ public struct GitHubReleaseChecker: AppReleaseChecking {
         }
         let version = AppVersion.normalized(tag: body.tagName)
         guard !version.isEmpty else { throw AppReleaseCheckError.invalidResponse }
-        return AppReleaseInfo(version: version, url: url)
+        return AppReleaseInfo(version: version, url: url, notes: body.body)
     }
 }
 
@@ -198,12 +230,23 @@ public final class AppUpdateModel: ObservableObject {
         /// True only when this build can install in-app (a Sparkle driver is
         /// attached) — the dialog's primary button becomes "Update Now".
         public var offersInstall: Bool
+        /// Issue #675: the release notes to read INSIDE the dialog, heading
+        /// stripped (`AppReleaseNotes.forDisplay`). nil means no notes are
+        /// available and the dialog shows none — it never says so.
+        public var releaseNotes: String?
 
-        public init(title: String, message: String, releaseURL: URL? = nil, offersInstall: Bool = false) {
+        public init(
+            title: String,
+            message: String,
+            releaseURL: URL? = nil,
+            offersInstall: Bool = false,
+            releaseNotes: String? = nil
+        ) {
             self.title = title
             self.message = message
             self.releaseURL = releaseURL
             self.offersInstall = offersInstall
+            self.releaseNotes = releaseNotes
         }
     }
 
@@ -237,7 +280,8 @@ public final class AppUpdateModel: ObservableObject {
                     ? running + "Update Now downloads, verifies, and installs it, then relaunches ModelDeck."
                     : running + "View the release to download it.",
                 releaseURL: release.url,
-                offersInstall: canInstall
+                offersInstall: canInstall,
+                releaseNotes: AppReleaseNotes.forDisplay(release.notes)
             )
         case .unavailable(let message):
             return ResultDialog(title: "Couldn't check for updates", message: message)
@@ -278,6 +322,12 @@ public struct AppUpdateNotification: Equatable, Sendable {
 /// download + stage when "Install updates automatically" is on, availability
 /// notice otherwise. Without a driver (dev builds, pre-Sparkle releases) the
 /// original notify-only behavior is unchanged.
+///
+/// Issue #675 (Tim, 2026-09-19): the toggle DEFAULTS ON. It shipped off, so
+/// a fresh install never checked at all until someone found the switch —
+/// while "Install updates automatically" was already on by spec, waiting for
+/// a check that never ran. Turning it off is still honoured forever; only
+/// the never-touched case changed.
 @MainActor
 public final class AppUpdateAutoChecker: ObservableObject {
     nonisolated public static let enabledDefaultsKey = "modeldeck.appupdate.autoCheckEnabled"
@@ -316,11 +366,19 @@ public final class AppUpdateAutoChecker: ObservableObject {
         self.defaults = defaults
         self.clock = clock
         self.notify = notify
-        self.isEnabled = defaults.bool(forKey: Self.enabledDefaultsKey)
+        self.isEnabled = Self.storedEnabled(in: defaults)
     }
 
     deinit {
         schedulerTask?.cancel()
+    }
+
+    /// Issue #675: unset means ON. An explicit choice — either way — is
+    /// written to the key and wins from then on, so a user who turned
+    /// automatic checks off never has them turned back on by this default.
+    nonisolated static func storedEnabled(in defaults: UserDefaults) -> Bool {
+        guard defaults.object(forKey: enabledDefaultsKey) != nil else { return true }
+        return defaults.bool(forKey: enabledDefaultsKey)
     }
 
     /// The Settings toggle. Enabling starts the schedule (with an immediate

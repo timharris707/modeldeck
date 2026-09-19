@@ -177,6 +177,7 @@ export function createApp({
   let startup = Promise.resolve();
 
   const server = http.createServer(async (req, res) => {
+    let migrationReader = false;
     try {
       await startup;
       const actualPort = server.address()?.port || port;
@@ -186,6 +187,14 @@ export function createApp({
       if (!loopbackPeer(req)) return json(res, 403, { error: 'loopback connections only' });
       if (!hostAllowed(req, actualPort)) return json(res, 403, { error: 'unexpected host header' });
       const url = new URL(req.url, `http://${host}:${actualPort}`);
+      const migrationRequest = req.method === 'POST' && url.pathname === '/api/codex-profiles/migrate';
+      if (!migrationRequest && url.pathname !== '/api/health') {
+        // Readers and mutations see either the original or the published
+        // profile tree. An on-demand request joins the attempt in its route.
+        while (ownedService.codexProfilesMigrationPromise) await ownedService.codexProfilesMigrationPromise;
+        ownedService.codexProfilesMigrationReaders = (ownedService.codexProfilesMigrationReaders || 0) + 1;
+        migrationReader = true;
+      }
       if (ownedService.codexProfilesMigrationBlocked && url.pathname !== '/api/health') {
         return json(res, 503, { error: ownedService.codexProfilesMigrationWarning });
       }
@@ -229,6 +238,12 @@ export function createApp({
           ok: true, name: 'ModelDeck', version: VERSION, MDGitCommit: GIT_COMMIT, tokenSource, projectsRoot: ownedService.projectsRoot,
           ...(ownedService.codexProfilesMigrationWarning ? { warning: ownedService.codexProfilesMigrationWarning } : {}),
         });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/codex-profiles/migrate') {
+        const result = await ownedService.migrateCodexProfilesDir();
+        return json(res, 200, result.migrated ? { status: 'moved' }
+          : result.warning ? { status: 'deferred', holders: result.holders || [] }
+            : { status: 'not-needed' });
       }
       if (req.method === 'GET' && url.pathname === '/api/state') return json(res, 200, await ownedService.state());
       if (req.method === 'GET' && url.pathname === '/api/config-lint') {
@@ -700,6 +715,8 @@ export function createApp({
         ...(EXPOSED_ERROR_CODES.has(error.code) ? { code: error.code } : {}),
         ...(error.code === 'profile-exists' ? { profile: error.profile } : {}),
       });
+    } finally {
+      if (migrationReader) ownedService.codexProfilesMigrationReaders -= 1;
     }
   });
 
@@ -733,6 +750,7 @@ export function createApp({
     async close() {
       await startup;
       await Promise.all([
+        ownedService.stopCodexProfilesMigration?.() || Promise.resolve(),
         ownedService.stopAutoRefresh(),
         ownedService.stopUsageSnapshotRetention?.() || Promise.resolve(),
         ownedService.stopUsageQueueConsumer?.() || Promise.resolve(),

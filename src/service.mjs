@@ -96,7 +96,7 @@ import { refitUsageEstimates } from './usage-estimate.mjs';
 import { collectConfigLintSnapshot, configLintSnapshotOptions } from './config-linter-snapshot.mjs';
 import { configLintFailureFindings, evaluateConfigLint } from './config-linter.mjs';
 import { CODEX_PROFILES_DIR } from './paths.mjs';
-import { migrateCodexProfilesDir } from './codex-profiles-migration.mjs';
+import { migrateCodexProfilesDir, legacyCodexProfilesUsage } from './codex-profiles-migration.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -114,6 +114,9 @@ const ACTIVE_SESSION_REFRESH_CAP_MS = 30 * 60_000;
 
 const DAY_MS = 24 * 60 * 60_000;
 export const USAGE_SNAPSHOT_PRUNE_INTERVAL_MS = DAY_MS;
+const USAGE_SNAPSHOT_FIRST_PRUNE_DELAY_MS = 30_000;
+const OTEL_QUARANTINE_PRUNE_PAUSE_MS = 25;
+const OTEL_QUARANTINE_CHECKPOINT_BATCHES = 20;
 export const WAREHOUSE_INGEST_INTERVAL_MS = 15 * 60_000;
 export const CONFIG_LINT_INTERVAL_MS = DAY_MS;
 
@@ -904,6 +907,10 @@ export class ModelDeckService {
     this.codexProfilesMigrationWarning = null;
     this.codexProfilesMigrationBlocked = false;
     this.codexProfilesMigrationPromise = null;
+    this.codexProfilesMigrationTimer = null;
+    this.codexProfilesMigrationStopped = false;
+    this.codexProfilesMigration = null;
+    this.codexProfilesMigrationReaders = 0;
     this.codexShellEnvFile = options.codexShellEnvFile || path.join(this.dataDir, 'codex-env.sh');
     this.providerManagementOperations = new Set();
     this.providerTakeovers = new Set();
@@ -991,14 +998,13 @@ export class ModelDeckService {
     this.logRequestUsagePrune = options.logRequestUsagePrune
       || ((count) => console.log(`[modeldeck] request usage pruned: ${count}`));
     this.logOtelQuarantinePrune = options.logOtelQuarantinePrune
-      || ((count) => {
-        if (count > 0) console.log(`[modeldeck] OTLP quarantine pruned: ${count}`);
-      });
+      || ((count, elapsedMs) => console.log(`[modeldeck] OTLP quarantine pruned: ${count} rows in ${(elapsedMs / 1_000).toFixed(2)} s`));
     this.usageSnapshotPruneTimer = null;
     this.usageSnapshotPrunePromise = null;
     this.requestUsagePrunePromise = null;
     this.otelQuarantinePrunePromise = null;
     this.usageSnapshotPruneStarted = false;
+    this.usageSnapshotPruneWaitingForState = false;
     this.usageSnapshotPruneGeneration = 0;
     this.usageQueueConsumerTimer = null;
     this.usageQueueConsumerPromise = null;
@@ -1026,6 +1032,7 @@ export class ModelDeckService {
       || ((message) => console.error(`[modeldeck] ${message}`));
     this.warehouseIngestTimer = null;
     this.warehouseIngestPromise = null;
+    this.warehouseIngestActive = false;
     this.warehouseIngestStarted = false;
     this.warehouseIngestGeneration = 0;
     this.warehouseIngestScheduledEnabled = null;
@@ -1140,6 +1147,7 @@ export class ModelDeckService {
     this.configLintClearTimeout = options.configLintClearTimeout || globalThis.clearTimeout;
     this.configLintLatest = null;
     this.configLintPromise = null;
+    this.configLintActive = false;
     this.configLintTimer = null;
     this.configLintStarted = false;
     this.configLintGeneration = 0;
@@ -1152,6 +1160,9 @@ export class ModelDeckService {
   async runConfigLint() {
     if (this.configLintPromise) return this.configLintPromise;
     const task = (async () => {
+      if (this.codexProfilesMigrationPromise) await this.codexProfilesMigrationPromise;
+      if (this.codexProfilesMigrationBlocked) return this.configLintStatus();
+      this.configLintActive = true;
       let findings;
       try {
         const snapshot = await this.configLintSnapshotCollector(configLintSnapshotOptions(this));
@@ -1169,7 +1180,7 @@ export class ModelDeckService {
     this.configLintPromise = task;
     try { return await task; }
     finally {
-      if (this.configLintPromise === task) this.configLintPromise = null;
+      if (this.configLintPromise === task) { this.configLintPromise = null; this.configLintActive = false; }
     }
   }
 
@@ -1202,10 +1213,31 @@ export class ModelDeckService {
   }
 
   migrateCodexProfilesDir() {
-    if (this.demoFixtures) return Promise.resolve();
+    if (this.codexProfilesMigrationPromise) return this.codexProfilesMigrationPromise;
+    if (this.demoFixtures || this.codexProfilesMigrationStopped) return Promise.resolve({});
+    if (this.codexProfilesMigrationTimer != null) this.clearTimeout(this.codexProfilesMigrationTimer);
+    this.codexProfilesMigrationTimer = null;
     this.codexProfilesMigrationTarget ??= this.codexProfilesDir;
-    this.codexProfilesMigrationPromise ??= migrateCodexProfilesDir({
+    this.codexProfilesMigrationPromise = migrateCodexProfilesDir({
+      now: () => new Date(this.now()),
       ...this.codexMigrationOptions,
+      isLegacyInUse: async (legacyDir) => {
+        const usage = await (this.codexMigrationOptions.isLegacyInUse || legacyCodexProfilesUsage)(legacyDir);
+        if (usage !== false && usage?.inUse !== false) return usage;
+        // Startup used to be the only attempt. Runtime moves also wait for
+        // daemon work that could still hold an old account reference.
+        // A queued lint or ingest pass is WAITING for this migration (its
+        // promise field is set while it awaits us): counting it as a holder
+        // would defer the move against our own waiter and roll back entries
+        // already moved (CodeRabbit, PR #680). Only a pass that has passed
+        // the migration await holds anything.
+        if (this.codexProfilesMigrationReaders || this.refreshPromise || this.warehouseIngestActive
+            || this.configLintActive || this.autoRefreshStartupTasks.size
+            || this.providerManagementOperations.size || this.codexActivationCount) {
+          return { inUse: true, holders: [path.basename(this.daemonExecPath)] };
+        }
+        return usage;
+      },
       store: this.store, legacyDir: this.codexLegacyProfilesDir,
       profilesDir: this.codexProfilesMigrationTarget, activeLink: this.codexActiveLink,
       dataDir: this.dataDir, log: this.logCodexMigration,
@@ -1230,14 +1262,39 @@ export class ModelDeckService {
             await this.writeCodexShellEnvFile(this.providerProfileRef(account));
           }
         } catch {
-          result = { ...result, blocked: true, warning: 'The Codex terminal environment could not be updated. Restart ModelDeck to retry.' };
+          result = { ...result, retryable: false, blocked: true, warning: 'The Codex terminal environment could not be updated. Restart ModelDeck to retry.' };
         }
       }
       this.codexProfilesMigrationWarning = result.warning || null;
       this.codexProfilesMigrationBlocked = result.blocked === true;
+      if (result.migrated) {
+        this.codexProfilesMigration = { status: 'done', movedAt: new Date(this.now()).toISOString() };
+      } else if (result.warning) {
+        this.codexProfilesMigration = {
+          status: 'deferred', holders: result.holders || [],
+          since: this.codexProfilesMigration?.since || new Date(this.now()).toISOString(),
+        };
+      } else if (this.codexProfilesMigration?.status !== 'done') {
+        this.codexProfilesMigration = null;
+      }
+      if (result.retryable && !result.blocked && !this.codexProfilesMigrationStopped) {
+        const delay = 10 * 60_000 + (Math.random() * 4 - 2) * 60_000;
+        this.codexProfilesMigrationTimer = this.setTimeout(() => {
+          this.codexProfilesMigrationTimer = null;
+          return this.migrateCodexProfilesDir();
+        }, delay);
+        this.codexProfilesMigrationTimer?.unref?.();
+      }
       return result;
-    });
+    }).finally(() => { this.codexProfilesMigrationPromise = null; });
     return this.codexProfilesMigrationPromise;
+  }
+
+  async stopCodexProfilesMigration() {
+    this.codexProfilesMigrationStopped = true;
+    if (this.codexProfilesMigrationTimer != null) this.clearTimeout(this.codexProfilesMigrationTimer);
+    this.codexProfilesMigrationTimer = null;
+    await this.codexProfilesMigrationPromise;
   }
 
   startAutoRefresh() {
@@ -1327,11 +1384,24 @@ export class ModelDeckService {
     if (this.usageSnapshotPruneStarted) return;
     this.usageSnapshotPruneStarted = true;
     const generation = ++this.usageSnapshotPruneGeneration;
-    this.runScheduledUsageSnapshotPrune(generation);
+    this.usageSnapshotPruneWaitingForState = true;
+    this.scheduleUsageSnapshotPrune(USAGE_SNAPSHOT_FIRST_PRUNE_DELAY_MS, generation);
+  }
+
+  scheduleUsageSnapshotPrune(delay, generation = this.usageSnapshotPruneGeneration) {
+    if (this.usageSnapshotPruneTimer != null) this.clearTimeout(this.usageSnapshotPruneTimer);
+    this.usageSnapshotPruneTimer = this.setTimeout(() => {
+      this.usageSnapshotPruneTimer = null;
+      if (!this.usageSnapshotPruneStarted || generation !== this.usageSnapshotPruneGeneration) return;
+      this.usageSnapshotPruneWaitingForState = false;
+      this.runScheduledUsageSnapshotPrune(generation);
+    }, delay);
+    this.usageSnapshotPruneTimer?.unref?.();
   }
 
   async stopUsageSnapshotRetention() {
     this.usageSnapshotPruneStarted = false;
+    this.usageSnapshotPruneWaitingForState = false;
     this.usageSnapshotPruneGeneration += 1;
     if (this.usageSnapshotPruneTimer != null) this.clearTimeout(this.usageSnapshotPruneTimer);
     this.usageSnapshotPruneTimer = null;
@@ -1353,12 +1423,7 @@ export class ModelDeckService {
       console.error(`[modeldeck] usage retention prune failed: ${error?.message || error}`);
     }).finally(() => {
       if (!this.usageSnapshotPruneStarted || generation !== this.usageSnapshotPruneGeneration) return;
-      this.usageSnapshotPruneTimer = this.setTimeout(() => {
-        this.usageSnapshotPruneTimer = null;
-        if (!this.usageSnapshotPruneStarted || generation !== this.usageSnapshotPruneGeneration) return;
-        this.runScheduledUsageSnapshotPrune(generation);
-      }, USAGE_SNAPSHOT_PRUNE_INTERVAL_MS);
-      this.usageSnapshotPruneTimer?.unref?.();
+      this.scheduleUsageSnapshotPrune(USAGE_SNAPSHOT_PRUNE_INTERVAL_MS, generation);
     });
   }
 
@@ -1427,18 +1492,34 @@ export class ModelDeckService {
     if (this.otelQuarantinePrunePromise) return this.otelQuarantinePrunePromise;
     const cutoff = new Date(this.now() - OTEL_QUARANTINE_RETENTION_DAYS * DAY_MS).toISOString();
     const promise = (async () => {
+      const startedAt = this.now();
+      const autoCheckpointPages = this.store.walAutoCheckpointPages();
       let total = 0;
       let cursor = {};
+      let batches = 0;
       try {
+        // A DELETE must not synchronously checkpoint a large upgrade backlog.
+        // Give reads a timer turn before each batch and each passive checkpoint.
+        this.store.setWalAutoCheckpointPages(0);
         while (true) {
           cursor = this.store.pruneOtelQuarantineBatch({ cutoff, ...cursor });
           total += cursor.deleted;
+          batches += 1;
           if (cursor.scanned < OTEL_QUARANTINE_PRUNE_BATCH_SIZE) break;
-          await this.yieldToServeLoop();
+          await new Promise((resolve) => this.setTimeout(resolve, OTEL_QUARANTINE_PRUNE_PAUSE_MS));
+          if (batches % OTEL_QUARANTINE_CHECKPOINT_BATCHES === 0) {
+            this.store.checkpointWal();
+            await new Promise((resolve) => this.setTimeout(resolve, OTEL_QUARANTINE_PRUNE_PAUSE_MS));
+          }
+        }
+        if (total > 0) {
+          await new Promise((resolve) => this.setTimeout(resolve, OTEL_QUARANTINE_PRUNE_PAUSE_MS));
+          this.store.checkpointWal();
         }
       } finally {
-        this.logOtelQuarantinePrune(total);
+        this.store.setWalAutoCheckpointPages(autoCheckpointPages);
       }
+      this.logOtelQuarantinePrune(total, this.now() - startedAt);
       return total;
     })();
     this.otelQuarantinePrunePromise = promise;
@@ -1715,6 +1796,9 @@ export class ModelDeckService {
   runWarehouseIngestPass() {
     if (this.warehouseIngestPromise) return this.warehouseIngestPromise;
     const promise = (async () => {
+      if (this.codexProfilesMigrationPromise) await this.codexProfilesMigrationPromise;
+      if (this.codexProfilesMigrationBlocked) return;
+      this.warehouseIngestActive = true;
       const startedAt = new Date(this.now()).toISOString();
       const jobs = [
         ['transcriptArchive', () => this.ingestTranscriptArchive({
@@ -1772,7 +1856,7 @@ export class ModelDeckService {
     })();
     this.warehouseIngestPromise = promise;
     const clear = () => {
-      if (this.warehouseIngestPromise === promise) this.warehouseIngestPromise = null;
+      if (this.warehouseIngestPromise === promise) { this.warehouseIngestPromise = null; this.warehouseIngestActive = false; }
     };
     void promise.then(clear, clear);
     return promise;
@@ -4135,6 +4219,8 @@ export class ModelDeckService {
   }
 
   async refreshAll() {
+    if (this.codexProfilesMigrationPromise) await this.codexProfilesMigrationPromise;
+    if (this.codexProfilesMigrationBlocked) throw serviceError(this.codexProfilesMigrationWarning, 503);
     // Demo fixture mode: the seeded snapshots ARE the data — a provider
     // refresh could only fail (placeholder accounts hold no credentials)
     // and would wrongly degrade auth chips. Report a truthful no-op.
@@ -7027,7 +7113,7 @@ export class ModelDeckService {
     const claudeSecureStorage = this.claudeSecureStorage.value == null && claudeActivation.resolvedProfileRef
       ? { ...this.claudeSecureStorage, value: claudeActivation.resolvedProfileRef }
       : this.claudeSecureStorage;
-    return {
+    const result = {
       ...value,
       accounts,
       activation: { claude: claudeActivation, codex: codexActivation },
@@ -7038,11 +7124,18 @@ export class ModelDeckService {
       usageQueue: this.usageQueueStatus(),
       warehouseIngest: this.warehouseIngestStatus(),
       daemon: this.daemonRuntimeStatus(),
+      ...(this.codexProfilesMigration ? { codexProfilesMigration: this.codexProfilesMigration } : {}),
       managedProxy: this.managedProxyStatus(),
       memberBlackout: this.memberBlackoutStatus(accounts),
       modelDrop: this.modelDropStatus(accounts, value.usage),
       sharedScope: this.sharedScope.status(),
     };
+    if (this.usageSnapshotPruneWaitingForState) {
+      this.usageSnapshotPruneWaitingForState = false;
+      // Let the first response leave before starting synchronous maintenance.
+      this.scheduleUsageSnapshotPrune(0);
+    }
+    return result;
   }
 
   async providerAuthState(provider, activeLink) {

@@ -7,11 +7,11 @@ import { spawnSync } from 'node:child_process';
 import { Store } from '../src/db.mjs';
 import { ModelDeckService } from '../src/service.mjs';
 import { createApp } from '../src/server.mjs';
-import { legacyCodexProfilesInUse } from '../src/codex-profiles-migration.mjs';
+import { legacyCodexProfilesInUse, legacyCodexProfilesUsage } from '../src/codex-profiles-migration.mjs';
 import { collectConfigLintSnapshot, configLintSnapshotOptions } from '../src/config-linter-snapshot.mjs';
 import { evaluateConfigLint } from '../src/config-linter.mjs';
 
-function fixture(t, migrationOptions = {}) {
+function fixture(t, migrationOptions = {}, serviceOptions = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-647-')));
   const legacyDir = path.join(root, '.codex-profiles');
   const dataDir = path.join(root, 'data');
@@ -37,8 +37,9 @@ function fixture(t, migrationOptions = {}) {
     claudeActiveLink: path.join(root, '.claude'),
     codexMigrationOptions: { now: () => new Date('2026-09-11T20:00:00.000Z'), isLegacyInUse: async () => false, ...migrationOptions },
     logCodexMigration: (message) => logs.push(message),
+    ...serviceOptions,
   });
-  t.after(() => { store.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  t.after(async () => { await service.stopCodexProfilesMigration?.(); store.close(); fs.rmSync(root, { recursive: true, force: true }); });
   return { root, legacyDir, dataDir, profilesDir, activeLink, store, account, service, logs };
 }
 
@@ -548,4 +549,327 @@ test('codex-profiles-migration-marker-collision-preserves-unowned-file', async (
   assert.equal(fs.readFileSync(path.join(data.profilesDir, '.migrated-from'), 'utf8'), 'dummy-existing-marker');
   assert.equal(fs.realpathSync(data.activeLink), data.account.profileRef);
   assert.deepEqual(fs.readdirSync(data.legacyDir), ['first', 'second']);
+});
+
+
+function migrationClock() {
+  let time = Date.parse('2026-09-19T12:00:00Z');
+  const timers = new Map();
+  let id = 0;
+  return {
+    now: () => time,
+    setTimeout: (run, delay) => { timers.set(++id, { run, delay }); return id; },
+    clearTimeout: (timer) => timers.delete(timer),
+    timers,
+    async tick() {
+      assert.equal(timers.size, 1);
+      const [key, timer] = timers.entries().next().value;
+      timers.delete(key);
+      assert.ok(timer.delay >= 8 * 60_000 && timer.delay <= 12 * 60_000);
+      time += timer.delay;
+      await timer.run();
+    },
+  };
+}
+
+async function migrationRequest(app, method, url, headers = {}) {
+  return new Promise((resolve) => {
+    let status;
+    app.server.emit('request', {
+      method, url, headers: { host: '127.0.0.1:3867', ...headers },
+      socket: { remoteAddress: '127.0.0.1' },
+    }, { writeHead(code) { status = code; }, end: (body) => resolve({ status, body: JSON.parse(body) }) });
+  });
+}
+const migrationToken = { 'x-modeldeck-token': 'dummy-token', cookie: 'modeldeck_session=dummy-token' };
+
+test('TRIPWIRE codex-migration-retries-after-deferral', async (t) => {
+  const clock = migrationClock();
+  let checks = 0;
+  const data = fixture(t, { isLegacyInUse: async () => ++checks === 1
+    ? { inUse: true, holders: ['ChatGPT', 'codex'] } : false }, clock);
+  const first = await data.service.migrateCodexProfilesDir();
+  assert.equal(first.retryable, true);
+  assert.deepEqual(data.service.codexProfilesMigration, {
+    status: 'deferred', holders: ['ChatGPT', 'codex'], since: new Date(clock.now()).toISOString(),
+  });
+  await clock.tick();
+  assert.equal(data.store.getAccount(data.account.id).profileRef, path.join(data.profilesDir, 'first'));
+  assert.deepEqual(data.service.codexProfilesMigration, { status: 'done', movedAt: new Date(clock.now()).toISOString() });
+  assert.equal(data.service.codexProfilesMigrationWarning, null);
+  assert.equal(clock.timers.size, 0);
+  assert.equal(checks, 5, 'one deferred check plus all four idle safety checks during the move');
+});
+
+test('codex-migration-retry-never-overlaps', async (t) => {
+  const clock = migrationClock();
+  let checks = 0;
+  let release;
+  let entered;
+  const waiting = new Promise((resolve) => { entered = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  const data = fixture(t, { isLegacyInUse: async () => {
+    checks++;
+    if (checks === 2) { entered(); await gate; }
+    return { inUse: true, holders: ['codex'] };
+  } }, clock);
+  await data.service.migrateCodexProfilesDir();
+  const queuedTick = [...clock.timers.values()][0].run;
+  const onDemand = data.service.migrateCodexProfilesDir();
+  await waiting;
+  const tick = queuedTick();
+  const joined = data.service.migrateCodexProfilesDir();
+  assert.equal(joined, onDemand);
+  assert.equal(checks, 2);
+  release();
+  await Promise.all([tick, onDemand]);
+  assert.equal(checks, 2);
+  assert.equal(clock.timers.size, 1);
+});
+
+test('TRIPWIRE codex-migration-on-demand-endpoint', async (t) => {
+  const clock = migrationClock();
+  let busy = true;
+  let checks = 0;
+  const data = fixture(t, { isLegacyInUse: async () => {
+    checks++;
+    return busy ? { inUse: true, holders: ['codex'] } : false;
+  } }, clock);
+  const { app } = await startup(data);
+  const before = checks;
+  for (const headers of [{}, { 'x-modeldeck-token': 'dummy-token' }, { ...migrationToken, origin: 'https://invalid.example' }]) {
+    assert.equal((await migrationRequest(app, 'POST', '/api/codex-profiles/migrate', headers)).status, 403);
+  }
+  assert.equal(checks, before);
+  assert.deepEqual(await migrationRequest(app, 'POST', '/api/codex-profiles/migrate', migrationToken), {
+    status: 200, body: { status: 'deferred', holders: ['codex'] },
+  });
+  busy = false;
+  assert.deepEqual(await migrationRequest(app, 'POST', '/api/codex-profiles/migrate', migrationToken), {
+    status: 200, body: { status: 'moved' },
+  });
+  assert.deepEqual(await migrationRequest(app, 'POST', '/api/codex-profiles/migrate', migrationToken), {
+    status: 200, body: { status: 'not-needed' },
+  });
+  assert.equal(clock.timers.size, 0);
+  assert.equal((await migrationRequest(app, 'GET', '/api/state')).body.codexProfilesMigration.status, 'done');
+});
+
+test('TRIPWIRE codex-migration-warning-names-holders-not-paths', async (t) => {
+  const clock = migrationClock();
+  const data = fixture(t, {}, clock);
+  const processes = [
+    { ...chatgptCodex, command: `${chatgptCodex.command} CODEX_HOME=${data.legacyDir}/first DUMMY_SECRET=private` },
+    { executable: '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT', command: 'never read this' },
+    { executable: '/dummy/tools/SkyComputerUseService', command: 'never read this' },
+    { executable: '/dummy/other/SkyComputerUseService', command: 'never read this' },
+  ];
+  const exec = async (bin, args) => {
+    if (bin === '/usr/bin/pgrep') return { stdout: '1', stderr: '' };
+    return processInspection(processes, { openFiles: 'p1\np2\np3\np4\n' })(bin, args);
+  };
+  data.service.codexMigrationOptions.isLegacyInUse = (legacy) => legacyCodexProfilesUsage(legacy, exec);
+  const { app } = await startup(data);
+  const warning = (await health(app)).warning;
+  const record = (await migrationRequest(app, 'GET', '/api/state')).body.codexProfilesMigration;
+  assert.equal(warning, 'Codex profile move is waiting on codex, ChatGPT, and SkyComputerUseService');
+  assert.deepEqual(record, { status: 'deferred', holders: ['codex', 'ChatGPT', 'SkyComputerUseService'], since: new Date(clock.now()).toISOString() });
+  for (const text of [warning, JSON.stringify(record), ...data.logs]) {
+    assert.doesNotMatch(text, /\/|CODEX_HOME|legacy|DUMMY_SECRET|private/);
+  }
+});
+
+test('codex-migration-hard-failure-does-not-retry', async (t) => {
+  const clock = migrationClock();
+  const data = fixture(t, {}, clock);
+  fs.mkdirSync(data.profilesDir, { mode: 0o700 });
+  fs.writeFileSync(path.join(data.profilesDir, 'keep'), 'dummy');
+  const result = await data.service.migrateCodexProfilesDir();
+  assert.ok(result.warning);
+  assert.equal(result.retryable, false);
+  assert.equal(clock.timers.size, 0);
+});
+
+test('codex-migration-shutdown-cancels-and-drains-retry', async (t) => {
+  const clock = migrationClock();
+  let release;
+  let entered;
+  let checks = 0;
+  const waiting = new Promise((resolve) => { entered = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  const data = fixture(t, { isLegacyInUse: async () => {
+    if (++checks === 2) { entered(); await gate; }
+    return true;
+  } }, clock);
+  await data.service.migrateCodexProfilesDir();
+  const tick = clock.tick();
+  await waiting;
+  let stopped = false;
+  const stop = data.service.stopCodexProfilesMigration().then(() => { stopped = true; });
+  await Promise.resolve();
+  assert.equal(stopped, false);
+  release();
+  await Promise.all([tick, stop]);
+  assert.equal(clock.timers.size, 0);
+});
+
+test('codex-migration-runtime-requests-wait-and-active-requests-defer', async (t) => {
+  const clock = migrationClock();
+  let busy = true;
+  let hold = false;
+  let release;
+  let entered;
+  const waiting = new Promise((resolve) => { entered = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  const data = fixture(t, { isLegacyInUse: async () => {
+    if (busy) return true;
+    if (hold) { entered(); await gate; }
+    return false;
+  } }, clock);
+  const { app } = await startup(data);
+  let releaseState;
+  let stateEntered;
+  const stateWaiting = new Promise((resolve) => { stateEntered = resolve; });
+  const stateGate = new Promise((resolve) => { releaseState = resolve; });
+  const originalState = data.service.state.bind(data.service);
+  let stateCalls = 0;
+  data.service.state = async () => { stateCalls++; stateEntered(); await stateGate; return originalState(); };
+  const active = migrationRequest(app, 'GET', '/api/state');
+  await stateWaiting;
+  // An API reader that started first owns its stable profile view.
+  busy = false;
+  await clock.tick();
+  assert.equal(data.service.codexProfilesMigration.status, 'deferred');
+  releaseState();
+  await active;
+  hold = true;
+  const move = migrationRequest(app, 'POST', '/api/codex-profiles/migrate', migrationToken);
+  await waiting;
+  const joinedMove = migrationRequest(app, 'POST', '/api/codex-profiles/migrate', migrationToken);
+  let readDone = false;
+  const read = migrationRequest(app, 'GET', '/api/state').then((result) => { readDone = true; return result; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(readDone, false);
+  assert.equal(stateCalls, 1);
+  release();
+  assert.equal((await move).body.status, 'moved');
+  assert.equal((await joinedMove).body.status, 'moved');
+  assert.equal((await read).body.codexProfilesMigration.status, 'done');
+});
+
+test('codex-migration-unknown-process-check-retries-and-late-deferral-rolls-back', async (t) => {
+  const clock = migrationClock();
+  let checks = 0;
+  const data = fixture(t, { isLegacyInUse: async () => {
+    checks++;
+    if (checks === 1) throw new Error('dummy private command CODEX_HOME=/dummy/legacy');
+    if (checks === 5) return { inUse: true, holders: ['codex'] };
+    return false;
+  } }, clock);
+  await data.service.migrateCodexProfilesDir();
+  const since = data.service.codexProfilesMigration.since;
+  await clock.tick();
+  assert.equal(checks, 5);
+  assert.deepEqual(fs.readdirSync(data.legacyDir), ['first', 'second']);
+  assert.equal(data.service.codexProfilesMigration.since, since);
+  assert.deepEqual(data.service.codexProfilesMigration.holders, ['codex']);
+  await clock.tick();
+  assert.equal(data.service.codexProfilesMigration.status, 'done');
+  assert.equal(clock.timers.size, 0);
+  assert.doesNotMatch(data.logs.join(' '), /CODEX_HOME|\/dummy\/legacy/);
+});
+
+test('codex-migration-warning-limits-names-state-keeps-all-and-empty-start-omits-field', async (t) => {
+  const clock = migrationClock();
+  const holders = ['ChatGPT', 'codex', 'Helper1', 'Helper2', 'Helper3', 'Helper4', 'Helper5'];
+  const data = fixture(t, { isLegacyInUse: async () => ({ inUse: true, holders }) }, clock);
+  await data.service.migrateCodexProfilesDir();
+  assert.equal(data.service.codexProfilesMigrationWarning, 'Codex profile move is waiting on ChatGPT, codex, Helper1, Helper2, Helper3, and 2 more');
+  assert.deepEqual(data.service.codexProfilesMigration.holders, holders);
+  data.service.codexMigrationOptions.isLegacyInUse = async () => false;
+  await data.service.migrateCodexProfilesDir();
+  const empty = fixture(t, {}, migrationClock());
+  empty.store.deleteAccount(empty.account.id);
+  fs.rmSync(empty.legacyDir, { recursive: true });
+  fs.unlinkSync(empty.activeLink);
+  await empty.service.migrateCodexProfilesDir();
+  assert.equal(Object.hasOwn(await empty.service.state(), 'codexProfilesMigration'), false);
+});
+
+test('codex-migration-shutdown-drains-background-work-waiting-on-migration', async (t) => {
+  const clock = migrationClock();
+  let release;
+  let entered;
+  const waiting = new Promise((resolve) => { entered = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  const data = fixture(t, { isLegacyInUse: async () => { entered(); await gate; return true; } }, {
+    ...clock,
+    configLintSnapshotCollector: async () => ({}), configLintEvaluate: () => [],
+    ingestTranscriptArchive: async () => ({}), ingestCodexRollouts: async () => ({}),
+    runDiagnostician: async () => ({}), refitUsageEstimates: async () => ({}),
+  });
+  const move = data.service.migrateCodexProfilesDir();
+  await waiting;
+  const lint = data.service.runConfigLint();
+  const ingest = data.service.runWarehouseIngestPass();
+  let lintStopped = false;
+  let ingestStopped = false;
+  const stopLint = data.service.stopConfigLint().then(() => { lintStopped = true; });
+  const stopIngest = data.service.stopWarehouseIngest().then(() => { ingestStopped = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  const stoppedEarly = { lintStopped, ingestStopped };
+  release();
+  await Promise.all([move, lint, ingest, stopLint, stopIngest]);
+  assert.deepEqual(stoppedEarly, { lintStopped: false, ingestStopped: false });
+});
+
+test('codex-migration-endpoint-reports-move-before-terminal-pin-failure', async (t) => {
+  const clock = migrationClock();
+  const data = fixture(t, { isLegacyInUse: async () => true }, clock);
+  const { app } = await startup(data);
+  data.service.codexMigrationOptions.isLegacyInUse = async () => false;
+  fs.writeFileSync(data.service.codexShellEnvFile, 'dummy terminal pin', { mode: 0o600 });
+  data.service.writeCodexShellEnvFile = async () => { throw new Error('dummy terminal pin failure'); };
+  const response = await migrationRequest(app, 'POST', '/api/codex-profiles/migrate', migrationToken);
+  assert.deepEqual(response, { status: 200, body: { status: 'moved' } });
+  assert.equal(data.service.codexProfilesMigration.status, 'done');
+  assert.equal(data.service.codexProfilesMigrationBlocked, true);
+  assert.equal(fs.realpathSync(data.activeLink), path.join(data.profilesDir, 'first'));
+  assert.equal(clock.timers.size, 0);
+  assert.match((await health(app)).warning, /terminal environment/);
+  assert.equal((await migrationRequest(app, 'GET', '/api/state')).status, 503);
+});
+
+test('TRIPWIRE codex-migration-waiting-daemon-work-is-not-a-holder (CodeRabbit, PR #680)', async (t) => {
+  // A lint pass and an ingest pass queued WHILE the migration runs sit in
+  // their promise fields awaiting the migration. The idle check must not
+  // count those waiters as holders of the legacy root, or the move defers
+  // against its own waiters and rolls back entries it already moved.
+  const clock = migrationClock();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let checks = 0;
+  const data = fixture(t, { isLegacyInUse: async () => {
+    checks++;
+    if (checks === 1) await gate; // hold the first idle check open
+    return false;
+  } }, {
+    ...clock,
+    configLintSnapshotCollector: async () => ({}), configLintEvaluate: () => [],
+    ingestTranscriptArchive: async () => ({}), ingestCodexRollouts: async () => ({}),
+    runDiagnostician: async () => ({}), refitUsageEstimates: async () => ({}),
+  });
+  const migration = data.service.migrateCodexProfilesDir();
+  await new Promise((resolve) => setImmediate(resolve));
+  const lint = data.service.runConfigLint();
+  const ingest = data.service.runWarehouseIngestPass();
+  assert.ok(data.service.configLintPromise && data.service.warehouseIngestPromise, 'both passes are queued behind the migration');
+  release();
+  const result = await migration;
+  assert.equal(result.migrated, true, 'queued daemon work must not defer the move');
+  assert.deepEqual(data.service.codexProfilesMigration.status, 'done');
+  assert.equal(data.store.getAccount(data.account.id).profileRef, path.join(data.profilesDir, 'first'));
+  await Promise.all([lint, ingest]);
+  assert.equal(data.service.configLintActive, false);
+  assert.equal(data.service.warehouseIngestActive, false);
 });

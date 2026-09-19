@@ -16,13 +16,27 @@ public struct DaemonHealth: Codable, Equatable, Sendable {
     /// process predates the bundle that just registered it.
     public var MDGitCommit: String?
     public var projectsRoot: String?
+    /// Issue #677: the daemon's own one-line note about a deferred or failed
+    /// Codex profile move. Optional by design, like every other field the
+    /// daemon grew later. Nothing renders it today; when something does, it
+    /// goes through `CodexProfilesMigration.healthWarningToShow` so the deck
+    /// header's line stays the only place this fact appears.
+    public var warning: String?
 
-    public init(ok: Bool, name: String, version: String, MDGitCommit: String? = nil, projectsRoot: String? = nil) {
+    public init(
+        ok: Bool,
+        name: String,
+        version: String,
+        MDGitCommit: String? = nil,
+        projectsRoot: String? = nil,
+        warning: String? = nil
+    ) {
         self.ok = ok
         self.name = name
         self.version = version
         self.MDGitCommit = MDGitCommit
         self.projectsRoot = projectsRoot
+        self.warning = warning
     }
 }
 
@@ -1040,6 +1054,12 @@ public struct DeckState: Codable, Equatable, Sendable {
     /// daemon-version skew — the #174 claudeStatusline / #196 renew
     /// precedents: a pre-#204 daemon omits it, nil renders nothing.
     public var sharedScope: SharedScopeStatus?
+    /// Issue #677 (#676 daemon half): the state of the one-time move of
+    /// `~/.codex-profiles` under ModelDeck's data directory. Absent when
+    /// nothing needed moving. Same tolerant contract as the fields above,
+    /// plus one more: a `status` this build does not recognize reads as
+    /// absent rather than rendering a line it cannot explain.
+    public var codexProfilesMigration: CodexProfilesMigration?
 
     public init(
         accounts: [DeckAccount] = [],
@@ -1050,6 +1070,7 @@ public struct DeckState: Codable, Equatable, Sendable {
         memberBlackout: MemberBlackoutStatus? = nil,
         modelDrop: ModelDropStatus? = nil,
         sharedScope: SharedScopeStatus? = nil,
+        codexProfilesMigration: CodexProfilesMigration? = nil,
         managed: [String: Bool]? = nil,
         managementBlocked: [String: String]? = nil
     ) {
@@ -1063,10 +1084,12 @@ public struct DeckState: Codable, Equatable, Sendable {
         self.memberBlackout = memberBlackout
         self.modelDrop = modelDrop
         self.sharedScope = sharedScope
+        self.codexProfilesMigration = codexProfilesMigration
     }
 
     private enum CodingKeys: String, CodingKey {
         case managed, managementBlocked, accounts, usage, activation, scheduler, daemon, memberBlackout, modelDrop, sharedScope
+        case codexProfilesMigration
     }
 
     public init(from decoder: Decoder) throws {
@@ -1081,6 +1104,10 @@ public struct DeckState: Codable, Equatable, Sendable {
         self.memberBlackout = try? container.decodeIfPresent(MemberBlackoutStatus.self, forKey: .memberBlackout)
         self.modelDrop = try? container.decodeIfPresent(ModelDropStatus.self, forKey: .modelDrop)
         self.sharedScope = try? container.decodeIfPresent(SharedScopeStatus.self, forKey: .sharedScope)
+        self.codexProfilesMigration = try? container.decodeIfPresent(
+            CodexProfilesMigration.self,
+            forKey: .codexProfilesMigration
+        )
     }
 
     public func isManaged(_ provider: DeckProvider) -> Bool {

@@ -265,7 +265,7 @@ test('retention prunes on startup and schedules one pass every 24 hours', async 
   try {
     service.startUsageSnapshotRetention();
     service.startUsageSnapshotRetention(); // lifecycle start is idempotent
-    await clock.flush();
+    await clock.advance(30_000); // first pass waits for state or the startup deadline
     assert.deepEqual(logs, [1]);
     assert.equal(rawSnapshots(store).length, 1);
     assert.equal(clock.timers.size, 1);
