@@ -621,20 +621,40 @@ public final class DaemonSetupModel: ObservableObject {
     /// tests run instantly.
     private let startupProbeAttempts: Int
     private let startupProbeDelay: @Sendable () async -> Void
+    /// Issue #697: the launch-time budget for a registered service that has
+    /// not started listening yet. The app and the service both start at
+    /// login, and a service opening a multi-GB database was measured at
+    /// about 35 s before it listened. Each probe runs under
+    /// `restartProbeTimeout` (1 s), so the wait is ≈ 60 s against a refused
+    /// connection (fails at once) and ≤ 3 min against a port that accepts
+    /// but does not answer (Astra review of PR #698: the 5 s default made
+    /// the same budget ≈ 11 min).
+    private let launchProbeAttempts: Int
+    public static let defaultLaunchProbeAttempts = 120
 
     public init(
         dependencies: Dependencies,
         startupProbeAttempts: Int = 10,
+        launchProbeAttempts: Int = DaemonSetupModel.defaultLaunchProbeAttempts,
         startupProbeDelay: @escaping @Sendable () async -> Void = {
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
     ) {
         self.deps = dependencies
         self.startupProbeAttempts = max(1, startupProbeAttempts)
+        self.launchProbeAttempts = max(1, launchProbeAttempts)
         self.startupProbeDelay = startupProbeDelay
     }
 
     // MARK: Launch
+
+    /// Issue #688: the one evaluation allowed to be in flight. `@MainActor`
+    /// serializes the synchronous stretches of an evaluation, not the awaits
+    /// between them (launchctl probes, `waitForDaemon`, the kickstart), so a
+    /// second call arriving during one of those waits used to run a second
+    /// full evaluation — two kickstarts against launchd. Cleared by the task
+    /// itself the moment its evaluation finishes, success or failure.
+    private var inFlightEvaluation: Task<Bool, Never>?
 
     /// Returns whether the evaluation ended with the bundled daemon VERIFIED
     /// answering (review of PR #687, round 2): `.running`, or a repair rung
@@ -643,8 +663,25 @@ public final class DaemonSetupModel: ObservableObject {
     /// even though they share the `.quiet` phase — the phase says "nothing
     /// for this surface to show", not "the service is up", and the launch
     /// follow-up read must key on the latter only.
+    ///
+    /// Single-flight (#688): a call that arrives while an evaluation is
+    /// running joins it and receives that evaluation's result instead of
+    /// starting another. Once it has finished, the next call runs fresh.
     @discardableResult
     public func evaluateOnLaunch() async -> Bool {
+        if let inFlightEvaluation { return await inFlightEvaluation.value }
+        // The body cannot start before this method suspends, so the slot is
+        // set before any joiner can look at it.
+        let evaluation = Task { @MainActor [self] in
+            let verifiedUp = await runEvaluation()
+            inFlightEvaluation = nil
+            return verifiedUp
+        }
+        inFlightEvaluation = evaluation
+        return await evaluation.value
+    }
+
+    private func runEvaluation() async -> Bool {
         phase = .checking
         legacyAgentPresent = deps.legacyAgent.isLegacyAgentPresent()
         let registration = deps.registrar.status
@@ -684,6 +721,9 @@ public final class DaemonSetupModel: ObservableObject {
            deps.marker.registeredPlistFingerprint == nil {
             deps.marker.registeredPlistFingerprint = deps.bundledPlistFingerprint
         }
+        // Non-nil past the stand-downs: `decideDaemonSetup` returns
+        // `.bundledServiceUnavailable` for an empty bundled commit.
+        let bundledCommit = deps.bundledCommit ?? ""
         switch decision {
         case .hostSignatureStandDown, .bundledServiceUnavailable:
             phase = .quiet
@@ -698,8 +738,33 @@ public final class DaemonSetupModel: ObservableObject {
             phase = .awaitingApproval
             return false
         case .registeredNotRunning:
-            phase = .startingUp
-            return false
+            // Issue #697: at login the app and the service start together,
+            // and a service opening a large database can take tens of
+            // seconds to listen. One refused probe is not "not running";
+            // keep asking for the same bounded window the install path
+            // uses, so the card clears on its own and the launch follow-up
+            // read fills the deck. Nothing answering leaves the card and
+            // its Check Again exactly as before. A late answer is checked
+            // the way an immediate one is (rule 4 above): a process that
+            // reports another build than the bundle's gets the same forced
+            // restart (CodeRabbit, PR #698).
+            let snapshot = await waitForDaemon(
+                probeTimeout: Self.restartProbeTimeout, attempts: launchProbeAttempts
+            )
+            switch verifyDaemonAfterReregister(probe: snapshot, bundledCommit: bundledCommit) {
+            case .verified:
+                return true
+            case .unreachable:
+                return false
+            case .staleProcessNeedsRestart:
+                // `waitForDaemon` set `.quiet` on the answer; leave it before
+                // the bootout suspends, or the #185 missing-binary repair
+                // (guarded on `.quiet`, fed by the concurrent first read)
+                // can register a second time mid-restart (Astra review of
+                // PR #698, round 2).
+                phase = .checking
+                await forceRestartService(bundledCommit: bundledCommit)
+            }
         case .legacyInstalledNotRunning:
             phase = .legacyNotRunning
             return false
@@ -728,7 +793,8 @@ public final class DaemonSetupModel: ObservableObject {
         phase = .declined
     }
 
-    /// Retry from the declined / failed / starting-up states.
+    /// Retry from the declined / failed / starting-up states. Joins an
+    /// evaluation already in flight rather than starting a second (#688).
     public func retry() async {
         await evaluateOnLaunch()
     }
@@ -843,7 +909,8 @@ public final class DaemonSetupModel: ObservableObject {
     /// Issue #678: the health-probe timeout while waiting for a kickstarted
     /// daemon. 1 s, not the client's 5 s default — the old process is being
     /// replaced, so an unanswered probe should fail fast: 10 × (1 s + 0.5 s)
-    /// ≈ 15 s worst case instead of ≈ 55 s. Nothing else uses this.
+    /// ≈ 15 s worst case instead of ≈ 55 s. The #697 launch wait uses it
+    /// for the same reason: its attempt budget must be a time budget.
     public static let restartProbeTimeout: TimeInterval = 1
 
     /// Rung 1 of the post-update ladder (decision 0041): restart the process
@@ -997,16 +1064,19 @@ public final class DaemonSetupModel: ObservableObject {
     /// Polls until the daemon answers, returning the answering probe
     /// snapshot so callers can verify the build WITHOUT a second request.
     /// Issue #678: `probeTimeout` overrides the probe's default request
-    /// timeout (the restart rung passes `restartProbeTimeout`; every other
-    /// caller keeps the default), and `keepPhaseWhileWaiting` leaves the
-    /// phase alone instead of showing the starting-up card.
+    /// timeout (the restart rung and the #697 launch wait pass
+    /// `restartProbeTimeout`; every other caller keeps the default),
+    /// `keepPhaseWhileWaiting` leaves the
+    /// phase alone instead of showing the starting-up card, and `attempts`
+    /// overrides the post-install budget (the launch wait, #697).
     @discardableResult
     private func waitForDaemon(
         probeTimeout: TimeInterval? = nil,
-        keepPhaseWhileWaiting: Bool = false
+        keepPhaseWhileWaiting: Bool = false,
+        attempts: Int? = nil
     ) async -> DaemonProbeSnapshot? {
         if !keepPhaseWhileWaiting { phase = .startingUp }
-        for attempt in 0..<startupProbeAttempts {
+        for attempt in 0..<(attempts ?? startupProbeAttempts) {
             if attempt > 0 { await startupProbeDelay() }
             let snapshot: DaemonProbeSnapshot?
             if let probeTimeout {
