@@ -4,7 +4,7 @@
 // notarized, and stapled; also directly testable (node --test drives it with
 // a stub sign_update and the clearly-fake test key in test/fixtures/sparkle).
 //
-// The appcast is a single-item RSS feed: newest release only. It is uploaded
+// Issue #705: each feed carries signed release history. It is uploaded
 // as an asset named "appcast.xml" on the SAME GitHub release as the DMG, and
 // the app's SUFeedURL points at the STABLE redirect
 //   https://github.com/timharris707/modeldeck/releases/latest/download/appcast.xml
@@ -27,6 +27,8 @@
 //     [--key-file /path/to/TEST-key]   (tests only — real key stays in Keychain)
 //     [--pub-date "Wed, 22 Jul 2026 12:00:00 +0000"]  (injectable for tests)
 //     [--min-system 14.0] \
+//     [--channel beta] [--merge-existing previous-appcast.xml] \
+//     [--rollback-floor <version|unchanged>] [--stable-only] \
 //     --out dist/appcast.xml
 import { execFileSync } from "node:child_process";
 import { statSync, writeFileSync, existsSync, realpathSync, readFileSync } from "node:fs";
@@ -69,8 +71,12 @@ export function parseArgs(argv) {
     ["--pub-date", "pubDate"],
     ["--min-system", "minSystem"],
     ["--out", "out"],
+    ["--channel", "channel"],
+    ["--merge-existing", "mergeExisting"],
+    ["--rollback-floor", "rollbackFloor"],
   ]);
   for (let i = 0; i < argv.length; i += 1) {
+    if (argv[i] === "--stable-only") { args.stableOnly = true; continue; }
     const key = flags.get(argv[i]);
     if (!key) throw new Error(`unknown argument: ${argv[i]}`);
     if (i + 1 >= argv.length) throw new Error(`${argv[i]} requires a value`);
@@ -82,6 +88,15 @@ export function parseArgs(argv) {
   }
   if (!/^\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$/.test(args.version)) {
     throw new Error(`--version '${args.version}' is not a dotted version`);
+  }
+  if (args.channel !== undefined && !/^[0-9A-Za-z._-]+$/.test(args.channel)) throw new Error('invalid --channel name');
+  if (args.version !== undefined && !isStrictVersion(args.version)) throw new Error(`invalid --version (strict SemVer required): ${args.version}`);
+  if (args.rollbackFloor !== undefined && args.rollbackFloor !== "unchanged" && !isStrictVersion(args.rollbackFloor)) {
+    throw new Error(`invalid --rollback-floor (strict SemVer or "unchanged"): ${args.rollbackFloor}`);
+  }
+  if (args.stableOnly && args.channel) throw new Error('--stable-only cannot carry a --channel');
+  if (args.rollbackFloor && args.rollbackFloor !== 'unchanged' && !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(args.rollbackFloor)) {
+    throw new Error('invalid --rollback-floor version');
   }
   if (!/^\d+$/.test(args.build)) throw new Error(`--build '${args.build}' is not an integer`);
   return args;
@@ -127,7 +142,77 @@ function cdata(text) {
   return `<![CDATA[${String(text).replaceAll("]]>", "]]]]><![CDATA[>")}]]>`;
 }
 
+// Issue #705: skip CDATA/comments while locating items, then carry the raw
+// slices. Re-serializing old XML could change signed enclosure metadata.
+// Issue #705 (CodeRabbit, PR #710): ONE strict SemVer 2.0.0 shape for release
+// versions and rollback floors, used by every JavaScript entrypoint. No
+// leading zeros, no empty identifiers, dot-separated prerelease only.
+// Stricter than SemVer in one place on purpose: a prerelease identifier may
+// not START with a hyphen (SemVer allows "--beta"; a tag like that is only
+// ever a typo here).
+const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z][0-9A-Za-z-]*))*))?$/;
+export function isStrictVersion(value) {
+  return typeof value === "string" && SEMVER.test(value);
+}
+export function isPrereleaseVersion(value) {
+  return isStrictVersion(value) && value.includes("-");
+}
+
+export function appcastItems(xml) {
+  const items = [];
+  let start = null;
+  for (const match of xml.matchAll(/<!\[CDATA\[[\s\S]*?\]\]>|<!--[\s\S]*?-->|<[^>]+>/g)) {
+    if (/^<item(?:\s|>)/.test(match[0])) start = match.index;
+    if (match[0] !== '</item>' || start === null) continue;
+    const raw = xml.slice(start, match.index + match[0].length);
+    const metadata = raw.replace(/<!\[CDATA\[[\s\S]*?\]\]>|<!--[\s\S]*?-->/g, '');
+    const field = name => metadata.match(new RegExp(`<${name}\\b[^>]*>([^<]*)</${name}>`))?.[1]?.trim() ?? null;
+    items.push({ raw, version: field('sparkle:shortVersionString'),
+      channel: field('sparkle:channel') ?? (/<sparkle:channel\b/.test(metadata) ? '' : null),
+      rollbackFloor: field('modeldeck:rollbackFloor') });
+    start = null;
+  }
+  return items;
+}
+
+// Issue #705: numeric prerelease identifiers must keep beta.10 after beta.9.
+export function compareVersions(a, b) {
+  const parts = value => value.split('+')[0].split(/-(.*)/s).slice(0, 2);
+  const [aCore, aPre] = parts(a);
+  const [bCore, bPre] = parts(b);
+  const compare = (left, right, prerelease = false) => {
+    if (/^\d+$/.test(left) && /^\d+$/.test(right)) {
+      return BigInt(left) > BigInt(right) ? 1 : BigInt(left) < BigInt(right) ? -1 : 0;
+    }
+    if (prerelease && /^\d+$/.test(left) !== /^\d+$/.test(right)) return /^\d+$/.test(left) ? -1 : 1;
+    return left < right ? -1 : left > right ? 1 : 0;
+  };
+  const ac = aCore.split('.'), bc = bCore.split('.');
+  for (let i = 0; i < Math.max(ac.length, bc.length); i++) {
+    const order = compare(ac[i] ?? '0', bc[i] ?? '0');
+    if (order) return order;
+  }
+  if (aPre === undefined || bPre === undefined) return aPre === bPre ? 0 : aPre === undefined ? 1 : -1;
+  const ap = aPre.split('.'), bp = bPre.split('.');
+  for (let i = 0; i < Math.min(ap.length, bp.length); i++) {
+    const order = compare(ap[i], bp[i], true);
+    if (order) return order;
+  }
+  return Math.sign(ap.length - bp.length);
+}
+
 /// Pure appcast rendering — the shape under test.
+// Issue #705 (CodeRabbit, PR #710): a required prior feed that is empty or
+// carries no versioned item would silently produce a one-item feed and drop
+// the rollback history. Refuse it here so the release stops before writing.
+export function readPriorFeed(file) {
+  const xml = readFileSync(file, "utf8");
+  if (!appcastItems(xml).some(item => item.version)) {
+    throw new Error(`prior feed has no versioned items: ${file}`);
+  }
+  return xml;
+}
+
 export function renderAppcast({
   version,
   build,
@@ -138,7 +223,22 @@ export function renderAppcast({
   releaseNotesUrl,
   description,
   minSystem = "14.0",
+  channel,
+  existingXML = "",
+  rollbackFloor = "unchanged",
+  stableOnly = false,
 }) {
+  const older = appcastItems(existingXML).filter(item => item.version && item.version !== version);
+  const stables = older.filter(item => item.channel === null && !item.version.includes("-"))
+    .sort((a, b) => compareVersions(b.version, a.version));
+  const newestStable = channel ? stables[0]?.version : version;
+  const carriedStables = stables.filter(item => channel || compareVersions(item.version, version) < 0)
+    .slice(0, channel ? 4 : 3);
+  const betas = stableOnly ? [] : older.filter(item => item.channel === "beta"
+    && (!newestStable || compareVersions(item.version, newestStable) > 0));
+  const carried = [...carriedStables, ...betas].sort((a, b) => compareVersions(b.version, a.version));
+  const floor = rollbackFloor === "unchanged"
+    ? (carriedStables[0]?.rollbackFloor || version) : rollbackFloor;
   const notes = releaseNotesUrl
     ? `\n            <sparkle:releaseNotesLink>${xmlEscape(releaseNotesUrl)}</sparkle:releaseNotesLink>`
     : "";
@@ -149,7 +249,7 @@ export function renderAppcast({
     ? `\n            <description>${cdata(description)}</description>`
     : "";
   return `<?xml version="1.0" encoding="utf-8"?>
-<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:modeldeck="https://modeldeck.ai/appcast">
     <channel>
         <title>ModelDeck</title>
         <item>
@@ -157,14 +257,15 @@ export function renderAppcast({
             <pubDate>${xmlEscape(pubDate)}</pubDate>${notes}${body}
             <sparkle:version>${xmlEscape(build)}</sparkle:version>
             <sparkle:shortVersionString>${xmlEscape(version)}</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>${xmlEscape(minSystem)}</sparkle:minimumSystemVersion>
+            <sparkle:minimumSystemVersion>${xmlEscape(minSystem)}</sparkle:minimumSystemVersion>${channel ? `\n            <sparkle:channel>${xmlEscape(channel)}</sparkle:channel>` : ""}
+            <modeldeck:rollbackFloor>${xmlEscape(floor)}</modeldeck:rollbackFloor>
             <enclosure
                 url="${xmlEscape(url)}"
                 length="${length}"
                 type="application/octet-stream"
                 sparkle:edSignature="${xmlEscape(signature)}"
             />
-        </item>
+        </item>${carried.map(item => `\n        ${item.raw}`).join("")}
     </channel>
 </rss>
 `;
@@ -195,6 +296,10 @@ function main() {
     fail(`sign_update reported length ${signed.length} but the DMG is ${dmgSize} bytes — refusing to publish a mismatched appcast`);
   }
   const xml = renderAppcast({
+    channel: args.channel,
+    existingXML: args.mergeExisting ? readPriorFeed(args.mergeExisting) : "",
+    rollbackFloor: args.rollbackFloor,
+    stableOnly: args.stableOnly,
     version: args.version,
     build: args.build,
     url: args.url,

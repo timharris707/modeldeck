@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import net from 'node:net';
+import { once } from 'node:events';
+import { spawn, spawnSync } from 'node:child_process';
 import { Store } from '../src/db.mjs';
 import { ModelDeckService } from '../src/service.mjs';
 import { createApp } from '../src/server.mjs';
@@ -11,8 +13,8 @@ import { legacyCodexProfilesInUse, legacyCodexProfilesUsage } from '../src/codex
 import { collectConfigLintSnapshot, configLintSnapshotOptions } from '../src/config-linter-snapshot.mjs';
 import { evaluateConfigLint } from '../src/config-linter.mjs';
 
-function fixture(t, migrationOptions = {}, serviceOptions = {}) {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-647-')));
+function fixture(t, migrationOptions = {}, serviceOptions = {}, { sameVolume = false, shortRoot = false } = {}) {
+  const root = fs.realpathSync(fs.mkdtempSync(shortRoot ? '/tmp/md693-' : path.join(os.tmpdir(), 'modeldeck-647-')));
   const legacyDir = path.join(root, '.codex-profiles');
   const dataDir = path.join(root, 'data');
   const profilesDir = path.join(dataDir, 'codex-profiles');
@@ -29,13 +31,19 @@ function fixture(t, migrationOptions = {}, serviceOptions = {}) {
   const account = store.saveAccount({
     provider: 'codex', label: 'Dummy first', profileRef: path.join(legacyDir, 'first'), isDefault: true,
   });
+  // The original 41 tests retain the idle-only copy contract on another device.
+  const io = { ...fs.promises, lstat: async (file) => {
+    const stat = await fs.promises.lstat(file);
+    if (!sameVolume && file === path.dirname(profilesDir)) stat.dev += 1;
+    return stat;
+  } };
   const logs = [];
   const service = new ModelDeckService(store, {
     dataDir, codexProfilesDir: profilesDir, codexLegacyProfilesDir: legacyDir,
     codexActiveLink: activeLink,
     claudeProfilesDir: path.join(dataDir, 'claude-profiles'),
     claudeActiveLink: path.join(root, '.claude'),
-    codexMigrationOptions: { now: () => new Date('2026-09-11T20:00:00.000Z'), isLegacyInUse: async () => false, ...migrationOptions },
+    codexMigrationOptions: { io, now: () => new Date('2026-09-11T20:00:00.000Z'), isLegacyInUse: async () => false, ...migrationOptions },
     logCodexMigration: (message) => logs.push(message),
     ...serviceOptions,
   });
@@ -111,7 +119,7 @@ test('codex-profiles-migration-running-process-refuses-with-health-warning', asy
 test('codex-profiles-migration-second-rename-rolls-back-first-profile', async (t) => {
   const data = fixture(t);
   const before = data.store.listAccounts();
-  data.service.codexMigrationOptions.io = { ...fs.promises, rename: async (from, to) => {
+  data.service.codexMigrationOptions.io = { ...data.service.codexMigrationOptions.io, rename: async (from, to) => {
     if (from === path.join(data.legacyDir, 'second')) throw new Error('injected second rename failure');
     return fs.promises.rename(from, to);
   } };
@@ -128,7 +136,7 @@ test('codex-profiles-migration-second-rename-rolls-back-first-profile', async (t
 
 test('codex-profiles-migration-EXDEV-verifies-bytes-and-preserves-modes', async (t) => {
   const data = fixture(t);
-  data.service.codexMigrationOptions.io = { ...fs.promises, rename: async (from, to) => {
+  data.service.codexMigrationOptions.io = { ...data.service.codexMigrationOptions.io, rename: async (from, to) => {
     if (path.dirname(from) === data.legacyDir) throw Object.assign(new Error('cross-device fixture'), { code: 'EXDEV' });
     return fs.promises.rename(from, to);
   } };
@@ -150,7 +158,7 @@ test('codex-profiles-migration-EXDEV-verifies-bytes-and-preserves-modes', async 
 test('codex-profiles-migration-EXDEV-corrupt-copy-never-removes-source', async (t) => {
   const data = fixture(t);
   data.service.codexMigrationOptions.io = {
-    ...fs.promises,
+    ...data.service.codexMigrationOptions.io,
     rename: async (from, to) => {
       if (path.dirname(from) === data.legacyDir) throw Object.assign(new Error('cross-device fixture'), { code: 'EXDEV' });
       return fs.promises.rename(from, to);
@@ -187,7 +195,7 @@ test('codex-profiles-migration-database-failure-restores-link-files-and-all-refe
 
 test('codex-profiles-migration-marker-failure-restores-active-link', async (t) => {
   const data = fixture(t);
-  data.service.codexMigrationOptions.io = { ...fs.promises, open: async (file, flags, mode) => {
+  data.service.codexMigrationOptions.io = { ...data.service.codexMigrationOptions.io, open: async (file, flags, mode) => {
     if (path.basename(file) === '.migrated-from') throw new Error('injected marker failure');
     return fs.promises.open(file, flags, mode);
   } };
@@ -200,7 +208,7 @@ test('codex-profiles-migration-marker-failure-restores-active-link', async (t) =
 
 test('codex-profiles-migration-active-link-failure-keeps-store-untouched', async (t) => {
   const data = fixture(t);
-  data.service.codexMigrationOptions.io = { ...fs.promises, rename: async (from, to) => {
+  data.service.codexMigrationOptions.io = { ...data.service.codexMigrationOptions.io, rename: async (from, to) => {
     if (to === data.activeLink) throw new Error('injected active link failure');
     return fs.promises.rename(from, to);
   } };
@@ -378,7 +386,7 @@ test('codex-profiles-migration-MD-L04-flags-legacy-active-link-after-migration',
 
 test('codex-profiles-migration-corrupt-renamed-tree-recovers-from-verified-backup', async (t) => {
   const data = fixture(t);
-  data.service.codexMigrationOptions.io = { ...fs.promises, rename: async (from, to) => {
+  data.service.codexMigrationOptions.io = { ...data.service.codexMigrationOptions.io, rename: async (from, to) => {
     await fs.promises.rename(from, to);
     if (from === path.join(data.legacyDir, 'first')) await fs.promises.writeFile(path.join(to, 'auth.json'), 'wrong-auth-first\n');
   } };
@@ -391,7 +399,7 @@ test('codex-profiles-migration-corrupt-renamed-tree-recovers-from-verified-backu
 
 test('codex-profiles-migration-incomplete-rollback-stays-blocked-on-restart', async (t) => {
   const data = fixture(t);
-  data.service.codexMigrationOptions.io = { ...fs.promises, rename: async (from, to) => {
+  data.service.codexMigrationOptions.io = { ...data.service.codexMigrationOptions.io, rename: async (from, to) => {
     if (from === path.join(data.legacyDir, 'second') || from === path.join(data.profilesDir, 'first')) {
       throw new Error('injected forward/reverse failure');
     }
@@ -483,7 +491,7 @@ test('codex-profiles-migration-EXDEV-partial-source-removal-rolls-back', async (
   const data = fixture(t);
   let failed = false;
   data.service.codexMigrationOptions.io = {
-    ...fs.promises,
+    ...data.service.codexMigrationOptions.io,
     rename: async (from, to) => {
       if ((path.dirname(from) === data.legacyDir && path.dirname(to) === data.profilesDir)
           || (path.dirname(from) === data.profilesDir && path.dirname(to) === data.legacyDir)) {
@@ -540,7 +548,7 @@ test('codex-profiles-migration-refuses-symlinks-that-would-change-meaning', asyn
 
 test('codex-profiles-migration-marker-collision-preserves-unowned-file', async (t) => {
   const data = fixture(t);
-  data.service.codexMigrationOptions.io = { ...fs.promises, open: async (file, flags, mode) => {
+  data.service.codexMigrationOptions.io = { ...data.service.codexMigrationOptions.io, open: async (file, flags, mode) => {
     if (path.basename(file) === '.migrated-from') await fs.promises.writeFile(file, 'dummy-existing-marker', { mode: 0o600 });
     return fs.promises.open(file, flags, mode);
   } };
@@ -872,4 +880,471 @@ test('TRIPWIRE codex-migration-waiting-daemon-work-is-not-a-holder (CodeRabbit, 
   await Promise.all([lint, ingest]);
   assert.equal(data.service.configLintActive, false);
   assert.equal(data.service.warehouseIngestActive, false);
+});
+
+
+test('TRIPWIRE codex-migration-held-root-renames-and-aliases', async (t) => {
+  let processChecks = 0;
+  const data = fixture(t, { isLegacyInUse: async () => {
+    processChecks++;
+    return { inUse: true, holders: ['ChatGPT', 'codex'] };
+  } }, migrationClock(), { sameVolume: true, shortRoot: true });
+  const file = path.join(data.legacyDir, 'first', 'auth.json');
+  const fd = fs.openSync(file, 'a');
+  const child = spawn('/bin/sleep', ['5'], { cwd: path.dirname(file) });
+  await once(child, 'spawn');
+  t.after(async () => {
+    fs.closeSync(fd);
+    if (child.exitCode == null && child.signalCode == null) {
+      const exited = once(child, 'exit');
+      child.kill();
+      await exited;
+    }
+  });
+  const socketPath = path.join(data.legacyDir, 'first', 'ipc.sock');
+  const socket = net.createServer((client) => client.end('dummy'));
+  let socketAvailable = true;
+  try {
+    socket.listen(socketPath);
+    await once(socket, 'listening');
+  } catch (error) {
+    if (error.code !== 'EPERM') throw error;
+    socketAvailable = false;
+  }
+  t.after(async () => { if (socket.listening) await new Promise((resolve) => socket.close(resolve)); });
+  const app = createApp({ store: data.store, service: data.service, mutationToken: 'dummy-token' });
+  const response = await migrationRequest(app, 'POST', '/api/codex-profiles/migrate', migrationToken);
+  assert.deepEqual(response, { status: 200, body: { status: 'moved' } });
+  assert.equal(processChecks, 0);
+  assert.ok(fs.lstatSync(data.legacyDir).isSymbolicLink());
+  assert.equal(fs.readlinkSync(data.legacyDir), data.profilesDir);
+  fs.writeSync(fd, 'after-move');
+  assert.match(fs.readFileSync(path.join(data.profilesDir, 'first', 'auth.json'), 'utf8'), /after-move$/);
+  fs.writeFileSync(path.join(data.legacyDir, 'first', 'new-file'), 'new-dummy');
+  assert.equal(fs.readFileSync(path.join(data.profilesDir, 'first', 'new-file'), 'utf8'), 'new-dummy');
+  assert.equal(child.exitCode, null);
+  assert.equal(fs.realpathSync(data.activeLink), path.join(data.profilesDir, 'first'));
+  assert.equal(data.store.getAccount(data.account.id).profileRef, path.join(data.profilesDir, 'first'));
+  const marker = JSON.parse(fs.readFileSync(path.join(data.profilesDir, '.migrated-from'), 'utf8'));
+  assert.deepEqual(Object.keys(marker).sort(), ['alias', 'legacyDir', 'migratedAt']);
+  assert.equal(marker.alias, true);
+  assert.equal(marker.legacyDir, data.legacyDir);
+  assert.equal((await migrationRequest(app, 'GET', '/api/state')).body.codexProfilesMigration.status, 'done');
+  await t.test('socket accepts connections through the legacy alias', async (t) => {
+    if (!socketAvailable) return t.skip('sandbox denies unix socket listen with EPERM; other held-root assertions ran');
+    const client = net.createConnection(socketPath);
+    let bytes = '';
+    client.setEncoding('utf8');
+    client.on('data', (chunk) => { bytes += chunk; });
+    await once(client, 'end');
+    client.destroy();
+    assert.equal(bytes, 'dummy');
+  });
+});
+
+test('TRIPWIRE codex-migration-held-root-never-copies', async (t) => {
+  const data = fixture(t, { isLegacyInUse: async () => ({ inUse: true, holders: ['codex'] }) });
+  const result = await data.service.migrateCodexProfilesDir();
+  assert.equal(result.retryable, true);
+  assert.match(result.warning, /waiting on codex/);
+  assert.equal(fs.existsSync(data.profilesDir), false);
+});
+
+test('TRIPWIRE codex-migration-alias-race-rolls-back', async (t) => {
+  const data = fixture(t, {}, {}, { sameVolume: true });
+  let raced = false;
+  data.service.codexMigrationOptions.io = { ...data.service.codexMigrationOptions.io,
+    symlink: async (target, link, type) => {
+      if (!raced) { raced = true; await fs.promises.mkdir(data.legacyDir, { mode: 0o700 }); }
+      return fs.promises.symlink(target, link, type);
+    },
+  };
+  const result = await data.service.migrateCodexProfilesDir();
+  assert.equal(result.blocked, false);
+  assert.equal(result.retryable, true);
+  assert.equal(fs.lstatSync(data.legacyDir).isDirectory(), true);
+  assert.equal(fs.readFileSync(path.join(data.legacyDir, 'first', 'auth.json'), 'utf8'), 'dummy-auth-first\n');
+  assert.equal(data.store.getAccount(data.account.id).profileRef, data.account.profileRef);
+});
+
+test('TRIPWIRE codex-migration-restart-after-alias-is-done', async (t) => {
+  const data = fixture(t, {}, {}, { sameVolume: true });
+  fs.mkdirSync(data.profilesDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(data.profilesDir, 'marker-file'), 'dummy');
+  data.store.repointCodexProfiles([{ id: data.account.id, from: data.account.profileRef, to: path.join(data.profilesDir, 'first') }]);
+  fs.rmSync(data.legacyDir, { recursive: true });
+  fs.symlinkSync(data.profilesDir, data.legacyDir, 'dir');
+  assert.deepEqual(await data.service.migrateCodexProfilesDir(), {});
+  assert.equal(data.service.codexProfilesMigrationWarning, null);
+});
+
+test('TRIPWIRE codex-migration-alias-is-owner-only-and-never-followed', async (t) => {
+  const data = fixture(t, {}, {}, { sameVolume: true });
+  const foreign = path.join(data.root, 'foreign');
+  fs.mkdirSync(foreign, { mode: 0o700 });
+  fs.writeFileSync(path.join(foreign, 'canary'), 'untouched');
+  fs.rmSync(data.legacyDir, { recursive: true });
+  fs.symlinkSync(foreign, data.legacyDir, 'dir');
+  const result = await data.service.migrateCodexProfilesDir();
+  assert.ok(result.warning);
+  assert.equal(fs.readFileSync(path.join(foreign, 'canary'), 'utf8'), 'untouched');
+});
+
+test('codex-migration-absolute-links-into-legacy-survive-via-alias', async (t) => {
+  const data = fixture(t, {}, {}, { sameVolume: true });
+  const target = path.join(data.legacyDir, 'first', 'auth.json');
+  fs.symlinkSync(target, path.join(data.legacyDir, 'first', 'absolute-link'));
+  const result = await data.service.migrateCodexProfilesDir();
+  assert.equal(result.migrated, true);
+  assert.equal(fs.readFileSync(path.join(data.profilesDir, 'first', 'absolute-link'), 'utf8'), 'dummy-auth-first\n');
+});
+
+test('codex-migration-daemon-busy-still-defers-on-rename-path', async (t) => {
+  const data = fixture(t, {}, {}, { sameVolume: true });
+  data.service.codexProfilesMigrationReaders = 1;
+  const result = await data.service.migrateCodexProfilesDir();
+  assert.equal(result.retryable, true);
+  assert.match(result.warning, /node/);
+  assert.equal(fs.existsSync(data.profilesDir), false);
+});
+
+test('TRIPWIRE codex-migration-root-identity-race-never-publishes-replacement', async (t) => {
+  for (const restoreOriginal of [false, true]) {
+    await t.test(restoreOriginal ? 'original restored permits retry' : 'original still missing blocks operations', async (t) => {
+      const clock = migrationClock();
+      const data = fixture(t, {}, clock, { sameVolume: true });
+      const saved = `${data.legacyDir}-save`;
+      let raced = false;
+      data.service.codexMigrationOptions.io = { ...data.service.codexMigrationOptions.io,
+        rename: async (from, to) => {
+          if (from === data.legacyDir && !raced) {
+            raced = true;
+            await fs.promises.rename(from, saved);
+            await fs.promises.mkdir(from, { mode: 0o700 });
+          }
+          await fs.promises.rename(from, to);
+          if (from === data.profilesDir && restoreOriginal) {
+            await fs.promises.rmdir(data.legacyDir);
+            await fs.promises.rename(saved, data.legacyDir);
+          }
+        },
+      };
+      const result = await data.service.migrateCodexProfilesDir();
+      assert.ok(result.warning);
+      assert.equal(result.migrated, undefined);
+      assert.equal(result.blocked, !restoreOriginal);
+      assert.equal(result.retryable, restoreOriginal);
+      assert.equal(clock.timers.size, restoreOriginal ? 1 : 0);
+      assert.equal(fs.existsSync(data.profilesDir), false);
+      assert.equal(fs.existsSync(path.join(data.legacyDir, '.migrated-from')), false);
+      if (!restoreOriginal) assert.deepEqual(fs.readdirSync(data.legacyDir), []);
+      assert.equal(fs.readFileSync(path.join(restoreOriginal ? data.legacyDir : saved, 'first', 'auth.json'), 'utf8'), 'dummy-auth-first\n');
+      assert.equal(data.store.getAccount(data.account.id).profileRef, data.account.profileRef);
+      assert.equal(fs.readlinkSync(data.activeLink), '.codex-profiles/first');
+    });
+  }
+});
+
+test('TRIPWIRE codex-migration-destination-swap-after-moved-inode-check-never-publishes-replacement', async (t) => {
+  const data = fixture(t, {}, {}, { sameVolume: true });
+  const saved = `${data.profilesDir}-original`;
+  let raced = false;
+  let activeLinkTouched = false;
+  data.service.codexMigrationOptions.io = { ...data.service.codexMigrationOptions.io,
+    symlink: async (target, link, type) => {
+      if (link === data.legacyDir && !raced) {
+        raced = true;
+        await fs.promises.rename(data.profilesDir, saved);
+        fs.mkdirSync(data.profilesDir, { mode: 0o700 });
+        fs.mkdirSync(path.join(data.profilesDir, 'first'), { mode: 0o700 });
+        fs.writeFileSync(path.join(data.profilesDir, 'first', 'auth.json'), 'foreign-dummy\n', { mode: 0o600 });
+      }
+      return fs.promises.symlink(target, link, type);
+    },
+    rename: async (from, to) => {
+      if (to === data.activeLink) activeLinkTouched = true;
+      return fs.promises.rename(from, to);
+    },
+  };
+  const result = await data.service.migrateCodexProfilesDir();
+  assert.equal(raced, true);
+  assert.equal(result.migrated, undefined);
+  assert.equal(result.blocked, true);
+  assert.equal(activeLinkTouched, false);
+  assert.equal(fs.readFileSync(path.join(saved, 'first', 'auth.json'), 'utf8'), 'dummy-auth-first\n');
+  assert.equal(fs.readFileSync(path.join(data.profilesDir, 'first', 'auth.json'), 'utf8'), 'foreign-dummy\n');
+  assert.equal(fs.existsSync(path.join(data.profilesDir, '.migrated-from')), false);
+  assert.equal(data.store.getAccount(data.account.id).profileRef, data.account.profileRef);
+});
+
+test('TRIPWIRE codex-migration-rollback-alias-quarantine-preserves-foreign-substitution', async (t) => {
+  for (const variant of ['symlink', 'file']) {
+    await t.test(variant, async (t) => {
+      const data = fixture(t, {}, {}, { sameVolume: true });
+      const foreignTarget = path.join(data.root, `${variant}-foreign-target`);
+      fs.mkdirSync(foreignTarget, { mode: 0o700 });
+      fs.writeFileSync(path.join(foreignTarget, 'canary'), 'untouched\n');
+      let raced = false;
+      const placeForeign = () => {
+        if (variant === 'symlink') fs.symlinkSync(foreignTarget, data.legacyDir, 'dir');
+        else fs.writeFileSync(data.legacyDir, 'foreign-file-canary\n', { mode: 0o600 });
+      };
+      data.service.codexMigrationOptions.io = { ...data.service.codexMigrationOptions.io,
+        open: async (file, flags, mode) => {
+          if (path.basename(file) === '.migrated-from') throw new Error('injected marker failure');
+          return fs.promises.open(file, flags, mode);
+        },
+        rename: async (from, to) => {
+          const result = await fs.promises.rename(from, to);
+          if (!raced && from === data.legacyDir && path.basename(to).startsWith('.codex-migration-alias-')) {
+            raced = true;
+            placeForeign();
+          }
+          return result;
+        },
+        unlink: async (file) => {
+          if (!raced && file === data.legacyDir) {
+            raced = true;
+            fs.unlinkSync(data.legacyDir);
+            placeForeign();
+          }
+          return fs.promises.unlink(file);
+        },
+      };
+      const result = await data.service.migrateCodexProfilesDir();
+      assert.equal(raced, true);
+      assert.equal(result.migrated, undefined);
+      assert.equal(result.blocked, true);
+      if (variant === 'symlink') {
+        assert.equal(fs.readlinkSync(data.legacyDir), foreignTarget);
+        assert.equal(fs.readFileSync(path.join(foreignTarget, 'canary'), 'utf8'), 'untouched\n');
+      } else {
+        assert.equal(fs.readFileSync(data.legacyDir, 'utf8'), 'foreign-file-canary\n');
+      }
+    });
+  }
+});
+
+test('TRIPWIRE codex-migration-alias-race-preserves-foreign-symlink', async (t) => {
+  const data = fixture(t, {}, {}, { sameVolume: true });
+  const foreign = path.join(data.root, 'foreign');
+  fs.mkdirSync(foreign, { mode: 0o700 });
+  fs.writeFileSync(path.join(foreign, 'canary'), 'untouched');
+  let raced = false;
+  const race = () => {
+    if (!raced) { raced = true; fs.symlinkSync(foreign, data.legacyDir); }
+  };
+  data.service.codexMigrationOptions.io = { ...data.service.codexMigrationOptions.io,
+    symlink: async (target, link, type) => {
+      if (link === data.legacyDir) race();
+      return fs.promises.symlink(target, link, type);
+    },
+    rename: async (from, to) => {
+      if (to === data.legacyDir && path.basename(from).startsWith('.codex-migration-')) race();
+      return fs.promises.rename(from, to);
+    },
+  };
+  const result = await data.service.migrateCodexProfilesDir();
+  assert.ok(raced);
+  assert.equal(result.migrated, undefined);
+  assert.equal(result.blocked, true, 'foreign entry prevents a safe rename back');
+  assert.equal(fs.readlinkSync(data.legacyDir), foreign);
+  assert.equal(fs.readFileSync(path.join(foreign, 'canary'), 'utf8'), 'untouched');
+  assert.equal(fs.readFileSync(path.join(data.profilesDir, 'first', 'auth.json'), 'utf8'), 'dummy-auth-first\n');
+  assert.equal(fs.existsSync(path.join(data.profilesDir, '.migrated-from')), false);
+  assert.equal(data.store.getAccount(data.account.id).profileRef, data.account.profileRef);
+});
+
+test('TRIPWIRE codex-migration-restart-alias-validates-destination-integrity', async (t) => {
+  for (const variant of ['dangling', 'redirected', 'public', 'foreign-owner', 'identity-swap']) {
+    await t.test(variant, async (t) => {
+      const data = fixture(t, {}, {}, { sameVolume: true });
+      fs.renameSync(data.legacyDir, data.profilesDir);
+      fs.symlinkSync(data.profilesDir, data.legacyDir);
+      const saved = path.join(data.root, 'saved');
+      if (variant === 'dangling') fs.renameSync(data.profilesDir, saved);
+      if (variant === 'redirected') {
+        fs.renameSync(data.profilesDir, saved);
+        fs.symlinkSync(saved, data.profilesDir);
+      }
+      if (variant === 'public') fs.chmodSync(data.profilesDir, 0o755);
+      let swapped = false;
+      data.service.codexMigrationOptions.io = { ...data.service.codexMigrationOptions.io,
+        lstat: async (file) => {
+          const stat = await fs.promises.lstat(file);
+          if (variant === 'foreign-owner' && file === data.profilesDir) stat.uid += 1;
+          return stat;
+        },
+        realpath: async (file) => {
+          if (variant === 'identity-swap' && file === data.legacyDir && !swapped) {
+            swapped = true;
+            fs.renameSync(data.profilesDir, saved);
+            fs.mkdirSync(data.profilesDir, { mode: 0o700 });
+          }
+          return fs.promises.realpath(file);
+        },
+      };
+      const result = await data.service.migrateCodexProfilesDir();
+      assert.ok(result.warning);
+      assert.equal(result.retryable, false);
+      assert.equal(data.store.getAccount(data.account.id).profileRef, data.account.profileRef);
+    });
+  }
+});
+
+test('TRIPWIRE codex-migration-restart-alias-repairs-stale-references-transactionally', async (t) => {
+  for (const abort of [false, true]) {
+    await t.test(abort ? 'transaction failure retains every old reference' : 'publishes every legacy reference', async (t) => {
+      const data = fixture(t, {}, {}, { sameVolume: true });
+      const second = data.store.saveAccount({ provider: 'codex', label: 'Dummy second', profileRef: path.join(data.legacyDir, 'second') });
+      fs.renameSync(data.legacyDir, data.profilesDir);
+      fs.symlinkSync(data.profilesDir, data.legacyDir);
+      if (abort) data.store.db.exec(`CREATE TRIGGER abort_restart BEFORE UPDATE OF profile_ref ON accounts
+        WHEN OLD.label = 'Dummy second' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END`);
+      let publishes = 0;
+      const repoint = data.store.repointCodexProfiles.bind(data.store);
+      data.store.repointCodexProfiles = (moves) => { publishes++; return repoint(moves); };
+      const result = await data.service.migrateCodexProfilesDir();
+      assert.equal(publishes, 1);
+      for (const account of [data.account, second]) {
+        assert.equal(data.store.getAccount(account.id).profileRef,
+          abort ? account.profileRef : path.join(data.profilesDir, path.basename(account.profileRef)));
+      }
+      if (abort) { assert.ok(result.warning); assert.equal(result.blocked, true); }
+      else { assert.deepEqual(result, {}); assert.equal(data.service.codexProfilesMigration, null); }
+      assert.equal(fs.realpathSync(data.legacyDir), data.profilesDir);
+    });
+  }
+});
+
+test('TRIPWIRE codex-migration-rename-validates-registered-nested-profile', async (t) => {
+  for (const variant of ['public', 'symlink', 'file', 'foreign-owner']) {
+    await t.test(variant, async (t) => {
+      const data = fixture(t, {}, {}, { sameVolume: true });
+      const nested = path.join(data.legacyDir, 'first', 'nested');
+      if (variant === 'symlink') fs.symlinkSync(path.join(data.legacyDir, 'second'), nested);
+      else if (variant === 'file') fs.writeFileSync(nested, 'dummy', { mode: 0o600 });
+      else fs.mkdirSync(nested, { mode: variant === 'public' ? 0o755 : 0o700 });
+      data.store.repointCodexProfiles([{ id: data.account.id, from: data.account.profileRef, to: nested }]);
+      data.service.codexMigrationOptions.io = { ...data.service.codexMigrationOptions.io,
+        lstat: async (file) => {
+          const stat = await fs.promises.lstat(file);
+          if (variant === 'foreign-owner' && file === nested) stat.uid += 1;
+          return stat;
+        },
+      };
+      const result = await data.service.migrateCodexProfilesDir();
+      assert.ok(result.warning);
+      assert.equal(fs.existsSync(data.profilesDir), false);
+      assert.equal(fs.lstatSync(data.legacyDir).isDirectory(), true);
+      assert.equal(data.store.getAccount(data.account.id).profileRef, nested);
+    });
+  }
+});
+
+// CodeRabbit (PR #695): a legacy root at 0o750/0o755 passes every earlier
+// guard, must not be RENAMED (the mode would ride along), and before #693 it
+// migrated through the verified copy. Falling through keeps that behavior.
+test('TRIPWIRE codex-migration-non-private-legacy-root-enters-verified-copy-not-abort', async (t) => {
+  for (const held of [false, true]) {
+    await t.test(`held ${held}`, async (t) => {
+      const clock = migrationClock();
+      let checks = 0;
+      const data = fixture(t, { isLegacyInUse: async () => {
+        checks++;
+        return held ? { inUse: true, holders: ['codex'] } : false;
+      } }, clock, { sameVolume: true });
+      fs.chmodSync(data.legacyDir, 0o750);
+      let renamedRoot = false;
+      data.service.codexMigrationOptions.io = { ...data.service.codexMigrationOptions.io,
+        rename: async (from, to) => {
+          if (from === data.legacyDir) renamedRoot = true;
+          return fs.promises.rename(from, to);
+        },
+      };
+      const result = await data.service.migrateCodexProfilesDir();
+      assert.equal(renamedRoot, false, 'a non-private root must never be renamed');
+      assert.ok(checks > 0, 'the copy path must consult the process gate');
+      if (held) {
+        assert.equal(result.retryable, true, 'held copy path defers, never a permanent warning');
+        assert.equal(result.blocked, false);
+        assert.equal(clock.timers.size, 1);
+      } else {
+        assert.equal(result.migrated, true);
+        assert.ok(result.backupDir, 'the copy path ran');
+        assert.equal(fs.statSync(data.profilesDir).mode & 0o077, 0, 'the destination root is owner-only');
+      }
+    });
+  }
+});
+
+test('TRIPWIRE codex-migration-same-device-EXDEV-enters-idle-verified-copy', async (t) => {
+  for (const emptyDestination of [false, true]) {
+    for (const held of [false, true]) {
+      await t.test(`empty destination ${emptyDestination}, held ${held}`, async (t) => {
+        const clock = migrationClock();
+        let checks = 0;
+        const data = fixture(t, { isLegacyInUse: async () => {
+          checks++;
+          return held ? { inUse: true, holders: ['codex'] } : false;
+        } }, clock, { sameVolume: true });
+        if (emptyDestination) fs.mkdirSync(data.profilesDir, { mode: 0o700 });
+        data.service.codexMigrationOptions.io = { ...data.service.codexMigrationOptions.io,
+          rename: async (from, to) => {
+            if (from === data.legacyDir || path.dirname(from) === data.legacyDir) {
+              throw Object.assign(new Error('same-device EXDEV fixture'), { code: 'EXDEV' });
+            }
+            return fs.promises.rename(from, to);
+          },
+        };
+        const result = await data.service.migrateCodexProfilesDir();
+        assert.ok(checks > 0, 'fallback must consult the process gate');
+        if (held) {
+          assert.equal(result.retryable, true);
+          assert.equal(result.blocked, false);
+          assert.equal(clock.timers.size, 1);
+          assert.equal(fs.existsSync(data.profilesDir), false);
+          assert.deepEqual(fs.readdirSync(data.dataDir), []);
+          assert.equal(data.store.getAccount(data.account.id).profileRef, data.account.profileRef);
+        } else {
+          assert.equal(result.migrated, true);
+          assert.ok(result.backupDir);
+          for (const root of [data.profilesDir, path.join(result.backupDir, 'profiles')]) {
+            assert.equal(fs.readFileSync(path.join(root, 'first', 'auth.json'), 'utf8'), 'dummy-auth-first\n');
+          }
+          assert.deepEqual(fs.readdirSync(data.legacyDir), []);
+          assert.equal(data.store.getAccount(data.account.id).profileRef, path.join(data.profilesDir, 'first'));
+        }
+      });
+    }
+  }
+});
+
+
+test('codex-migration-rename-failures-restore-original-root', async (t) => {
+  for (const stage of ['active-link', 'marker', 'database']) {
+    await t.test(stage, async (t) => {
+      const data = fixture(t, {}, {}, { sameVolume: true });
+      const identity = fs.lstatSync(data.legacyDir);
+      data.service.codexMigrationOptions.io = { ...data.service.codexMigrationOptions.io,
+        rename: async (from, to) => {
+          if (stage === 'active-link' && to === data.activeLink) throw new Error('fixture link failure');
+          return fs.promises.rename(from, to);
+        },
+        open: async (file, flags, mode) => {
+          if (stage === 'marker' && file === path.join(data.profilesDir, '.migrated-from')) throw new Error('fixture marker failure');
+          return fs.promises.open(file, flags, mode);
+        },
+      };
+      if (stage === 'database') data.store.repointCodexProfiles = () => { throw new Error('fixture database failure'); };
+      const result = await data.service.migrateCodexProfilesDir();
+      assert.ok(result.warning);
+      assert.equal(result.blocked, false);
+      assert.equal(fs.lstatSync(data.legacyDir).ino, identity.ino);
+      assert.equal(fs.existsSync(data.profilesDir), false);
+      assert.deepEqual(fs.readdirSync(data.legacyDir), ['first', 'second']);
+      assert.equal(fs.readlinkSync(data.activeLink), '.codex-profiles/first');
+      assert.equal(data.store.getAccount(data.account.id).profileRef, data.account.profileRef);
+    });
+  }
 });

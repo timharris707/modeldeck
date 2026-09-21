@@ -110,7 +110,7 @@ This is the point of the tool, so it's worth being explicit:
 |---|---|
 | Cloud services | **None.** No backend, no sync, no accounts. |
 | Telemetry | **None.** Nothing is phoned home, ever. |
-| Provider credentials | Sign-in happens in the provider's own browser flow; credentials stay in the profile/Keychain. The one-time Codex profile directory migration moves existing homes into ModelDeck's data directory and retains an owner-only recovery backup there. |
+| Provider credentials | Sign-in happens in the provider's own browser flow; credentials stay in the profile/Keychain. The one-time Codex profile directory migration moves existing homes into ModelDeck's data directory; when the two are on different volumes it copies and retains an owner-only recovery backup there, and on the same volume it renames in place with no backup. |
 | ModelDeck's own secrets | A few Keychain items of its own, all locally generated: one random token that authorizes the app to the daemon's localhost API, plus — only if you use the managed proxy — one client key per profile (service `cli-proxy-api-client.<profile>`) that ModelDeck mints for its own local proxy. None contain provider data. |
 | Network | Daemon binds to `127.0.0.1` only. Outbound calls go solely to the providers you already use, with credentials they already hold. |
 | Removal | Removing an account deletes only ModelDeck's reference. Deleting ModelDeck's data directory also deletes its managed Codex profiles and migration backups; Keychain entries remain. Custom profile-directory overrides must be removed separately. |
@@ -158,8 +158,8 @@ first and keep a backup of any profiles you want to retain.
      and isolated per-account profile homes, including `codex-profiles` and
      its migration backups. Deleting it removes those managed sign-ins;
      activation symlinks such as `~/.codex` may then point at a missing home.
-     The migration leaves the empty `~/.codex-profiles` directory for you to
-     remove. If you use `MODELDECK_DATA_DIR`, `MODELDECK_DB_PATH`, or
+     The migration leaves a symlink at `~/.codex-profiles` so anything still using the old path (ChatGPT, its Codex helpers, Codex sessions) keeps working; remove it only after all of those have stopped.
+     If you use `MODELDECK_DATA_DIR`, `MODELDECK_DB_PATH`, or
      `MODELDECK_CODEX_PROFILES_DIR`, remove those configured locations instead.
    - `~/Library/Preferences/app.modeldeck.mac.plist`,
      `~/Library/Caches/app.modeldeck.mac`, and (if you ever ran the

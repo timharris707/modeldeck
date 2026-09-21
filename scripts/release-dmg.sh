@@ -20,19 +20,21 @@
 # per-version volname would orphan it.
 #
 # Appcast (issue #121, Sparkle 2 in-app updates): after the DMG is stapled,
-# the script generates dist/appcast.xml — EdDSA-signed via Sparkle's
+# the script generates both stable/beta feeds (only beta with --beta),
+# EdDSA-signed via Sparkle's
 # sign_update (private key in the login Keychain from Tim's one-time
 # generate_keys run; never in the repo) — and stamps the Sparkle PUBLIC key
-# into the app's Info.plist (SUPublicEDKey) before signing. Publish BOTH the
-# DMG and appcast.xml as assets on the version's GitHub release; the app's
+# into the app's Info.plist (SUPublicEDKey) before signing. Stable releases
+# publish both feeds and both DMG names (docs/RELEASE.md); the app's
 # SUFeedURL points at the stable releases/latest/download/appcast.xml
 # redirect.
 #
 # Usage:
-#   scripts/release-dmg.sh [--dry-run] [--check-only] [--allow-dirty]
-#                          [--ref <ref>]
-#   scripts/release-dmg.sh --appcast-only <dmg>
-#       Regenerate only the appcast for an existing ModelDeck-<ver>.dmg
+#   scripts/release-dmg.sh [--dry-run] [--check-only] [--allow-dirty] [--first-feeds]
+#                          [--ref <ref>] [--beta]
+#                          [--merge-existing-stable <path>] [--merge-existing-beta <path>]
+#   scripts/release-dmg.sh --appcast-only <dmg> --build <CFBundleVersion>
+#       Regenerate only the feeds for an existing ModelDeck-<ver>.dmg
 #       (written beside it). No git guard, no identities — this is also the
 #       test hook: inject MD_SPARKLE_SIGN_UPDATE (+ MD_SPARKLE_KEY_FILE with
 #       the fake fixture key) to verify the step without real credentials.
@@ -112,59 +114,86 @@ locate_sign_update() {
   find "$PACKAGE_DIR/.build/artifacts" -type f -name sign_update 2>/dev/null | head -1 || true
 }
 
-# Generates <dir-of-dmg>/appcast.xml for a ModelDeck-<version>.dmg.
-# $1 = dmg path, $2 = sparkle build number (CFBundleVersion).
+# Issue #705: feed inputs are fetched by the operator before this script;
+# appcast-only stays offline and uses the exact build number from the DMG.
 generate_appcast() {
-  local dmg="$1" build="$2" version base sign_update out
+  local dmg="$1" build="$2" version base sign_update out floor feed prior
   base="$(basename "$dmg")"
   version="${base#ModelDeck-}"; version="${version%.dmg}"
-  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
-    || fail "cannot derive a version from DMG name '$base' (expected ModelDeck-<version>.dmg)"
+  local beta_args=() key_args=() notes_args=() merge_args=() channel_args=()
+  [[ "$BETA" == 0 ]] || beta_args=(--beta)
+  local notes_file="$REPO_ROOT/docs/release-notes/$version.md"
+  floor="$(node "$REPO_ROOT/scripts/release-checks.mjs" --channel-only \
+    --version "$version" --notes "$notes_file" "${beta_args[@]+"${beta_args[@]}"}")" \
+    || fail "release channel or rollback floor check failed"
   sign_update="$(locate_sign_update)"
   [[ -n "$sign_update" && -x "$sign_update" ]] || fail "Sparkle sign_update tool not found (set MD_SPARKLE_SIGN_UPDATE or resolve SwiftPM packages).
 $SPARKLE_ONE_TIME_HELP"
-  out="$(cd "$(dirname "$dmg")" && pwd)/appcast.xml"
-  local key_args=()
-  # TESTS ONLY: an injected key FILE (fake fixture). Real releases use the
-  # Keychain — sign_update's default — and fail loudly when it is absent.
   if [[ -n "${MD_SPARKLE_KEY_FILE:-}" ]]; then
     key_args=(--key-file "$MD_SPARKLE_KEY_FILE")
   fi
-  # Issue #685: the release notes ride the appcast as <description>, so the
-  # app's update check and Sparkle read the same feed. A version without a
-  # notes file still gets an appcast — just without notes.
-  local notes_args=()
-  local notes_file="$REPO_ROOT/docs/release-notes/$version.md"
-  if [[ -f "$notes_file" ]]; then
-    notes_args=(--release-notes-file "$notes_file")
-  fi
-  node "$REPO_ROOT/scripts/generate-appcast.mjs" \
-    --version "$version" \
-    --build "$build" \
-    --dmg "$dmg" \
-    --url "https://github.com/timharris707/modeldeck/releases/download/v$version/ModelDeck-$version.dmg" \
-    --release-notes-url "https://github.com/timharris707/modeldeck/releases/tag/v$version" \
-    "${notes_args[@]+"${notes_args[@]}"}" \
-    --sign-update "$sign_update" \
-    "${key_args[@]+"${key_args[@]}"}" \
-    --out "$out" \
-    || fail "appcast generation failed.
+  [[ ! -f "$notes_file" ]] || notes_args=(--release-notes-file "$notes_file")
+  local feeds=(appcast.xml appcast-beta.xml)
+  [[ "$BETA" == 0 ]] || feeds=(appcast-beta.xml)
+  for feed in "${feeds[@]}"; do
+    out="$(cd "$(dirname "$dmg")" && pwd)/$feed"
+    merge_args=(); channel_args=()
+    if [[ "$feed" == appcast.xml ]]; then
+      prior="$MERGE_EXISTING_STABLE"
+      channel_args=(--stable-only)
+    else
+      prior="$MERGE_EXISTING_BETA"
+      [[ "$BETA" == 0 ]] || channel_args=(--channel beta)
+    fi
+    [[ -z "$prior" ]] || merge_args=(--merge-existing "$prior")
+    node "$REPO_ROOT/scripts/generate-appcast.mjs" \
+      --version "$version" --build "$build" --dmg "$dmg" \
+      --url "https://github.com/timharris707/modeldeck/releases/download/v$version/ModelDeck-$version.dmg" \
+      --release-notes-url "https://github.com/timharris707/modeldeck/releases/tag/v$version" \
+      --rollback-floor "$floor" \
+      "${notes_args[@]+"${notes_args[@]}"}" \
+      "${merge_args[@]+"${merge_args[@]}"}" \
+      "${channel_args[@]+"${channel_args[@]}"}" \
+      --sign-update "$sign_update" "${key_args[@]+"${key_args[@]}"}" --out "$out" \
+      || fail "appcast generation failed.
 $SPARKLE_ONE_TIME_HELP"
-  # The generator's entry detection failed SILENTLY on v0.3.9 and v0.3.10
-  # (symlinked mktemp worktree; see generate-appcast.mjs) — node exited 0
-  # without writing anything. Never report a file that isn't there.
-  [[ -s "$out" ]] || fail "appcast generation exited 0 but $out is missing or empty — entry-detection regression in generate-appcast.mjs?"
-  echo "==> appcast written: $out"
+    [[ -s "$out" ]] || fail "appcast generation exited 0 but $out is missing or empty — entry-detection regression in generate-appcast.mjs?"
+    if [[ "$feed" == appcast.xml ]]; then
+      node "$REPO_ROOT/scripts/release-checks.mjs" --channel-only --version "$version" \
+        --notes "$notes_file" --stable-appcast "$out" >/dev/null \
+        || fail "stable appcast contains a channel item"
+    fi
+    echo "==> appcast written: $out"
+  done
 }
 
 DRY_RUN=0
 CHECK_ONLY=0
 ALLOW_DIRTY=0
 APPCAST_ONLY=""
+APPCAST_BUILD=""
+BETA=0
+MERGE_EXISTING_STABLE=""
+MERGE_EXISTING_BETA=""
+# Issue #705 (Astra review of PR #710): without the prior feeds a release
+# silently publishes one-item feeds and throws away the rollback history, so
+# both are REQUIRED; --first-feeds is the explicit, one-time bootstrap.
+FIRST_FEEDS=0
 RELEASE_REF="origin/main"
 REF_OVERRIDDEN=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --beta) BETA=1 ;;
+    --first-feeds) FIRST_FEEDS=1 ;;
+    --build|--merge-existing-stable|--merge-existing-beta)
+      [[ $# -ge 2 && "$2" != --* ]] || fail "$1 requires a value"
+      case "$1" in
+        --build) APPCAST_BUILD="$2" ;;
+        --merge-existing-stable) MERGE_EXISTING_STABLE="$2" ;;
+        --merge-existing-beta) MERGE_EXISTING_BETA="$2" ;;
+      esac
+      shift
+      ;;
     --dry-run) DRY_RUN=1 ;;
     --check-only) CHECK_ONLY=1 ;;
     --allow-dirty) ALLOW_DIRTY=1 ;;
@@ -185,13 +214,33 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+# Issue #705 (Astra review of PR #710): every feed the script writes must
+# carry the prior history, on the real path AND on --appcast-only (the
+# reviewer's reproduction used the latter). --first-feeds is the explicit
+# one-time bootstrap; --dry-run/--check-only never write a feed.
+require_prior_feeds() {
+  if [[ "$FIRST_FEEDS" == 1 ]]; then
+    [[ -z "$MERGE_EXISTING_STABLE" && -z "$MERGE_EXISTING_BETA" ]] \
+      || fail "--first-feeds and --merge-existing-* are mutually exclusive"
+    echo "==> WARNING: --first-feeds: publishing feeds with NO prior history (one-time bootstrap)"
+    return 0
+  fi
+  # A beta release writes only the beta feed, so only that prior is required.
+  [[ "$BETA" == 1 || ( -n "$MERGE_EXISTING_STABLE" && -f "$MERGE_EXISTING_STABLE" ) ]] \
+    || fail "--merge-existing-stable <prior appcast.xml> is required so the feed keeps its rollback history (fetch the live feed first; see docs/RELEASE.md). First publication ever: --first-feeds."
+  [[ -n "$MERGE_EXISTING_BETA" && -f "$MERGE_EXISTING_BETA" ]] \
+    || fail "--merge-existing-beta <prior appcast-beta.xml> is required so the feed keeps its beta history (fetch the live feed first; see docs/RELEASE.md). First publication ever: --first-feeds."
+}
+
 # --------------------------------------- appcast-only mode (issue #121)
 # Regenerates the feed for an already-built DMG. Deliberately BEFORE the
 # repository guard: no build, no signing identities, no git required — this
 # is the test hook for the new release step.
 if [[ -n "$APPCAST_ONLY" ]]; then
   [[ -f "$APPCAST_ONLY" ]] || fail "DMG not found: $APPCAST_ONLY"
-  BUILD_NUMBER="$(git -C "$REPO_ROOT" rev-list --count HEAD 2>/dev/null || echo 0)"
+  [[ "$APPCAST_BUILD" =~ ^[0-9]+$ ]] || fail "--appcast-only requires --build <CFBundleVersion from the DMG>"
+  BUILD_NUMBER="$APPCAST_BUILD"
+  require_prior_feeds
   generate_appcast "$APPCAST_ONLY" "$BUILD_NUMBER"
   exit 0
 fi
@@ -237,7 +286,9 @@ echo "    required ref:    $RELEASE_REF"
 [[ -f "$REPO_ROOT/scripts/release-checks.mjs" ]] \
   || fail "release checks missing: $REPO_ROOT/scripts/release-checks.mjs"
 echo "==> release checks"
-node "$REPO_ROOT/scripts/release-checks.mjs" \
+RELEASE_CHECK_ARGS=()
+[[ "$BETA" == 0 ]] || RELEASE_CHECK_ARGS=(--beta)
+node "$REPO_ROOT/scripts/release-checks.mjs" "${RELEASE_CHECK_ARGS[@]+"${RELEASE_CHECK_ARGS[@]}"}" \
   || fail "release checks failed"
 
 [[ -f "$CLIPROXY_PIN" ]] || fail "CLIProxyAPI pin missing: $CLIPROXY_PIN"
@@ -438,7 +489,10 @@ cp "$AGENT_PLIST" "$APP/Contents/Library/LaunchAgents/ai.hermes.modeldeck.plist"
 plutil -lint "$APP/Contents/Library/LaunchAgents/ai.hermes.modeldeck.plist" >/dev/null
 
 echo "==> stamping version $VERSION (build $BUILD_NUMBER), commit $GIT_COMMIT into Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+# Issue #705: Apple requires the numeric short version; discovery needs
+# the full prerelease string to offer the final after its beta.
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION%%-*}" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :ModelDeckDisplayVersion string $VERSION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :MDGitCommit $GIT_COMMIT" "$APP/Contents/Info.plist" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Add :MDGitCommit string $GIT_COMMIT" "$APP/Contents/Info.plist"
@@ -660,9 +714,10 @@ spctl -a -t open --context context:primary-signature -vv "$DMG"
 
 # ---------------------------------------------------- 8. appcast (issue #121)
 # Signed AFTER stapling: the EdDSA signature must cover the exact bytes
-# users download. Publish appcast.xml as an asset on the SAME release as
-# the DMG (SUFeedURL reads releases/latest/download/appcast.xml).
+# users download. Publish both feeds on stable releases; beta publication
+# also replaces the latest stable release's beta asset (docs/RELEASE.md).
 echo "==> generating Sparkle appcast"
+require_prior_feeds
 generate_appcast "$DMG" "$BUILD_NUMBER"
 
 # ------------------------------------- 9. stable-named asset (modeldeck.ai)
@@ -676,6 +731,10 @@ cp "$DMG" "$STABLE_DMG"
 echo "==> stable-named asset written: $STABLE_DMG (same bytes as $DMG)"
 
 echo "==> done: $DMG"
-echo "    publish ALL THREE assets on the release (the stable-named"
-echo "    ModelDeck.dmg keeps the website's permanent download URL alive):"
-echo "    gh release create v$VERSION \"$DMG\" \"$DIST_DIR/appcast.xml\" \"$STABLE_DMG\""
+if [[ "$BETA" == 1 ]]; then
+  echo "    publish as a prerelease; replace appcast-beta.xml on the latest stable release too (docs/RELEASE.md):"
+  echo "    gh release create -R timharris707/modeldeck --prerelease v$VERSION \"$DMG\" \"$DIST_DIR/appcast-beta.xml\""
+else
+  echo "    publish both feeds and both DMG names on the stable release:"
+  echo "    gh release create -R timharris707/modeldeck v$VERSION \"$DMG\" \"$DIST_DIR/appcast.xml\" \"$DIST_DIR/appcast-beta.xml\" \"$STABLE_DMG\""
+fi

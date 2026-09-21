@@ -21,18 +21,34 @@ public struct AppcastItem: Equatable, Sendable {
     /// on ("14.0"). nil when the feed carries none: no floor, runs anywhere.
     public var minimumSystemVersion: String?
 
+    public var build: String?
+    public var rollbackFloor: String?
+    public var channel: String?
+    public var edSignature: String?
+    public var enclosureLength: Int?
+
     public init(
         shortVersionString: String,
         description: String? = nil,
         releaseNotesLink: URL? = nil,
         enclosureURL: URL? = nil,
-        minimumSystemVersion: String? = nil
+        minimumSystemVersion: String? = nil,
+        build: String? = nil,
+        rollbackFloor: String? = nil,
+        channel: String? = nil,
+        edSignature: String? = nil,
+        enclosureLength: Int? = nil
     ) {
         self.shortVersionString = shortVersionString
         self.description = description
         self.releaseNotesLink = releaseNotesLink
         self.enclosureURL = enclosureURL
         self.minimumSystemVersion = minimumSystemVersion
+        self.build = build
+        self.rollbackFloor = rollbackFloor
+        self.channel = channel
+        self.edSignature = edSignature
+        self.enclosureLength = enclosureLength
     }
 
     /// Whether Sparkle would install this item on `system` (CodeRabbit,
@@ -93,18 +109,25 @@ public enum AppcastDecoder {
         return collector.items
     }
 
-    /// The newest item by version that THIS Mac can install (the appcast is
-    /// single-item today, but a multi-item feed must still answer with its
-    /// newest eligible one). Items whose `minimumSystemVersion` is above
+    /// The newest eligible item by version. Issue #705: a stable-feed read
+    /// excludes channel-tagged items even if an old feed contains one.
+    /// Items whose `minimumSystemVersion` is above
     /// `runningSystem` are skipped — Sparkle would refuse them, so they are
     /// not an update for this Mac. nil when nothing remains: an empty
     /// channel, or a feed whose every item needs a newer macOS.
     public static func newestItem(
         from data: Data,
-        runningSystem: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
+        runningSystem: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion,
+        betaEnabled: Bool = false,
+        allowing isAllowed: (AppcastItem) -> Bool = { _ in true }
     ) throws -> AppcastItem? {
         try items(from: data)
-            .filter { $0.isEligible(on: runningSystem) }
+            // CodeRabbit (PR #710): the beta feed admits untagged and
+            // "beta" items only; the Sparkle delegate allows exactly
+            // ["beta"], so any other tag would be found here and then
+            // refused by the installer. `allowing` is the caller's extra
+            // veto (issue #706: the version a rollback left).
+            .filter { $0.isEligible(on: runningSystem) && ($0.channel == nil || (betaEnabled && $0.channel == "beta")) && isAllowed($0) }
             .max { lhs, rhs in
                 AppVersion.isNewer(rhs.shortVersionString, than: lhs.shortVersionString)
             }
@@ -124,6 +147,11 @@ public enum AppcastDecoder {
         private var releaseNotesLink: String?
         private var enclosureURL: String?
         private var minimumSystemVersion: String?
+        private var build: String?
+        private var rollbackFloor: String?
+        private var channel: String?
+        private var edSignature: String?
+        private var enclosureLength: Int?
 
         private static func localName(_ qualified: String) -> String {
             qualified.split(separator: ":").last.map(String.init) ?? qualified
@@ -137,7 +165,7 @@ public enum AppcastDecoder {
             attributes: [String: String]
         ) {
             switch Self.localName(elementName) {
-            case "channel":
+            case "channel" where !inItem:
                 sawChannel = true
             case "item":
                 inItem = true
@@ -146,8 +174,15 @@ public enum AppcastDecoder {
                 releaseNotesLink = nil
                 enclosureURL = nil
                 minimumSystemVersion = nil
+                build = nil
+                rollbackFloor = nil
+                channel = nil
+                edSignature = nil
+                enclosureLength = nil
             case "enclosure" where inItem:
                 enclosureURL = attributes["url"]
+                edSignature = attributes.first { Self.localName($0.key) == "edSignature" }?.value
+                enclosureLength = attributes["length"].flatMap(Int.init)
             default:
                 break
             }
@@ -170,6 +205,12 @@ public enum AppcastDecoder {
         ) {
             guard inItem else { return }
             switch Self.localName(elementName) {
+            case "version":
+                build = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            case "rollbackFloor":
+                rollbackFloor = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            case "channel":
+                channel = text.trimmingCharacters(in: .whitespacesAndNewlines)
             case "shortVersionString":
                 version = text.trimmingCharacters(in: .whitespacesAndNewlines)
             case "description":
@@ -186,7 +227,12 @@ public enum AppcastDecoder {
                         description: notes,
                         releaseNotesLink: releaseNotesLink.flatMap(URL.init(string:)),
                         enclosureURL: enclosureURL.flatMap(URL.init(string:)),
-                        minimumSystemVersion: minimumSystemVersion
+                        minimumSystemVersion: minimumSystemVersion,
+                        build: build,
+                        rollbackFloor: rollbackFloor,
+                        channel: channel,
+                        edSignature: edSignature,
+                        enclosureLength: enclosureLength
                     ))
                 }
             default:

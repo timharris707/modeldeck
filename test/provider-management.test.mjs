@@ -293,7 +293,12 @@ test('Codex migration updates an existing terminal pin and retries a failed writ
   service.codexLegacyProfilesDir = legacy;
   service.codexMigrationOptions = { isLegacyInUse: async () => true };
   service.logCodexMigration = () => {};
+  // #693: a process holder no longer defers a same-volume move; only the
+  // daemon's own in-flight work does. Hold the first attempt that way.
+  service.codexActivationCount = 1;
   await service.migrateCodexProfilesDir();
+  service.codexActivationCount = 0;
+  assert.equal(fs.existsSync(original), true);
   await service.activateCodexProfile(original);
   const oldPin = fs.readFileSync(service.codexShellEnvFile, 'utf8');
   assert.ok(oldPin.includes(original));
@@ -311,7 +316,9 @@ test('Codex migration updates an existing terminal pin and retries a failed writ
   assert.equal(failed.codexProfilesMigrationBlocked, true);
   assert.match(failed.codexProfilesMigrationWarning, /terminal environment/);
   assert.equal(fs.readFileSync(service.codexShellEnvFile, 'utf8'), oldPin);
-  assert.equal(fs.existsSync(original), false);
+  // The root moved; the old path is now the #693 alias onto the new root.
+  assert.equal(fs.lstatSync(legacy).isSymbolicLink(), true);
+  assert.equal(fs.existsSync(path.join(destination, 'personal')), true);
 
   const retried = restart();
   await retried.migrateCodexProfilesDir();

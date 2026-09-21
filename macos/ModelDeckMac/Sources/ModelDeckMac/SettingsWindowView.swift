@@ -30,6 +30,7 @@ struct SettingsWindowView: View {
     /// Issue #33: the app's own update check — a strictly separate surface
     /// from CLI updates (never a shared control or wording).
     @ObservedObject var appUpdateModel: AppUpdateModel
+    @ObservedObject var appRollbackModel: AppRollbackModel
     /// Issue #60: the "Check for updates automatically" toggle's model.
     @ObservedObject var appUpdateAutoChecker: AppUpdateAutoChecker
     /// Issue #121: in-app install state + "Install updates automatically".
@@ -74,6 +75,7 @@ struct SettingsWindowView: View {
                 deckModel: deckModel,
                 updateModel: updateModel,
                 appUpdateModel: appUpdateModel,
+                appRollbackModel: appRollbackModel,
                 appUpdateAutoChecker: appUpdateAutoChecker,
                 appUpdateInstallModel: appUpdateInstallModel,
                 daemonSetupModel: daemonSetupModel,
@@ -1468,6 +1470,8 @@ struct AccountEditSheet: View {
 // MARK: - General pane
 
 struct GeneralSettingsPane: View {
+    @State private var rollbackConfirmation: AppcastItem?
+    @AppStorage(AppUpdateFeedPolicy.betaReleasesKey) private var betaReleases = false
     @ObservedObject var settingsSync: SettingsSyncModel
     @ObservedObject var toolsModel: ToolsStatusModel
     /// Issue #32 item 4: the CLI-row chip is the ACTIVE account's auth state
@@ -1480,6 +1484,7 @@ struct GeneralSettingsPane: View {
     /// Issue #33: app-update check state (GitHub releases feed of the public
     /// repo). Deliberately separate from every CLI update control.
     @ObservedObject var appUpdateModel: AppUpdateModel
+    @ObservedObject var appRollbackModel: AppRollbackModel
     /// Issue #60: the "Check for updates automatically" toggle — periodic
     /// check (every few hours since #241; was daily) of the SAME releases
     /// feed; issue #121 made it the scheduling brain for Sparkle's quiet
@@ -1501,6 +1506,15 @@ struct GeneralSettingsPane: View {
     /// section renders only when `/api/state` reported the `sharedScope`
     /// object — a pre-#204 daemon renders nothing at all (the contract).
     @ObservedObject var sharedScopeModel: SharedScopeModel
+
+    @State private var releaseNotes: String?
+
+    private static let lastCheckFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
 
     @Environment(\.openURL) private var openURL
 
@@ -2045,28 +2059,13 @@ struct GeneralSettingsPane: View {
                     Text(appUpdateModel.currentVersion ?? "Unknown (development build)")
                         .foregroundStyle(.secondary)
                 }
-                HStack {
-                    Button("Check for App Updates") {
-                        // Issue #675: explicitCheck(), like the gear menu and
-                        // the context menu since #170 — plain check() no-ops
-                        // when the 4-hourly background check is already in
-                        // flight, which silently dropped this click. The
-                        // dialog it returns is unused here: the inline status
-                        // line below is this surface's feedback.
-                        Task { _ = await appUpdateModel.explicitCheck() }
-                    }
-                    .disabled(appUpdateModel.isChecking)
-                    .help(appUpdateInstallModel.canInstall
-                        ? "Check the ModelDeck releases feed on GitHub. Installing is a separate, explicit step."
-                        : "Check the ModelDeck releases feed on GitHub. Nothing installs automatically.")
-                    if appUpdateModel.isChecking {
-                        ProgressView().controlSize(.small)
-                    }
-                }
-                appUpdateStatusLine
-                installStatusLine
+                Text("Last checked: " + (appUpdateAutoChecker.lastCheckAt.map {
+                    Self.lastCheckFormatter.string(from: $0)
+                } ?? "Never"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 // Issue #60: automatic checks reuse the exact same feed and
-                // model as the manual button above — the only difference is
+                // model as the manual button below — the only difference is
                 // who initiates. App-local preference (like Launch at
                 // Login); the daemon never stores it.
                 Toggle("Check for updates automatically", isOn: Binding(
@@ -2104,6 +2103,73 @@ struct GeneralSettingsPane: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                Toggle("Beta Releases", isOn: $betaReleases)
+                    .help("Opt in to preview builds that may be unstable.")
+                HStack {
+                    Button("Check for App Updates") {
+                        // Issue #675: explicitCheck(), like the gear menu and
+                        // the context menu since #170 — plain check() no-ops
+                        // when the 4-hourly background check is already in
+                        // flight, which silently dropped this click. The
+                        // dialog it returns is unused here: the inline status
+                        // line below is this surface's feedback.
+                        Task { _ = await appUpdateModel.explicitCheck() }
+                    }
+                    .disabled(appUpdateModel.isChecking)
+                    .help(appUpdateInstallModel.canInstall
+                        ? "Check the ModelDeck releases feed on GitHub. Installing is a separate, explicit step."
+                        : "Check the ModelDeck releases feed on GitHub. Nothing installs automatically.")
+                    if appUpdateModel.isChecking {
+                        ProgressView().controlSize(.small)
+                    }
+                    Button("Release Notes") {
+                        switch AppReleaseNotes.resolve(
+                            currentVersion: appUpdateModel.currentVersion,
+                            latestRelease: appUpdateModel.latestKnownRelease
+                        ) {
+                        case .inApp(_, let body): releaseNotes = body
+                        case .web(let url): openURL(url)
+                        }
+                    }
+                    if case .updateAvailable = appUpdateModel.phase,
+                       appUpdateModel.canInstallUpdates, !appUpdateInstallModel.isBusy {
+                        Button("Update Now") { appUpdateInstallModel.updateNow() }
+                            .help("Downloads, verifies, and installs the update, then relaunches ModelDeck.")
+                    }
+                    if let target = appRollbackModel.target {
+                        Button("Rollback to \(target.shortVersionString)") { rollbackConfirmation = target }
+                            .disabled(appRollbackModel.isBusy)
+                    }
+                    Button("Get Previous Builds") {
+                        openURL(URL(string: "https://github.com/timharris707/modeldeck/releases")!)
+                    }
+                }
+                .task { await appRollbackModel.refreshTarget() }
+                .sheet(isPresented: Binding(
+                    get: { rollbackConfirmation != nil },
+                    set: { if !$0 { rollbackConfirmation = nil } }
+                )) {
+                    if let target = rollbackConfirmation {
+                        VStack(alignment: .leading, spacing: 16) {
+                            Text("Rollback to \(target.shortVersionString)?").font(.headline)
+                            Text("ModelDeck will download this version, replace the app, and restart. Your settings and data are kept. Version \(appUpdateModel.currentVersion ?? "you are leaving") will not be offered again until you choose Check for App Updates.")
+                            HStack {
+                                Spacer()
+                                Button("Cancel") { rollbackConfirmation = nil }
+                                    .keyboardShortcut(.cancelAction)
+                                Button("Rollback and Restart") {
+                                    rollbackConfirmation = nil
+                                    Task { await appRollbackModel.rollback(to: target) }
+                                }
+                            }
+                        }
+                        .padding(24)
+                        .frame(width: 420)
+                    }
+                }
+                rollbackStatusLine
+                appUpdateStatusLine
+                installStatusLine
             }
 
             if let error = settingsSync.lastError {
@@ -2114,6 +2180,30 @@ struct GeneralSettingsPane: View {
             }
         }
         .formStyle(.grouped)
+        .sheet(isPresented: Binding(
+            get: { releaseNotes != nil },
+            set: { if !$0 { releaseNotes = nil } }
+        )) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("ModelDeck \(appUpdateModel.currentVersion ?? "")")
+                    .font(.headline)
+                ScrollView {
+                    Text(AppUpdateDialogView.attributedNotes(releaseNotes ?? ""))
+                        .font(.callout)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 220)
+                HStack {
+                    Spacer()
+                    Button("Done") { releaseNotes = nil }
+                        .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(16)
+            .frame(width: 360, alignment: .leading)
+        }
         // Issue #204: nothing is sent to the daemon until this sheet's
         // explicit confirm — the toggle itself never mutates anything.
         .sheet(isPresented: Binding(
@@ -2213,6 +2303,35 @@ struct GeneralSettingsPane: View {
         .accessibilityLabel("Dismiss shared-scope result")
     }
 
+    // Issue #706: rollback uses the same compact feedback as app installs.
+    @ViewBuilder private var rollbackStatusLine: some View {
+        switch appRollbackModel.phase {
+        case .idle: EmptyView()
+        case .failed(let message):
+            Text(message).font(.caption).foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+        default:
+            HStack(spacing: 8) {
+                if case .downloading(let fraction) = appRollbackModel.phase {
+                    ProgressView(value: fraction).frame(width: 80)
+                } else {
+                    ProgressView().controlSize(.small)
+                }
+                Text(rollbackStatusText).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var rollbackStatusText: String {
+        switch appRollbackModel.phase {
+        case .downloading: "Downloading previous version…"
+        case .verifying: "Verifying previous version…"
+        case .swapping: "Replacing ModelDeck…"
+        case .relaunching: "Restarting ModelDeck…"
+        case .idle, .failed: ""
+        }
+    }
+
     /// Outcome line under "Check for App Updates". Issue #121 (Tim
     /// directive 2026-07-22): in Sparkle-configured builds the primary
     /// action is "Update Now" (download → verify → install → relaunch) with
@@ -2239,14 +2358,7 @@ struct GeneralSettingsPane: View {
                     Text("Version \(release.version) is available.")
                         .font(.caption)
                         .foregroundStyle(.orange)
-                    if appUpdateModel.canInstallUpdates {
-                        Button("Update Now") { appUpdateInstallModel.updateNow() }
-                            .controlSize(.small)
-                            .help("Downloads, verifies, and installs the update, then relaunches ModelDeck.")
-                        Button("Release Notes") { openURL(release.url) }
-                            .controlSize(.small)
-                            .help("Opens the GitHub release page.")
-                    } else {
+                    if !appUpdateModel.canInstallUpdates {
                         Button("View Release") { openURL(release.url) }
                             .controlSize(.small)
                             .help("Opens the GitHub release page — download and install from there.")

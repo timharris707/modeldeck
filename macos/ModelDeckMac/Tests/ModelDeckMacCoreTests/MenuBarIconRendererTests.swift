@@ -173,13 +173,27 @@ struct MenuBarIconRendererTests {
         #expect(image.size.width > MenuBarIconRenderer.deckGlyph.size.width + 4)
         #expect(!image.isTemplate)
 
+        // Keep the plain glyph at its natural size on the same canvas, so
+        // the empty percent region is measured rather than skipped.
+        let plain = MenuBarIconRenderer.labelImage(for: .plain)
+        let emptyPercent = NSImage(size: image.size, flipped: false) { _ in
+            plain.draw(at: .zero, from: .zero, operation: .sourceOver, fraction: 1)
+            return true
+        }
+
         func percentBrightness(_ appearance: NSAppearance.Name) throws -> CGFloat {
             let rep = try rasterize(image, appearance: appearance)
+            let control = try rasterize(emptyPercent, appearance: appearance)
+            #expect(opaquePixelCount(control, xRange: 19..<control.pixelsWide) == 0,
+                "plain glyph must leave the percent region empty")
             var total: CGFloat = 0
             var count: CGFloat = 0
+            // x=19 is the 16pt glyph plus 3pt spacing. On macOS 27,
+            // alpha > 0.8 counts only 18 Aqua / 41 Dark Aqua pixels;
+            // >= 0.5 counts 65 / 87, including visible antialiased text.
             for x in 19..<rep.pixelsWide {
                 for y in 0..<rep.pixelsHigh {
-                    guard let color = rep.colorAt(x: x, y: y), color.alphaComponent > 0.8 else { continue }
+                    guard let color = rep.colorAt(x: x, y: y), color.alphaComponent >= 0.5 else { continue }
                     let rgb = color.usingColorSpace(.deviceRGB) ?? color
                     #expect(!(rgb.redComponent > 0.6 && rgb.blueComponent < 0.4),
                         "pinned percent must stay neutral, not warm")

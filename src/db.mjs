@@ -149,11 +149,28 @@ export const USAGE_SNAPSHOT_RETENTION_DAYS = 90;
 export const USAGE_SNAPSHOT_PRUNE_BATCH_SIZE = 500;
 // Keep usage indexes hot across reads of multi-gigabyte databases (64 MiB).
 const SQLITE_PAGE_CACHE_KIB = 65_536;
+// Issue #701: lock waits. Opening tolerates another process's one-time
+// auto_vacuum conversion; serving keeps the short wait so a stray writer
+// can never hold the serve loop for longer than the app's health timeout.
+export const SQLITE_OPEN_BUSY_TIMEOUT_MS = 30_000;
+export const SQLITE_RUNTIME_BUSY_TIMEOUT_MS = 5_000;
 export const OTEL_QUARANTINE_RETENTION_DAYS = 7;
 export const OTEL_QUARANTINE_MAX_ROWS = 50_000;
 export const OTEL_QUARANTINE_PRUNE_BATCH_SIZE = 500;
 export const REQUEST_USAGE_RETENTION_DAYS = 400;
 export const REQUEST_USAGE_PRUNE_BATCH_SIZE = 500;
+// Issue #701: the OTLP metric and event tables had no retention at all
+// (382k rows in five weeks on one machine). Nothing reads them yet (#342
+// scoped views out); the receipts arc's 13-month rule (charter 0033) is the
+// widest window any future reader could claim, so that is the bound.
+export const OTEL_HISTORY_RETENTION_DAYS = 400;
+export const OTEL_HISTORY_PRUNE_BATCH_SIZE = 500;
+// Issue #701: pages freed by every prune above stay in the file until a
+// VACUUM (1.8 GB of a 2.9 GB file on Tim's Mac). Reclaim them incrementally,
+// a bounded number of pages per pass, so the file tracks live data without a
+// full-file rewrite while the daemon serves. Only meaningful once the file
+// has been converted to incremental auto_vacuum (see migrateAutoVacuum).
+export const SQLITE_RECLAIM_PAGES_PER_PASS = 2_048;
 // Raw history retains the newest rows; truncated=true means older matching
 // observations were omitted from the response.
 export const USAGE_HISTORY_RAW_LIMIT = 10_000;
@@ -916,12 +933,34 @@ export class Store {
     }
     if (dbPath !== ':memory:') fs.mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(dbPath);
-    this.db.exec(`PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA cache_size = -${SQLITE_PAGE_CACHE_KIB};`);
+    // Issue #701 (CodeRabbit, PR #702): while opening, wait up to 30 s so a
+    // second writable opener (a script, the CLI) sits out another process's
+    // one-time auto_vacuum conversion (~4 s per GB) instead of failing with
+    // SQLITE_BUSY. Astra round 2: the serve loop must NOT inherit that wait
+    // (a stray writer would freeze every request for half a minute), so the
+    // runtime timeout is restored before the constructor returns.
+    this.db.exec(`PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = ${SQLITE_OPEN_BUSY_TIMEOUT_MS}; PRAGMA cache_size = -${SQLITE_PAGE_CACHE_KIB};`);
     this.migrate();
+    if (dbPath !== ':memory:') this.migrateAutoVacuum();
+    this.db.exec(`PRAGMA busy_timeout = ${SQLITE_RUNTIME_BUSY_TIMEOUT_MS}`);
     if (dbPath !== ':memory:') {
       fs.chmodSync(path.dirname(dbPath), 0o700);
       fs.chmodSync(dbPath, 0o600);
     }
+  }
+
+  /// Issue #701: switch the file to incremental auto_vacuum so freed pages
+  /// can be handed back a bounded chunk at a time (reclaimFreePages). The
+  /// mode change only takes effect through a full VACUUM, so this is a
+  /// one-time rewrite of the file on the first open after it ships (about
+  /// 4 s per GB measured on Tim's Mac) and a no-op on every later open. It
+  /// also collapses whatever free space the file already carries.
+  migrateAutoVacuum() {
+    if (this.db.prepare('PRAGMA auto_vacuum').get().auto_vacuum === 2) return false;
+    const startedAt = Date.now();
+    this.db.exec('PRAGMA auto_vacuum = INCREMENTAL; VACUUM;');
+    console.error(`[modeldeck] database converted to incremental auto_vacuum in ${((Date.now() - startedAt) / 1_000).toFixed(1)} s`);
+    return true;
   }
 
   /// Decision 0035: the accounts table's provider CHECK predates Grok, and
@@ -1873,6 +1912,48 @@ export class Store {
         LIMIT ?
       )
     `).run(cutoff, batchSize).changes;
+  }
+
+  /// Issue #701: one bounded batch of OTLP metrics or events strictly older
+  /// than the cutoff, walked on the table's observed_at index. Same boundary
+  /// contract as request_usage: rows AT the cutoff and future-stamped rows stay.
+  pruneOtelHistoryBatch(table, { cutoff, batchSize = OTEL_HISTORY_PRUNE_BATCH_SIZE }) {
+    if (table !== 'otel_metrics' && table !== 'otel_events') {
+      throw new Error('OTLP history prune table must be otel_metrics or otel_events');
+    }
+    const cutoffMs = typeof cutoff === 'string' ? Date.parse(cutoff) : NaN;
+    if (!Number.isFinite(cutoffMs) || new Date(cutoffMs).toISOString() !== cutoff) {
+      throw new Error('OTLP history prune cutoff must be a canonical ISO timestamp');
+    }
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > OTEL_HISTORY_PRUNE_BATCH_SIZE) {
+      throw new Error(`OTLP history prune batchSize must be an integer from 1 to ${OTEL_HISTORY_PRUNE_BATCH_SIZE}`);
+    }
+    return this.db.prepare(`
+      DELETE FROM ${table}
+      WHERE id IN (
+        SELECT id
+        FROM ${table} INDEXED BY ${table}_observed
+        WHERE observed_at < ?
+        ORDER BY observed_at, id
+        LIMIT ?
+      )
+    `).run(cutoff, batchSize).changes;
+  }
+
+  /// Issue #701: hand a bounded number of free pages back to the filesystem.
+  /// Returns the number of free pages still waiting, so the caller can keep
+  /// yielding between passes. A no-op (0) on a file not in incremental mode.
+  /// Issue #701: free pages waiting to be reclaimed (0 outside incremental mode).
+  freePageCount() {
+    if (this.db.prepare('PRAGMA auto_vacuum').get().auto_vacuum !== 2) return 0;
+    return this.db.prepare('PRAGMA freelist_count').get().freelist_count;
+  }
+
+  reclaimFreePages(pages = SQLITE_RECLAIM_PAGES_PER_PASS) {
+    if (!Number.isInteger(pages) || pages < 1) throw new Error('reclaim pages must be a positive integer');
+    if (this.db.prepare('PRAGMA auto_vacuum').get().auto_vacuum !== 2) return 0;
+    this.db.exec(`PRAGMA incremental_vacuum(${pages})`);
+    return this.db.prepare('PRAGMA freelist_count').get().freelist_count;
   }
 
   /// Delete at most one bounded batch of request evidence strictly older than

@@ -115,19 +115,23 @@ function owned(stat, uid) {
   }
 }
 
-async function directoryGuard(directory, io, uid) {
+async function directoryGuard(directory, io, uid, expectedIdentity) {
   const initial = await io.lstat(directory);
+  owned(initial, uid);
+  const identity = expectedIdentity || { dev: initial.dev, ino: initial.ino };
+  if (initial.dev !== identity.dev || initial.ino !== identity.ino) throw new Error('migration directory changed');
+  const initialMode = initial.mode;
   const canonical = await io.realpath(directory);
   const check = async () => {
     const current = await io.lstat(directory);
     owned(current, uid);
-    if (!current.isDirectory() || current.isSymbolicLink() || current.mode !== initial.mode || current.dev !== initial.dev
-        || current.ino !== initial.ino || await io.realpath(directory) !== canonical) {
+    if (!current.isDirectory() || current.isSymbolicLink() || current.mode !== initialMode
+        || current.dev !== identity.dev || current.ino !== identity.ino || await io.realpath(directory) !== canonical) {
       throw new Error('migration directory changed');
     }
   };
   await check();
-  return check;
+  return Object.assign(check, { identity });
 }
 
 /// Hash regular files through no-follow handles; record symlinks without
@@ -194,7 +198,7 @@ async function replaceLink(link, target, io) {
 /// succeed first. Backups remain inert recovery data, never another CODEX_HOME.
 export async function migrateCodexProfilesDir({
   store, legacyDir, profilesDir, activeLink, dataDir,
-  io = fs.promises, isLegacyInUse = legacyCodexProfilesUsage,
+  io = fs.promises, isLegacyInUse = legacyCodexProfilesUsage, isDaemonBusy = () => false,
   uid = process.getuid?.(), now = () => new Date(), log = () => {},
 }) {
   const report = (message) => { try { log(message); } catch { /* Logging cannot affect the transaction. */ } };
@@ -203,6 +207,9 @@ export async function migrateCodexProfilesDir({
   let processDeferred = false;
   let holders = [];
   let backupDir;
+  let rootMoved = false;
+  let movedRootIdentity;
+  let aliasCreated = false;
   let createdDestination = false;
   let markerCreated = false;
   let activeChanged = false;
@@ -225,7 +232,43 @@ export async function migrateCodexProfilesDir({
       if (accounts.length) throw new Error('registered legacy root is missing');
       return {};
     }
-    if (!legacyStat.isDirectory() || legacyStat.isSymbolicLink()) throw new Error('legacy root is not a real directory');
+    if (legacyStat.isSymbolicLink()) {
+      const target = await io.readlink(legacyDir);
+      const destination = path.resolve(profilesDir);
+      if (legacyStat.uid !== uid || path.resolve(path.dirname(legacyDir), target) !== destination) {
+        throw new Error('legacy root is not a real directory');
+      }
+      const stat = await io.lstat(destination);
+      owned(stat, uid);
+      if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) {
+        throw new Error('destination is not a private directory');
+      }
+      const canonical = await io.realpath(destination);
+      if (await io.realpath(legacyDir) !== canonical) throw new Error('legacy alias changed');
+      const resolved = await io.lstat(canonical);
+      if (!resolved.isDirectory() || resolved.isSymbolicLink() || resolved.dev !== stat.dev || resolved.ino !== stat.ino) {
+        throw new Error('destination changed');
+      }
+      destinationGuard = await directoryGuard(destination, io, uid);
+      if (destinationGuard.identity.dev !== stat.dev || destinationGuard.identity.ino !== stat.ino) {
+        throw new Error('destination changed');
+      }
+      const accountMoves = [];
+      for (const account of accounts) {
+        const to = path.join(destination, path.relative(legacyDir, account.profileRef));
+        const profile = await io.lstat(to);
+        owned(profile, uid);
+        if (!profile.isDirectory() || profile.isSymbolicLink() || (profile.mode & 0o077) !== 0) {
+          throw new Error('registered profile unavailable');
+        }
+        accountMoves.push({ id: account.id, from: account.profileRef, to });
+      }
+      stage = 'publishing account references';
+      await destinationGuard();
+      if (accountMoves.length) store.repointCodexProfiles(accountMoves);
+      return {};
+    }
+    if (!legacyStat.isDirectory()) throw new Error('legacy root is not a real directory');
     owned(legacyStat, uid);
     legacyDir = await io.realpath(legacyDir);
     legacyGuard = await directoryGuard(legacyDir, io, uid);
@@ -233,7 +276,7 @@ export async function migrateCodexProfilesDir({
     profilesDir = path.resolve(profilesDir);
     if (profilesDir === legacyDir) return {}; // Explicit legacy env override.
     if (within(profilesDir, legacyDir) || within(legacyDir, profilesDir)) throw new Error('overlapping roots');
-    const destinationStat = await statOrNull(profilesDir, io);
+    let destinationStat = await statOrNull(profilesDir, io);
     accounts = store.listAccounts().filter((account) => account.provider === 'codex'
       && (account.profileRef === legacyDir || within(account.profileRef, legacyDir)));
     const names = (await io.readdir(legacyDir)).sort();
@@ -253,9 +296,9 @@ export async function migrateCodexProfilesDir({
       if (accounts.length) throw new Error('registered legacy profile is missing');
       return {};
     }
-    const ensureIdle = async () => {
+    const ensureIdle = async (inspect = isLegacyInUse) => {
       try {
-        const usage = await isLegacyInUse(legacyDir);
+        const usage = await inspect(legacyDir);
         // Keep boolean injection compatibility and fail closed on unknown results.
         if (usage === false || usage?.inUse === false) return;
         holders = [...new Set((usage?.holders || []).filter((name) => typeof name === 'string'
@@ -266,8 +309,104 @@ export async function migrateCodexProfilesDir({
         throw new Error('process inspection deferred');
       }
     };
+    const ensureCopyIdle = async () => {
+      await ensureIdle();
+      await ensureIdle(isDaemonBusy);
+    };
+    const destinationParent = await io.realpath(path.dirname(profilesDir));
+    const canonicalDestination = path.join(destinationParent, path.basename(profilesDir));
+    if (canonicalDestination === legacyDir || within(canonicalDestination, legacyDir)
+        || within(legacyDir, canonicalDestination)) throw new Error('overlapping canonical roots');
+    renamePath: if (legacyGuard.identity.dev === (await io.lstat(destinationParent)).dev) {
+      stage = 'validating profile directories';
+      // CodeRabbit (PR #695): a rename would carry a non-private root mode
+      // onto the destination, so it must not rename; but before #693 such an
+      // install migrated through the verified copy (which recreates the root
+      // owner-only), so it falls through to the copy path, never aborts.
+      if ((legacyStat.mode & 0o077) !== 0) break renamePath;
+      for (const name of names) {
+        if (name === '.migrated-from') throw new Error('reserved migration marker at source');
+        const stat = await io.lstat(path.join(legacyDir, name));
+        owned(stat, uid);
+        if (stat.isDirectory() && (stat.mode & 0o077) !== 0) throw new Error('profile is not a private directory');
+      }
+      const accountMoves = [];
+      for (const account of accounts) {
+        if (!names.some((name) => account.profileRef === path.join(legacyDir, name)
+            || within(account.profileRef, path.join(legacyDir, name)))) {
+          throw new Error('registered profile not present in legacy tree');
+        }
+        const stat = await io.lstat(account.profileRef);
+        owned(stat, uid);
+        if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) {
+          throw new Error('registered profile unavailable');
+        }
+        accountMoves.push({ id: account.id, from: account.profileRef, to: path.join(profilesDir, path.relative(legacyDir, account.profileRef)) });
+      }
+      const activeStat = await statOrNull(activeLink, io);
+      if (activeStat?.isSymbolicLink()) {
+        previousLink = await io.readlink(activeLink);
+        const target = await io.realpath(activeLink);
+        if (within(target, legacyDir)) nextLink = path.join(profilesDir, path.relative(legacyDir, target));
+      }
+      guards.push(await directoryGuard(dataDir, io, uid));
+      guards.push(await directoryGuard(path.dirname(profilesDir), io, uid));
+      stage = 'checking for daemon work';
+      await ensureIdle(isDaemonBusy);
+      await checkRoots();
+      if (destinationStat) {
+        await io.rmdir(profilesDir);
+        guards.splice(guards.indexOf(destinationGuard), 1);
+        destinationStat = null;
+        destinationGuard = null;
+      }
+      stage = 'renaming profiles';
+      await legacyGuard();
+      try { await io.rename(legacyDir, profilesDir); }
+      catch (error) {
+        if (error.code !== 'EXDEV') throw error;
+        break renamePath;
+      }
+      rootMoved = true;
+      const movedRootStat = await io.lstat(profilesDir);
+      movedRootIdentity = { dev: movedRootStat.dev, ino: movedRootStat.ino };
+      if (movedRootStat.dev !== legacyGuard.identity.dev || movedRootStat.ino !== legacyGuard.identity.ino) {
+        processDeferred = true;
+        throw new Error('source directory changed during rename');
+      }
+      stage = 'aliasing the old location';
+      try {
+        // symlink is no-replace: an intervening entry must never be overwritten.
+        await io.symlink(profilesDir, legacyDir, 'dir');
+        aliasCreated = true;
+      } catch (error) {
+        if (['EEXIST', 'EISDIR', 'ENOTDIR'].includes(error.code)) processDeferred = true;
+        throw error;
+      }
+      destinationGuard = await directoryGuard(profilesDir, io, uid, movedRootIdentity);
+      await destinationGuard();
+      stage = 'repointing the active link';
+      if (nextLink) {
+        if (await io.readlink(activeLink) !== previousLink) throw new Error('active link changed during migration');
+        await replaceLink(activeLink, nextLink, io);
+        activeChanged = true;
+      }
+      stage = 'writing the migration marker';
+      await destinationGuard();
+      const markerHandle = await io.open(marker, 'wx', 0o600);
+      markerCreated = true;
+      try {
+        await markerHandle.writeFile(`${JSON.stringify({ legacyDir, migratedAt: now().toISOString(), alias: true }, null, 2)}\n`);
+        await markerHandle.sync();
+      } finally { await markerHandle.close(); }
+      stage = 'publishing account references';
+      await destinationGuard();
+      store.repointCodexProfiles(accountMoves);
+      report('Codex profiles moved. The old ~/.codex-profiles location now points at the new one; leave it in place while ChatGPT or Codex sessions are running.');
+      return { migrated: true };
+    }
     stage = 'checking for running processes';
-    await ensureIdle();
+    await ensureCopyIdle();
     stage = 'validating profile trees';
     const entries = [];
     for (const name of names) {
@@ -306,9 +445,9 @@ export async function migrateCodexProfilesDir({
     stage = 'creating and verifying recovery backup';
     guards.push(await directoryGuard(dataDir, io, uid));
     guards.push(await directoryGuard(path.dirname(profilesDir), io, uid));
-    const canonicalDestination = path.join(await io.realpath(path.dirname(profilesDir)), path.basename(profilesDir));
-    if (canonicalDestination === legacyDir || within(canonicalDestination, legacyDir)
-        || within(legacyDir, canonicalDestination)) throw new Error('overlapping canonical roots');
+    const checkedDestination = path.join(await io.realpath(path.dirname(profilesDir)), path.basename(profilesDir));
+    if (checkedDestination === legacyDir || within(checkedDestination, legacyDir)
+        || within(legacyDir, checkedDestination)) throw new Error('overlapping canonical roots');
     await checkRoots();
     backupDir = path.join(dataDir, `.codex-profiles-backup-${crypto.randomUUID()}`);
     await io.mkdir(backupDir, { mode: 0o700 });
@@ -325,7 +464,7 @@ export async function migrateCodexProfilesDir({
       await copyVerified(entry.from, path.join(backupDir, 'profiles', entry.name), entry.tree, io, uid);
     }
     stage = 'moving and verifying profiles';
-    await ensureIdle();
+    await ensureCopyIdle();
     await checkRoots();
     if (!destinationStat) {
       await io.mkdir(profilesDir, { mode: 0o700 });
@@ -334,7 +473,7 @@ export async function migrateCodexProfilesDir({
       guards.push(destinationGuard);
     }
     for (const entry of entries) {
-      await ensureIdle();
+      await ensureCopyIdle();
       await verify(entry.from, entry.tree, io, uid);
       await checkRoots();
       if (await statOrNull(entry.to, io)) throw new Error('destination entry appeared during migration');
@@ -348,7 +487,7 @@ export async function migrateCodexProfilesDir({
         const copied = { ...entry, removed: false };
         moved.push(copied);
         await copyVerified(entry.from, entry.to, entry.tree, io, uid);
-        await ensureIdle();
+        await ensureCopyIdle();
         await checkRoots();
         copied.removed = true;
         await io.rm(entry.from, { recursive: true });
@@ -387,6 +526,30 @@ export async function migrateCodexProfilesDir({
     if (markerCreated) await attempt(async () => {
       await destinationGuard();
       if (await statOrNull(marker, io)) await io.unlink(marker);
+    });
+    if (rootMoved) await attempt(async () => {
+      // Quarantine our alias by atomic rename before checking its identity. A
+      // foreign replacement is left at the quarantine path and blocks recovery.
+      const alias = await statOrNull(legacyDir, io);
+      if (alias?.isSymbolicLink()) {
+        if (!aliasCreated || alias.uid !== uid || await io.readlink(legacyDir) !== profilesDir) throw new Error('legacy alias changed');
+        const quarantine = path.join(path.dirname(legacyDir), `.codex-migration-alias-${crypto.randomUUID()}`);
+        await io.rename(legacyDir, quarantine);
+        const quarantined = await io.lstat(quarantine);
+        if (!quarantined.isSymbolicLink() || quarantined.uid !== uid || await io.readlink(quarantine) !== profilesDir) {
+          throw new Error('legacy alias changed');
+        }
+        await io.unlink(quarantine);
+      } else if (alias?.isDirectory() && alias.uid === uid && (alias.mode & 0o077) === 0
+          && (await io.readdir(legacyDir)).length === 0) {
+        await io.rmdir(legacyDir);
+      } else if (alias) throw new Error('legacy alias changed');
+      const root = await io.lstat(profilesDir);
+      owned(root, uid);
+      // The whole-root move preserves the guarded inode.
+      if (!root.isDirectory() || root.isSymbolicLink() || !movedRootIdentity
+          || root.dev !== movedRootIdentity.dev || root.ino !== movedRootIdentity.ino) throw new Error('moved root changed');
+      await io.rename(profilesDir, legacyDir);
     });
     for (const entry of moved.reverse()) await attempt(async () => {
       await legacyGuard();

@@ -47,6 +47,10 @@ let package = Package(
             ]
         ),
         .testTarget(
+            name: "ModelDeckMacTests",
+            dependencies: ["ModelDeckMac", "ModelDeckMacCore", .product(name: "Sparkle", package: "Sparkle")]
+        ),
+        .testTarget(
             name: "ModelDeckMacCoreTests",
             dependencies: ["ModelDeckMacCore"]
         )

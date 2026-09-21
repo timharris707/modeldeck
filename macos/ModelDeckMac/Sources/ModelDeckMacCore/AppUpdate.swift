@@ -41,6 +41,21 @@ public struct AppReleaseInfo: Equatable, Sendable {
 /// title already names the version, so a leading level-1 heading is dropped;
 /// blank edges go with it. nil for a release with nothing to read.
 public enum AppReleaseNotes {
+    public enum Destination: Equatable, Sendable {
+        case inApp(version: String, body: String)
+        case web(URL)
+    }
+
+    // Issue #704: Settings asks for the RUNNING version's notes, never
+    // a newer release's body just because that is what the feed contains.
+    public static func resolve(currentVersion: String?, latestRelease: AppReleaseInfo?) -> Destination {
+        if let currentVersion, let latestRelease,
+           latestRelease.version == currentVersion, let notes = latestRelease.notes {
+            return .inApp(version: currentVersion, body: forDisplay(notes) ?? "")
+        }
+        return .web(AppcastReleaseChecker.releasePageURL(for: currentVersion))
+    }
+
     public static func forDisplay(_ raw: String?) -> String? {
         guard let raw else { return nil }
         var lines = raw
@@ -83,24 +98,23 @@ public protocol AppReleaseChecking: Sendable {
 /// disagree about whether an update exists. Read-only GET; no token, no
 /// mutation, no daemon involvement. Version, notes, and release page all
 /// come from the appcast item (`AppcastDecoder`).
-public struct AppcastReleaseChecker: AppReleaseChecking {
+// Issues #705/#706: immutable fields; UserDefaults supports concurrent reads/writes.
+public struct AppcastReleaseChecker: AppReleaseChecking, @unchecked Sendable {
     /// The stable appcast redirect — GitHub serves the newest release's
     /// `appcast.xml` asset. Same value as `SUFeedURL` in Support/Info.plist.
     public static let defaultFeedURL =
         URL(string: "https://github.com/timharris707/modeldeck/releases/latest/download/appcast.xml")!
 
-    /// The bundle's `SUFeedURL` when present (a release build), else the
-    /// constant above (dev builds) — one URL for the check and the install.
     public static func feedURL(bundle: Bundle = .main) -> URL {
-        if let raw = bundle.object(forInfoDictionaryKey: "SUFeedURL") as? String,
-           let url = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
-           url.scheme != nil {
-            return url
-        }
-        return defaultFeedURL
+        AppUpdateFeedPolicy.feedURL(betaEnabled: UserDefaults.standard.bool(forKey: AppUpdateFeedPolicy.betaReleasesKey), bundle: bundle)
     }
 
-    private let feedURL: URL
+    private let overrideFeedURL: URL?
+    private let bundle: Bundle
+    private let defaults: UserDefaults
+    public var feedURL: URL {
+        overrideFeedURL ?? AppUpdateFeedPolicy.feedURL(betaEnabled: defaults.bool(forKey: AppUpdateFeedPolicy.betaReleasesKey), bundle: bundle)
+    }
     private let transport: any HTTPDataTransport
     /// The macOS this process runs on (CodeRabbit, PR #686): items the
     /// feed marks as needing a newer macOS are not offered — Sparkle would
@@ -108,16 +122,21 @@ public struct AppcastReleaseChecker: AppReleaseChecking {
     private let runningSystem: OperatingSystemVersion
 
     public init(
-        feedURL: URL = AppcastReleaseChecker.feedURL(),
+        feedURL: URL? = nil,
         transport: any HTTPDataTransport = URLSession.shared,
-        runningSystem: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
+        runningSystem: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion,
+        defaults: UserDefaults = .standard,
+        bundle: Bundle = .main
     ) {
-        self.feedURL = feedURL
+        self.overrideFeedURL = feedURL
+        self.defaults = defaults
+        self.bundle = bundle
         self.transport = transport
         self.runningSystem = runningSystem
     }
 
     public func latestRelease() async throws -> AppReleaseInfo? {
+        let feedURL = self.feedURL
         var request = URLRequest(url: feedURL)
         request.httpMethod = "GET"
         request.timeoutInterval = 15
@@ -133,7 +152,9 @@ public struct AppcastReleaseChecker: AppReleaseChecking {
         }
         let newest: AppcastItem?
         do {
-            newest = try AppcastDecoder.newestItem(from: data, runningSystem: runningSystem)
+            newest = try AppcastDecoder.newestItem(from: data, runningSystem: runningSystem,
+                                                   betaEnabled: feedURL.lastPathComponent == "appcast-beta.xml",
+                                                   allowing: { AppUpdateSkipPolicy.allows(version: $0.shortVersionString, defaults: defaults) })
         } catch {
             throw AppReleaseCheckError.invalidResponse
         }
@@ -152,9 +173,15 @@ public struct AppcastReleaseChecker: AppReleaseChecking {
     public static func releaseInfo(for item: AppcastItem) -> AppReleaseInfo? {
         let version = AppVersion.normalized(tag: item.shortVersionString)
         guard !version.isEmpty else { return nil }
-        let url = item.releaseNotesLink
-            ?? URL(string: "https://github.com/timharris707/modeldeck/releases/tag/v\(version)")!
+        let url = item.releaseNotesLink ?? releasePageURL(for: version)
         return AppReleaseInfo(version: version, url: url, notes: item.description)
+    }
+
+    // Issue #704: the feed fallback and Settings must name the same tag;
+    // an unstamped development build can only link to the releases list.
+    public static func releasePageURL(for version: String?) -> URL {
+        let releases = "https://github.com/timharris707/modeldeck/releases"
+        return URL(string: version.map { "\(releases)/tag/v\($0)" } ?? releases)!
     }
 }
 
@@ -177,29 +204,46 @@ public final class AppUpdateModel: ObservableObject {
     }
 
     @Published public private(set) var phase: Phase = .idle
+    @Published public private(set) var latestKnownRelease: AppReleaseInfo?
 
     /// The running app's version (bundle authority — see `AppVersion`).
     public let currentVersion: String?
 
     private let checker: any AppReleaseChecking
+    private let defaults: UserDefaults
+    private let clock: @Sendable () -> Date
+    private var completedCheckAt: Date?
 
-    public init(checker: any AppReleaseChecking, currentVersion: String? = AppVersion.current()) {
+    public init(
+        checker: any AppReleaseChecking,
+        currentVersion: String? = AppVersion.current(),
+        defaults: UserDefaults = .standard,
+        clock: @escaping @Sendable () -> Date = { Date() }
+    ) {
         self.checker = checker
         self.currentVersion = currentVersion
+        self.defaults = defaults
+        self.clock = clock
     }
 
     public var isChecking: Bool { phase == .checking }
 
     public func check() async {
         guard phase != .checking else { return }
+        completedCheckAt = nil
         phase = .checking
         let release: AppReleaseInfo?
         do {
             release = try await checker.latestRelease()
         } catch {
+            // Issue #704: HTTP/decoding errors still reached the feed;
+            // a transport failure must not replace the last-check date.
+            if error is AppReleaseCheckError { completedCheckAt = clock() }
             phase = .unavailable(message: "Update check unavailable — couldn't reach the releases feed.")
             return
         }
+        completedCheckAt = clock()
+        latestKnownRelease = release
         guard let release else {
             phase = .unavailable(message: "Update check unavailable — no releases published yet.")
             return
@@ -208,6 +252,10 @@ public final class AppUpdateModel: ObservableObject {
             // Development builds carry no bundle version; refusing to compare
             // beats claiming this unstamped binary is (or isn't) current.
             phase = .unavailable(message: "This build has no version to compare (development build).")
+            return
+        }
+        guard AppUpdateSkipPolicy.allows(version: release.version, defaults: defaults) else {
+            phase = .upToDate(latest: currentVersion)
             return
         }
         phase = AppVersion.isNewer(release.version, than: currentVersion)
@@ -226,6 +274,13 @@ public final class AppUpdateModel: ObservableObject {
     /// Background scheduled checks keep calling `check()` directly and stay
     /// exactly as silent as before — this path is for user clicks only.
     public func explicitCheck() async -> ResultDialog {
+        let hadSkip = defaults.string(forKey: AppUpdateSkipPolicy.key) != nil
+        AppUpdateSkipPolicy.clear(defaults: defaults)
+        // Issue #706: a check already selecting an item may have read the old
+        // skip. Wait it out, then fetch again for this explicit request.
+        if hadSkip {
+            while isChecking { try? await Task.sleep(nanoseconds: 50_000_000) }
+        }
         if !isChecking {
             await check()
         }
@@ -233,6 +288,12 @@ public final class AppUpdateModel: ObservableObject {
         // click too. Poll cheaply — checks finish in network time.
         while isChecking {
             try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        if let completedCheckAt {
+            objectWillChange.send()
+            // Issue #704: an explicit check intentionally delays the next
+            // automatic one. Keep the existing key so installed dates survive.
+            defaults.set(completedCheckAt, forKey: AppUpdateAutoChecker.lastCheckDefaultsKey)
         }
         // A finished check never rests on .idle/.checking, so this fallback
         // is defensive only — but "no feedback" is the bug, so never nil.
@@ -441,13 +502,13 @@ public final class AppUpdateAutoChecker: ObservableObject {
     }
 
     /// Pure due-ness rule: never checked → due; otherwise due once the
-    /// check interval has elapsed since the last automatic check.
+    /// check interval has elapsed since the last automatic or explicit check.
     nonisolated public static func isDue(now: Date, lastCheck: Date?) -> Bool {
         guard let lastCheck else { return true }
         return now.timeIntervalSince(lastCheck) >= checkInterval
     }
 
-    var lastCheckAt: Date? {
+    public var lastCheckAt: Date? {
         defaults.object(forKey: Self.lastCheckDefaultsKey) as? Date
     }
 
@@ -465,6 +526,7 @@ public final class AppUpdateAutoChecker: ObservableObject {
         // lastCheckAt for a check that never ran — the next tick retries.
         guard !model.isChecking else { return }
         await model.check()
+        objectWillChange.send()
         defaults.set(clock(), forKey: Self.lastCheckDefaultsKey)
         guard case .updateAvailable(let release) = model.phase else { return }
         // Issue #121: with a Sparkle driver attached and auto-install on,

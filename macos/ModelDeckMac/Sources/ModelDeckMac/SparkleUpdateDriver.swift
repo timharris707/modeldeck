@@ -21,6 +21,7 @@ import Sparkle
 /// funnels every state into the shared AppUpdateInstallModel.
 @MainActor
 final class SparkleUpdateDriver: NSObject, AppUpdateInstalling {
+    private var rollbackInProgress = false
     private let updater: SPUUpdater
     private let userDriver: OneClickUserDriver
     /// Issue #303: read for `stagedVersion` when an explicit start is
@@ -53,7 +54,7 @@ final class SparkleUpdateDriver: NSObject, AppUpdateInstalling {
         self.userDriver = userDriver
         self.installModel = installModel
         let relaunchDelegate = RelaunchMarkingUpdaterDelegate(
-            marker: UserDefaultsUpdateRelaunchMarker()
+            marker: UserDefaultsUpdateRelaunchMarker(), installModel: installModel, bundle: bundle
         )
         self.relaunchDelegate = relaunchDelegate
         self.updater = SPUUpdater(
@@ -78,7 +79,22 @@ final class SparkleUpdateDriver: NSObject, AppUpdateInstalling {
 
     // MARK: AppUpdateInstalling
 
+    // Issue #706: Sparkle and rollback must never replace the same app at once.
+    func reserveForRollback() -> Bool {
+        guard !rollbackInProgress,
+              installModel?.canReserveForRollback(canCheckForUpdates: updater.canCheckForUpdates,
+                                                  sessionInProgress: updater.sessionInProgress) == true else { return false }
+        rollbackInProgress = true
+        return true
+    }
+
+    func releaseRollbackReservation() { rollbackInProgress = false }
+
     func beginInstall() {
+        guard !rollbackInProgress else {
+            installModel?.report(.failed(message: "A rollback is in progress. Wait for ModelDeck to restart."))
+            return
+        }
         guard updater.canCheckForUpdates else {
             // Issue #163: a silent return here left the model stuck on
             // "Checking…" forever (updateNow() already reported .checking).
@@ -151,7 +167,7 @@ final class SparkleUpdateDriver: NSObject, AppUpdateInstalling {
     }
 
     func checkInBackground() {
-        guard updater.canCheckForUpdates else { return }
+        guard !rollbackInProgress, updater.canCheckForUpdates else { return }
         userDriver.mode = .background
         updater.checkForUpdatesInBackground()
     }
@@ -171,9 +187,50 @@ final class SparkleUpdateDriver: NSObject, AppUpdateInstalling {
 /// force-quit path in OneClickUserDriver is untouched.
 final class RelaunchMarkingUpdaterDelegate: NSObject, SPUUpdaterDelegate {
     private let marker: any UpdateRelaunchMarking
+    private weak var installModel: AppUpdateInstallModel?
 
-    init(marker: any UpdateRelaunchMarking) {
+    private let bundle: Bundle
+    private let defaults: UserDefaults
+
+    init(marker: any UpdateRelaunchMarking, installModel: AppUpdateInstallModel,
+         bundle: Bundle = .main, defaults: UserDefaults = .standard) {
         self.marker = marker
+        self.installModel = installModel
+        self.bundle = bundle
+        self.defaults = defaults
+    }
+
+    func updater(_ updater: SPUUpdater, willInstallUpdateOnQuit item: SUAppcastItem,
+                 immediateInstallationBlock: @escaping () -> Void) -> Bool {
+        let version = item.displayVersionString
+        let build = item.versionString
+        let installModel = self.installModel
+        MainActor.assumeIsolated {
+            installModel?.report(.installedPendingRelaunch(version: version), build: build)
+        }
+        // Sparkle retains installation responsibility, including installation
+        // on quit. Do not invoke or retain the immediate-install block.
+        return false
+    }
+
+    func feedURLString(for updater: SPUUpdater) -> String? {
+        AppUpdateFeedPolicy.feedURL(betaEnabled: defaults.bool(forKey: AppUpdateFeedPolicy.betaReleasesKey), bundle: bundle).absoluteString
+    }
+
+    // Issue #705: Sparkle still filters channel-tagged items in the beta
+    // file. Derive permission from the selected feed, never a second toggle.
+    func allowedChannels(for updater: SPUUpdater) -> Set<String> {
+        URL(string: feedURLString(for: updater) ?? "")?.lastPathComponent == "appcast-beta.xml" ? ["beta"] : []
+    }
+
+    // Issue #706: Sparkle prefilters platform/channel eligibility before
+    // this hook. Preserve its numeric build ordering after the exact skip.
+    func bestValidUpdate(in appcast: SUAppcast, for updater: SPUUpdater) -> SUAppcastItem? {
+        guard defaults.string(forKey: AppUpdateSkipPolicy.key) != nil else { return nil }
+        return appcast.items
+            .filter { AppUpdateSkipPolicy.allows(version: $0.displayVersionString, defaults: defaults) }
+            .max { SUStandardVersionComparator.default.compareVersion($0.versionString, toVersion: $1.versionString) == .orderedAscending }
+            ?? SUAppcastItem.empty()
     }
 
     func updaterWillRelaunchApplication(_ updater: SPUUpdater) {
@@ -203,6 +260,7 @@ final class OneClickUserDriver: NSObject {
     private var expectedDownloadLength: UInt64 = 0
     private var receivedDownloadLength: UInt64 = 0
     private var foundVersion: String = ""
+    private var foundBuild: String?
     /// Issue #163: set when the user's Cancel invoked Sparkle's cancellation
     /// block — the follow-up updater "error" (if Sparkle raises one) is the
     /// cancellation echo, never a failure to surface.
@@ -230,7 +288,7 @@ final class OneClickUserDriver: NSObject {
     }
 
     private func report(_ phase: AppUpdateInstallPhase) {
-        installModel?.report(phase)
+        installModel?.report(phase, build: foundBuild)
     }
 
     /// Offers Sparkle's cancellation block to the shared model (Cancel in
@@ -305,6 +363,7 @@ extension OneClickUserDriver: SPUUserDriver {
         nonisolated(unsafe) let reply = reply
         MainActor.assumeIsolated {
             foundVersion = appcastItem.displayVersionString
+            foundBuild = appcastItem.versionString
             switch mode {
             case .userInitiated:
                 // The check's cancellation block is spent — the download

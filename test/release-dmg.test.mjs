@@ -217,7 +217,7 @@ test('missing Sparkle artifacts dir fails loudly, not with a silent exit', (t) =
   const root = releaseRepository(t);
   const dmg = path.join(root, 'dist', 'ModelDeck-0.0.0.dmg');
   fs.writeFileSync(dmg, 'not a real dmg');
-  const result = spawnSync('bash', ['scripts/release-dmg.sh', '--appcast-only', dmg], {
+  const result = spawnSync('bash', ['scripts/release-dmg.sh', '--appcast-only', dmg, '--build', '512', '--first-feeds'], {
     cwd: root,
     encoding: 'utf8',
     env: { ...process.env, MD_SPARKLE_SIGN_UPDATE: '' },

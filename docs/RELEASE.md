@@ -15,7 +15,10 @@ scripts/build-daemon-binary.sh
 scripts/build-cliproxyapi.sh --fetch-go --handshake-port 18317
 npm run test:cliproxyapi-pin
 scripts/release-dmg.sh --check-only
-scripts/release-dmg.sh
+mkdir -p dist
+curl --fail --location https://github.com/timharris707/modeldeck/releases/latest/download/appcast.xml -o dist/previous-appcast.xml
+curl --fail --location https://github.com/timharris707/modeldeck/releases/latest/download/appcast-beta.xml -o dist/previous-appcast-beta.xml
+scripts/release-dmg.sh --merge-existing-stable dist/previous-appcast.xml --merge-existing-beta dist/previous-appcast-beta.xml
 
 xcrun stapler validate dist/ModelDeck.app
 xcrun stapler validate "dist/ModelDeck-$(tr -d '\n' < VERSION).dmg"
@@ -39,9 +42,11 @@ worktree with `git worktree remove "$RELEASE_WORKTREE"` from the original
 checkout.
 
 ```sh
-scripts/release-dmg.sh            # the real thing
+scripts/release-dmg.sh --merge-existing-stable dist/previous-appcast.xml \
+  --merge-existing-beta dist/previous-appcast-beta.xml   # the real thing (both prior feeds are required)
 scripts/release-dmg.sh --dry-run  # preflight + plan, builds nothing
 scripts/release-dmg.sh --check-only # repository guard + release checks; no credentials/build
+scripts/release-dmg.sh --first-feeds # ONLY for the very first publication: no prior feeds exist
 ```
 
 Output: `dist/ModelDeck-<version>.dmg` (gitignored). The version comes
@@ -54,8 +59,9 @@ release hit exactly that. `npm install --package-lock-only` after editing
 package.json updates the lock's two version fields) — the release-tag authority
 documented in `macos/ModelDeckMac/Sources/ModelDeckMacCore/AppVersion.swift`.
 Bump `VERSION` first; the script stamps it into the app bundle's
-`CFBundleShortVersionString` at build time (`CFBundleVersion` is the repo
-commit count). The exact commit hash is logged and stamped as `MDGitCommit`
+`CFBundleShortVersionString` at build time (numeric portion only for betas).
+`ModelDeckDisplayVersion` preserves the full version for display and update
+comparisons; `CFBundleVersion` is the repo commit count. The exact commit hash is logged and stamped as `MDGitCommit`
 in the built app's `Info.plist`.
 
 The repository guard fetches `origin`, rejects tracked changes outside
@@ -242,13 +248,12 @@ machine needs no Terminal steps.
 
 ## Sparkle in-app updates (issue #121)
 
-The script's final step generates `dist/appcast.xml` — the Sparkle 2 feed for
+The script's final step generates `dist/appcast.xml` and `dist/appcast-beta.xml` — the Sparkle 2 feeds for
 in-app updates — and, during assembly, embeds `Sparkle.framework` and stamps
 the Sparkle EdDSA **public** key into the app's `Info.plist`
 (`SUPublicEDKey`). The app's `SUFeedURL` is the stable redirect
 `https://github.com/timharris707/modeldeck/releases/latest/download/appcast.xml`,
-so the appcast **must be uploaded as an asset named `appcast.xml` on every
-release** (see Publishing below); GitHub's `releases/latest/download/`
+so **both feeds must be uploaded on every stable release** (see Publishing below); GitHub's `releases/latest/download/`
 redirect then always serves the newest release's feed.
 
 One-time provisioning (release Mac, in addition to the identity/notary
@@ -271,11 +276,13 @@ the SwiftPM artifacts directory cannot exist yet, so the script runs
 `swift package resolve` itself before this preflight (the v0.3.2 release
 tripped over a silent exit here before that was added).
 
-`scripts/release-dmg.sh --appcast-only <dmg>` regenerates just the appcast
-for an existing DMG (also the test hook — `MD_SPARKLE_KEY_FILE` may inject
-the fake fixture key for tests, never for real releases).
+`scripts/release-dmg.sh --appcast-only <dmg> --build <CFBundleVersion>` regenerates just the feeds
+for an existing DMG. Read the numeric build from that archive, not the current
+checkout; pass the same merge arguments and `--beta` when appropriate. This is
+also the test hook — `MD_SPARKLE_KEY_FILE` may inject
+the fake fixture key for tests, never for real releases.
 
-Since issue #685 the appcast is the app's ONLY update feed: the in-app check
+Since issue #685 the selected appcast is the app's ONLY update feed: the in-app check
 ("Check for App Updates", the 4-hourly automatic check) reads the same
 `appcast.xml` Sparkle installs from, taking the version, the release page
 link, and the release notes from it — the GitHub API is no longer consulted.
@@ -286,27 +293,75 @@ notes in the dialog.
 
 ## Publishing
 
-Attach **all three** build outputs to a GitHub Release for the version tag:
+Attach **all four** build outputs to every stable GitHub Release:
 
 ```sh
 VERSION="$(cat VERSION)"
 gh release create -R timharris707/modeldeck "v$VERSION" \
-  "dist/ModelDeck-$VERSION.dmg" "dist/appcast.xml" "dist/ModelDeck.dmg"
+  "dist/ModelDeck-$VERSION.dmg" "dist/appcast.xml" "dist/appcast-beta.xml" "dist/ModelDeck.dmg"
 ```
 
 The release must live on the **public mirror repo** (`-R
 timharris707/modeldeck`): that is where the app's update checker and the
-Sparkle `SUFeedURL` both point. All three assets are required:
+Sparkle `SUFeedURL` both point. All four assets are required:
 
 - `ModelDeck-<version>.dmg` — what the appcast's enclosure URL points at.
 - `appcast.xml` — what installed apps poll via the stable
   `releases/latest/download/appcast.xml` URL.
+- `appcast-beta.xml` — stable history plus every beta newer than the newest
+  stable, for users who enable Beta Releases. Publish it even if no beta exists.
 - `ModelDeck.dmg` — the stable-named copy (identical bytes, produced by
   the script since v0.3.3). modeldeck.ai's no-JavaScript fallback download
   link is the permanent URL
   `releases/latest/download/ModelDeck.dmg`, which resolves only while
   **every** release ships an asset with that exact name. Omitting it
   silently breaks the website's fallback download for the release.
+
+## Beta releases and feed history (issue #705)
+
+Fetch both current feeds with the two `curl --fail --location` commands above
+**before** building. Keep them under the `previous-` filenames so output cannot
+overwrite an input. On the first release that introduces the beta feed, its URL
+will return 404; copy `dist/previous-appcast.xml` to
+`dist/previous-appcast-beta.xml` for that one bootstrap. Any other download
+failure needs resolving before release. The feed-generation step itself makes
+no network requests; signing/notarization and the repository guard retain their
+existing network requirements.
+
+Every stable release writes and publishes **both feeds**. The stable feed never
+contains beta items, including for old app versions that ignore channel tags.
+The beta feed keeps each beta newer than the newest stable. Both retain the
+newest stable and three older stables, with each carried item's XML unchanged.
+
+For a beta, use a prerelease version such as `1.2.0-beta.1` in VERSION and both
+package files, and write `docs/release-notes/1.2.0-beta.1.md`. Pass `--beta` to
+both the release checks (`npm run release:check -- --beta`) and the build:
+
+```sh
+scripts/release-dmg.sh --beta --merge-existing-stable dist/previous-appcast.xml --merge-existing-beta dist/previous-appcast-beta.xml
+VERSION="$(cat VERSION)"
+gh release create -R timharris707/modeldeck "v$VERSION" --prerelease \
+  "dist/ModelDeck-$VERSION.dmg" dist/appcast-beta.xml
+STABLE_TAG="$(gh release view -R timharris707/modeldeck --json tagName --jq .tagName)"
+gh release upload -R timharris707/modeldeck "$STABLE_TAG" dist/appcast-beta.xml --clobber
+```
+
+The final upload matters: GitHub's `releases/latest` excludes prereleases.
+Replace only `appcast-beta.xml` on the latest stable release so opted-in apps
+see the new beta through their permanent URL. Leave its stable appcast and DMGs
+alone. Beta releases do not update the Homebrew cask or the website's stable
+DMG. Verify the permanent beta URL serves the new version after uploading.
+
+Settings → General → Beta Releases is off by default. It switches both the
+app's check and Sparkle to `appcast-beta.xml` on the next check, without a
+relaunch. Turning it off while running a beta does not downgrade the app.
+
+Release notes may declare `Rollback floor: <version>` or
+`Rollback floor: unchanged` on its own line. Omission means unchanged, unless
+the notes mention "schema" in any letter case; then the line is required.
+Use a release's own version when its database changes prevent an older daemon
+from opening the data. Unchanged inherits the newest carried stable item's
+floor; when that item or its floor is absent, it uses the new release's version.
 
 ## Homebrew tap bump
 

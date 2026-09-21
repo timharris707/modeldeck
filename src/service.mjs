@@ -70,6 +70,8 @@ import {
   proxyReloginNextPhase,
 } from './proxy-relogin.mjs';
 import {
+  OTEL_HISTORY_PRUNE_BATCH_SIZE,
+  OTEL_HISTORY_RETENTION_DAYS,
   OTEL_QUARANTINE_PRUNE_BATCH_SIZE,
   OTEL_QUARANTINE_RETENTION_DAYS,
   REQUEST_USAGE_PRUNE_BATCH_SIZE,
@@ -96,7 +98,7 @@ import { refitUsageEstimates } from './usage-estimate.mjs';
 import { collectConfigLintSnapshot, configLintSnapshotOptions } from './config-linter-snapshot.mjs';
 import { configLintFailureFindings, evaluateConfigLint } from './config-linter.mjs';
 import { CODEX_PROFILES_DIR } from './paths.mjs';
-import { migrateCodexProfilesDir, legacyCodexProfilesUsage } from './codex-profiles-migration.mjs';
+import { migrateCodexProfilesDir } from './codex-profiles-migration.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -999,9 +1001,20 @@ export class ModelDeckService {
       || ((count) => console.log(`[modeldeck] request usage pruned: ${count}`));
     this.logOtelQuarantinePrune = options.logOtelQuarantinePrune
       || ((count, elapsedMs) => console.log(`[modeldeck] OTLP quarantine pruned: ${count} rows in ${(elapsedMs / 1_000).toFixed(2)} s`));
+    this.logOtelHistoryPrune = options.logOtelHistoryPrune
+      || ((counts) => {
+        if (counts.otel_metrics + counts.otel_events > 0) {
+          console.log(`[modeldeck] OTLP history pruned: metrics=${counts.otel_metrics} events=${counts.otel_events}`);
+        }
+      });
+    this.logFreePageReclaim = options.logFreePageReclaim
+      || ((passes, remaining) => {
+        if (passes > 0) console.log(`[modeldeck] database free pages reclaimed in ${passes} passes; ${remaining} remaining`);
+      });
     this.usageSnapshotPruneTimer = null;
     this.usageSnapshotPrunePromise = null;
     this.requestUsagePrunePromise = null;
+    this.scheduledPrunePromise = null;
     this.otelQuarantinePrunePromise = null;
     this.usageSnapshotPruneStarted = false;
     this.usageSnapshotPruneWaitingForState = false;
@@ -1221,22 +1234,13 @@ export class ModelDeckService {
     this.codexProfilesMigrationPromise = migrateCodexProfilesDir({
       now: () => new Date(this.now()),
       ...this.codexMigrationOptions,
-      isLegacyInUse: async (legacyDir) => {
-        const usage = await (this.codexMigrationOptions.isLegacyInUse || legacyCodexProfilesUsage)(legacyDir);
-        if (usage !== false && usage?.inUse !== false) return usage;
-        // Startup used to be the only attempt. Runtime moves also wait for
-        // daemon work that could still hold an old account reference.
-        // A queued lint or ingest pass is WAITING for this migration (its
-        // promise field is set while it awaits us): counting it as a holder
-        // would defer the move against our own waiter and roll back entries
-        // already moved (CodeRabbit, PR #680). Only a pass that has passed
-        // the migration await holds anything.
-        if (this.codexProfilesMigrationReaders || this.refreshPromise || this.warehouseIngestActive
-            || this.configLintActive || this.autoRefreshStartupTasks.size
-            || this.providerManagementOperations.size || this.codexActivationCount) {
-          return { inUse: true, holders: [path.basename(this.daemonExecPath)] };
-        }
-        return usage;
+      isDaemonBusy: () => {
+        // Queued lint/ingest passes await this migration; only active work
+        // can still hold an old account reference.
+        const inUse = Boolean(this.codexProfilesMigrationReaders || this.refreshPromise || this.warehouseIngestActive
+          || this.configLintActive || this.autoRefreshStartupTasks.size
+          || this.providerManagementOperations.size || this.codexActivationCount);
+        return { inUse, holders: inUse ? [path.basename(this.daemonExecPath)] : [] };
       },
       store: this.store, legacyDir: this.codexLegacyProfilesDir,
       profilesDir: this.codexProfilesMigrationTarget, activeLink: this.codexActiveLink,
@@ -1407,24 +1411,38 @@ export class ModelDeckService {
     this.usageSnapshotPruneTimer = null;
     // The Store is closed immediately after app.close(), so let a batch already
     // in progress finish before the caller can close its SQLite connection.
+    // Issue #701 (Astra review of PR #702): the scheduled run chains a
+    // reclaim AFTER the prunes, so a snapshot of the individual promises
+    // taken mid-prune misses it. Await the whole scheduled run, plus any
+    // prune or reclaim a manual caller started on its own.
     await Promise.all([
+      (this.scheduledPrunePromise || Promise.resolve()).catch(() => {}),
       (this.usageSnapshotPrunePromise || Promise.resolve()).catch(() => {}),
       (this.requestUsagePrunePromise || Promise.resolve()).catch(() => {}),
       (this.otelQuarantinePrunePromise || Promise.resolve()).catch(() => {}),
+      (this.otelHistoryPrunePromise || Promise.resolve()).catch(() => {}),
+      (this.freePageReclaimPromise || Promise.resolve()).catch(() => {}),
     ]);
   }
 
   runScheduledUsageSnapshotPrune(generation) {
-    void Promise.all([
+    const run = Promise.all([
       this.pruneUsageSnapshots(),
       this.pruneRequestUsage(),
       this.pruneOtelQuarantine(),
-    ]).catch((error) => {
+      this.pruneOtelHistory(),
+    ]).then(() => {
+      // A stop that landed during the prunes owns the Store now.
+      if (!this.usageSnapshotPruneStarted || generation !== this.usageSnapshotPruneGeneration) return 0;
+      return this.reclaimFreePages();
+    }).catch((error) => {
       console.error(`[modeldeck] usage retention prune failed: ${error?.message || error}`);
     }).finally(() => {
+      if (this.scheduledPrunePromise === run) this.scheduledPrunePromise = null;
       if (!this.usageSnapshotPruneStarted || generation !== this.usageSnapshotPruneGeneration) return;
       this.scheduleUsageSnapshotPrune(USAGE_SNAPSHOT_PRUNE_INTERVAL_MS, generation);
     });
+    this.scheduledPrunePromise = run;
   }
 
   /// Drain expired history through bounded synchronous DELETEs, yielding
@@ -1480,6 +1498,66 @@ export class ModelDeckService {
     this.requestUsagePrunePromise = promise;
     const clear = () => {
       if (this.requestUsagePrunePromise === promise) this.requestUsagePrunePromise = null;
+    };
+    void promise.then(clear, clear);
+    return promise;
+  }
+
+  /// Issue #701: drain OTLP metrics and events older than the 13-month bound
+  /// through the same bounded, yielding shape as request usage.
+  pruneOtelHistory() {
+    if (this.otelHistoryPrunePromise) return this.otelHistoryPrunePromise;
+    const cutoff = new Date(this.now() - OTEL_HISTORY_RETENTION_DAYS * DAY_MS).toISOString();
+    const promise = (async () => {
+      const counts = { otel_metrics: 0, otel_events: 0 };
+      try {
+        for (const table of Object.keys(counts)) {
+          while (true) {
+            const pruned = this.store.pruneOtelHistoryBatch(table, {
+              cutoff,
+              batchSize: OTEL_HISTORY_PRUNE_BATCH_SIZE,
+            });
+            counts[table] += pruned;
+            if (pruned < OTEL_HISTORY_PRUNE_BATCH_SIZE) break;
+            await this.yieldToServeLoop();
+          }
+        }
+      } finally {
+        this.logOtelHistoryPrune(counts);
+      }
+      return counts;
+    })();
+    this.otelHistoryPrunePromise = promise;
+    const clear = () => {
+      if (this.otelHistoryPrunePromise === promise) this.otelHistoryPrunePromise = null;
+    };
+    void promise.then(clear, clear);
+    return promise;
+  }
+
+  /// Issue #701: after the prunes, give freed pages back to the filesystem
+  /// a bounded chunk per turn, yielding between chunks, until none remain.
+  reclaimFreePages() {
+    if (this.freePageReclaimPromise) return this.freePageReclaimPromise;
+    const promise = (async () => {
+      let passes = 0;
+      let remaining = 0;
+      while (true) {
+        const before = this.store.freePageCount();
+        if (before <= 0) break;
+        remaining = this.store.reclaimFreePages();
+        passes += 1;
+        if (remaining <= 0) break;
+        await this.yieldToServeLoop();
+        // Shutdown is waiting on this promise; leave the rest for tomorrow.
+        if (!this.usageSnapshotPruneStarted) break;
+      }
+      this.logFreePageReclaim(passes, remaining);
+      return passes;
+    })();
+    this.freePageReclaimPromise = promise;
+    const clear = () => {
+      if (this.freePageReclaimPromise === promise) this.freePageReclaimPromise = null;
     };
     void promise.then(clear, clear);
     return promise;

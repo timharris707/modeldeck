@@ -27,6 +27,7 @@ struct ModelDeckMacApp: App {
     /// accounts) — the confirmation-gated enable/disable state machine.
     @StateObject private var sharedScopeModel: SharedScopeModel
     @StateObject private var toolUpdateModel: ToolUpdateModel
+    @StateObject private var appRollbackModel: AppRollbackModel
     @StateObject private var appUpdateModel: AppUpdateModel
     @StateObject private var appUpdateAutoChecker: AppUpdateAutoChecker
     /// Issue #121: in-app install state ("Update Now" + the automatic-install
@@ -179,6 +180,16 @@ struct ModelDeckMacApp: App {
             appUpdateInstallModel.attach(driver: sparkleDriver)
             appUpdateModel.canInstallUpdates = true
         }
+        let rollbackLive = AppRollbackLive()
+        let appRollbackModel = AppRollbackModel(
+            currentVersion: AppVersion.current() ?? "",
+            currentBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "",
+            runningBundle: Bundle.main.bundleURL,
+            publicKey: Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String ?? "",
+            inspector: rollbackLive, swapper: AppRollbackFileSwapper(), launcher: rollbackLive,
+            reserveInstallation: { sparkleDriver?.reserveForRollback() ?? true },
+            releaseInstallation: { sparkleDriver?.releaseRollbackReservation() }
+        )
         // Issue #60: optional daily check of the same releases feed — still
         // the scheduling brain. With Sparkle attached it hands a found
         // update to the install model (quiet install when the automatic
@@ -645,6 +656,7 @@ struct ModelDeckMacApp: App {
         _identityVerifyModel = StateObject(wrappedValue: identityVerifyModel)
         _sharedScopeModel = StateObject(wrappedValue: sharedScopeModel)
         _toolUpdateModel = StateObject(wrappedValue: toolUpdateModel)
+        _appRollbackModel = StateObject(wrappedValue: appRollbackModel)
         _appUpdateModel = StateObject(wrappedValue: appUpdateModel)
         _appUpdateAutoChecker = StateObject(wrappedValue: appUpdateAutoChecker)
         _appUpdateInstallModel = StateObject(wrappedValue: appUpdateInstallModel)
@@ -725,6 +737,7 @@ struct ModelDeckMacApp: App {
             // value-type dependencies captured up here.
             MenuBarIconView(statusModel: statusModel, stagedPromptModel: appUpdateStagedPrompt)
                 .task {
+                    AppRollbackLive.finishLaunch(installModel: appUpdateInstallModel)
                     IconDebugLog.log("label .task fired; starting initial refresh")
                     contextMenuController.install()
                     // Issue #295: a deck that was floating at last quit
@@ -808,6 +821,7 @@ struct ModelDeckMacApp: App {
                 identityVerifyModel: identityVerifyModel,
                 updateModel: toolUpdateModel,
                 appUpdateModel: appUpdateModel,
+                appRollbackModel: appRollbackModel,
                 appUpdateAutoChecker: appUpdateAutoChecker,
                 appUpdateInstallModel: appUpdateInstallModel,
                 daemonSetupModel: daemonSetupModel,

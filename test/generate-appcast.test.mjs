@@ -80,7 +80,7 @@ test('appcast XML carries version, build, url, length, signature, pubDate', (t) 
   ]);
   assert.equal(result.status, 0, result.stderr);
   const xml = fs.readFileSync(out, 'utf8');
-  assert.match(xml, /<rss version="2.0" xmlns:sparkle="http:\/\/www\.andymatuschak\.org\/xml-namespaces\/sparkle">/);
+  assert.match(xml, /<rss version="2.0" xmlns:sparkle="http:\/\/www\.andymatuschak\.org\/xml-namespaces\/sparkle" xmlns:modeldeck="https:\/\/modeldeck.ai\/appcast">/);
   assert.match(xml, /<title>ModelDeck 0\.9\.9<\/title>/);
   assert.match(xml, /<sparkle:version>512<\/sparkle:version>/);
   assert.match(xml, /<sparkle:shortVersionString>0\.9\.9<\/sparkle:shortVersionString>/);
@@ -272,7 +272,7 @@ test('release-dmg.sh --appcast-only generates the appcast next to the DMG', (t) 
   const dmg = path.join(dir, 'ModelDeck-9.9.9.dmg');
   fs.writeFileSync(dmg, Buffer.alloc(1024, 3));
   const stub = writeSignUpdateStub(dir);
-  const result = spawnSync('bash', [releaseDmgScript, '--appcast-only', dmg], {
+  const result = spawnSync('bash', [releaseDmgScript, '--appcast-only', dmg, '--build', '512', '--first-feeds'], {
     encoding: 'utf8',
     env: {
       ...process.env,
@@ -294,7 +294,7 @@ test('release-dmg.sh --appcast-only fails loudly without a signing key path', (t
   const dmg = path.join(dir, 'ModelDeck-9.9.9.dmg');
   fs.writeFileSync(dmg, Buffer.alloc(64, 1));
   const stub = writeSignUpdateStub(dir); // requires -f; none injected → real-tool-like failure
-  const result = spawnSync('bash', [releaseDmgScript, '--appcast-only', dmg], {
+  const result = spawnSync('bash', [releaseDmgScript, '--appcast-only', dmg, '--build', '512', '--first-feeds'], {
     encoding: 'utf8',
     env: { ...process.env, MD_SPARKLE_SIGN_UPDATE: stub, MD_SPARKLE_KEY_FILE: '' },
   });

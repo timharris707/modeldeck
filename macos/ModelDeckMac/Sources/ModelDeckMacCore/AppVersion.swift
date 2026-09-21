@@ -17,7 +17,10 @@ public enum AppVersion {
     /// there is no bundle version (bare `swift run` development builds).
     /// Callers degrade honestly on nil rather than inventing a number.
     public static func current(bundle: Bundle = .main) -> String? {
-        display(of: bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString"))
+        // Issue #705: Apple's short version stays numeric, while beta
+        // comparisons need the prerelease suffix recorded by the release.
+        display(of: bundle.object(forInfoDictionaryKey: "ModelDeckDisplayVersion"))
+            ?? display(of: bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString"))
     }
 
     /// Pure derivation seam for `current(bundle:)` — normalizes whatever the
@@ -43,22 +46,38 @@ public enum AppVersion {
         return trimmed
     }
 
-    /// Dotted-numeric comparison: true when `candidate` is a strictly newer
-    /// version than `current`. Missing segments read as 0 ("1.2" == "1.2.0");
-    /// non-numeric segments fall back to case-insensitive string comparison
-    /// so unexpected tags still order deterministically.
+    /// Issue #705: finals follow their prereleases; numeric identifiers
+    /// compare numerically. Build metadata never changes version ordering.
     public static func isNewer(_ candidate: String, than current: String) -> Bool {
-        let lhs = normalized(tag: candidate).split(separator: ".")
-        let rhs = normalized(tag: current).split(separator: ".")
-        for index in 0..<max(lhs.count, rhs.count) {
-            let l = index < lhs.count ? String(lhs[index]) : "0"
-            let r = index < rhs.count ? String(rhs[index]) : "0"
-            if let ln = Int(l), let rn = Int(r) {
-                if ln != rn { return ln > rn }
-            } else if l.caseInsensitiveCompare(r) != .orderedSame {
-                return l.caseInsensitiveCompare(r) == .orderedDescending
-            }
+        func parts(_ version: String) -> [Substring] {
+            normalized(tag: version).split(separator: "+", maxSplits: 1, omittingEmptySubsequences: false)[0]
+                .split(separator: "-", maxSplits: 1)
         }
-        return false
+        func compare(_ l: String, _ r: String, prerelease: Bool = false) -> ComparisonResult {
+            let ln = !l.isEmpty && l.allSatisfy { $0.isASCII && $0.isNumber }
+            let rn = !r.isEmpty && r.allSatisfy { $0.isASCII && $0.isNumber }
+            if ln && rn {
+                let left = String(l.drop(while: { $0 == "0" }))
+                let right = String(r.drop(while: { $0 == "0" }))
+                if left.count != right.count { return left.count > right.count ? .orderedDescending : .orderedAscending }
+                return left.compare(right)
+            }
+            if prerelease && ln != rn { return ln ? .orderedAscending : .orderedDescending }
+            return prerelease ? l.compare(r) : l.caseInsensitiveCompare(r)
+        }
+        let lhs = parts(candidate), rhs = parts(current)
+        let lc = lhs.first?.split(separator: ".") ?? [], rc = rhs.first?.split(separator: ".") ?? []
+        for index in 0..<max(lc.count, rc.count) {
+            let order = compare(index < lc.count ? String(lc[index]) : "0", index < rc.count ? String(rc[index]) : "0")
+            if order != .orderedSame { return order == .orderedDescending }
+        }
+        if lhs.count != rhs.count { return lhs.count == 1 }
+        guard lhs.count > 1 else { return false }
+        let lp = lhs[1].split(separator: "."), rp = rhs[1].split(separator: ".")
+        for index in 0..<min(lp.count, rp.count) {
+            let order = compare(String(lp[index]), String(rp[index]), prerelease: true)
+            if order != .orderedSame { return order == .orderedDescending }
+        }
+        return lp.count > rp.count
     }
 }

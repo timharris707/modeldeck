@@ -229,14 +229,15 @@ public final class AppUpdateInstallModel: ObservableObject {
     private var cancelHandler: (() -> Void)?
 
     /// Issue #303 — the last version Sparkle reported as staged
-    /// (`.installedPendingRelaunch`). Sticky for the process lifetime once
-    /// set: a staged install stays staged through later phase traffic
+    /// (`.installedPendingRelaunch`). Stays staged through later phase traffic
     /// (`updateNow()`'s `.checking`, a failed resume, background re-checks)
-    /// until this process quits and the installer applies it. The driver
+    /// and process restarts until the installed version passes readiness. The driver
     /// reads it to tell "blocked because MY staged update holds the
     /// updater" (retry when idle) from "blocked, nothing staged" (#165's
     /// honest message).
     public private(set) var stagedVersion: String?
+    nonisolated public static let pendingInstallBuildKey = "modeldeck.appupdate.pendingInstallBuild"
+    nonisolated public static let pendingInstallVersionKey = "modeldeck.appupdate.pendingInstallVersion"
 
     private let defaults: UserDefaults
     /// Nil in builds without a Sparkle-configured bundle (dev builds, and
@@ -246,6 +247,10 @@ public final class AppUpdateInstallModel: ObservableObject {
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         self.isAutoInstallEnabled = Self.storedAutoInstall(defaults)
+        if let version = defaults.string(forKey: Self.pendingInstallVersionKey) {
+            stagedVersion = version
+            phase = .installedPendingRelaunch(version: version)
+        }
     }
 
     /// Default ON (Tim's call on issue #121): an absent key reads true, so
@@ -296,10 +301,14 @@ public final class AppUpdateInstallModel: ObservableObject {
     /// past the cancellable window (checking/downloading) drops the cancel
     /// handler: Sparkle's cancellation blocks are only valid before
     /// extraction starts (issue #163).
-    public func report(_ phase: AppUpdateInstallPhase) {
+    public func report(_ phase: AppUpdateInstallPhase, build: String? = nil) {
         self.phase = phase
         if case .installedPendingRelaunch(let version) = phase {
             stagedVersion = version // #303: sticky — see the property doc
+            // Sparkle's separate installer can survive this process.
+            defaults.set(build, forKey: Self.pendingInstallBuildKey)
+            defaults.set(version, forKey: Self.pendingInstallVersionKey)
+            defaults.synchronize()
         }
         switch phase {
         case .checking, .downloading:
@@ -315,6 +324,28 @@ public final class AppUpdateInstallModel: ObservableObject {
     public func setCancelHandler(_ handler: (() -> Void)?) {
         cancelHandler = handler
         canCancel = handler != nil
+    }
+
+    // Issue #706: canCheckForUpdates is menu validation, not installer ownership.
+    // CodeRabbit (PR #711): the two ownership keys are written one after the
+    // other, so a build key without its version key still means Sparkle owns
+    // a staged install; either key present refuses the rollback path.
+    public func canReserveForRollback(canCheckForUpdates: Bool, sessionInProgress: Bool) -> Bool {
+        canCheckForUpdates && !sessionInProgress && !isBusy && stagedVersion == nil
+            && defaults.string(forKey: Self.pendingInstallBuildKey) == nil
+    }
+
+    // A verified installed or newer build supersedes the pending installer.
+    // Display versions cannot identify beta bundles; commit counts can.
+    public func finishInstallLaunch(currentBuild: String?, isRunningProcess: Bool) {
+        guard isRunningProcess, let currentBuild, let running = UInt64(currentBuild),
+              let pendingBuild = defaults.string(forKey: Self.pendingInstallBuildKey),
+              let pending = UInt64(pendingBuild), running >= pending else { return }
+        defaults.removeObject(forKey: Self.pendingInstallBuildKey)
+        defaults.removeObject(forKey: Self.pendingInstallVersionKey)
+        defaults.synchronize()
+        stagedVersion = nil
+        if case .installedPendingRelaunch = phase { phase = .idle }
     }
 
     /// The dialog's Cancel button. Returns the flow to an actionable idle
