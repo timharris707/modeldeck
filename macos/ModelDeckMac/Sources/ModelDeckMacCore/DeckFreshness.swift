@@ -455,13 +455,30 @@ public enum DeckFreshness {
     /// story for Claude and the last-refresh-error line; both occupy the
     /// same single notice slot and drive the same #118 one-click path.
     public static func signInRecovery(for account: DeckAccount) -> SignInRecovery? {
+        let renewalFailures = account.provider == "claude"
+            ? (account.renew?.consecutiveFailures ?? 0)
+            : 0
+        let renewalFailed = account.authState == "signin-required"
+            && account.signinReason?.lowercased() == "expired"
+            && renewalFailures >= 2
         let tone: SignInRecovery.Tone
-        switch account.healthChip {
-        case .signInAgain: tone = .signedOut
-        case .idleSignIn: tone = .idle
-        default: return nil
+        if renewalFailed {
+            tone = .signedOut
+        } else {
+            switch account.healthChip {
+            case .signInAgain: tone = .signedOut
+            case .idleSignIn: tone = .idle
+            default: return nil
+            }
         }
-        var detail = tone == .idle ? idleSignInDetail : signInRecoveryDetail
+        var detail: String
+        if renewalFailed {
+            let last = account.renew?.lastAttempt?.detail
+            let suffix = last.map { " Last: \($0)." } ?? ""
+            detail = "Automatic renewal failed \(renewalFailures) times.\(suffix) \(signInRecoveryDetail)"
+        } else {
+            detail = tone == .idle ? idleSignInDetail : signInRecoveryDetail
+        }
         if account.provider == "claude" {
             detail += " \(signInRecoveryClaudeDetail)"
         }
@@ -471,11 +488,14 @@ public enum DeckFreshness {
         // Orchestrator verify on PR #150: the notice must stay ONE line in
         // the two-column card width (Tim's constraint 1 — same footprint),
         // so the deck copy matches the Settings chip verbatim and the full
-        // "renews when this account is next used" sentence stays in the
-        // tooltip and explanation popover where it always was.
-        let text = tone == .idle
-            ? "Idle — renews on next use"
-            : "Sign in needed"
+        // The old idle mechanics stay in the tooltip; repeated renewal
+        // failures use the short signed-out lead above.
+        let text: String
+        if renewalFailed {
+            text = "Renewal failed — sign in needed"
+        } else {
+            text = tone == .idle ? "Idle — renews on next use" : "Sign in needed"
+        }
         return SignInRecovery(
             text: text,
             tooltip: detail,

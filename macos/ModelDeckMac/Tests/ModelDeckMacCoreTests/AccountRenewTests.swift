@@ -30,6 +30,7 @@ final class AccountRenewTests: XCTestCase {
         XCTAssertEqual(account.renew?.lastAttempt?.outcome, "renewed")
         XCTAssertEqual(account.renew?.lastAttempt?.mechanism, "invoke")
         XCTAssertEqual(account.renew?.lastAttempt?.at, "2026-07-31T10:00:00Z")
+        XCTAssertNil(account.renew?.consecutiveFailures)
     }
 
     func testAccountWithoutRenewObjectDecodesNil() throws {
@@ -46,6 +47,22 @@ final class AccountRenewTests: XCTestCase {
         let account = try JSONDecoder().decode(DeckAccount.self, from: Data(json.utf8))
         XCTAssertNil(account.renew)
         XCTAssertNil(AccountRenew.action(for: account))
+    }
+
+    func testRenewDecodeCarriesFailureCause() throws {
+        let json = """
+        {
+          "id": "acct-4", "provider": "claude", "label": "Network",
+          "enabled": true, "isDefault": false,
+          "renew": {
+            "available": true, "consecutiveFailures": 2,
+            "lastAttempt": { "outcome": "failed", "cause": "network" }
+          }
+        }
+        """
+        let account = try JSONDecoder().decode(DeckAccount.self, from: Data(json.utf8))
+        XCTAssertEqual(account.renew?.consecutiveFailures, 2)
+        XCTAssertEqual(account.renew?.lastAttempt?.cause, "network")
     }
 
     func testUnexpectedRenewShapeDecodesInert() throws {
@@ -158,7 +175,7 @@ final class AccountRenewTests: XCTestCase {
 
     func testOutcomeTextPrefersDaemonDetailVerbatim() {
         let renewal = AccountRenewal(outcome: "failed", detail: "The invocation timed out after 60 seconds.")
-        XCTAssertEqual(AccountRenew.outcomeText(for: renewal), "The invocation timed out after 60 seconds.")
+        XCTAssertEqual(AccountRenew.outcomeText(for: renewal), "Renewal didn't complete: The invocation timed out after 60 seconds.")
     }
 
     func testOutcomeTextFallbacksCoverEveryContractOutcome() {

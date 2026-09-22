@@ -242,16 +242,21 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
     /// tooltip carries the honest `lastRefreshError` message.
     /// Issue #149: `signin-required` splits by the daemon's additive
     /// `signinReason` — "expired" is idle-decay (credentials present, the
-    /// provider CLI renews them on next use) and earns the calm idle chip;
-    /// any other reason, or none at all (old daemon), keeps the alarming
-    /// "Sign in again" verbatim as the conservative default. Reason-based,
-    /// never activation-based: an ACTIVE account with an expired token is
-    /// idle too.
+    /// provider CLI renews them on next use) and earns the calm idle chip until
+    /// two automatic renewal failures make the existing sign-in action honest
+    /// (#724). Any other reason, or none at all (old daemon), keeps the
+    /// alarming "Sign in again" verbatim as the conservative default.
+    /// Reason-based, never activation-based: an ACTIVE account with an expired
+    /// token is idle too.
     public var healthChip: ToolProbe.HealthChip {
         switch authState {
         case "ok": return .healthy
         case "signin-required":
-            return signinReason?.lowercased() == "expired" ? .idleSignIn : .signInAgain
+            guard signinReason?.lowercased() == "expired" else { return .signInAgain }
+            if provider == "claude", (renew?.consecutiveFailures ?? 0) >= 2 {
+                return .signInAgain
+            }
+            return .idleSignIn
         default: return .unknown
         }
     }
@@ -353,7 +358,7 @@ public struct ClaudeStatuslineOptIn: Codable, Equatable, Sendable {
 
 /// Issue #176: the daemon's per-account renewal capability from
 /// `GET /api/state`
-/// (`renew: {available, authOverride, helperRouted?, lastAttempt}`).
+/// (`renew: {available, authOverride, helperRouted?, consecutiveFailures?, lastAttempt}`).
 /// `available` — the guarded renew op can run for this profile;
 /// `authOverride` — the profile's settings env supplies an Anthropic
 /// credential (`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`), so ModelDeck's
@@ -377,22 +382,26 @@ public struct AccountRenewCapability: Codable, Equatable, Sendable {
     public var available: Bool
     public var authOverride: Bool
     public var helperRouted: Bool
+    /// Consecutive automatic renewal failures. Optional for old daemons.
+    public var consecutiveFailures: Int?
     public var lastAttempt: AccountRenewAttempt?
 
     public init(
         available: Bool = false,
         authOverride: Bool = false,
         helperRouted: Bool = false,
+        consecutiveFailures: Int? = nil,
         lastAttempt: AccountRenewAttempt? = nil
     ) {
         self.available = available
         self.authOverride = authOverride
         self.helperRouted = helperRouted
+        self.consecutiveFailures = consecutiveFailures
         self.lastAttempt = lastAttempt
     }
 
     private enum CodingKeys: String, CodingKey {
-        case available, authOverride, helperRouted, lastAttempt
+        case available, authOverride, helperRouted, consecutiveFailures, lastAttempt
     }
 
     public init(from decoder: Decoder) throws {
@@ -404,13 +413,14 @@ public struct AccountRenewCapability: Codable, Equatable, Sendable {
             available: (try? container.decodeIfPresent(Bool.self, forKey: .available)) ?? false,
             authOverride: (try? container.decodeIfPresent(Bool.self, forKey: .authOverride)) ?? false,
             helperRouted: (try? container.decodeIfPresent(Bool.self, forKey: .helperRouted)) ?? false,
+            consecutiveFailures: (try? container.decodeIfPresent(Int.self, forKey: .consecutiveFailures)) ?? nil,
             lastAttempt: (try? container.decodeIfPresent(AccountRenewAttempt.self, forKey: .lastAttempt)) ?? nil
         )
     }
 }
 
 /// Issue #176: the daemon's record of this account's last renewal attempt
-/// (`{at, outcome, mechanism}`). All optional — the fields are informational
+/// (`{at, outcome, mechanism, cause?, detail?}`). All optional — the fields are informational
 /// and the daemon may omit any of them.
 public struct AccountRenewAttempt: Codable, Equatable, Sendable {
     public var at: String?
@@ -431,23 +441,31 @@ public struct AccountRenewAttempt: Codable, Equatable, Sendable {
     /// explanation that stops at the JSON boundary is the same blind spot
     /// wearing a different hat.
     public var identityDecline: String?
+    /// Why the last renewal failed, when the daemon classified it.
+    public var cause: String?
+    /// The daemon's already-redacted plain-words failure explanation.
+    public var detail: String?
 
     public init(
         at: String? = nil,
         outcome: String? = nil,
         mechanism: String? = nil,
         path: String? = nil,
-        identityDecline: String? = nil
+        identityDecline: String? = nil,
+        cause: String? = nil,
+        detail: String? = nil
     ) {
         self.at = at
         self.outcome = outcome
         self.mechanism = mechanism
         self.path = path
         self.identityDecline = identityDecline
+        self.cause = cause
+        self.detail = detail
     }
 
     private enum CodingKeys: String, CodingKey {
-        case at, outcome, mechanism, path, identityDecline
+        case at, outcome, mechanism, path, identityDecline, cause, detail
     }
 
     /// Shape-tolerant, matching `AccountRenewCapability`: an unexpected type on
@@ -462,7 +480,9 @@ public struct AccountRenewAttempt: Codable, Equatable, Sendable {
             outcome: (try? container.decodeIfPresent(String.self, forKey: .outcome)) ?? nil,
             mechanism: (try? container.decodeIfPresent(String.self, forKey: .mechanism)) ?? nil,
             path: (try? container.decodeIfPresent(String.self, forKey: .path)) ?? nil,
-            identityDecline: (try? container.decodeIfPresent(String.self, forKey: .identityDecline)) ?? nil
+            identityDecline: (try? container.decodeIfPresent(String.self, forKey: .identityDecline)) ?? nil,
+            cause: (try? container.decodeIfPresent(String.self, forKey: .cause)) ?? nil,
+            detail: (try? container.decodeIfPresent(String.self, forKey: .detail)) ?? nil
         )
     }
 }

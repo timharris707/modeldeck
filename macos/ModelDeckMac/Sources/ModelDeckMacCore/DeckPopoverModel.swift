@@ -925,6 +925,7 @@ public enum DeckBuilder {
                 let windows = snapshots
                     .map { window(from: $0, thresholds: thresholds, now: now) }
                     .filter { !isMeaninglessWindow($0) }
+                    .filter { !isUnusedCodexModelWindow($0, provider: DeckProvider.from(account.provider)) }
                     .sorted { lhs, rhs in
                         let l = windowRank(scope: lhs.scope)
                         let r = windowRank(scope: rhs.scope)
@@ -1168,6 +1169,23 @@ public enum DeckBuilder {
         guard window.resetsAt == nil, window.spendText == nil else { return false }
         guard let remaining = window.remainingPercent else { return true } // unknown usage
         return remaining >= 100 // zero usage
+    }
+
+    /// Issue #728 (Tim, 2026-09-22): a Codex card shows the account weekly
+    /// as its main window and a general 5-hour window beneath it, nothing
+    /// else, unless a model-scoped window carries real usage. Codex reports
+    /// per-model windows (the "GPT-5.3-Codex-Spark" pair, "gpt-reserve")
+    /// that sat at 0% used on every account for two months and crowded the
+    /// expanded card with three "Starts on first use" rows Tim never acts
+    /// on. Codex ONLY: on a Claude card the model-scoped weekly is the
+    /// window that matters. The row returns the moment the provider states
+    /// usage for it, so nothing is silently lost.
+    static func isUnusedCodexModelWindow(_ window: DeckWindow, provider: DeckProvider?) -> Bool {
+        // CodeRabbit on PR #730: the daemon may spell the provider "openai";
+        // compare the mapped provider, never the raw string.
+        guard provider == .codex, windowRank(scope: window.scope) == 2 else { return false }
+        guard let remaining = window.remainingPercent else { return true }
+        return remaining >= 100
     }
 
     /// Whether the scope is of a kind the deck recognises, independent of

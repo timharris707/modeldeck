@@ -194,6 +194,28 @@ const CLAUDE_RENEWAL_MODEL = 'claude-haiku-4-5-20251001';
 // renew…", which read as a failed to-do).
 const CLAUDE_RENEWAL_BUSY_DETAIL = 'Will renew automatically at the next quiet moment — a Claude session is running right now.';
 const CLAUDE_RENEWAL_BUDGET_OUTCOMES = new Set(['renewed', 'failed']);
+// Issue #724: network errors need a visible cause without spending one of the
+// six provider attempts; classification stays credential-free and redacted.
+const CLAUDE_RENEWAL_NETWORK_PATTERN = /ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENETUNREACH|Connection error|Can't reach the API server|isNetworkDown/i;
+const CLAUDE_RENEWAL_AUTH_PATTERN = /401|invalid_grant|OAuth|expired|not logged in|authentication/i;
+// Review of #724 (PR #731): explicit auth evidence outranks the broad
+// "Connection error" marker, or a 401 whose text also says "connection"
+// would be filed as network and retry unbudgeted forever. "expired" stays in
+// the broad pattern only: an SSL "certificate expired" is not an auth verdict.
+const CLAUDE_RENEWAL_STRONG_AUTH_PATTERN = /401|invalid_grant|OAuth|not logged in|authentication/i;
+
+// CodeRabbit on PR #731: the long-token rule alone left short Basic/Bearer
+// values and token=/authToken= fields readable. Same families the daemon
+// entry's redactObviousSecrets covers, plus Basic; value-bearing forms first
+// so the bare-prefix rule cannot pre-empt them.
+function redactClaudeRenewalDetail(value) {
+  return String(value || '')
+    .split(/\r?\n/).find((line) => line.trim())?.trim()
+    ?.replace(/\b(Bearer|Basic)\s+[^\s'"]+/gi, '$1 <redacted>')
+    .replace(/\b(auth[_-]?token|access[_-]?token|refresh[_-]?token|api[_-]?key|token)(\s*[=:]\s*)[^\s&'"]+/gi, '$1$2<redacted>')
+    .replace(/(sk-ant-|[A-Za-z0-9_-]{40,})/g, '<redacted>')
+    .slice(0, 160) || '';
+}
 const CLAUDE_AUTH_OVERRIDE_KEYS = [
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
@@ -2715,6 +2737,21 @@ export class ModelDeckService {
     for (const result of results) {
       if (result.ok) this.accountRefreshErrors.delete(result.accountId);
       else this.accountRefreshErrors.set(result.accountId, { message: result.error, at });
+      if (result.ok) {
+        // Issue #724: a successful refresh is the daemon's post-login proof;
+        // clear the stale automatic-renewal failure streak immediately.
+        const account = this.store.getAccount(result.accountId);
+        const renewal = account?.metadata?.claudeRenewal;
+        if (account?.provider === 'claude' && Number.isInteger(renewal?.consecutiveFailures) && renewal.consecutiveFailures > 0) {
+          this.store.saveAccount({
+            ...account,
+            metadata: {
+              ...account.metadata,
+              claudeRenewal: { ...renewal, consecutiveFailures: 0 },
+            },
+          });
+        }
+      }
     }
     const after = this.signInRequiredByRefreshError();
     const changed = after.size !== before.size || [...after].some((id) => !before.has(id));
@@ -4163,13 +4200,24 @@ export class ModelDeckService {
       || (account.provider === 'codex'
         && JSON.stringify(codexPlan) !== JSON.stringify(account.metadata?.codexPlan || null))
     );
-    if (identityChanged || planChanged || confirmsMovedHome) {
+    const resetRenewalFailures = account.provider === 'claude'
+      && result.authenticated
+      && Number.isInteger(latest.metadata?.claudeRenewal?.consecutiveFailures)
+      && latest.metadata.claudeRenewal.consecutiveFailures > 0;
+    if (identityChanged || planChanged || confirmsMovedHome || resetRenewalFailures) {
       const metadata = { ...account.metadata };
       if (confirmsMovedHome) delete metadata.claudeHomeNeedsVerification;
       if (claudePlan) metadata.claudePlan = claudePlan;
       if (account.provider === 'codex') {
         if (codexPlan) metadata.codexPlan = codexPlan;
         else delete metadata.codexPlan;
+      }
+      if (resetRenewalFailures && metadata.claudeRenewal) {
+        // CodeRabbit on PR #731: `metadata` is the pre-probe snapshot and
+        // `claudeRenewal` is about to be marked authored, so a renewal that
+        // landed during the probe await would be overwritten by stale data.
+        // Reset the counter on the CURRENT stored object instead.
+        metadata.claudeRenewal = { ...latest.metadata.claudeRenewal, consecutiveFailures: 0 };
       }
       // The provider auth probe above spawns the provider CLI and can run for
       // seconds; `account` is the pre-probe snapshot. Rebase the daemon-owned
@@ -4181,12 +4229,13 @@ export class ModelDeckService {
       const authored = account.provider === 'codex' ? ['codexPlan'] : [];
       if (claudePlan) authored.push('claudePlan');
       if (confirmsMovedHome) authored.push('claudeHomeNeedsVerification');
+      if (resetRenewalFailures) authored.push('claudeRenewal');
       saved = this.store.saveAccount({
         ...latest,
         identity: identityChanged ? result.identity : account.identity,
         metadata: this.mergeDaemonMetadataAtPersist(
           account.id,
-          planChanged || confirmsMovedHome ? metadata : account.metadata,
+          planChanged || confirmsMovedHome || resetRenewalFailures ? metadata : account.metadata,
           authored,
         ),
       });
@@ -4388,17 +4437,59 @@ export class ModelDeckService {
     });
   }
 
+  claudeRenewalFailure(attempt, error = null) {
+    // Issue #724: the CLI's own output is evidence for the cause, never API
+    // state or logs; only the first safe line can leave this method.
+    const output = `${error?.stderr ?? ''}\n${error?.stdout ?? ''}\n${error?.message ?? ''}`;
+    if (CLAUDE_RENEWAL_STRONG_AUTH_PATTERN.test(output)) {
+      return { cause: 'auth', detail: 'Anthropic rejected the stored sign-in; sign in again.' };
+    }
+    if (CLAUDE_RENEWAL_NETWORK_PATTERN.test(output)) {
+      let detail = 'Could not reach Anthropic';
+      if (/ENOTFOUND|EAI_AGAIN/i.test(output)) detail += ' (DNS lookup failed)';
+      else if (/ECONNREFUSED/i.test(output)) detail += ' (connection refused)';
+      else if (/ETIMEDOUT/i.test(output)) detail += ' (timed out)';
+      return { cause: 'network', detail };
+    }
+    if (CLAUDE_RENEWAL_AUTH_PATTERN.test(output)) {
+      return { cause: 'auth', detail: 'Anthropic rejected the stored sign-in; sign in again.' };
+    }
+    const source = [error?.stderr, error?.stdout, error?.message]
+      .find((value) => typeof value === 'string' && value.trim()) || attempt.detail;
+    const detail = redactClaudeRenewalDetail(source);
+    return { cause: 'other', detail: detail || 'Claude ran but the stored sign-in is still expired' };
+  }
+
   recordClaudeRenewalAttempt(accountId, attempt) {
     const account = this.store.getAccount(accountId);
     if (!account) return attempt;
+    const normalized = attempt.outcome === 'failed'
+      ? {
+        ...attempt,
+        cause: attempt.cause || 'other',
+        detail: redactClaudeRenewalDetail(attempt.detail),
+      }
+      : attempt;
     const timestamp = Date.parse(attempt.at);
     const attempts = this.renewalAttemptHistory(account, Number.isFinite(timestamp) ? timestamp : this.now());
-    if (CLAUDE_RENEWAL_BUDGET_OUTCOMES.has(attempt.outcome)) attempts.push(attempt.at);
+    const budgeted = CLAUDE_RENEWAL_BUDGET_OUTCOMES.has(normalized.outcome) && normalized.cause !== 'network';
+    if (budgeted) attempts.push(normalized.at);
+    const previousFailures = Number.isInteger(account.metadata?.claudeRenewal?.consecutiveFailures)
+      ? account.metadata.claudeRenewal.consecutiveFailures
+      : 0;
     const claudeRenewal = {
       ...account.metadata?.claudeRenewal,
       attempts,
-      lastAttempt: attempt,
+      lastAttempt: normalized,
+      lastAttemptAt: normalized.at,
     };
+    if (normalized.outcome === 'failed' && normalized.cause === 'network') {
+      claudeRenewal.lastNetworkFailureAt = normalized.at;
+    } else if (budgeted) {
+      delete claudeRenewal.lastNetworkFailureAt;
+    }
+    if (normalized.outcome === 'failed') claudeRenewal.consecutiveFailures = previousFailures + 1;
+    else if (normalized.outcome === 'renewed') claudeRenewal.consecutiveFailures = 0;
     // Leftovers from the removed pre-expiry renewal path (#564): prune them
     // from stored metadata as attempts land so old rows converge clean.
     delete claudeRenewal.lastPreExpiryAttemptAt;
@@ -4418,14 +4509,28 @@ export class ModelDeckService {
       enabled: account.enabled,
       metadata,
     });
-    return attempt;
+    if (normalized.outcome === 'failed') {
+      console.error(`[modeldeck] Claude renewal failed account=${account.label || '-'} path=${normalized.path || '-'} mechanism=${normalized.mechanism || '-'} cause=${normalized.cause} detail=${normalized.detail || '-'}`);
+    }
+    return normalized;
+  }
+
+  // CodeRabbit on PR #731: the backoff must not read `lastAttempt`, because
+  // the `rate-limited` refusal itself becomes `lastAttempt` and the second
+  // click would sail through. `lastNetworkFailureAt` is written only by a
+  // real network failure and cleared by any budgeted or renewed attempt.
+  networkRenewalBackoffActive(account) {
+    const lastAt = Date.parse(account?.metadata?.claudeRenewal?.lastNetworkFailureAt ?? '');
+    return Number.isFinite(lastAt) && this.now() - lastAt < CLAUDE_RENEWAL_BACKOFF_MS;
   }
 
   renewalAttemptAllowed(account) {
     const timestamp = this.now();
     const history = this.renewalAttemptHistory(account, timestamp);
     if (history.length >= CLAUDE_RENEWAL_DAILY_LIMIT) return false;
-    const lastAt = history.reduce((latest, at) => Math.max(latest, Date.parse(at)), Number.NEGATIVE_INFINITY);
+    const newestBudgetAt = history.reduce((latest, at) => Math.max(latest, Date.parse(at)), Number.NEGATIVE_INFINITY);
+    const lastNetworkAt = Date.parse(account?.metadata?.claudeRenewal?.lastNetworkFailureAt ?? '');
+    const lastAt = Math.max(newestBudgetAt, Number.isFinite(lastNetworkAt) ? lastNetworkAt : Number.NEGATIVE_INFINITY);
     return timestamp - lastAt >= CLAUDE_RENEWAL_BACKOFF_MS;
   }
 
@@ -4691,6 +4796,7 @@ export class ModelDeckService {
       at,
       outcome: 'failed',
       mechanism: 'auth-status',
+      cause: 'other',
       detail: 'Claude did not refresh this account’s expired stored sign-in.',
       path: renewalPath,
     };
@@ -4707,14 +4813,17 @@ export class ModelDeckService {
     if (!verified.expired) return result;
 
     result.mechanism = 'invoke';
+    let invocationError = null;
     try {
       await this.runClaudeRenewalCli(['-p', 'ok', '--model', CLAUDE_RENEWAL_MODEL], account.profileRef);
     } catch (error) {
+      invocationError = error;
       if (this.claudeModelRejected(error)) {
         try {
           await this.runClaudeRenewalCli(['-p', 'ok'], account.profileRef);
-        } catch {
-          // Verification, not CLI exit status, decides the outcome.
+          invocationError = null;
+        } catch (retryError) {
+          invocationError = retryError;
         }
       }
     }
@@ -4727,6 +4836,11 @@ export class ModelDeckService {
         detail: 'Claude refreshed this account’s stored sign-in with the minimal renewal request.',
         path: renewalPath,
       };
+    } else if (invocationError) {
+      Object.assign(result, this.claudeRenewalFailure(result, invocationError));
+    } else {
+      result.cause = 'other';
+      result.detail = 'Claude ran but the stored sign-in is still expired';
     }
     return result;
   }
@@ -4739,6 +4853,7 @@ export class ModelDeckService {
       at,
       outcome: 'failed',
       mechanism: null,
+      cause: 'other',
       detail: 'Claude did not refresh this account’s expired stored sign-in.',
       path: 'flip',
     };
@@ -4785,6 +4900,7 @@ export class ModelDeckService {
             at,
             outcome: 'failed',
             mechanism: result.mechanism,
+            cause: 'other',
             detail: 'ModelDeck could not restore the previously active Claude profile after renewal.',
             path: 'flip',
             restoreFailed: true,
@@ -4824,7 +4940,7 @@ export class ModelDeckService {
       return decided('auth-overridden', null, 'This profile sets an Anthropic authentication override, so renewal was not attempted.');
     }
     if (!override.readable) {
-      return decided('failed', null, 'ModelDeck could not safely inspect this profile’s Claude settings, so renewal was not attempted.');
+      return decided('failed', null, 'ModelDeck could not safely inspect this profile’s Claude settings, so renewal was not attempted.', { cause: 'other' });
     }
 
     const authStatus = await this.readScopedClaudeAuthStatus(account.profileRef);
@@ -4834,7 +4950,7 @@ export class ModelDeckService {
       return decided('signin-required', null, 'This account requires an explicit Claude sign-in; automatic renewal was not attempted.');
     }
     if (latestAccount.provider !== 'claude' || latestAccount.profileRef !== account.profileRef) {
-      return decided('failed', null, 'This account changed while ModelDeck was checking its Claude identity, so renewal was not attempted.');
+      return decided('failed', null, 'This account changed while ModelDeck was checking its Claude identity, so renewal was not attempted.', { cause: 'other' });
     }
     if (claudeRenewalIdentityMatches(latestAccount, reportedIdentity)) {
       this.promoteSeededClaudeIdentity(account.id, account.profileRef, reportedIdentity);
@@ -4863,7 +4979,7 @@ export class ModelDeckService {
         return decided('busy', null, CLAUDE_RENEWAL_BUSY_DETAIL, { path: 'flip', identityDecline });
       }
     } catch {
-      return decided('failed', null, 'ModelDeck could not confirm that Claude was idle, so renewal was not attempted.', { path: 'flip', identityDecline });
+      return decided('failed', null, 'ModelDeck could not confirm that Claude was idle, so renewal was not attempted.', { path: 'flip', identityDecline, cause: 'other' });
     }
 
     this.requireManaged('claude');
@@ -4882,6 +4998,19 @@ export class ModelDeckService {
         outcome: 'rate-limited',
         mechanism: null,
         detail: 'This account has reached the Claude renewal limit for the last 24 hours; try again later.',
+      });
+    }
+    // Review of #724 (PR #731): a network failure spends no budget, so the
+    // 30-minute backoff is the ONLY thing between a dead network and a tight
+    // retry loop against Anthropic. The scheduler honours it through
+    // renewalAttemptAllowed; a manual caller must too. Budgeted failures keep
+    // their pre-#724 behaviour (the daily limit alone gates a click).
+    if (account?.provider === 'claude' && this.networkRenewalBackoffActive(account)) {
+      return this.recordClaudeRenewalAttempt(account.id, {
+        at: new Date(this.now()).toISOString(),
+        outcome: 'rate-limited',
+        mechanism: null,
+        detail: 'The last renewal could not reach Anthropic less than 30 minutes ago; it can run again after that.',
       });
     }
     const promise = this.withClaudeActivationLock(() => this.performClaudeRenewal(accountId));
@@ -6785,6 +6914,8 @@ export class ModelDeckService {
             at: storedAttempt.at,
             outcome: storedAttempt.outcome,
             mechanism: storedAttempt.mechanism ?? null,
+            ...(storedAttempt.cause ? { cause: storedAttempt.cause } : {}),
+            ...(storedAttempt.outcome === 'failed' && storedAttempt.detail ? { detail: storedAttempt.detail } : {}),
             // Issue #263, additive: why the cheap no-flip rung was declined.
             // A bare `busy` hid this defect for four releases — it read as
             // "a session is in the way" when the truth was "the CLI named
@@ -6806,6 +6937,9 @@ export class ModelDeckService {
           // child reads a scratch settings context that has no helper.
           ...(override.helperRouted ? { helperRouted: true } : {}),
           lastAttempt,
+          consecutiveFailures: Number.isInteger(account.metadata?.claudeRenewal?.consecutiveFailures)
+            ? account.metadata.claudeRenewal.consecutiveFailures
+            : 0,
           ...(storedAttempt?.restoreFailed ? { error: storedAttempt.detail } : {}),
         };
       }

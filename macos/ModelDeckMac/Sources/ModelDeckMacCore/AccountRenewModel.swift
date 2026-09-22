@@ -166,9 +166,13 @@ public enum AccountRenew {
     }
 
     /// Calm one-line text for a decided outcome. The daemon's own `detail`
-    /// sentence is preferred verbatim; the fallbacks below cover a daemon
-    /// that sent none. Refusals stay matter-of-fact — never alarm copy.
+    /// sentence is preferred verbatim; failed renewals add a short lead so the
+    /// reason cannot read like an unexplained generic error. The fallbacks
+    /// below cover a daemon that sent none. Refusals stay matter-of-fact.
     public static func outcomeText(for renewal: AccountRenewal) -> String {
+        if renewal.outcome == "failed", let detail = renewal.detail, !detail.isEmpty {
+            return "Renewal didn't complete: \(detail)"
+        }
         if let detail = renewal.detail, !detail.isEmpty {
             return detail
         }

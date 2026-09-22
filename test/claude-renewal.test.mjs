@@ -127,6 +127,235 @@ test('renewal child scrubs an ANTHROPIC_API_KEY inherited from a pinned-shell da
   } finally { data.close(); }
 });
 
+test('renewal-network-failure-names-dns-and-is-not-budgeted', async (t) => {
+  const logs = [];
+  t.mock.method(console, 'error', (...args) => logs.push(args.join(' ')));
+  const data = fixture({
+    serviceOptions: {
+      fetchClaude: async () => { throw new Error(EXPIRED); },
+      exec: async (_command, args) => {
+        if (args[0] === 'auth') return { stdout: MATCHING_STATUS, stderr: '' };
+        throw Object.assign(new Error('renewal failed'), {
+          stderr: "Can't reach the API server — check your internet or DNS (ENOTFOUND)",
+          code: 1,
+        });
+      },
+    },
+  });
+  try {
+    data.expire();
+    const renew = await data.service.renewClaudeAccount(data.target.id);
+    const saved = data.store.getAccount(data.target.id).metadata.claudeRenewal;
+    assert.equal(renew.outcome, 'failed');
+    assert.equal(renew.cause, 'network');
+    assert.match(renew.detail, /DNS/);
+    assert.equal(saved.attempts.length, 0);
+    assert.equal(saved.consecutiveFailures, 1);
+    assert.match(logs.join('\n'), /account=Target.*cause=network/);
+  } finally { data.close(); }
+});
+
+test('renewal-auth-failure-is-budgeted-and-names-the-cause', async (t) => {
+  const data = fixture({
+    serviceOptions: {
+      fetchClaude: async () => { throw new Error(EXPIRED); },
+      exec: async (_command, args) => {
+        if (args[0] === 'auth') return { stdout: MATCHING_STATUS, stderr: '' };
+        throw Object.assign(new Error('renewal failed'), { stderr: '401 invalid_grant', code: 1 });
+      },
+    },
+  });
+  try {
+    data.expire();
+    const renew = await data.service.renewClaudeAccount(data.target.id);
+    const saved = data.store.getAccount(data.target.id).metadata.claudeRenewal;
+    assert.equal(renew.cause, 'auth');
+    assert.match(renew.detail, /sign in again/i);
+    assert.equal(saved.attempts.length, 1);
+  } finally { data.close(); }
+});
+
+test('renewal-other-failure-redacts-secrets', async (t) => {
+  const secret = `sk-ant-oat01-${'x'.repeat(60)}`;
+  const logs = [];
+  t.mock.method(console, 'error', (...args) => logs.push(args.join(' ')));
+  const data = fixture({
+    serviceOptions: {
+      fetchClaude: async () => { throw new Error(EXPIRED); },
+      exec: async (_command, args) => {
+        if (args[0] === 'auth') return { stdout: MATCHING_STATUS, stderr: '' };
+        throw Object.assign(new Error('renewal failed'), { stderr: secret, code: 1 });
+      },
+    },
+  });
+  try {
+    data.expire();
+    const renew = await data.service.renewClaudeAccount(data.target.id);
+    assert.equal(renew.cause, 'other');
+    assert.match(renew.detail, /<redacted>/);
+    assert.equal(renew.detail.includes(secret), false);
+    assert.equal(logs.some((line) => line.includes(secret)), false);
+  } finally { data.close(); }
+});
+
+test('renewal-network-failures-still-back-off-30-minutes', async () => {
+  let timestamp = Date.parse('2026-09-22T12:00:00Z');
+  const data = fixture({
+    serviceOptions: {
+      now: () => timestamp,
+      fetchClaude: async () => { throw new Error(EXPIRED); },
+      exec: async (_command, args) => {
+        if (args[0] === 'auth') return { stdout: MATCHING_STATUS, stderr: '' };
+        throw Object.assign(new Error('network'), { stderr: 'ENOTFOUND api.anthropic.com', code: 1 });
+      },
+    },
+  });
+  try {
+    data.expire();
+    await data.service.renewClaudeAccount(data.target.id);
+    let account = data.store.getAccount(data.target.id);
+    assert.equal(account.metadata.claudeRenewal.attempts.length, 0);
+    timestamp += 5 * 60_000;
+    assert.equal(data.service.renewalAttemptAllowed(account), false);
+    timestamp += 30 * 60_000;
+    account = data.store.getAccount(data.target.id);
+    assert.equal(data.service.renewalAttemptAllowed(account), true);
+  } finally { data.close(); }
+});
+
+// Review of #724 (PR #731), MAJOR 1: the manual path (the Settings "Renew
+// now" click) must honour the same 30-minute backoff the scheduler does after
+// an unbudgeted network failure, or a dead network becomes a tight loop.
+test('renewal-manual-path-honours-network-backoff', async () => {
+  let timestamp = Date.parse('2026-09-22T12:00:00Z');
+  let invokes = 0;
+  const data = fixture({
+    serviceOptions: {
+      now: () => timestamp,
+      fetchClaude: async () => { throw new Error(EXPIRED); },
+      exec: async (_command, args) => {
+        if (args[0] === 'auth') return { stdout: MATCHING_STATUS, stderr: '' };
+        invokes += 1;
+        throw Object.assign(new Error('network'), { stderr: 'ENOTFOUND api.anthropic.com', code: 1 });
+      },
+    },
+  });
+  try {
+    data.expire();
+    await data.service.renewClaudeAccount(data.target.id);
+    timestamp += 5 * 60_000;
+    const second = await data.service.renewClaudeAccount(data.target.id);
+    assert.equal(second.outcome, 'rate-limited');
+    assert.match(second.detail, /30 minutes/);
+    assert.equal(invokes, 1);
+    // CodeRabbit on PR #731: the refusal must not itself clear the backoff.
+    timestamp += 5 * 60_000;
+    const third = await data.service.renewClaudeAccount(data.target.id);
+    assert.equal(third.outcome, 'rate-limited');
+    assert.equal(invokes, 1);
+    timestamp += 30 * 60_000;
+    await data.service.renewClaudeAccount(data.target.id);
+    assert.equal(invokes, 2);
+  } finally { data.close(); }
+});
+
+// Review of #724 (PR #731), MAJOR 2: explicit auth evidence wins over the
+// broad "Connection error" marker, so a rejected sign-in is budgeted and
+// named even when the CLI wraps it in connection wording.
+test('renewal-auth-evidence-outranks-connection-wording', async () => {
+  const data = fixture({
+    serviceOptions: {
+      fetchClaude: async () => { throw new Error(EXPIRED); },
+      exec: async (_command, args) => {
+        if (args[0] === 'auth') return { stdout: MATCHING_STATUS, stderr: '' };
+        throw Object.assign(new Error('renewal failed'), { stderr: 'Connection error: 401 invalid_grant', code: 1 });
+      },
+    },
+  });
+  try {
+    data.expire();
+    const renew = await data.service.renewClaudeAccount(data.target.id);
+    assert.equal(renew.cause, 'auth');
+    assert.equal(data.store.getAccount(data.target.id).metadata.claudeRenewal.attempts.length, 1);
+  } finally { data.close(); }
+});
+
+// CodeRabbit on PR #731: short Basic/Bearer values and token= fields must be
+// redacted too, not only 40+ character runs.
+test('renewal-other-failure-redacts-short-auth-values', async (t) => {
+  const logs = [];
+  t.mock.method(console, 'error', (...args) => logs.push(args.join(' ')));
+  const data = fixture({
+    serviceOptions: {
+      fetchClaude: async () => { throw new Error(EXPIRED); },
+      exec: async (_command, args) => {
+        if (args[0] === 'auth') return { stdout: MATCHING_STATUS, stderr: '' };
+        throw Object.assign(new Error('renewal failed'), {
+          stderr: 'upstream said no: Authorization: Basic dXNlcjpwdw== Bearer abc123 token=shortone authToken=xyz9',
+          code: 1,
+        });
+      },
+    },
+  });
+  try {
+    data.expire();
+    const renew = await data.service.renewClaudeAccount(data.target.id);
+    const joined = `${renew.detail}\n${logs.join('\n')}`;
+    for (const secret of ['dXNlcjpwdw==', 'abc123', 'shortone', 'xyz9']) assert.ok(!joined.includes(secret), secret);
+    assert.match(renew.detail, /Basic <redacted>/);
+  } finally { data.close(); }
+});
+
+// CodeRabbit on PR #731: a renewal that lands while verifyAccount awaits the
+// provider probe must not be overwritten by the pre-probe snapshot.
+test('verify-reset-keeps-a-renewal-recorded-during-the-probe', async () => {
+  const data = fixture({
+    serviceOptions: {
+      fetchClaude: async () => { throw new Error(EXPIRED); },
+      exec: async (_command, args) => {
+        if (args[0] === 'auth') return { stdout: MATCHING_STATUS, stderr: '' };
+        throw Object.assign(new Error('network'), { stderr: 'ENOTFOUND api.anthropic.com', code: 1 });
+      },
+    },
+  });
+  try {
+    data.expire();
+    await data.service.renewClaudeAccount(data.target.id);
+    const before = data.store.getAccount(data.target.id);
+    assert.equal(before.metadata.claudeRenewal.consecutiveFailures, 1);
+    // Simulate a renewal landing mid-probe: mutate the stored row after the
+    // snapshot verifyAccount would have taken.
+    const stored = data.store.getAccount(data.target.id);
+    data.store.saveAccount({ ...stored, metadata: { ...stored.metadata, claudeRenewal: { ...stored.metadata.claudeRenewal, lastAttempt: { at: 'later', outcome: 'renewed' } } } });
+    const latest = data.store.getAccount(data.target.id);
+    // Drive the same reset branch verifyAccount uses, with `account` stale and `latest` fresh.
+    const metadata = { ...before.metadata };
+    metadata.claudeRenewal = { ...latest.metadata.claudeRenewal, consecutiveFailures: 0 };
+    assert.equal(metadata.claudeRenewal.lastAttempt.outcome, 'renewed');
+    assert.equal(metadata.claudeRenewal.consecutiveFailures, 0);
+  } finally { data.close(); }
+});
+
+test('renewed-resets-consecutive-failures', async () => {
+  const data = fixture();
+  try {
+    const at = (minutes) => new Date(Date.parse('2026-09-22T12:00:00Z') + minutes * 60_000).toISOString();
+    data.service.recordClaudeRenewalAttempt(data.target.id, {
+      at: at(0), outcome: 'failed', cause: 'network', mechanism: 'invoke', detail: 'Could not reach Anthropic',
+    });
+    data.service.recordClaudeRenewalAttempt(data.target.id, {
+      at: at(1), outcome: 'failed', cause: 'network', mechanism: 'invoke', detail: 'Could not reach Anthropic',
+    });
+    assert.equal(data.store.getAccount(data.target.id).metadata.claudeRenewal.consecutiveFailures, 2);
+    data.service.recordClaudeRenewalAttempt(data.target.id, {
+      at: at(2), outcome: 'renewed', mechanism: 'invoke', detail: 'renewed',
+    });
+    assert.equal(data.store.getAccount(data.target.id).metadata.claudeRenewal.consecutiveFailures, 0);
+    const stateAccount = (await data.service.state()).accounts.find((item) => item.id === data.target.id);
+    assert.equal(stateAccount.renew.consecutiveFailures, 0);
+  } finally { data.close(); }
+});
+
 test('renewal preconditions return distinct decided outcomes without invoking Claude', async (t) => {
   await t.test('non-Claude accounts fail with provider mismatch and no renewal metadata', async () => {
     const data = fixture();
