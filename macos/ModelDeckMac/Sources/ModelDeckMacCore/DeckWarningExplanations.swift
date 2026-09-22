@@ -180,7 +180,10 @@ public struct DeckWarningExplanation: Equatable, Sendable {
             // cannot start (the #396 no-dead-control rule).
             second = reason
         case .action, .quiet:
-            second = ProxyRelogin.confirmation(label: account.label)
+            // Issue #714: an overloaded provider gets no browser promise.
+            second = ProxyRelogin.credentialIsOverloaded(account)
+                ? ProxyRelogin.overloadedExplanation
+                : ProxyRelogin.confirmation(label: account.label)
         }
         return DeckWarningExplanation(
             title: "\(lead) · \(target)",

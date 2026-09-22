@@ -200,7 +200,7 @@ struct IdleRollforwardCopyTests {
     }
 
     // The #101 unanchored precedent: after the roll, the next weekly reset
-    // is unanchored — "resets 7 days after first use".
+    // is unanchored — the deck slot reads "Starts on first use".
     @Test func weeklyTooltipCarriesTheUnanchoredPrecedent() {
         #expect(notice(scope: "week", duration: week)?.tooltip
             == "This window's reset time passed after the last observation, "

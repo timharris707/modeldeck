@@ -221,7 +221,7 @@ struct DeckBuilderTests {
         )
         let row = DeckBuilder.rows(state: state, now: now).first
         #expect(row?.worstWindow?.scope == "5h") // display-order fallback
-        #expect(row?.worstWindow?.resetText == "Resets 5 hours after first use")
+        #expect(row?.worstWindow?.resetText == "Starts on first use")
     }
 
     @Test func spendStaysExcludedFromTieBreak() {
@@ -548,7 +548,7 @@ struct DeckBuilderTests {
 
     /// TRIPWIRE #621: the hide rule must not swallow a known window that
     /// happens to be untouched and unanchored — the 5-hour row reads
-    /// "Resets 5 hours after first use" at 100% left and must stay.
+    /// "Starts on first use" at 100% left and must stay.
     @Test func knownKindsAreNeverHiddenForBeingEmpty() {
         let state = DeckState(
             accounts: [account("c1", provider: "claude", label: "Studio", isDefault: true)],
@@ -1897,11 +1897,11 @@ struct NoResetPlaceholderTests {
         )
         let row = DeckBuilder.rows(state: state, now: now)[0]
         for window in row.windows {
-            #expect(window.displayedResetText?.hasSuffix("after first use") == true,
+            #expect(window.displayedResetText?.hasSuffix("first use") == true,
                     "\(window.scope) must name the fresh window, not render blank")
         }
         // The collapsed card carries it too — that is the surface Tim read.
-        #expect(row.worstSummary?.contains("after first use") == true)
+        #expect(row.worstSummary?.contains("first use") == true)
     }
 
     @Test func partiallyUsedWindowWithoutResetShowsLabelAndPercentCleanly() {
@@ -1935,7 +1935,7 @@ struct NoResetPlaceholderTests {
         )
         let window = DeckBuilder.rows(state: state, now: now)[0].windows[0]
         #expect(window.anchor == .unanchored(windowDuration: 7 * 86_400))
-        #expect(window.displayedResetText == "Resets 7 days after first use")
+        #expect(window.displayedResetText == "Starts on first use")
         #expect(window.resetTooltip.contains("Fresh window"))
     }
 
@@ -1954,7 +1954,7 @@ struct NoResetPlaceholderTests {
         )
         let window = DeckBuilder.rows(state: state, now: now)[0].windows[0]
         #expect(window.anchor == .unanchored(windowDuration: 5 * 3600))
-        #expect(window.displayedResetText == "Resets 5 hours after first use")
+        #expect(window.displayedResetText == "Starts on first use")
     }
 
     @Test func recentlyRolledWindowKeepsTimestampAndRolloverAnnotation() {

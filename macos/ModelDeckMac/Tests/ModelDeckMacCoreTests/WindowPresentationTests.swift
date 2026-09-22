@@ -327,11 +327,23 @@ struct WindowDurationTests {
 struct WindowPresentationCopyTests {
     @Test func unanchoredResetText() {
         #expect(WindowPresentation.unanchoredResetText(windowDuration: week)
-            == "Resets 7 days after first use")
+            == "Starts on first use")
         #expect(WindowPresentation.unanchoredResetText(windowDuration: fiveHours)
-            == "Resets 5 hours after first use")
+            == "Starts on first use")
         #expect(WindowPresentation.unanchoredResetText(windowDuration: 90 * 60)
-            == "Resets 90 minutes after first use")
+            == "Starts on first use")
+    }
+
+    // TRIPWIRE #725: the fresh-window copy sits beside the window title in
+    // the expanded row; past 20 characters it pushed "Weekly · <model>"
+    // down to "Weekly ·…" on Codex cards. The duration belongs in the
+    // title and the tooltip, never back in this slot.
+    @Test func unanchoredResetTextStaysShort() {
+        for duration in [week, fiveHours, 90 * 60.0] {
+            let text = WindowPresentation.unanchoredResetText(windowDuration: duration)
+            #expect(text.count <= 20, "\(text) would crowd the window title")
+            #expect(!text.contains("day") && !text.contains("hour") && !text.contains("minute"))
+        }
     }
 
     // Issue #247: the tooltip must not claim a placeholder timestamp
@@ -393,7 +405,7 @@ struct DeckBuilderWindowPresentationTests {
             durationMins: 10_080
         ))
         #expect(window.anchor == .unanchored(windowDuration: week))
-        #expect(window.resetText == "Resets 7 days after first use")
+        #expect(window.resetText == "Starts on first use")
         #expect(window.rolloverText == nil)
         #expect(window.resetTooltip.contains("Fresh window"))
         #expect(window.resetTooltip.contains("placeholder"))
@@ -408,7 +420,7 @@ struct DeckBuilderWindowPresentationTests {
             resetsAt: now.addingTimeInterval(week)
         ))
         #expect(window.anchor == .unanchored(windowDuration: week))
-        #expect(window.resetText == "Resets 7 days after first use")
+        #expect(window.resetText == "Starts on first use")
     }
 
     @Test func recentlyRolledWindowCarriesAnnotationAndRealResetText() {
@@ -424,7 +436,7 @@ struct DeckBuilderWindowPresentationTests {
         // The reset slot keeps the REAL timestamp — the roll is annotated,
         // never substituted.
         #expect(window.resetText.hasPrefix("Resets "))
-        #expect(window.resetText != "Resets 7 days after first use")
+        #expect(window.resetText != "Starts on first use")
     }
 
     @Test func anchoredWindowRendersExactlyAsBefore() {
@@ -464,7 +476,7 @@ struct DeckBuilderWindowPresentationTests {
     @Test func nullResetFreshWindowShowsFreshWindowCopy() {
         let window = build(snapshot(scope: "week", remaining: 100, resetsAt: nil))
         #expect(window.anchor == .unanchored(windowDuration: week))
-        #expect(window.displayedResetText == "Resets 7 days after first use")
+        #expect(window.displayedResetText == "Starts on first use")
         #expect(window.resetTooltip.contains("Fresh window"))
         // No placeholder was reported, so the tooltip must not claim one.
         #expect(!window.resetTooltip.contains("placeholder"))
@@ -474,7 +486,7 @@ struct DeckBuilderWindowPresentationTests {
     // so the 5-hour row must not stay blank either.
     @Test func nullResetFiveHourShowsFreshWindowCopy() {
         let window = build(snapshot(scope: "5h", remaining: 100, resetsAt: nil))
-        #expect(window.displayedResetText == "Resets 5 hours after first use")
+        #expect(window.displayedResetText == "Starts on first use")
     }
 
     // Spend rows keep their empty slot — 100% with no reset there is the

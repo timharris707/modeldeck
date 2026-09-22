@@ -238,9 +238,27 @@ echo "==> smoke-checking GET /api/health"
 SMOKE_DIR="$BUILD_DIR/smoke"
 SMOKE_LOG="$BUILD_DIR/smoke.log"
 mkdir -p "$SMOKE_DIR"
+# Issue #717: startup migrations must never see the operator's profiles.
+mkdir -m 700 "$SMOKE_DIR/home"
+HOME="$SMOKE_DIR/home" \
 MODELDECK_DB_PATH="$SMOKE_DIR/modeldeck.sqlite" \
 MODELDECK_DATA_DIR="$SMOKE_DIR/data" \
 MODELDECK_PROJECTS_ROOT="$SMOKE_DIR/projects" \
+MODELDECK_CODEX_PROFILES_DIR="$SMOKE_DIR/data/codex-profiles" \
+MODELDECK_LEGACY_CODEX_PROFILES_DIR="$SMOKE_DIR/home/.codex-profiles" \
+MODELDECK_CODEX_ACTIVE_LINK="$SMOKE_DIR/home/.codex" \
+MODELDECK_CLAUDE_PROFILES_DIR="$SMOKE_DIR/data/claude-profiles" \
+MODELDECK_CLAUDE_ACTIVE_LINK="$SMOKE_DIR/home/.claude" \
+MODELDECK_ZSHENV_PATH="$SMOKE_DIR/home/.zshenv" \
+MODELDECK_CLAUDE_SHELL_ENV_FILE="$SMOKE_DIR/data/claude-env.sh" \
+MODELDECK_GROK_SESSIONS_DIR="$SMOKE_DIR/home/.grok/sessions" \
+MODELDECK_CLIPROXY_CONFIG_DIR="$SMOKE_DIR/cliproxyapi" \
+MODELDECK_CLIPROXY_AUTH_DIR="$SMOKE_DIR/cliproxyapi/auth" \
+MODELDECK_CLIPROXY_MANAGEMENT_KEY_PATH="$SMOKE_DIR/cliproxyapi/.mgmt-key" \
+MODELDECK_USAGE_ARCHIVE_DIR="$SMOKE_DIR/cliproxyapi/usage" \
+MODELDECK_CLIPROXY_USAGE_ARCHIVE_DIR="$SMOKE_DIR/cliproxyapi/usage" \
+MODELDECK_CLAUDE_STATUSLINE_DIR="$SMOKE_DIR/data/statusline" \
+MODELDECK_LANE_MANIFEST_PATH="$SMOKE_DIR/projects/modeldeck/.claude/lane-logs/manifest.jsonl" \
 MODELDECK_MUTATION_TOKEN="build-smoke-placeholder" \
 MODELDECK_PORT=0 \
   "$STAGED_BINARY" >"$SMOKE_LOG" 2>&1 &

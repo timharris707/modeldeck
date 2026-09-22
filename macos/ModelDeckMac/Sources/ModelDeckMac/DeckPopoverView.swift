@@ -1,4 +1,12 @@
 import SwiftUI
+
+private struct DeckContentHeightPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
 import ModelDeckMacCore
 
 /// Phase 4 popover — the two-column deck (design/mac-app-spec.md, mockups
@@ -64,6 +72,10 @@ struct DeckPopoverView: View {
     /// item itself stays gated on the #343 flag; only its destination moved
     /// from the browser to the app window.
     var onOpenDashboardWindow: (() -> Void)?
+    /// Issue #719: the menu-bar host can retain the startup card's taller
+    /// height after that card clears. Track the last measured content height
+    /// so only a real shrink asks the captured window to fit.
+    @State private var contentHeight: CGFloat = 0
     /// Issue #45: Settings opens via the environment action wrapped in
     /// activation + fronting (see SettingsWindowFronting) instead of a bare
     /// SettingsLink, which with the accessory activation policy opened the
@@ -106,6 +118,20 @@ struct DeckPopoverView: View {
         // Decision 0035 made the column count variable, so this width is
         // derived from it rather than pinned at the two-column constant.
         .frame(width: deckWidth)
+        // Issue #719: SwiftUI grows this window with content but can leave a
+        // stale height after transient startup content disappears. Measure
+        // the padded root only in the menu-bar deck; floating windows remain
+        // user-sized and are never fitted.
+        .background {
+            if !isFloating {
+                GeometryReader { geometry in
+                    Color.clear.preference(
+                        key: DeckContentHeightPreferenceKey.self,
+                        value: geometry.size.height
+                    )
+                }
+            }
+        }
         // Issue #270 (Tim, 2026-08-06: "a little too transparent"): the deck
         // had NO background of its own — it inherited SwiftUI's default
         // MenuBarExtra window material and nothing else. This composites a
@@ -130,6 +156,10 @@ struct DeckPopoverView: View {
         // closed by Settings fronting, and that must not reach the deck
         // window the user chose to keep open.
         .background { if !isFloating { DeckWindowCaptureView() } }
+        .onPreferenceChange(DeckContentHeightPreferenceKey.self) { height in
+            guard !isFloating, height > 0 else { return }
+            contentHeight = DeckWindowRegistry.shared.fitContentHeight(height, previousHeight: contentHeight)
+        }
         .onAppear {
             // Tim directive 2026-08-02: one diff per open, against the
             // snapshot stored at the PREVIOUS open — changed cards glow, and

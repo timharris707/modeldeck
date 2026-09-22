@@ -14,6 +14,7 @@ struct DeckWindowRegistryTests {
     final class FakeWindow: DeckPopoverWindow {
         private(set) var closeCount = 0
         func close() { closeCount += 1 }
+        func fitContentHeight(_ height: CGFloat) {}
     }
 
     @Test("registered window is closed and reported")

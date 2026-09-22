@@ -55,7 +55,9 @@ export const CODEX_PATH = process.env.MODELDECK_CODEX_PATH || 'codex';
 export const CODEX_PROFILES_DIR = path.resolve(
   process.env.MODELDECK_CODEX_PROFILES_DIR || path.join(DATA_DIR, 'codex-profiles'),
 );
-export const LEGACY_CODEX_PROFILES_DIR = path.join(os.homedir(), '.codex-profiles');
+export const LEGACY_CODEX_PROFILES_DIR = path.resolve(
+  process.env.MODELDECK_LEGACY_CODEX_PROFILES_DIR || path.join(os.homedir(), '.codex-profiles'),
+);
 export const CODEX_ACTIVE_LINK = path.resolve(
   process.env.MODELDECK_CODEX_ACTIVE_LINK || path.join(os.homedir(), '.codex'),
 );

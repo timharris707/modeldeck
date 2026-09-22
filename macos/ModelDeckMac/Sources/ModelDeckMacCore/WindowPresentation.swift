@@ -60,7 +60,7 @@ public enum WindowAnchor: Equatable, Sendable {
     /// No usage this period — the provider's `resetsAt` is either a
     /// floating placeholder (probe time + duration) that drifts on every
     /// refresh, or null outright (#247: Anthropic after a rollover).
-    /// Show "resets N after first use" copy instead of the fake timestamp
+    /// Show "Starts on first use" copy instead of the fake timestamp
     /// (or the confusing blank).
     case unanchored(windowDuration: TimeInterval)
     /// The window rolled at `at` (its inferred start), recently enough
@@ -179,9 +179,15 @@ public enum WindowPresentation {
     }
 
     /// Reset-slot text for an unanchored window — replaces the drifting
-    /// placeholder timestamp. "Resets 7 days after first use".
+    /// placeholder timestamp. Issue #725 (Tim): the former "Resets 7 days
+    /// after first use" was long enough to truncate the window title beside
+    /// it to "Weekly ·…" on expanded Codex cards. The duration already lives
+    /// in that title ("Weekly", "5-hour limit") and in the tooltip, so the
+    /// slot states only the one fact the title lacks. Length is pinned by
+    /// `WindowPresentationCopyTests.unanchoredResetTextStaysShort`.
     public static func unanchoredResetText(windowDuration: TimeInterval) -> String {
-        "Resets \(durationPhrase(windowDuration)) after first use"
+        _ = windowDuration
+        return "Starts on first use"
     }
 
     /// Hover tooltip for an unanchored window — explains WHY there is no

@@ -52,13 +52,13 @@ function fixture(t, migrationOptions = {}, serviceOptions = {}, { sameVolume = f
 }
 
 // Exercise the real startup callback and HTTP handler without binding a socket.
-async function startup(data) {
+async function startup(data, { legacyRemains = false } = {}) {
   const app = createApp({ store: data.store, service: data.service, mutationToken: 'dummy-token' });
   const starts = [];
   for (const method of ['startAutoRefresh', 'startUsageSnapshotRetention', 'startUsageQueueConsumer', 'startConfigLint', 'startWarehouseIngest']) {
     data.service[method] = () => {
       starts.push(method);
-      assert.equal(fs.existsSync(data.account.profileRef), Boolean(data.service.codexProfilesMigrationWarning));
+      assert.equal(fs.existsSync(data.account.profileRef), legacyRemains || Boolean(data.service.codexProfilesMigrationWarning));
     };
   }
   app.server.listen = (_port, _host, ready) => { ready(); return app.server; };
@@ -92,6 +92,40 @@ test('codex-profiles-migration-startup-moves-verifies-and-repoints', async (t) =
   assert.equal((await health(app)).warning, undefined);
 });
 
+for (const sameVolume of [true, false]) {
+  test(`codex-migration-unregistered-root-is-left-alone${sameVolume ? '' : '-EXDEV'}`, async (t) => {
+    const data = fixture(t, {}, {}, { sameVolume });
+    data.store.deleteAccount(data.account.id);
+    if (!sameVolume) {
+      data.service.codexMigrationOptions.io.rename = async (from, to) => {
+        if (path.dirname(from) === data.legacyDir) throw Object.assign(new Error('cross-device fixture'), { code: 'EXDEV' });
+        return fs.promises.rename(from, to);
+      };
+    }
+    const result = await data.service.migrateCodexProfilesDir();
+    assert.deepEqual(result, {});
+    assert.equal(fs.lstatSync(data.legacyDir).isDirectory(), true);
+    assert.equal(fs.lstatSync(data.legacyDir).isSymbolicLink(), false);
+    assert.deepEqual(fs.readdirSync(data.legacyDir), ['first', 'second']);
+    for (const name of ['first', 'second']) {
+      assert.equal(fs.readFileSync(path.join(data.legacyDir, name, 'auth.json'), 'utf8'), `dummy-auth-${name}\n`);
+      assert.equal(fs.readFileSync(path.join(data.legacyDir, name, 'sessions', 'dummy.jsonl'), 'utf8'), 'dummy-session\n');
+    }
+    assert.deepEqual(fs.readdirSync(data.dataDir), []);
+    assert.equal(fs.existsSync(data.profilesDir), false);
+    assert.equal(fs.existsSync(path.join(data.profilesDir, '.migrated-from')), false);
+    assert.equal(fs.readlinkSync(data.activeLink), '.codex-profiles/first');
+    assert.deepEqual(data.store.listAccounts(), []);
+    assert.deepEqual(data.logs, [`Codex legacy profiles at ${data.legacyDir} are not registered to any account; leaving them in place`]);
+    const { app, starts } = await startup(data, { legacyRemains: true });
+    assert.equal(starts.length, 5);
+    assert.equal((await health(app)).warning, undefined);
+    assert.equal(data.service.codexProfilesMigrationBlocked, false);
+    assert.equal(data.service.codexProfilesMigration, null);
+    assert.equal(data.service.codexProfilesMigrationTimer, null);
+  });
+}
+
 test('codex-profiles-path-default-and-env-override', () => {
   for (const override of ['', '/dummy/custom-codex']) {
     const result = spawnSync(process.execPath, ['--input-type=module', '-e',
@@ -102,6 +136,30 @@ test('codex-profiles-path-default-and-env-override', () => {
     assert.equal(result.status, 0);
     assert.equal(result.stdout.trim(), override || '/dummy/data/codex-profiles');
   }
+});
+
+// Review of PR #721: the store records canonical paths, so a legacy root
+// configured through a symlinked parent must still count as registered.
+test('codex-migration-registered-root-under-symlinked-parent-still-migrates', async (t) => {
+  const data = fixture(t, {}, {}, { sameVolume: true });
+  const alias = path.join(data.root, 'home-alias');
+  fs.symlinkSync(data.root, alias);
+  data.service.codexLegacyProfilesDir = path.join(alias, '.codex-profiles');
+  const result = await data.service.migrateCodexProfilesDir();
+  assert.equal(result.migrated, true);
+  assert.equal(data.store.getAccount(data.account.id).profileRef, path.join(data.profilesDir, 'first'));
+  assert.equal(fs.lstatSync(data.legacyDir).isSymbolicLink(), true);
+  assert.ok(!data.logs.some((line) => line.includes('not registered to any account')));
+});
+
+test('codex-legacy-profiles-path-has-an-env-override', () => {
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e',
+    "import { LEGACY_CODEX_PROFILES_DIR } from './src/paths.mjs'; console.log(LEGACY_CODEX_PROFILES_DIR)"], {
+    cwd: new URL('..', import.meta.url), encoding: 'utf8',
+    env: { ...process.env, HOME: '/real-home-must-not-win', MODELDECK_LEGACY_CODEX_PROFILES_DIR: '/scratch/legacy-codex' },
+  });
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout.trim(), '/scratch/legacy-codex');
 });
 
 test('codex-profiles-migration-running-process-refuses-with-health-warning', async (t) => {

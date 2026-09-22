@@ -237,6 +237,35 @@ test('daemon build uses documented SEA injection and an EPERM-only smoke skip', 
   assert.match(script, /smoke test skipped because this sandbox forbids socket bind \(EPERM\)/);
 });
 
+test('daemon-build-smoke-isolates-home-and-profile-paths', () => {
+  const script = fs.readFileSync(buildScript, 'utf8');
+  // Issue #717: a temporary DB alone let migration move the operator's profiles.
+  assert.match(script, /SMOKE_DIR="\$BUILD_DIR\/smoke"/);
+  assert.match(script, /mkdir -m 700 "\$SMOKE_DIR\/home"/);
+  // Review of PR #721: only assignment lines may precede the launch, so a
+  // stray command between them (`MODELDECK_PORT=0 true; \`) would detach the
+  // environment from the daemon and must fail this match.
+  const invocation = script.match(/^(?:[A-Z_]+="?[^"\n;|&]*"? \\\n)+\s+"\$STAGED_BINARY"[^\n]*&/m)?.[0];
+  assert.ok(invocation, 'smoke environment must be attached to the daemon invocation');
+  assert.match(invocation, /^HOME="\$SMOKE_DIR\/home" \\$/m);
+  for (const name of [
+    'MODELDECK_DB_PATH', 'MODELDECK_DATA_DIR', 'MODELDECK_PROJECTS_ROOT',
+    'MODELDECK_CODEX_PROFILES_DIR', 'MODELDECK_LEGACY_CODEX_PROFILES_DIR',
+    'MODELDECK_CODEX_ACTIVE_LINK', 'MODELDECK_CLAUDE_PROFILES_DIR',
+    'MODELDECK_CLAUDE_ACTIVE_LINK', 'MODELDECK_ZSHENV_PATH',
+    'MODELDECK_CLAUDE_SHELL_ENV_FILE', 'MODELDECK_GROK_SESSIONS_DIR',
+    'MODELDECK_CLIPROXY_CONFIG_DIR', 'MODELDECK_CLIPROXY_AUTH_DIR',
+    'MODELDECK_USAGE_ARCHIVE_DIR', 'MODELDECK_CLIPROXY_USAGE_ARCHIVE_DIR',
+    'MODELDECK_CLIPROXY_MANAGEMENT_KEY_PATH', 'MODELDECK_CLAUDE_STATUSLINE_DIR',
+    'MODELDECK_LANE_MANIFEST_PATH',
+  ]) {
+    assert.match(invocation, new RegExp(`^${name}="\\$SMOKE_DIR/[^"\\n]+" \\\\$`, 'm'));
+  }
+  const detached = script.replace('MODELDECK_PORT=0 \\\n', 'MODELDECK_PORT=0 true; \\\n');
+  assert.equal(detached.match(/^(?:[A-Z_]+="?[^"\n;|&]*"? \\\n)+\s+"\$STAGED_BINARY"[^\n]*&/m), null,
+    'a command separator between the assignments and the launch must not match');
+});
+
 test('smoke signing applies the hardened runtime with the daemon entitlements', () => {
   const script = fs.readFileSync(new URL('../scripts/build-daemon-binary.sh', import.meta.url), 'utf8');
   assert.match(script, /codesign --force --options runtime \\\n\s+--entitlements "\$REPO_ROOT\/scripts\/daemon-entitlements\.plist" --sign - "\$STAGED_BINARY"/);

@@ -194,7 +194,8 @@ precedent for this Go binary.
    `scripts/build-daemon-binary.sh`. That build bundles the dependency-free
    Node daemon, embeds it in a Node >=24 single executable application,
    ad-hoc signs it, writes `dist/daemon/manifest.json`, and smoke-checks
-   `GET /api/health`. It also requires the signed pinned-source CLIProxyAPI at
+   `GET /api/health`. The smoke daemon runs under a scratch HOME so it can never
+   see the operator's real profiles. It also requires the signed pinned-source CLIProxyAPI at
    `dist/cliproxyapi/cliproxyapi`, produced by the command above.
 2. Runs `swift build -c release` in `macos/ModelDeckMac`.
 3. Assembles `dist/ModelDeck.app` (bundle id `app.modeldeck.mac`,

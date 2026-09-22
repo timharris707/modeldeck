@@ -388,7 +388,7 @@ struct Issue542CardCredentialIndicatorTests {
     @Test func theAppFeedsTheReconcileFromTheSameDerivation() throws {
         let source = try viewSource("Sources/ModelDeckMac/ModelDeckMacApp.swift")
         #expect(source.contains("proxyCredentialBroken: { row in"))
-        #expect(source.contains("?.credentialIsBroken == true"))
+        #expect(source.contains("ProxyRelogin.cardIndicator(proxyReloginModel?.presentation("))
     }
 }
 

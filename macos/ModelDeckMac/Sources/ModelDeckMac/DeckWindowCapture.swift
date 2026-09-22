@@ -2,10 +2,19 @@ import AppKit
 import ModelDeckMacCore
 import SwiftUI
 
-/// Issue #230 (reopened): `NSWindow` already speaks the registry's whole
-/// contract (`close()` resets SwiftUI presentation state, unlike a bare
-/// `orderOut` — the PR #231 lesson), so the conformance is empty.
-extension NSWindow: DeckPopoverWindow {}
+/// Issue #230 (reopened): `NSWindow` speaks the registry's close contract;
+/// issue #719 adds the shrink-only fit operation for the menu-bar window.
+extension NSWindow: DeckPopoverWindow {
+    public func fitContentHeight(_ height: CGFloat) {
+        // CodeRabbit (PR #720): `height` is CONTENT height; the frame may
+        // carry chrome, so convert before sizing or the content gets clipped.
+        var content = contentRect(forFrameRect: frame)
+        content.size.height = height
+        var next = frameRect(forContentRect: content)
+        next.origin.y = frame.maxY - next.height
+        setFrame(next, display: true, animate: false)
+    }
+}
 
 /// Issue #230 (reopened): the deck's window accessor — a zero-size,
 /// hit-test-inert NSView planted in `DeckPopoverView`'s background whose one

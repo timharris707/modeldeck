@@ -1,5 +1,14 @@
 import Foundation
 
+/// Issue #719: the menu-bar deck can grow with SwiftUI but its host window
+/// does not reliably shrink when transient content disappears. Keep the
+/// resize decision pure so the window seam remains testable without AppKit.
+public enum DeckWindowSizing {
+    public static func shouldShrink(from currentHeight: CGFloat, to newHeight: CGFloat) -> Bool {
+        currentHeight - newHeight > 0.5
+    }
+}
+
 /// Issue #230 (reopened): the abstract shape of "the deck popover's own
 /// window" — the one operation the dismissal choke point needs. `NSWindow`
 /// satisfies it verbatim (an empty conformance in the app target); tests
@@ -11,6 +20,7 @@ import Foundation
 @MainActor
 public protocol DeckPopoverWindow: AnyObject {
     func close()
+    func fitContentHeight(_ height: CGFloat)
 }
 
 /// Issue #230 (reopened, Tim's 2026-08-04 field report on v0.3.17): the
@@ -47,6 +57,22 @@ public final class DeckWindowRegistry {
     /// lands in a(nother) window. Last registration wins.
     public func register(_ window: DeckPopoverWindow) {
         self.window = window
+    }
+
+    /// Issue #719: resize only after content became materially shorter. SwiftUI
+    /// remains responsible for growth; this path repairs its stale window
+    /// height while keeping the status-item window's top edge fixed.
+    /// Returns the height the caller should carry as its next baseline:
+    /// the new height after a fit or a growth, the OLD height after a
+    /// sub-threshold decrease (CodeRabbit, PR #720: otherwise 385 → 384.5 →
+    /// 384.0 never fits, each step being under the threshold on its own).
+    @discardableResult
+    public func fitContentHeight(_ newHeight: CGFloat, previousHeight: CGFloat) -> CGFloat {
+        if newHeight > previousHeight { return newHeight }
+        guard DeckWindowSizing.shouldShrink(from: previousHeight, to: newHeight),
+              let window else { return previousHeight }
+        window.fitContentHeight(newHeight)
+        return newHeight
     }
 
     /// The currently registered (still-alive) deck window, if any.

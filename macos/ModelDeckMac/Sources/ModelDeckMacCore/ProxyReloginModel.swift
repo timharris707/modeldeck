@@ -60,8 +60,40 @@ public enum ProxyRelogin {
     /// quiet menu item, because a working account does not need a button
     /// telling it to sign in again.
     public static func credentialIsBroken(_ account: DeckAccount) -> Bool {
-        account.proxyCredential?.lowercased() == "error"
+        account.proxyCredential?.lowercased() == "error" && !credentialIsOverloaded(account)
     }
+
+    // MARK: - Provider overload (issue #714)
+    //
+    // 2026-09-20: the proxy marked codex/LoanMeld unavailable because the
+    // provider answered `server_is_overloaded` — a provider-side outage, not a
+    // dead refresh token — and the card said "Proxy sign-in expired". Signing
+    // in again fixes nothing here, so the sentence and the promoted repair
+    // are reserved for a login the proxy actually lost.
+
+    /// Whether the proxy's `error` verdict is a provider overload or temporary
+    /// unavailability rather than a lost login. Matched on the proxy's own
+    /// status message; an empty detail stays a dead login (the #542 shape).
+    public static func credentialIsOverloaded(_ account: DeckAccount) -> Bool {
+        guard account.proxyCredential?.lowercased() == "error" else { return false }
+        return detailIsProviderOverload(account.proxyCredentialDetail)
+    }
+
+    public static func detailIsProviderOverload(_ detail: String?) -> Bool {
+        guard let detail = detail?.lowercased(), !detail.isEmpty else { return false }
+        if detail.contains("invalid_grant") || detail.contains("refresh token") { return false }
+        return detail.contains("overloaded")
+            || detail.contains("service_unavailable")
+            || detail.contains("try again later")
+    }
+
+    public static let overloadedText = "Provider overloaded · proxy retrying"
+
+    /// The popover's second line for an overloaded member: what is happening
+    /// and why no browser sign-in is offered.
+    public static let overloadedExplanation =
+        "The provider turned the proxy's requests away as overloaded. The proxy keeps retrying "
+            + "on its own; signing in again would not help."
 
     // MARK: - Wire evidence (issue #515)
     //
@@ -101,6 +133,10 @@ public enum ProxyRelogin {
         routedFailures alert: MemberBlackoutAlert?
     ) -> Bool {
         if credentialIsBroken(account) { return true }
+        // Issue #714 (CodeRabbit, PR #715): the proxy's own verdict is an
+        // overload, so a routed-failure streak is the same incident and
+        // must not promote a sign-in repair either.
+        if credentialIsOverloaded(account) { return false }
         // Issue #539: the daemon says this member was signed in again after
         // the last failure in the streak. The streak still stands as measured
         // evidence — the banner stays up, softened — but there is nothing to
@@ -145,6 +181,7 @@ public enum ProxyRelogin {
     public static func credentialText(for account: DeckAccount) -> String? {
         switch account.proxyCredential?.lowercased() {
         case "error":
+            if credentialIsOverloaded(account) { return overloadedText }
             guard let detail = account.proxyCredentialDetail, !detail.isEmpty else {
                 return "Proxy sign-in expired"
             }
@@ -310,7 +347,9 @@ public enum ProxyRelogin {
     public static func cardIndicator(
         _ presentation: ProxyReloginRowPresentation?
     ) -> ProxyReloginRowPresentation? {
-        guard let presentation, presentation.credentialIsBroken else { return nil }
+        guard let presentation,
+              presentation.credentialIsBroken || presentation.credentialIsOverloaded
+        else { return nil }
         return presentation
     }
 
@@ -326,7 +365,8 @@ public enum ProxyRelogin {
     /// still-"ok" credential only proves it is not working, so it does not
     /// borrow the stronger claim.
     public static func indicatorLead(for account: DeckAccount) -> String {
-        credentialIsBroken(account) ? "Proxy sign-in expired" : "Proxy sign-in not working"
+        if credentialIsOverloaded(account) { return "Provider overloaded" }
+        return credentialIsBroken(account) ? "Proxy sign-in expired" : "Proxy sign-in not working"
     }
 
     /// What VoiceOver hears on the card's glyph — the account, its provider,
@@ -374,10 +414,19 @@ public struct ProxyReloginRowPresentation: Equatable, Sendable {
     /// reads this instead of re-deriving from the account, so the deck banner
     /// and the Settings row can never reach opposite conclusions.
     public var credentialIsBroken: Bool
+    /// Issue #714: the proxy's `error` is a provider overload, not a lost
+    /// login. The card still shows the glyph; nothing promotes the repair.
+    public var credentialIsOverloaded: Bool
 
-    public init(credentialText: String?, display: Display, credentialIsBroken: Bool = false) {
+    public init(
+        credentialText: String?,
+        display: Display,
+        credentialIsBroken: Bool = false,
+        credentialIsOverloaded: Bool = false
+    ) {
         self.credentialText = credentialText
         self.display = display
+        self.credentialIsOverloaded = credentialIsOverloaded
         self.credentialIsBroken = credentialIsBroken
     }
 }
@@ -484,7 +533,8 @@ public final class ProxyReloginModel: ObservableObject {
         return ProxyReloginRowPresentation(
             credentialText: credential,
             display: display,
-            credentialIsBroken: isBroken
+            credentialIsBroken: isBroken,
+            credentialIsOverloaded: ProxyRelogin.credentialIsOverloaded(account)
         )
     }
 

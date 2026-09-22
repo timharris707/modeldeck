@@ -249,7 +249,7 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
     /// Issue #101: how this window's reset presents — `.anchored` (normal
     /// timestamp), `.unanchored` (no usage this period; the provider's
     /// resetsAt is a drifting placeholder, so `resetText` carries the
-    /// "resets N after first use" copy instead), or `.recentlyRolled`
+    /// "Starts on first use" copy instead), or `.recentlyRolled`
     /// (annotated via `rolloverText`). See WindowPresentation.swift for
     /// the detection heuristics.
     public var anchor: WindowAnchor
@@ -344,8 +344,8 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
     /// window — rate-limit and spend alike), absence reads better than
     /// noise, and the hover tooltip keeps the fuller explanation
     /// (`resetTooltip` explains the missing report). Preserved as
-    /// information, not placeholder: the #101 unanchored copy ("Resets
-    /// 7 days after first use") — keyed on the anchor, not the date,
+    /// information, not placeholder: the #101 unanchored copy
+    /// ("Starts on first use") — keyed on the anchor, not the date,
     /// because an unanchored window deliberately IGNORES its drifting
     /// `resetsAt` — and any real reset timestamp, which renders as always.
     /// Issue #247 narrows #145's empty slot: a FULL window with a null

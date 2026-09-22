@@ -409,10 +409,10 @@ struct ModelDeckMacApp: App {
                     // anchor too — without this its open explanation would
                     // be dismissed by the very next state the deck reads.
                     proxyCredentialBroken: { row in
-                        proxyReloginModel?.presentation(
+                        ProxyRelogin.cardIndicator(proxyReloginModel?.presentation(
                             for: row.account,
                             routedFailures: ProxyRelogin.routedFailures(for: row.account, in: state)
-                        )?.credentialIsBroken == true
+                        )) != nil
                     }
                 )
             }

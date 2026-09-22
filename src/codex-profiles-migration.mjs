@@ -225,8 +225,27 @@ export async function migrateCodexProfilesDir({
   const moved = [];
   const marker = path.join(profilesDir, '.migrated-from');
   try {
-    accounts = store.listAccounts().filter((account) => account.provider === 'codex'
-      && (account.profileRef === legacyDir || within(account.profileRef, legacyDir)));
+    // Issue #717: an unregistered root may belong to another install, not
+    // this store. The store records canonical paths, so a legacy root reached
+    // through a symlinked parent (review of PR #721) is matched by its real
+    // spelling too; the guard runs before any filesystem mutation.
+    const registeredUnder = (root) => store.listAccounts().filter((account) => account.provider === 'codex'
+      && (account.profileRef === root || within(account.profileRef, root)));
+    accounts = registeredUnder(legacyDir);
+    if (!accounts.length) {
+      // A finished move leaves the legacy path as an alias onto the
+      // destination; accounts already there are not "under the legacy root".
+      const canonicalLegacy = await io.realpath(legacyDir).catch(() => null);
+      const destination = path.resolve(profilesDir);
+      if (canonicalLegacy && canonicalLegacy !== legacyDir
+          && canonicalLegacy !== destination && !within(canonicalLegacy, destination)) {
+        accounts = registeredUnder(canonicalLegacy);
+      }
+    }
+    if (!accounts.length) {
+      report(`Codex legacy profiles at ${legacyDir} are not registered to any account; leaving them in place`);
+      return {};
+    }
     const legacyStat = await statOrNull(legacyDir, io);
     if (!legacyStat) {
       if (accounts.length) throw new Error('registered legacy root is missing');
