@@ -1,7 +1,7 @@
 {
   "repository": "https://github.com/router-for-me/CLIProxyAPI",
-  "tag": "v7.2.149",
-  "commit": "2a6b87aca083a5bf498ac1f68a1b636c500d7aaa",
+  "tag": "v7.3.20",
+  "commit": "ef9e71201e0ca72b03a540d9b6e0862f8c053347",
   "goVersion": "1.26.4",
   "goDarwinArm64Sha256": "b62ad2b6d7d2464f12a5bcad7ff47f19d08325773b5efd21610e445a05a9bf53",
   "bundlePath": "Contents/Resources/cliproxyapi/cliproxyapi"

@@ -60,7 +60,7 @@ struct MemberBlackoutTests {
         // adjacency string on main — two green PRs, one red composition).
         // The tripwire's claim is placement in the HEADER stack, above the
         // account content, so assert order against `content` instead.
-        let anchors = ["connectionBanner", "proxyBanner", "memberBlackoutBanner", "installProgressLine\n            content"]
+        let anchors = ["connectionBanner", "proxyBanner", "memberBlackoutBanner", "installProgressLine\n            DeckCardScroller { content }"]
         let positions = anchors.map { source.range(of: $0)?.lowerBound }
         #expect(positions.allSatisfy { $0 != nil })
         #expect(positions.compactMap { $0 } == positions.compactMap { $0 }.sorted())

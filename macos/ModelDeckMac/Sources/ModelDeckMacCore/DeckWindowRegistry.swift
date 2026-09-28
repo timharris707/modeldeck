@@ -7,6 +7,14 @@ public enum DeckWindowSizing {
     public static func shouldShrink(from currentHeight: CGFloat, to newHeight: CGFloat) -> Bool {
         currentHeight - newHeight > 0.5
     }
+
+    /// The tallest the deck may lay out on a screen whose visible height
+    /// (menu bar and Dock excluded) is `visibleHeight`, in a window whose
+    /// title bar takes `chrome`. A small margin keeps the bottom edge off
+    /// the Dock. Past this the deck's card area scrolls.
+    public static func maxContentHeight(visibleHeight: CGFloat, chrome: CGFloat) -> CGFloat {
+        visibleHeight - chrome - 10
+    }
 }
 
 /// Issue #230 (reopened): the abstract shape of "the deck popover's own
@@ -20,6 +28,7 @@ public enum DeckWindowSizing {
 @MainActor
 public protocol DeckPopoverWindow: AnyObject {
     func close()
+    var deckContentHeight: CGFloat { get }
     func fitContentHeight(_ height: CGFloat)
 }
 
@@ -59,20 +68,15 @@ public final class DeckWindowRegistry {
         self.window = window
     }
 
-    /// Issue #719: resize only after content became materially shorter. SwiftUI
-    /// remains responsible for growth; this path repairs its stale window
-    /// height while keeping the status-item window's top edge fixed.
-    /// Returns the height the caller should carry as its next baseline:
-    /// the new height after a fit or a growth, the OLD height after a
-    /// sub-threshold decrease (CodeRabbit, PR #720: otherwise 385 → 384.5 →
-    /// 384.0 never fits, each step being under the threshold on its own).
-    @discardableResult
-    public func fitContentHeight(_ newHeight: CGFloat, previousHeight: CGFloat) -> CGFloat {
-        if newHeight > previousHeight { return newHeight }
-        guard DeckWindowSizing.shouldShrink(from: previousHeight, to: newHeight),
-              let window else { return previousHeight }
-        window.fitContentHeight(newHeight)
-        return newHeight
+    /// Issue #719: resize only when the window is materially taller than the
+    /// deck's laid-out content. SwiftUI remains responsible for growth; this
+    /// path repairs its stale window height while keeping the status-item
+    /// window's top edge fixed. Compares against the window itself, not a
+    /// remembered height, so no baseline can go stale.
+    public func fitContentHeight(_ height: CGFloat) {
+        guard height > 0, let window,
+              DeckWindowSizing.shouldShrink(from: window.deckContentHeight, to: height) else { return }
+        window.fitContentHeight(height)
     }
 
     /// The currently registered (still-alive) deck window, if any.

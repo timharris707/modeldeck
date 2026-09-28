@@ -94,6 +94,13 @@ async function assertFixtureAuthFormat(authDir) {
     ['claude-fable-fixture'],
   );
   assert.match(claude.access_token, /placeholder-not-a-credential$/);
+  // Upstream v7.2.158+ names Claude credentials `claude-<org hash>-<email>.json`
+  // (org-hashed; legacy `claude-<email>.json` still loads). ModelDeck joins on
+  // the email INSIDE the file, so the hashed name must change nothing.
+  const hashed = JSON.parse(fs.readFileSync(path.join(authDir, 'claude-525d4af1-pin-bump-hashed@example.invalid.json'), 'utf8'));
+  assert.equal(hashed.type, 'claude');
+  assert.equal(hashed.email, 'pin-bump-hashed@example.invalid');
+  assert.match(hashed.access_token, /placeholder-not-a-credential$/);
   assert.equal(codex.type, 'codex');
   assert.equal(codex.account_id, 'acct-pin-bump-placeholder');
   assert.equal(codex.weight, 3);
@@ -105,6 +112,10 @@ async function assertFixtureAuthFormat(authDir) {
   assert.deepEqual(
     weights.byClaudeEmail.get('pin-bump-claude@example.invalid'),
     { weight: 7, fableExcluded: true },
+  );
+  assert.deepEqual(
+    weights.byClaudeEmail.get('pin-bump-hashed@example.invalid'),
+    { weight: 5, fableExcluded: false },
   );
   assert.deepEqual(
     weights.byCodexAccountId.get('acct-pin-bump-placeholder'),
@@ -441,6 +452,10 @@ test(
       assert.ok(
         authFileEntries.some((entry) => entry.email === 'pin-bump-claude@example.invalid'),
         'the live auth-files answer must carry the claude fixture identity the daemon joins on',
+      );
+      assert.ok(
+        authFileEntries.some((entry) => entry.email === 'pin-bump-hashed@example.invalid'),
+        'the live auth-files answer must carry the email of an org-hashed claude file name too',
       );
 
       const anthropicResponse = await fetchTestURL(`${baseURL}/v0/management/anthropic-auth-url`, management);

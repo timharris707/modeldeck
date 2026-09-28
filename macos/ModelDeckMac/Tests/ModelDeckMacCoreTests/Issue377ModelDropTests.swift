@@ -222,7 +222,7 @@ struct ModelDropTests {
             "connectionBanner",
             "memberBlackoutBanner",
             "modelDropBanner",
-            "installProgressLine\n            content",
+            "installProgressLine\n            DeckCardScroller { content }",
         ]
         let positions = anchors.map { source.range(of: $0)?.lowerBound }
         #expect(positions.allSatisfy { $0 != nil })

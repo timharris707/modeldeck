@@ -1,0 +1,8 @@
+{
+  "type": "claude",
+  "email": "pin-bump-hashed@example.invalid",
+  "organization_uuid": "00000000-0000-4000-8000-00000000f1a7",
+  "account_uuid": "00000000-0000-4000-8000-00000000acc7",
+  "weight": 5,
+  "access_token": "modeldeck-pin-bump-claude-hashed-placeholder-not-a-credential"
+}

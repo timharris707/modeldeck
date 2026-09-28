@@ -39,8 +39,23 @@ final class FloatingDeckWindowController: NSObject, NSWindowDelegate {
             present(window, activate: activate)
             return
         }
-        let hosting = NSHostingController(rootView: content())
+        let window = Self.makeWindow(rootView: content())
+        window.setFrameAutosaveName(Self.frameAutosaveName)
+        window.delegate = self
+        self.window = window
+        present(window, activate: activate)
+    }
+
+    /// The floating deck's window, without the position memory and the
+    /// delegate (so tests can host a deck in it without touching either).
+    static func makeWindow(rootView: some View) -> NSWindow {
+        let hosting = NSHostingController(rootView: rootView)
         let window = NSWindow(contentViewController: hosting)
+        // Tim, 2026-09-27: on screen this automatic sizing raised the
+        // window's minimum and maximum to an expanded deck's height but never
+        // resized the window. `DeckHeightLimit` sizes it instead; turned
+        // off after creation so the window opens at the deck's size.
+        hosting.sizingOptions = []
         // Tim's decisions: draggable, closable, NOT resizable — the deck
         // sizes itself exactly like the popover, from the same
         // `DeckLayoutMetrics` derivation: single-column 420, and in column
@@ -55,10 +70,7 @@ final class FloatingDeckWindowController: NSObject, NSWindowDelegate {
         window.level = .normal
         window.isReleasedWhenClosed = false
         window.isMovableByWindowBackground = true
-        window.setFrameAutosaveName(Self.frameAutosaveName)
-        window.delegate = self
-        self.window = window
-        present(window, activate: activate)
+        return window
     }
 
     private func present(_ window: NSWindow, activate: Bool) {
@@ -74,6 +86,15 @@ final class FloatingDeckWindowController: NSObject, NSWindowDelegate {
     /// close button, so there is exactly one teardown.
     func close() {
         window?.close()
+    }
+
+    /// Tim, 2026-09-27: the window grows downward when a card expands. If
+    /// that pushes its bottom below the screen's visible area, lift it so the
+    /// whole deck stays in view (`DeckHeightLimit` keeps it short enough).
+    func windowDidResize(_ notification: Notification) {
+        guard let window, let visible = window.screen?.visibleFrame,
+              window.frame.minY < visible.minY else { return }
+        window.setFrameOrigin(NSPoint(x: window.frame.minX, y: visible.minY))
     }
 
     func windowWillClose(_ notification: Notification) {
