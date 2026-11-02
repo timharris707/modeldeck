@@ -782,3 +782,20 @@ test('release verifier requires the surfaced queue guard to be clear and running
     }),
   }), /foreign consumer placeholder/);
 });
+
+// CodeRabbit on #816: a whitespace-only token is no token, from an argument or
+// from the environment, and nothing is sent to the daemon.
+test('a whitespace-only mutation token is refused before any request', async (t) => {
+  let fetched = 0;
+  await assert.rejects(() => enableUsageQueue({ token: '  \t', fetcher: async () => { fetched += 1; } }), /no mutation token/);
+  assert.equal(fetched, 0);
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-enable-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const script = fileURLToPath(new URL('../scripts/enable-usage-queue.mjs', import.meta.url));
+  const result = spawnSync(process.execPath, [script], { encoding: 'utf8', env: {
+    PATH: process.env.PATH, HOME: home, MODELDECK_MUTATION_TOKEN: '   ', MODELDECK_SKIP_KEYCHAIN: '1',
+    MODELDECK_SECRETS_DIR: path.join(home, 'secrets'), MODELDECK_BASE_URL: 'http://127.0.0.1:9',
+  } });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /no mutation token/);
+});

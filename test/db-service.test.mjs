@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { LEGACY_CLIENT_KEY_HELPER, LEGACY_CLIENT_KEY_SERVICE, clientKeyShellFetch } from '../src/client-key-helper.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -77,14 +78,14 @@ test('the MAPPED account decides the launch credential, not the launching shell 
     // #277 pointer directive, resolved at spawn time by the launcher.
     fs.writeFileSync(path.join(data.claudeBusinessHome, 'settings.json'), JSON.stringify({
       env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8317' },
-      apiKeyHelper: 'security find-generic-password -s cli-proxy-api-client -w',
+      apiKeyHelper: LEGACY_CLIENT_KEY_HELPER,
     }));
     const routed = await service.launchSpec('claude', path.join(data.projectPath, 'apps', 'web'));
     assert.equal(routed.credential, 'cliproxy-pointer');
-    assert.match(routed.preview, /find-generic-password -s cli-proxy-api-client -w/);
+    assert.ok(routed.preview.includes(clientKeyShellFetch(LEGACY_CLIENT_KEY_SERVICE)));
     // CodeRabbit (PR #301): the pasted preview must be as trace-safe and
     // path-safe as the generated env file — same guarded fragment.
-    assert.ok(routed.preview.includes('${MODELDECK_SECURITY_BIN:-/usr/bin/security}'));
+    if (process.platform === 'darwin') assert.ok(routed.preview.includes('${MODELDECK_SECURITY_BIN:-/usr/bin/security}'));
     assert.ok(routed.preview.includes('case $- in *x*) __modeldeck_xtrace=1; set +x;; esac'));
     assert.ok(routed.preview.includes('if [ -n "${__modeldeck_key:-}" ]; then export ANTHROPIC_API_KEY'));
     assert.ok(!('ANTHROPIC_API_KEY' in routed.env), 'spec env must never carry a credential value');
@@ -250,6 +251,47 @@ test('Claude refresh captures the plan tier from the profile home', async () => 
     await service.refreshClaude();
     assert.equal(data.store.getAccount(data.claudeBusiness.id).updatedAt, updatedAt);
     assert.ok(tierReads >= 2);
+  } finally { data.close(); }
+});
+
+// Issue #825: the refresh pass also saves the plan name Claude writes beside
+// the tier code ("Ultra"), and leaves the record unchanged when it is absent.
+test('Claude refresh captures the plan display name beside the tier', async () => {
+  const data = fixture();
+  try {
+    let displayName = null;
+    const service = new ModelDeckService(data.store, {
+      fetchClaude: async () => [{ scope: 'weekly', usedPercent: 12, resetsAt: '2026-07-25T20:00:00Z', source: 'claude-oauth-api', detail: {} }],
+      readClaudeTier: async () => 'default_claude_max_20x',
+      readClaudePlanName: async () => displayName,
+    });
+    await service.refreshClaude();
+    assert.deepEqual(data.store.getAccount(data.claudeBusiness.id).metadata.claudePlan,
+      { subscriptionType: null, rateLimitTier: 'default_claude_max_20x' });
+    displayName = 'Ultra';
+    await service.refreshClaude();
+    assert.deepEqual(data.store.getAccount(data.claudeBusiness.id).metadata.claudePlan,
+      { subscriptionType: null, rateLimitTier: 'default_claude_max_20x', displayName: 'Ultra' });
+    // The name gone from a profile whose tier still reads → the stale name clears.
+    displayName = null;
+    await service.refreshClaude();
+    assert.deepEqual(data.store.getAccount(data.claudeBusiness.id).metadata.claudePlan,
+      { subscriptionType: null, rateLimitTier: 'default_claude_max_20x' });
+  } finally { data.close(); }
+});
+
+test('Claude refresh saves a plan display name even with no tier code', async () => {
+  const data = fixture();
+  try {
+    const service = new ModelDeckService(data.store, {
+      fetchClaude: async () => [],
+      readClaudeTier: async () => null,
+      readClaudePlanName: async ({ claudeConfigDir }) => (path.basename(claudeConfigDir) === 'business' ? 'Ultra' : null),
+    });
+    await service.refreshClaude();
+    assert.deepEqual(data.store.getAccount(data.claudeBusiness.id).metadata.claudePlan,
+      { subscriptionType: null, rateLimitTier: null, displayName: 'Ultra' });
+    assert.deepEqual(data.store.getAccount(data.claudePersonal.id).metadata, {});
   } finally { data.close(); }
 });
 

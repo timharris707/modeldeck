@@ -67,12 +67,15 @@ STRIPPED_PATHS=(
   "docs/ACCOUNT_ONBOARDING.md"
   "docs/lane-routing-policy.md"
   "docs/live-proxy-ops.md"
+  "docs/linux-install.md"
   "docs/incidents"
   "scripts/lane-codex.sh"
   "scripts/lane-watch.mjs"
   "scripts/live-proxy-swap.sh"
   "test/lane-codex-args.test.mjs"
   "design/mac-app-roadmap.md"
+  "ops"
+  ".github/workflows/test-linux.yml"
 )
 for stripped_path in "${STRIPPED_PATHS[@]}"; do
   rm -rf -- "$SNAPSHOT/$stripped_path"

@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { USAGE_QUEUE_CONSUMER_INTERVAL_MS } from './usage-queue-consumer.mjs';
 
 const COULD_NOT_EVALUATE_SEVERITY = Object.freeze({ error: 'warn', warn: 'warn', info: 'info' });
 
@@ -35,7 +36,7 @@ function finding(rule, input) {
     scope: input.scope,
     message: input.message,
     evidence: input.evidence || [],
-    suggestedFix: rule.suggestedFix,
+    suggestedFix: input.suggestedFix || rule.suggestedFix,
     provenance: {
       incidentSource: rule.incidentSource,
       verifiedAgainstCliVersions: rule.verifiedAgainstCliVersions,
@@ -170,6 +171,9 @@ function mdL03(snapshot, rule) {
       continue;
     }
     const wrongOrigin = normalizedOrigin(observed) !== expectedOrigin;
+    // A remote-role client routes through its forwarder; pool membership is
+    // the host's to check.
+    if (!wrongOrigin && snapshot.proxy?.roster?.status === 'remote') continue;
     if (!wrongOrigin && snapshot.proxy?.roster?.status !== 'ok') {
       findings.push(couldNotEvaluate(rule, profileScope(profile), [
         { path: profile.settings.path, property: 'ANTHROPIC_BASE_URL', observed },
@@ -275,6 +279,10 @@ function mdL06(snapshot, rule) {
   return [finding(rule, {
     scope: 'machine:codex-shell',
     message: 'Multiple Codex homes exist, but the shell does not pin CODEX_HOME.',
+    // install-shell-env.sh is macOS-only; elsewhere launch sets CODEX_HOME per session.
+    ...((snapshot.platform ?? process.platform) === 'darwin' ? {} : {
+      suggestedFix: 'Start Codex with `modeldeck launch codex`, which sets CODEX_HOME for that session.',
+    }),
     evidence: [
       { path: zshenv.path, observed: 'generated-Codex-block-missing' },
       { managedCodexHomes: profiles.map((profile) => profile.path).sort() },
@@ -462,7 +470,7 @@ function mdL12(snapshot, rule) {
 
 function mdL13(snapshot, rule) {
   const authFiles = snapshot.proxy?.authFiles;
-  if (authFiles?.status === 'not-installed') return [];
+  if (authFiles?.status === 'not-installed' || authFiles?.status === 'remote') return [];
   if (authFiles?.status !== 'ok') return [couldNotEvaluate(rule, 'machine:proxy-auth', unavailableEvidence(authFiles))];
   const unreadable = (authFiles.issues || []).map((issue) => couldNotEvaluate(
     rule,
@@ -504,6 +512,28 @@ function mdL15(snapshot, rule) {
     message: 'Running-daemon MODELDECK overrides split related data, configuration, or authentication paths across installs.',
     evidence: [split],
   }));
+}
+
+// Issue #785: the daemon pulls the usage queue every
+// USAGE_QUEUE_CONSUMER_INTERVAL_MS, and the proxy drops what waits longer
+// than its retention. Each pull takes one batch and the next timer starts
+// after it finishes, so anything under two intervals can lose usage.
+function mdL17(snapshot, rule) {
+  const queue = snapshot.proxy?.usageQueue;
+  if (queue?.status === 'remote' || (queue?.status === 'ok' && !queue.consumerEnabled)) return [];
+  if (queue?.status !== 'ok') return [couldNotEvaluate(rule, 'machine:proxy-usage-queue', unavailableEvidence(queue))];
+  const pullSeconds = USAGE_QUEUE_CONSUMER_INTERVAL_MS / 1000;
+  if (queue.retentionSeconds >= 2 * pullSeconds) return [];
+  return [finding(rule, {
+    scope: 'machine:proxy-usage-queue',
+    message: `The proxy keeps unread usage records for ${queue.retentionSeconds} seconds, less than twice ModelDeck's ${pullSeconds}-second read interval, so usage can be lost before it is read.`,
+    evidence: [{
+      path: queue.path,
+      retentionSeconds: queue.retentionSeconds,
+      retentionSource: queue.retentionSource,
+      pullIntervalSeconds: pullSeconds,
+    }],
+  })];
 }
 
 function rule(input) {
@@ -590,6 +620,12 @@ export const CONFIG_LINT_RULES = Object.freeze([
     id: 'MD-L15', predicate: mdL15, severity: 'warn', incidentSource: 'PR #430 review note in src/paths.mjs',
     verifiedAgainstCliVersions: {},
     suggestedFix: 'Remove the split overrides or point the related ModelDeck config and auth paths at the same install.',
+  }),
+  // MD-L16 is reserved for #585 (leaked auth-override environment).
+  rule({
+    id: 'MD-L17', predicate: mdL17, severity: 'warn', incidentSource: '#785',
+    verifiedAgainstCliVersions: {},
+    suggestedFix: 'Set redis-usage-queue-retention-seconds: 3600 in the proxy config.yaml (under observability: usage: if the file has that section); the proxy reloads it without a restart.',
   }),
 ]);
 

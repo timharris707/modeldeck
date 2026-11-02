@@ -319,6 +319,8 @@ test('TRIPWIRE ingest-attribution-discard-hardening — unresolved client identi
   const unknownClientKey = 'queue-unknown-client-key-placeholder';
   const mappedProfileLabel = 'Queue Mapped Profile Placeholder';
   const forgedUnknownLabel = 'Forged Unknown Profile Placeholder';
+  const remoteClientKey = 'queue-remote-client-key-placeholder';
+  const revokedClientKey = 'queue-revoked-client-key-placeholder';
   const store = new Store(':memory:');
   t.after(() => store.close());
   store.replaceClientKeyMap({
@@ -329,6 +331,10 @@ test('TRIPWIRE ingest-attribution-discard-hardening — unresolved client identi
       profileLabel: mappedProfileLabel,
     }],
   });
+  for (const key of [remoteClientKey, revokedClientKey]) {
+    store.addPoolClientKey({ keySha256: hash(key), machine: 'client-one', profileSlug: 'remote', profileLabel: 'Remote' });
+  }
+  store.revokePoolClientKey(hash(revokedClientKey));
   const warnings = [];
   const logs = [];
   const consumer = new UsageQueueConsumer({
@@ -346,6 +352,8 @@ test('TRIPWIRE ingest-attribution-discard-hardening — unresolved client identi
           profile_label: forgedUnknownLabel,
         }),
         proxyRecord({ request_id: 'queue-keyless-attribution', api_key: '' }),
+        proxyRecord({ request_id: 'queue-remote-attribution', api_key: remoteClientKey }),
+        proxyRecord({ request_id: 'queue-revoked-attribution', api_key: revokedClientKey }),
       ] }),
     }),
     warn: (message) => warnings.push(message),
@@ -353,13 +361,15 @@ test('TRIPWIRE ingest-attribution-discard-hardening — unresolved client identi
   });
 
   const result = await consumer.pull();
-  assert.equal(result.inserted, 3);
+  assert.equal(result.inserted, 5);
   assert.deepEqual(store.db.prepare(`
-    SELECT request_id, profile_label FROM request_usage ORDER BY request_id
+    SELECT request_id, profile_label, machine FROM request_usage ORDER BY request_id
   `).all().map((row) => ({ ...row })), [
-    { request_id: 'queue-keyless-attribution', profile_label: null },
-    { request_id: 'queue-mapped-attribution', profile_label: mappedProfileLabel },
-    { request_id: 'queue-unresolved-attribution', profile_label: null },
+    { request_id: 'queue-keyless-attribution', profile_label: null, machine: 'studio' },
+    { request_id: 'queue-mapped-attribution', profile_label: mappedProfileLabel, machine: 'studio' },
+    { request_id: 'queue-remote-attribution', profile_label: 'Remote', machine: 'client-one' },
+    { request_id: 'queue-revoked-attribution', profile_label: 'Remote', machine: 'client-one' },
+    { request_id: 'queue-unresolved-attribution', profile_label: null, machine: 'studio' },
   ]);
 
   const persistedUsage = JSON.stringify(store.db.prepare('SELECT * FROM request_usage').all());
@@ -371,6 +381,7 @@ test('TRIPWIRE ingest-attribution-discard-hardening — unresolved client identi
     hash(mappedClientKey),
     hash(unknownClientKey),
     forgedUnknownLabel,
+    remoteClientKey, revokedClientKey, hash(remoteClientKey), hash(revokedClientKey), 'api_key',
   ]) {
     assert.equal(persistedUsage.includes(forbidden), false, `${forbidden} must not be persisted`);
   }
@@ -381,6 +392,7 @@ test('TRIPWIRE ingest-attribution-discard-hardening — unresolved client identi
     hash(unknownClientKey),
     forgedUnknownLabel,
     mappedProfileLabel,
+    remoteClientKey, revokedClientKey, hash(remoteClientKey), hash(revokedClientKey), 'api_key',
   ]) {
     assert.equal(emitted.includes(forbidden), false, `${forbidden} must not be logged`);
   }

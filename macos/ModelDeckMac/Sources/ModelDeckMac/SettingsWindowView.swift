@@ -331,7 +331,9 @@ struct AccountsSettingsPane: View {
             // Issue #279: nil on a machine without the proxy — no line, no
             // menu item, nothing (the #149/#174 discipline). Every action
             // routes through the confirmation, never straight to the daemon.
-            proxy: proxyPoolModel.presentation(for: account),
+            // Issue #784 review: in remote role the line is session routing
+            // alone, from the same state as the row.
+            proxy: proxyPoolModel.presentation(for: account, role: state?.proxyRole ?? .host),
             onProxyJoin: { proxyConfirmation = ProxyPoolConfirmation(account: account, action: .join) },
             onProxyRoute: { proxyConfirmation = ProxyPoolConfirmation(account: account, action: .route) },
             onProxyUnroute: { proxyConfirmation = ProxyPoolConfirmation(account: account, action: .unroute) },

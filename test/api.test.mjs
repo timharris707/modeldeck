@@ -1684,6 +1684,9 @@ test('settings API validates partial updates and drives worst-capacity threshold
     pauseWhileActive: false,
     sharedUserScopeEnabled: false,
     usageQueueConsumerEnabled: false,
+    proxyRole: 'host',
+    // Issue #788: no pool hub page until the operator sets one.
+    poolHubUrl: '',
     layout: 'two-column',
     defaultSort: 'next-reset',
     notificationThresholdPercent: 25,
@@ -1791,7 +1794,7 @@ test('add-account flow: create, login spec, verify, and reference-only delete', 
       return {
         authenticated: true,
         identity: 'user@example.invalid',
-        plan: { subscriptionType: 'max', rateLimitTier: 'default_claude_max_20x' },
+        plan: { subscriptionType: 'max', rateLimitTier: 'default_claude_max_20x', displayName: 'Ultra' },
       };
     },
     readCodexAuth: async ({ codexHome }) => {
@@ -1849,13 +1852,16 @@ test('add-account flow: create, login spec, verify, and reference-only delete', 
   assert.equal(readCalls.claudeConfigDir, claudeAccount.profileRef);
   assert.equal(fixture.store.getAccount(claudeAccount.id).identity, 'user@example.invalid');
   // Issue #26 (Claude half): the same status read persists the plan facts.
+  // Issue #825: and the plan display name.
   assert.deepEqual(fixture.store.getAccount(claudeAccount.id).metadata.claudePlan, {
     subscriptionType: 'max',
     rateLimitTier: 'default_claude_max_20x',
+    displayName: 'Ultra',
   });
   assert.deepEqual(result.body.account.metadata.claudePlan, {
     subscriptionType: 'max',
     rateLimitTier: 'default_claude_max_20x',
+    displayName: 'Ultra',
   });
 
   // Codex verify surfaces display-ready plan metadata while retaining the raw

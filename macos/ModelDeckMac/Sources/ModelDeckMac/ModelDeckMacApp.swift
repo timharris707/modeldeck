@@ -222,12 +222,16 @@ struct ModelDeckMacApp: App {
         let daemonSetupModel = DaemonSetupModel(dependencies: .live(client: client))
         // Issue #421: all seams live (bundled binary resolved from the
         // cliproxyapi pin, loopback /healthz probe, guarded config writer).
+        // Issue #784: plus the pool role the last daemon state reported,
+        // remembered in UserDefaults; never recorded reads as host.
         let managedProxyModel = ManagedProxyModel(dependencies: .live(reporter: client))
         // Issue #422: all seams live (one named management handshake for
         // detection, launchd/process discovery for adoption, UserDefaults
         // for the remembered choice). Nothing acts without a button press.
+        // Issue #784: it starts from the same remembered role.
         let proxyOnboardingModel = ManagedProxyOnboardingModel(
-            dependencies: .live(proxy: managedProxyModel)
+            dependencies: .live(proxy: managedProxyModel),
+            proxyRole: managedProxyModel.proxyRole
         )
         // Issue #59: the status-item context menu shares the same update
         // model as the gear menu and Settings — one check state everywhere.
@@ -354,7 +358,18 @@ struct ModelDeckMacApp: App {
             }
         }
         // Every fresh daemon state feeds the notification transition check.
-        statusModel.onStateUpdate = { [weak notifications, weak modelDropNotifications, weak statusModel, weak deckModel, weak daemonSetupModel, weak appUpdateStagedPrompt, weak proxyReloginModel] worst, state in
+        statusModel.onStateUpdate = { [weak notifications, weak modelDropNotifications, weak statusModel, weak deckModel, weak daemonSetupModel, weak appUpdateStagedPrompt, weak proxyReloginModel, weak managedProxyModel, weak proxyOnboardingModel] worst, state in
+            // Issue #784: every fresh state carries the daemon's pool role,
+            // applied (and remembered) here synchronously and in state
+            // order, so a first read that lands at launch decides before
+            // the launch-time proxy evaluation. Off the pool host the
+            // lifecycle starts nothing, and stops its own proxy when the
+            // role moves to remote; the first-launch question waits for a
+            // host role too.
+            if let state {
+                managedProxyModel?.applyProxyRole(state.proxyRole)
+                proxyOnboardingModel?.applyProxyRole(state.proxyRole)
+            }
             Task { @MainActor [weak notifications] in
                 await notifications?.evaluate(worst: worst, state: state)
             }
@@ -776,6 +791,11 @@ struct ModelDeckMacApp: App {
                     // is held stopped (which also keeps the supervisor from
                     // starting one on its monitoring tick) until they choose
                     // — at the card below, or later in Settings.
+                    // Issue #784: never waits on the daemon. The pool role
+                    // is the one the last state reported, remembered across
+                    // launches (never recorded = host, so a host behaves
+                    // exactly as before), and a first read that landed above
+                    // has already applied the current one.
                     if managedProxyMayRunAtLaunch(
                         recordedChoice: proxyOnboardingModel.choice
                     ) {

@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { LEGACY_CLIENT_KEY_HELPER } from '../src/client-key-helper.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -333,10 +334,7 @@ test('service-wired routing preserves the #263 renewal isolation pin', async () 
     const parsed = JSON.parse(wiredSettings);
     assert.equal(parsed.env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:8317');
     assert.equal(parsed.env.KEEP_ME, 'unrelated-value');
-    assert.equal(
-      parsed.apiKeyHelper,
-      'security find-generic-password -s cli-proxy-api-client -w',
-    );
+    assert.equal(parsed.apiKeyHelper, LEGACY_CLIENT_KEY_HELPER);
 
     data.expire();
     const renew = await data.service.renewClaudeAccount(data.target.id);

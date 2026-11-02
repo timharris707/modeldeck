@@ -75,6 +75,19 @@ struct Issue431ManagementKeySeedTests {
         #expect(!FileManager.default.fileExists(atPath: paths.authDirectory.path))
     }
 
+    // Issue #785: the proxy drops usage records unread for 60 seconds by
+    // default, and the daemon pulls every 5 minutes.
+    @Test("a fresh seed keeps unread usage records for an hour")
+    func freshSeedSetsUsageQueueRetention() throws {
+        let (paths, root) = scratchPaths()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let configFile = try ManagedProxyConfigFileWriter().ensureConfig(paths: paths, port: 8317)
+        let lines = try String(contentsOf: configFile, encoding: .utf8).components(separatedBy: "\n")
+        #expect(lines.filter { $0.hasPrefix("redis-usage-queue-retention-seconds:") }
+            == ["redis-usage-queue-retention-seconds: 3600"])
+    }
+
     @Test("concurrent seeds of one directory agree on a single secret (CodeRabbit PR #439)")
     func concurrentSeedsAgree() async throws {
         // The race arbiter is O_EXCL creation: whichever seed creates

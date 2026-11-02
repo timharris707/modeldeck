@@ -6,9 +6,23 @@ export const PORT = Number(process.env.MODELDECK_PORT || 3867);
 export const PROJECTS_ROOT = path.resolve(
   process.env.MODELDECK_PROJECTS_ROOT || path.join(os.homedir(), 'projects'),
 );
-export const DATA_DIR = path.resolve(
-  process.env.MODELDECK_DATA_DIR || path.join(os.homedir(), 'Library', 'Application Support', 'ModelDeck'),
-);
+// macOS keeps app data under ~/Library; elsewhere the fixed folders
+// ~/.local/share/modeldeck and ~/.config/modeldeck (#807). The XDG variables
+// are deliberately not read: a value set in an SSH shell but not in the
+// systemd unit would split the CLI and the daemon across two folders (Codex
+// review of #813). MODELDECK_DATA_DIR and MODELDECK_SECRETS_DIR override.
+export function defaultDataDir({ platform = process.platform, home = os.homedir() } = {}) {
+  if (platform === 'darwin') return path.join(home, 'Library', 'Application Support', 'ModelDeck');
+  return path.join(home, '.local', 'share', 'modeldeck');
+}
+
+// Owner-only secret files, used where there is no Keychain (decision 0046).
+export function defaultSecretsDir({ home = os.homedir() } = {}) {
+  return path.join(home, '.config', 'modeldeck');
+}
+
+export const DATA_DIR = path.resolve(process.env.MODELDECK_DATA_DIR || defaultDataDir());
+export const SECRETS_DIR = path.resolve(process.env.MODELDECK_SECRETS_DIR || defaultSecretsDir());
 export const DB_PATH = process.env.MODELDECK_DB_PATH || path.join(DATA_DIR, 'modeldeck.sqlite');
 // The bundled launchd job cannot expand a per-user home path in its static
 // plist. The SEA bootstrap redirects fd 2 here before server imports, with

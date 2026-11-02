@@ -74,7 +74,8 @@
         { "path": "/fixture/proxy/auth/retired.json", "provider": "claude", "identity": "retired-placeholder@example.invalid", "weight": 15, "claimedAccountId": null }
       ]
     },
-    "managementKey": { "status": "ok", "path": "/fixture/proxy/.mgmt-key", "exists": false, "mode": null }
+    "managementKey": { "status": "ok", "path": "/fixture/proxy/.mgmt-key", "exists": false, "mode": null },
+    "usageQueue": { "status": "ok", "consumerEnabled": true, "path": "/fixture/proxy/config.yaml", "retentionSeconds": 60, "retentionSource": "default" }
   },
   "sharedScope": {
     "enabled": true,

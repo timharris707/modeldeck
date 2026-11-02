@@ -172,8 +172,10 @@ public struct ManagedProxyConfigFileWriter: ManagedProxyConfigWriting {
 
     /// The minimum that makes a fresh proxy usable: where to listen, where its
     /// own auth files live, and the management secret the daemon's usage-queue
-    /// consumer authenticates with (#431). Still says nothing about provider
-    /// credentials — those remain CLIProxyAPI's alone (#398).
+    /// consumer authenticates with (#431), and an hour of usage-queue
+    /// retention so records survive the daemon's 5-minute pull (#785; the
+    /// proxy's default of 60 seconds drops most of them). Still says nothing
+    /// about provider credentials — those remain CLIProxyAPI's alone (#398).
     static func seedConfig(paths: ManagedProxyPaths, port: Int, managementSecret: String) -> String {
         """
         # Written by ModelDeck when no CLIProxyAPI config existed yet.
@@ -186,6 +188,7 @@ public struct ManagedProxyConfigFileWriter: ManagedProxyConfigWriting {
           allow-remote: false
           secret-key: "\(managementSecret)"
         auth-dir: '\(paths.authDirectory.path.replacingOccurrences(of: "'", with: "''"))'
+        redis-usage-queue-retention-seconds: 3600
 
         """
     }
@@ -297,6 +300,31 @@ func loopbackBaseURL(port: Int) -> URL {
     return url
 }
 
+// MARK: - Remembered pool role
+
+/// Issue #784 review: the last pool role a daemon state reported, in the
+/// app's own defaults domain (same convention as the onboarding choice). A
+/// stored name this build does not know stands down like remote.
+public final class UserDefaultsProxyRoleMemory: ProxyRoleRemembering, @unchecked Sendable {
+    private static let key = "proxyRoleLastSeen"
+    private let defaults: UserDefaults
+
+    public init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    public var lastSeenRole: ProxyRole? {
+        get { defaults.string(forKey: Self.key).map(ProxyRole.init(named:)) }
+        set {
+            if let newValue {
+                defaults.set(newValue.rawValue, forKey: Self.key)
+            } else {
+                defaults.removeObject(forKey: Self.key)
+            }
+        }
+    }
+}
+
 // MARK: - Assembly
 
 extension ManagedProxyModel.Dependencies {
@@ -308,7 +336,8 @@ extension ManagedProxyModel.Dependencies {
         reporter: any ManagedProxyReporting,
         bundle: Bundle = .main,
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
-        port: Int = ManagedProxyDefaults.port
+        port: Int = ManagedProxyDefaults.port,
+        defaults: UserDefaults = .standard
     ) -> Self {
         let pin = CLIProxyBundlePin.load(from: bundle)
         let binaryURL = resolveCLIProxyBinaryURL(
@@ -331,7 +360,8 @@ extension ManagedProxyModel.Dependencies {
             reporter: reporter,
             appVersion: bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
             reportFailure: { message in logger.error("\(message, privacy: .public)") },
-            port: port
+            port: port,
+            roleMemory: UserDefaultsProxyRoleMemory(defaults: defaults)
         )
     }
 

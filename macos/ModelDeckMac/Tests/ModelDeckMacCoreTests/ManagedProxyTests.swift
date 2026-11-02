@@ -152,10 +152,13 @@ private func awaitReports(
     return await reporter.snapshot()
 }
 
+/// `roleMemory` starts empty: never recorded reads as host, the pool host
+/// every pre-#784 test here describes.
 @MainActor
 private func makeHarness(
     available: Bool = true,
     answering: Bool = false,
+    roleMemory: EphemeralProxyRoleMemory = EphemeralProxyRoleMemory(),
     maxRestarts: Int = ManagedProxyRestartPolicy.maxRestarts,
     healthyResetInterval: TimeInterval = 60,
     reporter: any ManagedProxyReporting = NoopManagedProxyReporter(),
@@ -180,7 +183,8 @@ private func makeHarness(
             config: config,
             reporter: reporter,
             appVersion: "1.0.0-test",
-            reportFailure: reportFailure
+            reportFailure: reportFailure,
+            roleMemory: roleMemory
         ),
         maxRestarts: maxRestarts,
         healthyResetInterval: healthyResetInterval,
@@ -660,6 +664,327 @@ struct ManagedProxyModelTests {
         await neverStarted.model.stopManaging()
         for _ in 0..<20 { await Task.yield() }
         #expect(await reporter.snapshot().isEmpty)
+    }
+}
+
+// MARK: - Pool role (issue #784)
+
+@Suite("Issue #784 — the pool role decides before the port")
+struct ManagedProxyRoleDecisionTests {
+    @Test("a remote role stands down in every state, ahead of the port")
+    func remoteOutranksThePort() {
+        for occupant in [ManagedProxyOccupant.none, .managed, .foreign] {
+            for desired in [ManagedProxyDesiredState.running, .stopped] {
+                #expect(decideManagedProxy(
+                    desired: desired, binaryAvailable: true, role: .remote,
+                    occupant: occupant, restartsSoFar: 2
+                ) == .remotePool)
+            }
+        }
+    }
+
+    @Test("a dev build stays unavailable whatever the role")
+    func devBuildIgnoresTheRole() {
+        for role in [ProxyRole.host, .remote] {
+            #expect(decideManagedProxy(
+                desired: .running, binaryAvailable: false, role: role, occupant: .none, restartsSoFar: 0
+            ) == .unavailable)
+        }
+    }
+
+    // The pre-#784 tests above call without a role, which defaults to host.
+    @Test("an explicit host role decides exactly as those calls do")
+    func hostIsUnchanged() {
+        #expect(decideManagedProxy(
+            desired: .running, binaryAvailable: true, role: .host, occupant: .none, restartsSoFar: 0
+        ) == .start)
+        #expect(decideManagedProxy(
+            desired: .running, binaryAvailable: true, role: .host, occupant: .foreign, restartsSoFar: 0
+        ) == .refuseExternalInstance)
+    }
+}
+
+/// Lets a seam closure reach the model it was handed to: the box is filled
+/// once the model exists.
+@MainActor
+private final class ModelBox {
+    var model: ManagedProxyModel?
+}
+
+/// A port that never answers, and runs `step` DURING its Nth probe — the
+/// window a role change can land in.
+private final class SteppingProxyHealth: ManagedProxyHealthProbing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private let stepAt: Int
+    private let step: @Sendable () async -> Void
+
+    init(stepAt: Int, step: @escaping @Sendable () async -> Void) {
+        self.stepAt = stepAt
+        self.step = step
+    }
+
+    var probeCount: Int { lock.withLock { count } }
+
+    func probeProxy() async -> Bool {
+        let call = lock.withLock { () -> Int in
+            count += 1
+            return count
+        }
+        if call == stepAt { await step() }
+        return false
+    }
+}
+
+/// Scripted `GET /api/state`: one answer per read, the last one repeating.
+private final class ScriptedRoleStates: DeckStateProviding, @unchecked Sendable {
+    private let lock = NSLock()
+    private var answers: [Result<DeckState, Error>]
+
+    init(_ answers: [Result<DeckState, Error>]) { self.answers = answers }
+
+    func deckState() async throws -> DeckState {
+        let next = lock.withLock { answers.count > 1 ? answers.removeFirst() : answers[0] }
+        return try next.get()
+    }
+}
+
+private func roleState(_ role: ProxyRole) -> DeckState {
+    DeckState(proxy: DeckProxyStatus(role: role))
+}
+
+/// The app's wiring in miniature (ModelDeckMacApp, pinned at source level in
+/// Issue784ProxyRoleTests): the status model's state hook applies the role.
+@MainActor
+private func statusModel(
+    applyingRolesTo model: ManagedProxyModel,
+    states: [Result<DeckState, Error>]
+) -> MenuBarStatusModel {
+    let status = MenuBarStatusModel(
+        evaluator: StubEvaluator(results: []),
+        stateProvider: ScriptedRoleStates(states)
+    )
+    status.onStateUpdate = { _, state in
+        if let state { model.applyProxyRole(state.proxyRole) }
+    }
+    return status
+}
+
+@Suite("Issue #784 — the bundled proxy follows the pool role")
+@MainActor
+struct ManagedProxyRoleTests {
+    // TRIPWIRE remote-role-never-starts-bundled-proxy: the forwarder that
+    // reaches the pool host holds this Mac's port 8317. Every way the app can
+    // ask for a start (launch, the deck's Start, adoption, Try Again, a
+    // monitoring tick) must start nothing, write no config, and never probe
+    // the port, which answers as the forwarder.
+    @Test("TRIPWIRE remote-role-never-starts-bundled-proxy: no start, no config, no probe")
+    func remoteRoleNeverStarts() async {
+        let harness = makeHarness(answering: true, roleMemory: EphemeralProxyRoleMemory(.remote))
+        await harness.model.evaluateOnLaunch()
+        await harness.model.startManaging()
+        await harness.model.startManagingAfterAdoption()
+        await harness.model.retry()
+        for _ in 0..<3 { await harness.model.superviseOnce() }
+
+        #expect(harness.process.startCount == 0)
+        #expect(harness.config.writes.isEmpty)
+        #expect(harness.health.probeCount == 0)
+        // The forwarder answering is not an external proxy to warn about.
+        #expect(harness.model.phase == .remotePool)
+        await harness.model.stopManaging()
+        #expect(harness.model.phase == .remotePool)
+    }
+
+    // The review's host-role regression: a host Mac must never wait on the
+    // daemon (busy for minutes after an update, #660/#675) to start the
+    // proxy its routed sessions need.
+    @Test("never recorded reads as host: with no daemon at all, the proxy starts at launch as before")
+    func hostWithNoDaemonStartsAtLaunch() async {
+        let harness = makeHarness()
+        let status = statusModel(
+            applyingRolesTo: harness.model,
+            states: [.failure(URLError(.cannotConnectToHost))]
+        )
+        await status.refresh()
+        await harness.model.evaluateOnLaunch()
+
+        #expect(harness.model.proxyRole == .host)
+        #expect(harness.process.startCount == 1)
+        #expect(harness.model.phase == .running)
+    }
+
+    // The forwarder is down too here: nothing on the port would stop a
+    // start except the remembered role.
+    @Test("a remembered remote role with no daemon never starts")
+    func rememberedRemoteWithNoDaemonNeverStarts() async {
+        let harness = makeHarness(roleMemory: EphemeralProxyRoleMemory(.remote))
+        let status = statusModel(
+            applyingRolesTo: harness.model,
+            states: [.failure(URLError(.cannotConnectToHost))]
+        )
+        await status.refresh()
+        await harness.model.evaluateOnLaunch()
+        for _ in 0..<3 { await harness.model.superviseOnce() }
+
+        #expect(harness.process.startCount == 0)
+        #expect(harness.health.probeCount == 0)
+        #expect(harness.model.phase == .remotePool)
+    }
+
+    @Test("every role a state reports is remembered for the next launch")
+    func theRoleIsRemembered() async {
+        let memory = EphemeralProxyRoleMemory()
+        let first = makeHarness(roleMemory: memory)
+        #expect(first.model.applyProxyRole(.host) == nil)
+        // Host over never-recorded writes nothing: absence already reads as host.
+        #expect(memory.lastSeenRole == nil)
+        await first.model.applyProxyRole(.remote)?.value
+        #expect(memory.lastSeenRole == .remote)
+
+        // The next launch, before any daemon read: remote, nothing starts.
+        let next = makeHarness(roleMemory: memory)
+        #expect(next.model.proxyRole == .remote)
+        await next.model.evaluateOnLaunch()
+        #expect(next.process.startCount == 0)
+
+        // Until a state says host, which is remembered the same way.
+        #expect(next.model.applyProxyRole(.host) == nil)
+        #expect(memory.lastSeenRole == .host)
+    }
+
+    @Test("host to remote stops the proxy this app started, and the report says why")
+    func hostToRemoteStopsOwnProxy() async {
+        let reporter = RecordingManagedProxyReporter()
+        let harness = makeHarness(reporter: reporter)
+        await harness.model.evaluateOnLaunch()
+        #expect(harness.process.startCount == 1)
+        let probesBefore = harness.health.probeCount
+
+        await harness.model.applyProxyRole(.remote)?.value
+
+        #expect(harness.process.stopCount == 1)
+        #expect(harness.model.phase == .remotePool)
+        #expect(harness.model.restartCount == 0)
+        let reports = await awaitReports(reporter, count: 2)
+        #expect(reports.map(\.phase) == [
+            ManagedProxyReportPhase.started,
+            ManagedProxyReportPhase.proxyRoleRemote,
+        ])
+        if reports.indices.contains(1) {
+            #expect(!reports[1].managed)
+            #expect(reports[1].pid == nil)
+            #expect(reports[1].phase == "proxy-role-remote")
+        }
+
+        // It stays down: later ticks neither restart it nor probe the port.
+        for _ in 0..<3 { await harness.model.superviseOnce() }
+        #expect(harness.process.startCount == 1)
+        #expect(harness.health.probeCount == probesBefore)
+        for _ in 0..<20 { await Task.yield() }
+        #expect(await reporter.snapshot().count == 2)
+    }
+
+    @Test("host to remote leaves a proxy someone else runs alone")
+    func hostToRemoteLeavesForeignProxyAlone() async {
+        let reporter = RecordingManagedProxyReporter()
+        let harness = makeHarness(answering: true, reporter: reporter)
+        await harness.model.evaluateOnLaunch()
+        #expect(harness.model.phase == .externalInstanceDetected)
+
+        // Nothing of ours to stop, so nothing to wait for.
+        #expect(harness.model.applyProxyRole(.remote) == nil)
+
+        #expect(harness.process.stopCount == 0)
+        #expect(harness.process.startCount == 0)
+        #expect(harness.model.phase == .remotePool)
+        for _ in 0..<20 { await Task.yield() }
+        #expect(await reporter.snapshot().isEmpty)
+    }
+
+    @Test("a role that moves to remote during a restart backoff restarts nothing")
+    func remoteDuringBackoffRestartsNothing() async {
+        let process = FakeProxyProcess()
+        let health = FakeProxyHealth()
+        let box = ModelBox()
+        let model = ManagedProxyModel(
+            dependencies: .init(
+                bundle: ManagedProxyBundle(binaryURL: URL(fileURLWithPath: "/fixture/Contents/Resources/cliproxyapi/cliproxyapi")),
+                paths: ManagedProxyPaths(configDirectory: URL(fileURLWithPath: "/tmp/modeldeck-tests-never-written/.config/cliproxyapi", isDirectory: true)),
+                process: process,
+                health: health,
+                config: RecordingConfigWriter()
+            ),
+            // The backoff wait is when the role changes.
+            sleep: { _ in await MainActor.run { _ = box.model?.applyProxyRole(.remote) } }
+        )
+        box.model = model
+        await model.evaluateOnLaunch()
+        process.simulateCrash()
+        await model.superviseOnce()
+
+        #expect(process.startCount == 1)
+        // No post-wait probe either: in remote role it would reach the forwarder.
+        #expect(health.probeCount == 2)
+        #expect(model.phase == .remotePool)
+    }
+
+    // TRIPWIRE remote-role-spawn-gate: launch() is the one place a proxy is
+    // spawned, and its own role check is the only one between the restart
+    // path's last probe and the spawn. A role that lands during that probe
+    // must stop there.
+    @Test("TRIPWIRE remote-role-spawn-gate: a role that moves to remote during the restart's last probe never spawns")
+    func remoteDuringTheLastProbeNeverSpawns() async {
+        let process = FakeProxyProcess()
+        let box = ModelBox()
+        // Probe 1: the launch. 2: the tick that finds the crash. 3: the probe
+        // after the backoff wait — the role moves while it is out.
+        let health = SteppingProxyHealth(stepAt: 3) {
+            await MainActor.run { _ = box.model?.applyProxyRole(.remote) }
+        }
+        let model = ManagedProxyModel(
+            dependencies: .init(
+                bundle: ManagedProxyBundle(binaryURL: URL(fileURLWithPath: "/fixture/Contents/Resources/cliproxyapi/cliproxyapi")),
+                paths: ManagedProxyPaths(configDirectory: URL(fileURLWithPath: "/tmp/modeldeck-tests-never-written/.config/cliproxyapi", isDirectory: true)),
+                process: process,
+                health: health,
+                config: RecordingConfigWriter()
+            ),
+            sleep: { _ in }
+        )
+        box.model = model
+        await model.evaluateOnLaunch()
+        process.simulateCrash()
+        await model.superviseOnce()
+
+        #expect(health.probeCount == 3)
+        #expect(process.startCount == 1)
+        #expect(model.phase == .remotePool)
+    }
+
+    @Test("remote back to host lets the next tick start the proxy the user's choice wants")
+    func remoteToHostResumesOnTheNextTick() async {
+        let harness = makeHarness(roleMemory: EphemeralProxyRoleMemory(.remote))
+        await harness.model.evaluateOnLaunch()
+        #expect(harness.model.applyProxyRole(.host) == nil)
+        #expect(harness.process.startCount == 0)
+        await harness.model.superviseOnce()
+        #expect(harness.process.startCount == 1)
+        #expect(harness.model.phase == .running)
+    }
+
+    @Test("a first state read that lands at launch decides before the launch-time evaluation")
+    func firstReadDecidesTheLaunch() async {
+        let harness = makeHarness(answering: true)
+        let status = statusModel(applyingRolesTo: harness.model, states: [.success(roleState(.remote))])
+        await status.refresh()
+        await harness.model.evaluateOnLaunch()
+        // Monitoring ticks after launch.
+        for _ in 0..<3 { await harness.model.superviseOnce() }
+
+        #expect(harness.process.startCount == 0)
+        #expect(harness.health.probeCount == 0)
+        #expect(harness.model.phase == .remotePool)
     }
 }
 

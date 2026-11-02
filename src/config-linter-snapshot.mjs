@@ -338,6 +338,60 @@ async function inspectManagementKey(file, { lstat }) {
   }
 }
 
+// Issue #785: CLIProxyAPI drops a usage record left unread longer than
+// redis-usage-queue-retention-seconds (absent or <= 0 means 60, capped at
+// 3600). Proxy v8 also reads it from observability.usage, and that spelling
+// wins when both exist. Only that one integer leaves this function; the rest
+// of config.yaml, which holds secrets, is never kept.
+const RETENTION_KEY = 'redis-usage-queue-retention-seconds';
+const RETENTION_PATHS = Object.freeze([`observability.usage.${RETENTION_KEY}`, RETENTION_KEY]);
+const YAML_KEY_LINE = /^( *)(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_.-]+|<<))[ \t]*:(?:[ \t]+(.*))?$/;
+
+export function parseUsageQueueRetention(source) {
+  const found = new Map();
+  const stack = [];
+  for (const line of source.split(/\r?\n/)) {
+    const match = YAML_KEY_LINE.exec(line);
+    if (!match) continue;
+    const indent = match[1].length;
+    while (stack.length && stack.at(-1).indent >= indent) stack.pop();
+    const parentPath = stack.map((entry) => entry.key).join('.');
+    const key = match[2] ?? match[3] ?? match[4];
+    const keyPath = parentPath ? `${parentPath}.${key}` : key;
+    const value = (match[5] ?? '').replace(/(^|[ \t])#.*$/, '').trim();
+    // A merge key, or a flow mapping, anchor, alias or tag on a parent of the
+    // setting, could hide its value from this line reader (CodeRabbit, #803).
+    const leadsToRetention = (prefix) => !prefix || RETENTION_PATHS.some((wanted) => wanted.startsWith(`${prefix}.`));
+    if (key === '<<' && leadsToRetention(parentPath)) return null;
+    if (value && leadsToRetention(keyPath)) return null;
+    if (!value) stack.push({ indent, key });
+    if (!RETENTION_PATHS.includes(keyPath)) continue;
+    if (found.has(keyPath)) return null;
+    found.set(keyPath, value);
+  }
+  const chosen = RETENTION_PATHS.find((wanted) => found.has(wanted));
+  if (!chosen) return { seconds: 60, source: 'default' };
+  // Leading zeros are left to the proxy's YAML reader (possibly octal).
+  if (!/^-?(0|[1-9]\d*)$/.test(found.get(chosen))) return null;
+  const value = Number(found.get(chosen));
+  return { seconds: value <= 0 ? 60 : Math.min(value, 3600), source: 'config' };
+}
+
+async function inspectUsageQueueRetention(consumerEnabled, cliproxyConfigDir, io) {
+  if (!consumerEnabled) return { status: 'ok', consumerEnabled: false };
+  if (!cliproxyConfigDir) return { status: 'unknown', reason: 'proxy config directory is not configured' };
+  const file = path.join(cliproxyConfigDir, 'config.yaml');
+  try {
+    const source = await readRegularText(file, io);
+    if (source == null) return { status: 'unknown', path: file, reason: 'proxy config.yaml not found' };
+    const retention = parseUsageQueueRetention(source);
+    if (!retention) return { status: 'unknown', path: file, reason: 'usage-queue retention is not one whole number' };
+    return { status: 'ok', consumerEnabled: true, path: file, retentionSeconds: retention.seconds, retentionSource: retention.source };
+  } catch (error) {
+    return { status: 'unknown', path: file, reason: safeError(error) };
+  }
+}
+
 async function sharedScopeConsistency({ enabled, sharedScopeDir, accounts, io }) {
   const manifestPath = path.join(sharedScopeDir, 'manifest.json');
   let manifest;
@@ -558,7 +612,22 @@ async function runtimeOverrides({
   }
 }
 
-async function proxySnapshot({ service, accounts, codexProfiles, cliproxyConfigDir, cliproxyAuthDir, cliproxyManagementKeyPath, io }) {
+async function proxySnapshot({ service, accounts, codexProfiles, cliproxyConfigDir, cliproxyAuthDir, cliproxyManagementKeyPath, usageQueueConsumerEnabled, io }) {
+  const remote = service?.proxyRoleRemote?.();
+  if (remote) {
+    // 'remote' is not 'unknown': the rules that read the local pool do not
+    // apply on a client of another Mac's pool, so they report nothing.
+    const unavailable = { status: 'remote', ...remote };
+    return {
+      expectedOrigin: safeUrlOrigin(service.cliproxyBaseUrl),
+      managed: false,
+      roster: unavailable,
+      authFiles: unavailable,
+      managementKey: unavailable,
+      usageQueue: unavailable,
+      ...remote,
+    };
+  }
   let weights = null;
   let readError = null;
   try { weights = await service?.readProxyWeights?.({ includeEmpty: true }); }
@@ -600,6 +669,7 @@ async function proxySnapshot({ service, accounts, codexProfiles, cliproxyConfigD
     roster,
     authFiles,
     managementKey: await inspectManagementKey(cliproxyManagementKeyPath, io),
+    usageQueue: await inspectUsageQueueRetention(usageQueueConsumerEnabled, cliproxyConfigDir, io),
   };
 }
 
@@ -755,6 +825,7 @@ export async function collectConfigLintSnapshot({
   const recordedVersions = service?.configLintInstalledCliVersions || {};
   const proxy = await proxySnapshot({
     service, accounts, codexProfiles, cliproxyConfigDir, cliproxyAuthDir, cliproxyManagementKeyPath, io,
+    usageQueueConsumerEnabled: settings.usageQueueConsumerEnabled === true,
   });
   return {
     accounts,
@@ -812,7 +883,8 @@ export async function collectConfigLintSnapshot({
       claudeProfilesDir,
       codexProfilesDir,
       claudeShellEnvFile,
-      cliproxyConfigDir,
+      // Remote clients retain these paths for rollback, not pool inspection.
+      cliproxyConfigDir: service?.proxyRoleRemote?.() ? null : cliproxyConfigDir,
       cliproxyAuthDir,
       cliproxyManagementKeyPath,
       realpath,

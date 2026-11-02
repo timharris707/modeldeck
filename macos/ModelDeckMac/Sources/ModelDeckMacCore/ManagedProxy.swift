@@ -15,6 +15,11 @@ import Foundation
 // while an EXTERNAL proxy answers on the port. Slice C refuses loudly and
 // reports honestly — no offers, no consent screens, and it never stops a
 // process the user started. The adoption UX is slice D (#422).
+//
+// Issue #784: the pool may live on another Mac, reached through a forwarder
+// on this Mac's port. Off the pool host nothing starts, and the lifecycle
+// stands down when the role moves away. The role is remembered across
+// launches, so launch never waits on the daemon to decide.
 
 // MARK: - Paths
 
@@ -237,6 +242,9 @@ public enum ManagedProxyReportPhase {
     public static let restart = "restart"
     public static let crashGaveUp = "crash-gave-up"
     public static let adopted = "adopted"
+    /// Issue #784: management stopped because the role moved to remote.
+    /// Named after the daemon's own refusal code, so the report says why.
+    public static let proxyRoleRemote = ProxyRoleCopy.remoteRefusalCode
 }
 
 /// The app-owned process facts the daemon cannot observe itself (#432).
@@ -333,6 +341,9 @@ public enum ManagedProxyDesiredState: Equatable, Sendable {
 public enum ManagedProxyDecision: Equatable, Sendable {
     /// No proxy in this build (dev build). Honest unavailable state, no offer.
     case unavailable
+    /// Issue #784: this Mac uses the pool on another machine and its proxy
+    /// port belongs to the forwarder. Stand down; stop only what we started.
+    case remotePool
     /// An external proxy answers on the port — refuse loudly, change nothing.
     case refuseExternalInstance
     /// The user stopped it; leave it down.
@@ -351,20 +362,26 @@ public enum ManagedProxyDecision: Equatable, Sendable {
 
 /// The supervision decision, kept pure for tests. Precedence:
 /// 1. no bundled binary → dev build, stand down (never offer anything);
-/// 2. a foreign proxy answers → refuse, loudly, in every desired state (the
+/// 2. (#784) remote role → stand down, before the port: off the pool host
+///    the port is the forwarder's, and the model never probes it;
+/// 3. a foreign proxy answers → refuse, loudly, in every desired state (the
 ///    #400 double-consume rail outranks even a user stop, because it is the
 ///    honest description of what is on the port);
-/// 3. the user stopped it → stay stopped;
-/// 4. our process alive → running;
-/// 5. nothing there → start / bounded-backoff restart / give up.
+/// 4. the user stopped it → stay stopped;
+/// 5. our process alive → running;
+/// 6. nothing there → start / bounded-backoff restart / give up.
+/// `role` defaults to host, the pre-#784 behaviour; the model always passes
+/// its own.
 public func decideManagedProxy(
     desired: ManagedProxyDesiredState,
     binaryAvailable: Bool,
+    role: ProxyRole = .host,
     occupant: ManagedProxyOccupant,
     restartsSoFar: Int,
     maxRestarts: Int = ManagedProxyRestartPolicy.maxRestarts
 ) -> ManagedProxyDecision {
     guard binaryAvailable else { return .unavailable }
+    if role == .remote { return .remotePool }
     if occupant == .foreign { return .refuseExternalInstance }
     if desired == .stopped { return .stayStopped }
     if occupant == .managed { return .running }
@@ -425,6 +442,9 @@ public final class ManagedProxyModel: ObservableObject {
         /// answering on the proxy port. Refuse, say so, touch nothing.
         case externalInstanceDetected
         case failed(String)
+        /// Issue #784: this Mac uses the proxy pool on another machine. Its
+        /// port is the forwarder's: nothing to start, adopt, probe, or offer.
+        case remotePool
     }
 
     public struct Dependencies {
@@ -438,6 +458,9 @@ public final class ManagedProxyModel: ObservableObject {
         public var reportFailure: @Sendable (String) -> Void
         /// The port the config seeds and the health probe watches.
         public var port: Int
+        /// Issue #784 review: the last pool role a state reported, across
+        /// launches. Never recorded reads as host.
+        public var roleMemory: any ProxyRoleRemembering
 
         public init(
             bundle: ManagedProxyBundle,
@@ -448,7 +471,8 @@ public final class ManagedProxyModel: ObservableObject {
             reporter: any ManagedProxyReporting = NoopManagedProxyReporter(),
             appVersion: String? = nil,
             reportFailure: @escaping @Sendable (String) -> Void = { _ in },
-            port: Int = ManagedProxyDefaults.port
+            port: Int = ManagedProxyDefaults.port,
+            roleMemory: any ProxyRoleRemembering = EphemeralProxyRoleMemory()
         ) {
             self.bundle = bundle
             self.paths = paths
@@ -459,6 +483,7 @@ public final class ManagedProxyModel: ObservableObject {
             self.appVersion = appVersion
             self.reportFailure = reportFailure
             self.port = port
+            self.roleMemory = roleMemory
         }
     }
 
@@ -480,6 +505,10 @@ public final class ManagedProxyModel: ObservableObject {
     /// User intent, independent of phase: a stop must survive every
     /// supervision tick until the user asks for a start.
     public private(set) var desiredState: ManagedProxyDesiredState = .running
+
+    /// Issue #784: the pool role this lifecycle acts on — the remembered one
+    /// at launch, then the latest state's. Nothing starts unless it is host.
+    @Published public private(set) var proxyRole: ProxyRole
 
     public var isAvailable: Bool { deps.bundle.isAvailable }
 
@@ -508,6 +537,10 @@ public final class ManagedProxyModel: ObservableObject {
         }
     ) {
         self.deps = dependencies
+        // Issue #784 review: decided from what the last state said, never by
+        // waiting for the daemon — after an update it can stay busy for
+        // minutes (#660/#675), and a host's routed sessions need the proxy.
+        self.proxyRole = dependencies.roleMemory.lastSeenRole ?? .host
         self.maxRestarts = max(1, maxRestarts)
         self.healthyResetInterval = max(0, healthyResetInterval)
         self.clock = clock
@@ -522,9 +555,51 @@ public final class ManagedProxyModel: ObservableObject {
     // MARK: Launch
 
     /// Called once from the app's launch sequence. Never starts anything if
-    /// an external proxy is already answering.
+    /// an external proxy is already answering, or (#784) off the pool host.
     public func evaluateOnLaunch() async {
         await superviseOnce()
+    }
+
+    // MARK: Pool role (issue #784)
+
+    /// Applies, and remembers, the role from a fresh daemon state. Recorded
+    /// synchronously, so the role always matches the latest state. Moved to
+    /// remote: stop the proxy this app started, now — the role change is the
+    /// user's own explicit action, and the report says so; a proxy someone
+    /// else runs on the port is never touched. The stop runs in the returned
+    /// task (tests await it; the app fires and forgets). Moved back to host:
+    /// the next monitoring tick decides, as a launch would, and only ticks
+    /// that run after the launch-time choice gate (#422) ever start anything.
+    @discardableResult
+    public func applyProxyRole(_ role: ProxyRole) -> Task<Void, Never>? {
+        guard role != proxyRole else { return nil }
+        proxyRole = role
+        deps.roleMemory.lastSeenRole = role
+        return role == .remote ? standDownForRemotePool() : nil
+    }
+
+    /// The remote-role stand-down. Bookkeeping happens at once, so no
+    /// supervision tick can see the token after the role moved; the stop
+    /// itself (SIGTERM, then a bounded wait) and its report run in the
+    /// returned task. Only `token` — a process this app spawned — is ever
+    /// stopped.
+    @discardableResult
+    private func standDownForRemotePool() -> Task<Void, Never>? {
+        // Every remote-role tick lands here; unchanged values are not
+        // republished, so an open deck is not re-rendered for nothing.
+        let resting: Phase = deps.bundle.isAvailable ? .remotePool : .unavailable
+        if phase != resting { phase = resting }
+        if restartCount != 0 { restartCount = 0 }
+        let started = token
+        let wasManaging = hasManagedState
+        token = nil
+        hasManagedState = false
+        guard started != nil || wasManaging else { return nil }
+        let process = deps.process
+        return Task {
+            if let started { await process.stop(started) }
+            self.enqueueReport(managed: false, phase: ManagedProxyReportPhase.proxyRoleRemote, pid: nil)
+        }
     }
 
     // MARK: User actions
@@ -557,7 +632,9 @@ public final class ManagedProxyModel: ObservableObject {
         }
         token = nil
         restartCount = 0
-        phase = deps.bundle.isAvailable ? .stopped : .unavailable
+        // Issue #784: off the pool host there is nothing of ours to call
+        // stopped; the phase keeps saying where the pool is.
+        phase = deps.bundle.isAvailable ? (proxyRole == .remote ? .remotePool : .stopped) : .unavailable
         hasManagedState = false
         if shouldReport {
             enqueueReport(managed: false, phase: ManagedProxyReportPhase.stopped, pid: nil)
@@ -581,19 +658,28 @@ public final class ManagedProxyModel: ObservableObject {
         let alive = token.map { deps.process.isRunning($0) } ?? false
         if !alive { token = nil }
         // A dev build has nothing to supervise and nothing to say about the
-        // port; don't spend a request finding that out.
-        let answering = deps.bundle.isAvailable ? await deps.health.probeProxy() : false
+        // port; don't spend a request finding that out. Issue #784: nor does
+        // a Mac off the pool host — in remote role the port is the
+        // forwarder's.
+        let answering = deps.bundle.isAvailable && proxyRole == .host
+            ? await deps.health.probeProxy()
+            : false
         let occupant = classifyProxyOccupant(portAnswering: answering, managedProcessAlive: alive)
 
+        // The role is read AFTER the probe: a change that landed while it was
+        // out is the one that counts.
         switch decideManagedProxy(
             desired: desiredState,
             binaryAvailable: deps.bundle.isAvailable,
+            role: proxyRole,
             occupant: occupant,
             restartsSoFar: restartCount,
             maxRestarts: maxRestarts
         ) {
         case .unavailable:
             phase = .unavailable
+        case .remotePool:
+            await standDownForRemotePool()?.value
         case .refuseExternalInstance:
             // Refusal only. No offer, no consent screen, and emphatically no
             // stopping the user's process — that is slice D's story (#422).
@@ -615,6 +701,9 @@ public final class ManagedProxyModel: ObservableObject {
         case .restart(let attempt):
             phase = .restarting(attempt: attempt)
             await sleep(managedProxyRestartDelay(attempt: attempt))
+            // Issue #784: the role may have moved to remote during the wait;
+            // its stand-down already owns the phase.
+            guard proxyRole == .host else { return }
             // The user may have stopped it, or an external instance may have
             // claimed the port, while we waited out the backoff.
             guard desiredState == .running else {
@@ -622,9 +711,12 @@ public final class ManagedProxyModel: ObservableObject {
                 return
             }
             if await deps.health.probeProxy() {
-                phase = .externalInstanceDetected
+                // Off the pool host the answer is the forwarder's, and the
+                // stand-down owns the phase.
+                if proxyRole == .host { phase = .externalInstanceDetected }
                 return
             }
+            // A role that moved during that probe stops at the spawn site.
             await launch(reportPhase: ManagedProxyReportPhase.restart)
         case .crashLoopGiveUp:
             let failedPhase = Phase.failed(Self.crashLoopMessage)
@@ -671,6 +763,10 @@ public final class ManagedProxyModel: ObservableObject {
             phase = .unavailable
             return
         }
+        // Issue #784: the one place a proxy is spawned holds the role gate
+        // too, so no path can start one off the pool host — a role that
+        // moved during the restart path's last probe stops here.
+        guard proxyRole == .host else { return }
         phase = .starting
         let configFile: URL
         do {

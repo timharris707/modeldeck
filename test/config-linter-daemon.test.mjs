@@ -87,7 +87,7 @@ test('collector failure becomes could-not-evaluate findings and never rejects th
   });
   t.after(() => data.close());
   const report = await data.service.runConfigLint();
-  assert.equal(report.findings.length, 15);
+  assert.equal(report.findings.length, 16);
   assert.ok(report.findings.every((finding) => /could not evaluate/i.test(finding.message)));
   assert.ok(report.findings.every((finding) => finding.severity !== 'error'));
 });

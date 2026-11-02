@@ -9,7 +9,7 @@ import { promisify } from 'node:util';
 import { extractIdentity } from './identity.mjs';
 import { claudeCredentialsPresent } from './claude-keychain.mjs';
 import { validateUnmanagedHome, createProviderProfileHelpers, activeLinkBlockedError } from './provider-profile.mjs';
-import { LEGACY_CLIENT_KEY_SERVICE, assertClientKeyService } from '../client-key-helper.mjs';
+import { LEGACY_CLIENT_KEY_SERVICE, assertClientKeyService, clientKeyShellFetch } from '../client-key-helper.mjs';
 
 const execFileAsync = promisify(execFile);
 const usageProbePath = isSea() ? null : fileURLToPath(new URL('./claude-usage-probe.mjs', import.meta.url));
@@ -303,7 +303,7 @@ export function claudeProxyPointerShellSnippet(keychainService = LEGACY_CLIENT_K
     // for a shell that never had it on (CodeRabbit, PR #301).
     'unset __modeldeck_xtrace',
     'case $- in *x*) __modeldeck_xtrace=1; set +x;; esac',
-    `__modeldeck_key="$("\${MODELDECK_SECURITY_BIN:-/usr/bin/security}" find-generic-password -s ${service} -w 2>/dev/null || true)"`,
+    `__modeldeck_key="$(${clientKeyShellFetch(service)} 2>/dev/null || true)"`,
     'if [ -n "${__modeldeck_key:-}" ]; then export ANTHROPIC_API_KEY="$__modeldeck_key" MODELDECK_MANAGED_ANTHROPIC_API_KEY=1',
     'elif [ "${MODELDECK_MANAGED_ANTHROPIC_API_KEY:-}" = "1" ]; then unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY; fi',
     'unset __modeldeck_key',
@@ -351,7 +351,8 @@ export function claudePinnedEnvFileContent(
       '',
       '  # Proxy-routed profile: headless children need a key the apiKeyHelper',
       '  # cannot supply without an interactive approval (issue #277). Pointer',
-      '  # only — the value is fetched from the Keychain at shell startup and',
+      '  # only — the value is fetched from the Keychain (or, on Linux, the',
+      '  # owner-only key file) at shell startup and',
       '  # never written to disk. A missing/empty item exports NOTHING (an',
       '  # empty ANTHROPIC_API_KEY would override stored OAuth and break the',
       '  # session). The marker records that WE set it, so the unproxied',
@@ -362,7 +363,7 @@ export function claudePinnedEnvFileContent(
       // can stand in a fake without touching the real Keychain; it carries
       // no security cost (anyone who controls the sourcing environment
       // already controls PATH).
-      `  __modeldeck_key="$("\${MODELDECK_SECURITY_BIN:-/usr/bin/security}" find-generic-password -s ${service} -w 2>/dev/null || true)"`,
+      `  __modeldeck_key="$(${clientKeyShellFetch(service)} 2>/dev/null || true)"`,
       '  if [ -n "${__modeldeck_key:-}" ]; then',
       '    export ANTHROPIC_API_KEY="$__modeldeck_key"',
       '    export MODELDECK_MANAGED_ANTHROPIC_API_KEY=1',
@@ -688,6 +689,19 @@ export async function readClaudeRateLimitTier({ claudeConfigDir, readFile = fs.p
   return typeof tier === 'string' && tier.trim() ? tier.trim() : null;
 }
 
+/// Issue #825: the plan name Claude Code saves beside the tier code
+/// (`oauthAccount.planDisplayName`, e.g. "Ultra"). Anthropic renamed Max 20x
+/// to Ultra without changing the tier code, so this is the only local fact
+/// that names the plan. Same local read as the tier; null on any miss.
+export async function readClaudePlanDisplayName({ claudeConfigDir, readFile = fs.promises.readFile } = {}) {
+  if (!claudeConfigDir) return null;
+  let parsed;
+  try { parsed = JSON.parse(await readFile(path.join(claudeConfigDir, '.claude.json'), 'utf8')); }
+  catch { return null; }
+  const name = parsed?.oauthAccount?.planDisplayName;
+  return typeof name === 'string' && name.trim() ? name.trim() : null;
+}
+
 /// Credential-free identity truth written by Claude Code into the profile
 /// home after a runtime session. Missing or malformed data is intentionally
 /// represented as null; callers must never infer an identity from credentials.
@@ -711,7 +725,8 @@ export async function readClaudeProfileIdentity({ claudeConfigDir, readFile = fs
 /// fails for a reason other than a missing CLI, we fall back to credential
 /// presence. On macOS that is a metadata-only Keychain lookup: no credential
 /// value is requested, read, copied, or logged. The result also carries
-/// `plan` (subscriptionType + rateLimitTier) for issue #26's tier line.
+/// `plan` (subscriptionType + rateLimitTier + displayName) for issue #26's
+/// tier line.
 export async function readClaudeAuthStatus({
   claudePath = 'claude',
   claudeConfigDir,
@@ -742,6 +757,7 @@ export async function readClaudeAuthStatus({
   });
 
   const rateLimitTier = await readClaudeRateLimitTier({ claudeConfigDir, readFile });
+  const displayName = await readClaudePlanDisplayName({ claudeConfigDir, readFile });
   try {
     const env = claudeProfileEnv(claudeConfigDir);
     // Native Claude resolves the Keychain item's account from USER. launchd
@@ -757,14 +773,14 @@ export async function readClaudeAuthStatus({
     return {
       authenticated: true,
       identity: extractIdentity(output),
-      plan: { subscriptionType: extractClaudeSubscriptionType(result?.stdout ?? ''), rateLimitTier },
+      plan: { subscriptionType: extractClaudeSubscriptionType(result?.stdout ?? ''), rateLimitTier, displayName },
     };
   } catch (error) {
     if (error.code === 'ENOENT') throw new Error('Claude Code is not installed — install it (npm install -g @anthropic-ai/claude-code), then try again');
     return {
       authenticated: credentialsPresent,
       identity: extractIdentity(`${error?.stdout ?? ''}\n${error?.stderr ?? ''}`),
-      plan: { subscriptionType: extractClaudeSubscriptionType(error?.stdout ?? ''), rateLimitTier },
+      plan: { subscriptionType: extractClaudeSubscriptionType(error?.stdout ?? ''), rateLimitTier, displayName },
       detail: error?.stderr?.trim() || error?.message || null,
     };
   }

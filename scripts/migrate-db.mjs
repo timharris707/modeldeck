@@ -8,7 +8,7 @@
  *   node scripts/migrate-db.mjs --source <path> [--target <path>] [--force] [--strip-prefix <path>]
  *
  * Defaults:
- *   --target        ~/Library/Application Support/ModelDeck/modeldeck.sqlite
+ *   --target        <data folder>/modeldeck.sqlite (src/paths.mjs DATA_DIR)
  *                   (or $MODELDECK_DB_PATH)
  *   --strip-prefix  /tmp/modeldeck-identity-stage
  *                   (staging project mappings must not migrate; repeatable)
@@ -24,7 +24,7 @@
  *   - Target directory is created 0700; the database file is chmod 0600.
  */
 import fs from 'node:fs';
-import os from 'node:os';
+import { DATA_DIR } from '../src/paths.mjs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
@@ -33,7 +33,7 @@ export const DEFAULT_STRIP_PREFIX = '/tmp/modeldeck-identity-stage';
 
 function defaultTarget() {
   return process.env.MODELDECK_DB_PATH
-    || path.join(os.homedir(), 'Library', 'Application Support', 'ModelDeck', 'modeldeck.sqlite');
+    || path.join(DATA_DIR, 'modeldeck.sqlite');
 }
 
 function count(db, table) {

@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { LEGACY_CLIENT_KEY_HELPER } from '../src/client-key-helper.mjs';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
@@ -11,7 +12,8 @@ const CLAUDE_EMAIL = 'pool-target@example.invalid';
 const CODEX_ACCOUNT_ID = 'acct-pool-placeholder';
 const CLIPROXY_PATH = '/fixture/bin/cliproxyapi';
 const PROXY_BASE_URL = 'http://127.0.0.1:9137';
-const API_KEY_HELPER = 'security find-generic-password -s cli-proxy-api-client -w';
+// The platform's helper: Keychain on macOS, the key file elsewhere (#808).
+const API_KEY_HELPER = LEGACY_CLIENT_KEY_HELPER;
 // PR #301 guarded form: pointer captured into a scratch var, exported only
 // when non-empty. The marker line proves the routed rewrite ran.
 const PINNED_PROXY_KEY = 'export ANTHROPIC_API_KEY="$__modeldeck_key"';

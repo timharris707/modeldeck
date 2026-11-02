@@ -64,7 +64,8 @@
         { "path": "/fixture/proxy/auth/codex-a.json", "provider": "codex", "identity": "acct-placeholder-a", "weight": 50, "claimedAccountId": "codex-placeholder-a" }
       ]
     },
-    "managementKey": { "status": "ok", "path": "/fixture/proxy/.mgmt-key", "exists": true, "mode": 384 }
+    "managementKey": { "status": "ok", "path": "/fixture/proxy/.mgmt-key", "exists": true, "mode": 384 },
+    "usageQueue": { "status": "ok", "consumerEnabled": true, "path": "/fixture/proxy/config.yaml", "retentionSeconds": 3600, "retentionSource": "config" }
   },
   "sharedScope": {
     "enabled": true,

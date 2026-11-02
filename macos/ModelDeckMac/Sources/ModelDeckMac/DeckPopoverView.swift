@@ -69,6 +69,7 @@ struct DeckPopoverView: View {
     /// SettingsLink, which with the accessory activation policy opened the
     /// window behind the frontmost app or failed to raise an existing one.
     @Environment(\.openSettings) private var openSettings
+    @Environment(\.openURL) private var openURL
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -93,6 +94,7 @@ struct DeckPopoverView: View {
             proxyBanner
             memberBlackoutBanner
             modelDropBanner
+            gitHubStarLine
             installProgressLine
             DeckCardScroller { content }
             Divider()
@@ -145,6 +147,7 @@ struct DeckPopoverView: View {
             // Cards animate via onChange, so parent-after-child onAppear
             // ordering is fine.
             deckModel.captureUsageChanges(state: statusModel.deckState)
+            deckModel.noteDeckOpenedForStarPrompt()
         }
         .task {
             launchAtLoginModel.load()
@@ -176,6 +179,17 @@ struct DeckPopoverView: View {
             }
             .accessibilityElement(children: .combine)
             .accessibilityAddTraits(.isHeader)
+
+            // Issue #784: beside the wordmark, never inside its combined
+            // element — a parent that combines or labels its children
+            // swallows theirs (#65/#113/#272). The role the lifecycle acts
+            // on, so a remembered remote role shows before the first read.
+            // Issue #788: the hub comes with each state read; the label's
+            // own timeline keeps its age moving between reads.
+            RemotePoolHeaderLabel(header: ProxyRoleCopy.remotePoolHeader(
+                role: proxyModel.proxyRole,
+                hub: statusModel.deckState?.proxy?.hub
+            ))
 
             Spacer()
 
@@ -556,7 +570,9 @@ struct DeckPopoverView: View {
     @ViewBuilder
     private var proxyBanner: some View {
         switch proxyModel.phase {
-        case .idle, .unavailable, .starting, .running:
+        // Issue #784: a remote-role Mac's story is the header's "Remote pool"
+        // label; it costs no row here.
+        case .idle, .unavailable, .starting, .running, .remotePool:
             EmptyView()
         case .externalInstanceDetected:
             // Issue #445 (Tim's ruling): this state may not cost a deck row.
@@ -668,6 +684,49 @@ struct DeckPopoverView: View {
                     .accessibilityLabel("Model drop. \(overflow)")
             }
         }
+    }
+
+    /// Tim, 2026-11-01: the rare, once-ever GitHub star line. It waits
+    /// while anything with real news holds the header (an update, setup,
+    /// a connection problem, an account alert), then appears in the same
+    /// dismissible style as every other header notice. Star or dismiss
+    /// ends it for good.
+    @ViewBuilder
+    private var gitHubStarLine: some View {
+        if deckModel.showsGitHubStarPrompt, headerHasNoNews {
+            DismissibleHeaderNotice(
+                dismissHelp: "Dismiss — this won't show again",
+                dismissAccessibilityLabel: "Dismiss GitHub star request",
+                onDismiss: { deckModel.finishGitHubStarPrompt() }
+            ) {
+                Text("Finding ModelDeck useful? A GitHub star helps other people find it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+                Button("★ Star") {
+                    openURL(GitHubStarPrompt.repositoryURL)
+                    deckModel.finishGitHubStarPrompt()
+                }
+                .buttonStyle(.link)
+                .font(.caption)
+                .help("Opens ModelDeck on GitHub")
+            }
+        }
+    }
+
+    /// No other header line with real news is showing.
+    private var headerHasNoNews: Bool {
+        if case .prompting = stagedPromptModel.state { return false }
+        if setupModel.phase.needsPopoverCard || onboardingModel.phase.needsPopoverCard { return false }
+        if case .unreachable = statusModel.connection { return false }
+        if case .busy = statusModel.connection { return false }
+        if launchAtLoginModel.lastError != nil || setupModel.didReregisterForUpdate { return false }
+        if deckModel.codexProfilesMigrationLine != nil || deckModel.codexProfilesMovedNoticeVisible { return false }
+        if AppUpdateInstallModel.statusText(for: appUpdateInstallModel.phase) != nil { return false }
+        if !(statusModel.deckState?.memberBlackout?.alerts ?? []).isEmpty { return false }
+        if !(statusModel.deckState?.modelDrop?.drops ?? []).isEmpty { return false }
+        return true
     }
 
     @ViewBuilder
@@ -3175,6 +3234,92 @@ struct MenuBarSourceCheckmark: View {
             .foregroundStyle(Color.accentColor)
             .help(tooltip)
             .accessibilityLabel("Shown in menu bar")
+    }
+}
+
+/// Issue #784: the header's quiet "Remote pool" label, beside the wordmark —
+/// remote role only, so a host deck is unchanged, and no row of its own
+/// (deck space is sacred). Its own accessibility element, and a leaf: it
+/// labels nothing but itself. The tooltip and the VoiceOver hint carry the
+/// daemon's reason, which is also why the pool controls are absent here.
+///
+/// Issue #788: when the daemon reports the pool host's usage page, the label
+/// opens it in the browser, with when the page last answered right after it.
+/// Still one leaf element: the link's explicit label carries the freshness
+/// its children show. On hover, a pointing hand and the faint halo of the
+/// card's graph trigger. A deck too narrow for the freshness (single column)
+/// drops it from view before the wordmark gives up any width; the tooltip
+/// and the spoken label keep it.
+struct RemotePoolHeaderLabel: View {
+    let header: RemotePoolHeader?
+    @State private var isHovered = false
+
+    var body: some View {
+        if let header {
+            switch header {
+            case .label:
+                label
+                    .help(ProxyRoleCopy.remoteReason)
+                    .accessibilityLabel(ProxyRoleCopy.remotePoolAccessibilityLabel)
+                    .accessibilityHint(ProxyRoleCopy.remoteReason)
+            case .link(let page, let hub):
+                // The footer freshness line's timeline: the age keeps moving
+                // while the deck stays open, and the spoken label and tooltip
+                // that repeat it move with it.
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    let freshness = ProxyRoleCopy.hubFreshness(hub, now: context.date)
+                    Button {
+                        header.open(with: WorkspaceBrowserOpener())
+                    } label: {
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 4) {
+                                label
+                                if let freshness {
+                                    Text(freshness)
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .fixedSize()
+                                }
+                            }
+                            label
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(ProxyRoleCopy.remotePoolLinkTooltip(page: page, freshness: freshness))
+                    .accessibilityLabel(ProxyRoleCopy.remotePoolLinkAccessibilityLabel(freshness: freshness))
+                    .accessibilityHint(ProxyRoleCopy.opensUsagePageHint)
+                }
+                .background(
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(Color.primary.opacity(isHovered ? 0.1 : 0))
+                        .padding(.horizontal, -4)
+                        .padding(.vertical, -2)
+                )
+                .onHover { inside in
+                    guard inside != isHovered else { return }
+                    isHovered = inside
+                    if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                }
+                // Keeps the cursor stack balanced if the link goes away
+                // under the pointer.
+                .onDisappear {
+                    if isHovered {
+                        isHovered = false
+                        NSCursor.pop()
+                    }
+                }
+            }
+        }
+    }
+
+    private var label: some View {
+        Text(ProxyRoleCopy.remotePoolLabel)
+            .font(.system(size: 10, weight: .medium))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .fixedSize()
     }
 }
 

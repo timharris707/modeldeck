@@ -6,6 +6,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+// The installer refuses off macOS (#806); its behaviour is only tested there.
+const darwinOnly = { skip: process.platform !== 'darwin' && 'install-shell-env.sh is macOS-only' };
 import { claudePinnedEnvFileContent } from '../src/adapters/claude.mjs';
 
 // Issue #66: the ~/.zshenv block must source the daemon-written pinned env
@@ -27,7 +30,7 @@ function fixtureHome(t) {
   return home;
 }
 
-test('shell removal refuses unmanaged homes and a symlinked shell file before writes', (t) => {
+test('shell removal refuses unmanaged homes and a symlinked shell file before writes', darwinOnly, (t) => {
   const home = fixtureHome(t);
   const target = path.join(home, '.zshenv');
   const original = '# placeholder original\n';
@@ -46,7 +49,7 @@ test('shell removal refuses unmanaged homes and a symlinked shell file before wr
   assert.equal(fs.readFileSync(other, 'utf8'), original);
 });
 
-test('installs a block that sources the pinned env file with a readlink fallback', (t) => {
+test('installs a block that sources the pinned env file with a readlink fallback', darwinOnly, (t) => {
   const home = fixtureHome(t);
   runInstaller(home);
   const content = fs.readFileSync(path.join(home, '.zshenv'), 'utf8');
@@ -67,7 +70,7 @@ test('installs a block that sources the pinned env file with a readlink fallback
   assert.equal(fs.readFileSync(path.join(home, '.zshenv'), 'utf8'), content);
 });
 
-test('sourcing the block exports the pinned pair when the env file exists', (t) => {
+test('sourcing the block exports the pinned pair when the env file exists', darwinOnly, (t) => {
   const home = fixtureHome(t);
   runInstaller(home);
   const dataDir = path.join(home, 'Library', 'Application Support', 'ModelDeck');
@@ -104,7 +107,7 @@ function fakeSecurity(t, home, mode) {
   return bin;
 }
 
-test('a failed proxy Keychain lookup exports NOTHING and shell startup continues (#277 / #278 review, major 1)', (t) => {
+test('a failed proxy Keychain lookup exports NOTHING and shell startup continues (#277 / #278 review, major 1)', darwinOnly, (t) => {
   // An empty exported ANTHROPIC_API_KEY is not harmless — it overrides the
   // profile's stored OAuth. A missing item must leave the variable unset.
   const home = fixtureHome(t);
@@ -119,7 +122,7 @@ test('a failed proxy Keychain lookup exports NOTHING and shell startup continues
   assert.equal(output, '<unset|unset>\ncontinued');
 });
 
-test('a present Keychain item exports the pointer value with the managed marker', (t) => {
+test('a present Keychain item exports the pointer value with the managed marker', darwinOnly, (t) => {
   const home = fixtureHome(t);
   runInstaller(home);
   const dataDir = path.join(home, 'Library', 'Application Support', 'ModelDeck');
@@ -132,7 +135,7 @@ test('a present Keychain item exports the pointer value with the managed marker'
   assert.equal(output, '<FAKE-PLACEHOLDER-KEY|1>');
 });
 
-test('a vanished Keychain item clears an inherited managed key instead of leaving it stale', (t) => {
+test('a vanished Keychain item clears an inherited managed key instead of leaving it stale', darwinOnly, (t) => {
   const home = fixtureHome(t);
   runInstaller(home);
   const dataDir = path.join(home, 'Library', 'Application Support', 'ModelDeck');
@@ -151,7 +154,7 @@ test('a vanished Keychain item clears an inherited managed key instead of leavin
   assert.equal(output, '<unset>');
 });
 
-test('xtrace never prints the expanded key assignment (#278 review, major 1)', (t) => {
+test('xtrace never prints the expanded key assignment (#278 review, major 1)', darwinOnly, (t) => {
   const home = fixtureHome(t);
   runInstaller(home);
   const dataDir = path.join(home, 'Library', 'Application Support', 'ModelDeck');
@@ -173,7 +176,7 @@ test('xtrace never prints the expanded key assignment (#278 review, major 1)', (
   assert.ok(stderr.includes('traced-after') || stderr.includes(':'), 'xtrace was not restored');
 });
 
-test('a nested shell with pins keeps its session identity and key — no repin (#278 review, blocker 3)', (t) => {
+test('a nested shell with pins keeps its session identity and key — no repin (#278 review, blocker 3)', darwinOnly, (t) => {
   // A nested zsh belongs to the session that spawned it. After a
   // proxy → direct activation flip rewrites claude-env.sh, a child of the
   // OLD proxied session must keep the old pins AND its inherited managed
@@ -200,7 +203,7 @@ test('a nested shell with pins keeps its session identity and key — no repin (
   assert.equal(output, '</profiles/old-proxied|inherited-managed-placeholder|1>');
 });
 
-test('an unproxied profile clears an inherited key, but never the user\'s own (CodeRabbit, PR #278)', (t) => {
+test('an unproxied profile clears an inherited key, but never the user\'s own (CodeRabbit, PR #278)', darwinOnly, (t) => {
   // The nested-shell case: a shell started while a PROXIED profile was
   // active exports the key; switching to an unproxied profile rewrites
   // claude-env.sh, and a subshell sourcing it must come up WITHOUT the key
@@ -232,7 +235,7 @@ test('an unproxied profile clears an inherited key, but never the user\'s own (C
   assert.equal(preserved, '<user-own-key-placeholder>', "a user's own key is never touched");
 });
 
-test('override path agrees end-to-end: daemon write path and generated block source the same file', async (t) => {
+test('override path agrees end-to-end: daemon write path and generated block source the same file', darwinOnly, async (t) => {
   const home = fixtureHome(t);
   runInstaller(home);
   const overrideFile = path.join(home, 'custom-state', 'claude-env.sh');
@@ -280,7 +283,7 @@ test('override path agrees end-to-end: daemon write path and generated block sou
 // the ~/.codex active-profile symlink once at shell startup, mirroring the
 // Claude pinning so a `codex login` can never land in a profile that was
 // activated after the terminal opened.
-test('installs a Codex block that resolves the symlink once and respects an explicit CODEX_HOME', (t) => {
+test('installs a Codex block that resolves the symlink once and respects an explicit CODEX_HOME', darwinOnly, (t) => {
   const home = fixtureHome(t);
   runInstaller(home);
   const content = fs.readFileSync(path.join(home, '.zshenv'), 'utf8');
@@ -297,7 +300,7 @@ test('installs a Codex block that resolves the symlink once and respects an expl
   assert.equal(content.match(/>>> ModelDeck Codex identity switching >>>/g).length, 1);
 });
 
-test('sourcing the Codex block exports the symlink target frozen at shell open', (t) => {
+test('sourcing the Codex block exports the symlink target frozen at shell open', darwinOnly, (t) => {
   const home = fixtureHome(t);
   runInstaller(home);
   const profile = path.join(home, '.codex-profiles', 'work');
@@ -309,7 +312,7 @@ test('sourcing the Codex block exports the symlink target frozen at shell open',
   assert.equal(output, profile);
 });
 
-test('a RELATIVE symlink target is anchored at $HOME before export (PR #162 review)', (t) => {
+test('a RELATIVE symlink target is anchored at $HOME before export (PR #162 review)', darwinOnly, (t) => {
   const home = fixtureHome(t);
   runInstaller(home);
   const profile = path.join(home, '.codex-profiles', 'work');
@@ -322,7 +325,7 @@ test('a RELATIVE symlink target is anchored at $HOME before export (PR #162 revi
   assert.equal(output, profile);
 });
 
-test('no ~/.codex symlink means no CODEX_HOME export (stock behavior)', (t) => {
+test('no ~/.codex symlink means no CODEX_HOME export (stock behavior)', darwinOnly, (t) => {
   const home = fixtureHome(t);
   runInstaller(home);
   // Nothing at ~/.codex at all.
@@ -338,7 +341,7 @@ test('no ~/.codex symlink means no CODEX_HOME export (stock behavior)', (t) => {
   assert.equal(realDir, 'unset');
 });
 
-test('an already-exported CODEX_HOME wins over the symlink (issue #106 launch commands)', (t) => {
+test('an already-exported CODEX_HOME wins over the symlink (issue #106 launch commands)', darwinOnly, (t) => {
   const home = fixtureHome(t);
   runInstaller(home);
   const active = path.join(home, '.codex-profiles', 'active');
@@ -352,7 +355,7 @@ test('an already-exported CODEX_HOME wins over the symlink (issue #106 launch co
   assert.equal(output, explicit);
 });
 
-test('adds the Codex block to a pre-#161 install without duplicating the Claude block', (t) => {
+test('adds the Codex block to a pre-#161 install without duplicating the Claude block', darwinOnly, (t) => {
   const home = fixtureHome(t);
   const zshenv = path.join(home, '.zshenv');
   // A ~/.zshenv exactly as the pre-#161 installer left it: Claude block
@@ -378,7 +381,7 @@ test('adds the Codex block to a pre-#161 install without duplicating the Claude 
   assert.ok(upgraded.includes('export EDITOR=vi'));
 });
 
-test('--remove strips the Codex block too', (t) => {
+test('--remove strips the Codex block too', darwinOnly, (t) => {
   const home = fixtureHome(t);
   runInstaller(home);
   runInstaller(home, ['--remove']);
@@ -387,7 +390,7 @@ test('--remove strips the Codex block too', (t) => {
   assert.ok(!removed.includes('CODEX_HOME'));
 });
 
-test('upgrades a legacy readlink-only block in place and --remove restores the file', (t) => {
+test('upgrades a legacy readlink-only block in place and --remove restores the file', darwinOnly, (t) => {
   const home = fixtureHome(t);
   const zshenv = path.join(home, '.zshenv');
   fs.writeFileSync(zshenv, [

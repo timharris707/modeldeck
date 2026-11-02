@@ -97,6 +97,53 @@ struct AvailabilityTierWeightTests {
         #expect(weight == AvailabilityTierWeight(value: 5, isKnown: true))
     }
 
+    // Issue #799: Anthropic renamed Max 20x to Ultra; a tier code or
+    // subscription that says "ultra" with no multiplier still weighs 20.
+    @Test func claudeUltraWithoutMultiplierWeighs20() {
+        #expect(AvailabilityHealthEngine.claudeTierWeight(
+            ProviderPlanInfo(rateLimitTier: "default_claude_ultra")
+        ) == AvailabilityTierWeight(value: 20, isKnown: true))
+        #expect(AvailabilityHealthEngine.claudeTierWeight(
+            ProviderPlanInfo(subscriptionType: "ultra")
+        ) == AvailabilityTierWeight(value: 20, isKnown: true))
+    }
+
+    @Test func ultraTierCodeLabelsUltra() {
+        #expect(PlanTierFormatter.label(subscriptionType: nil, rateLimitTier: "default_claude_ultra") == "Ultra")
+        #expect(PlanTierFormatter.label(subscriptionType: "ultra", rateLimitTier: "default_claude_ultra") == "Ultra")
+        #expect(PlanTierFormatter.label(subscriptionType: nil, rateLimitTier: "default_claude_max_20x") == "Max (20x)")
+    }
+
+    // Issue #825: Claude saves the plan name ("Ultra") beside a tier code
+    // that still says max_20x. The label shows the name; the weight stays 20,
+    // and the name alone still weighs 20 if the tier code loses its multiplier.
+    @Test func planDisplayNameWinsTheLabel() {
+        #expect(PlanTierFormatter.label(
+            subscriptionType: nil, rateLimitTier: "default_claude_max_20x", displayName: "Ultra"
+        ) == "Ultra")
+        #expect(PlanTierFormatter.label(
+            subscriptionType: nil, rateLimitTier: "default_claude_max_20x", displayName: "  "
+        ) == "Max (20x)")
+        let account = DeckAccount(
+            id: "c1", provider: "claude", label: "Studio",
+            metadata: DeckAccountMetadata(claudePlan: ProviderPlanInfo(
+                rateLimitTier: "default_claude_max_20x", displayName: "Ultra"
+            ))
+        )
+        #expect(account.planLabel == "Ultra")
+        #expect(AvailabilityHealthEngine.claudeTierWeight(account.metadata?.claudePlan)
+            == AvailabilityTierWeight(value: 20, isKnown: true))
+        #expect(AvailabilityHealthEngine.claudeTierWeight(
+            ProviderPlanInfo(rateLimitTier: "default_claude", displayName: "Ultra")
+        ) == AvailabilityTierWeight(value: 20, isKnown: true))
+    }
+
+    @Test func planDisplayNameDecodesFromDaemonJSON() throws {
+        let json = #"{"subscriptionType":null,"rateLimitTier":"default_claude_max_20x","displayName":"Ultra"}"#
+        let plan = try JSONDecoder().decode(ProviderPlanInfo.self, from: Data(json.utf8))
+        #expect(plan == ProviderPlanInfo(rateLimitTier: "default_claude_max_20x", displayName: "Ultra"))
+    }
+
     @Test func claudeUnknownTierFallsBackTo1AndIsFlagged() {
         #expect(AvailabilityHealthEngine.claudeTierWeight(nil)
             == AvailabilityTierWeight(value: 1, isKnown: false))

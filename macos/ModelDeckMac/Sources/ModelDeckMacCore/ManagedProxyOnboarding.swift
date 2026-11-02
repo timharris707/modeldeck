@@ -251,6 +251,24 @@ public func adoptionRecord(
     )
 }
 
+/// Issue #784: adoption's refusal on a Mac that is not the pool host. Its
+/// proxy port belongs to the forwarder that reaches the host, so nothing was
+/// inspected or stopped — and unlike the generic refusal, the record never
+/// suggests stopping what is on the port.
+public func remoteRoleAdoptionRecord() -> AdoptionRecord {
+    let plan = AdoptionPlan.refuse(reason: ProxyRoleCopy.remoteReason)
+    return AdoptionRecord(
+        outcome: .refused(reason: ProxyRoleCopy.remoteReason),
+        stoppedWhat: plan.targetDescription,
+        stoppedHow: plan.actionDescription,
+        headline: ManagedProxyOnboardingCopy.adoptionRefusedHeadline,
+        lines: [
+            ProxyRoleCopy.remoteReason,
+            "ModelDeck stopped nothing and changed nothing on this Mac.",
+        ]
+    )
+}
+
 // MARK: - Rollback (honest-uninstall style)
 
 /// The concrete steps the user's OWN setup needs to take the proxy back.
@@ -386,6 +404,13 @@ public func managedProxyStartOffered(
     managedProxyMayRunAtLaunch(recordedChoice: recordedChoice)
 }
 
+/// Issue #784: whether Settings → General → Managed proxy offers Enable or
+/// Stop Managing at all. Not on a Mac that uses the pool on another machine:
+/// there is no proxy of its own to manage, and the section says why instead.
+public func managedProxySettingsOffersActions(role: ProxyRole) -> Bool {
+    role != .remote
+}
+
 // MARK: - Copy
 
 /// Every user-visible string in the flow, in one place so the tests can hold
@@ -442,8 +467,14 @@ public enum ManagedProxyOnboardingCopy {
         "ModelDeck stops its proxy and hands the port back. It will print the exact commands your own setup needs to take over again."
     public static let enableFromSettingsTitle = "Enable Managed Proxy"
 
-    /// The choice, as one plain line in Settings.
-    public static func settingsSummary(for choice: ManagedProxyOnboardingChoice?) -> String {
+    /// The choice, as one plain line in Settings. Issue #784: in remote role
+    /// the line is the daemon's own reason instead — the choice still stands
+    /// for when this Mac hosts the pool again.
+    public static func settingsSummary(
+        for choice: ManagedProxyOnboardingChoice?,
+        role: ProxyRole = .host
+    ) -> String {
+        if role == .remote { return ProxyRoleCopy.remoteReason }
         switch choice {
         case .adopted:
             return "ModelDeck manages the proxy — it took over the one you were running."
@@ -545,25 +576,48 @@ public final class ManagedProxyOnboardingModel: ObservableObject {
     @Published public private(set) var lastAdoptionRecord: AdoptionRecord?
     /// Set by `stopManagingProxy()`; the rollback's printed steps.
     @Published public private(set) var restoreInstructions: RestoreInstructions?
+    /// Issue #784: the pool role the app acts on — the remembered one at
+    /// launch, then the latest state's. The question is asked on host only.
+    @Published public private(set) var proxyRole: ProxyRole
 
     public var choice: ManagedProxyOnboardingChoice? { deps.store.choice }
 
     private let deps: Dependencies
+    /// Issue #784: the launch question was due while the role was remote, so
+    /// a host role asks it then.
+    private var launchQuestionPending = false
 
-    public init(dependencies: Dependencies) {
+    /// `proxyRole` is the role the lifecycle remembered (the app passes the
+    /// managed proxy model's); host, today's behaviour, when none is.
+    public init(dependencies: Dependencies, proxyRole: ProxyRole = .host) {
         self.deps = dependencies
+        self.proxyRole = proxyRole
     }
 
     // MARK: Launch
 
-    /// Called once from the app's launch sequence, after slice C's evaluation.
+    /// Called once from the app's launch sequence, after slice C's evaluation
+    /// (and by `applyProxyRole` when the host role it waited for arrives).
     /// Asks at most one question, and only if the user has never answered.
     public func evaluateOnLaunch() async {
         guard deps.bundleAvailable, deps.store.choice == nil else {
             phase = .hidden
             return
         }
+        // Issue #784: asked on the pool host only. Elsewhere port 8317 is the
+        // forwarder's: the adoption offer would offer to stop it, the consent
+        // screen to start a proxy on its port, and detection would send the
+        // management handshake through it.
+        guard proxyRole == .host else {
+            deferLaunchQuestion()
+            return
+        }
         let detection = classifyExternalProxy(await deps.detector.detectExternalProxy())
+        // The role may have moved while detection was out.
+        guard proxyRole == .host else {
+            deferLaunchQuestion()
+            return
+        }
         switch decideFirstLaunch(
             bundleAvailable: deps.bundleAvailable,
             recordedChoice: deps.store.choice,
@@ -578,13 +632,58 @@ public final class ManagedProxyOnboardingModel: ObservableObject {
         }
     }
 
+    // MARK: Pool role (issue #784)
+
+    /// Applies the role from a fresh daemon state, synchronously and in state
+    /// order. A host role asks a launch question that was waiting for it (in
+    /// the returned task; tests await it, the app fires and forgets). A
+    /// remote role withdraws a card that is up — withdrawn, not answered, so
+    /// it is asked again if the role returns to host.
+    @discardableResult
+    public func applyProxyRole(_ role: ProxyRole) -> Task<Void, Never>? {
+        guard role != proxyRole else { return nil }
+        proxyRole = role
+        switch role {
+        case .remote:
+            switch phase {
+            case .adoptionOffer, .consent:
+                deferLaunchQuestion()
+            case .hidden, .working, .record:
+                break
+            }
+            return nil
+        case .host:
+            guard launchQuestionPending else { return nil }
+            launchQuestionPending = false
+            return Task { await self.evaluateOnLaunch() }
+        }
+    }
+
+    private func deferLaunchQuestion() {
+        phase = .hidden
+        launchQuestionPending = true
+    }
+
     // MARK: Adoption branch
 
     /// The one place a process the user started is ever stopped, and only
     /// from the explicit button. Every exit emits a record.
     public func adopt() async {
+        // Issue #784: only the pool host adopts. Elsewhere the port belongs
+        // to the forwarder that reaches the host, so nothing is inspected or
+        // stopped, and the refusal is recorded like every other exit.
+        guard proxyRole == .host else {
+            finish(record: remoteRoleAdoptionRecord())
+            return
+        }
         phase = .working(ManagedProxyOnboardingCopy.adoptionWorkingMessage)
         let supervision = await deps.supervision.inspectSupervision()
+        // Re-checked after the inspection: a role that moved meanwhile stops
+        // nothing.
+        guard proxyRole == .host else {
+            finish(record: remoteRoleAdoptionRecord())
+            return
+        }
         let plan = planAdoption(for: supervision)
 
         if case .refuse = plan {

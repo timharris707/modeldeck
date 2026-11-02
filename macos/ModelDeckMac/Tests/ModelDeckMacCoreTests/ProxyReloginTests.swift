@@ -390,6 +390,54 @@ struct ProxyReloginFlowTests {
         #expect(model.notes[broken.id] == nil)
         #expect(model.errors[broken.id] == nil)
     }
+
+    // Issue #784: the daemon refuses repairs on a Mac that uses the pool on
+    // another machine. Its sentence is the reason, not a failure.
+    @Test func aRemoteRoleRefusalReadsAsTheDaemonsReasonNotAFailure() async {
+        let manager = ReloginStub(start: .failure(DaemonClientError.daemonCodedError(
+            message: ProxyRoleCopy.remoteReason,
+            code: ProxyRoleCopy.remoteRefusalCode,
+            status: 409
+        )))
+        let model = makeModel(manager: manager)
+        let broken = account(proxyCredential: "error")
+
+        model.begin(account: broken)
+        await model.tasks[broken.id]?.value
+
+        #expect(model.phase(for: broken.id) == nil)
+        #expect(model.errors[broken.id] == nil)
+        #expect(model.notes[broken.id] == ProxyRoleCopy.remoteReason)
+    }
+
+    // Issue #784: a repair already waiting on the browser when the role moves
+    // to remote. The daemon answers `idle` for it from then on, which would
+    // never settle; the attempt ends on the daemon's reason instead.
+    @Test func aRoleMovedToRemoteEndsAPollingRepair() async {
+        let manager = ReloginStub(
+            start: .success(ProxyReloginState(phase: "awaiting-browser", url: "https://provider.invalid/a")),
+            polls: [
+                ProxyReloginState(phase: "awaiting-browser"),
+                ProxyReloginState(
+                    phase: "idle",
+                    available: false,
+                    reason: ProxyRoleCopy.remoteReason,
+                    code: ProxyRoleCopy.remoteRefusalCode
+                ),
+                // Never reached: the poll stops on the remote answer.
+                ProxyReloginState(phase: "succeeded"),
+            ]
+        )
+        let model = makeModel(manager: manager)
+        let broken = account(proxyCredential: "error")
+
+        model.begin(account: broken)
+        await model.tasks[broken.id]?.value
+
+        #expect(model.phase(for: broken.id) == nil)
+        #expect(model.errors[broken.id] == nil)
+        #expect(model.notes[broken.id] == ProxyRoleCopy.remoteReason)
+    }
 }
 
 // MARK: - Presentation

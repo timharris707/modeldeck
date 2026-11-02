@@ -371,6 +371,8 @@ public enum AvailabilityHealthEngine {
             return AvailabilityTierWeight(value: multiplier, isKnown: true)
         }
         let words = planWords(plan)
+        // Ultra is Max 20x renamed (Anthropic, 2026-10-30, issue #799).
+        if words.contains("ultra") { return AvailabilityTierWeight(value: 20, isKnown: true) }
         if words.contains("max") { return AvailabilityTierWeight(value: 5, isKnown: true) }
         if words.contains("pro") || words.contains("team") {
             return AvailabilityTierWeight(value: 1, isKnown: true)
@@ -392,7 +394,7 @@ public enum AvailabilityHealthEngine {
     /// on one exact payload spelling.
     private static func planWords(_ plan: ProviderPlanInfo?) -> Set<String> {
         var words: Set<String> = []
-        for raw in [plan?.subscriptionType, plan?.rateLimitTier].compactMap({ $0 }) {
+        for raw in [plan?.subscriptionType, plan?.rateLimitTier, plan?.displayName].compactMap({ $0 }) {
             for token in raw.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }) {
                 words.insert(String(token))
             }

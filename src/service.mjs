@@ -19,6 +19,7 @@ import {
   readClaudeAuthStatus,
   readClaudeProfileIdentity,
   readClaudeRateLimitTier,
+  readClaudePlanDisplayName,
   validateClaudeProfileHome,
 } from './adapters/claude.mjs';
 import {
@@ -47,7 +48,9 @@ import {
   clientKeyHelperCommand,
   clientKeyService,
   clientKeyServiceForRecord,
+  clientKeyShellFetch,
 } from './client-key-helper.mjs';
+import { assertPoolKeyHash, poolKeyEntry, poolKeySelection } from './pool-client-keys.mjs';
 import { claudeModelTier, isModelDowngrade, isModelRecovery } from './model-tier.mjs';
 import {
   createCodexProfileHome,
@@ -97,8 +100,9 @@ import { runDiagnostician as scanDiagnostician } from './diagnostician.mjs';
 import { refitUsageEstimates } from './usage-estimate.mjs';
 import { collectConfigLintSnapshot, configLintSnapshotOptions } from './config-linter-snapshot.mjs';
 import { configLintFailureFindings, evaluateConfigLint } from './config-linter.mjs';
-import { CODEX_PROFILES_DIR } from './paths.mjs';
+import { CLAUDE_PROFILES_DIR, CODEX_PROFILES_DIR } from './paths.mjs';
 import { migrateCodexProfilesDir } from './codex-profiles-migration.mjs';
+import { poolCredentialDetail, poolMemberTag } from './pool-member-tag.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -246,6 +250,12 @@ export const CLIPROXY_API_KEY_HELPER = LEGACY_CLIENT_KEY_HELPER;
 export const DEFAULT_CLIPROXY_BASE_URL = 'http://127.0.0.1:8317';
 const DEFAULT_PROXY_JOIN_POLL_INTERVAL_MS = 2_000;
 const DEFAULT_PROXY_JOIN_TIMEOUT_MS = 5 * 60_000;
+// Issue #827: remote decks show the hub's pool record, so the hub is read
+// every minute, and its record counts only while under 10 minutes old
+// (the hub's rebalancer writes weights every 5).
+export const POOL_HUB_POLL_MS = 60_000;
+export const POOL_HUB_FRESH_MS = 10 * 60_000;
+const POOL_HUB_CREDENTIALS = new Set(['ok', 'error', 'resting', 'disabled']);
 const DEFAULT_PROXY_JOIN_TERMINATION_GRACE_MS = 2_000;
 
 // A CLIProxyAPI instance is local by definition; anything else (corporate
@@ -726,6 +736,34 @@ function managedCodexProfile(profileRef, profilesDir) {
   return managedProfile(profileRef, profilesDir, 'Codex');
 }
 
+/// Issue #827: validate the hub page's `pool` block into
+/// `{ readAt, members: Map<provider:tag, entry | null> }`. A tag listed twice
+/// maps to null so it matches nobody. A detail other than the two safe forms
+/// (`poolCredentialDetail`) is refused. Throws on any malformed field.
+function parsePoolHubRecord(pool) {
+  const invalid = () => { throw new Error('invalid hub pool'); };
+  if (!pool || typeof pool !== 'object' || !isIso8601Timestamp(pool.readAt)
+    || !Array.isArray(pool.members) || pool.members.length > 200) invalid();
+  const members = new Map();
+  for (const entry of pool.members) {
+    if (!entry || (entry.provider !== 'claude' && entry.provider !== 'codex')
+      || typeof entry.match !== 'string' || !/^[0-9a-f]{24}$/.test(entry.match)
+      || !(entry.weight === null || (Number.isInteger(entry.weight) && entry.weight >= 0 && entry.weight <= 1000))
+      || typeof entry.fableExcluded !== 'boolean'
+      || !(entry.credential === null || POOL_HUB_CREDENTIALS.has(entry.credential))
+      || !(entry.credentialDetail === null
+        || poolCredentialDetail(entry.credential, entry.credentialDetail) === entry.credentialDetail)) {
+      invalid();
+    }
+    const key = `${entry.provider}:${entry.match}`;
+    members.set(key, members.has(key) ? null : {
+      weight: entry.weight, fableExcluded: entry.fableExcluded,
+      credential: entry.credential, credentialDetail: entry.credentialDetail,
+    });
+  }
+  return { readAt: Date.parse(pool.readAt), members };
+}
+
 function isIso8601Timestamp(value) {
   if (typeof value !== 'string') return false;
   const match = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-](\d{2}):(\d{2}))$/);
@@ -773,7 +811,7 @@ export class ModelDeckService {
     this.store = store;
     this.projectsRoot = options.projectsRoot;
     this.claudePath = options.claudePath || 'claude';
-    this.claudeProfilesDir = options.claudeProfilesDir || path.join(os.homedir(), 'Library', 'Application Support', 'ModelDeck', 'claude-profiles');
+    this.claudeProfilesDir = options.claudeProfilesDir || CLAUDE_PROFILES_DIR;
     this.claudeActiveLink = options.claudeActiveLink || path.join(os.homedir(), '.claude');
     // Issue #596: where an UNPINNED `claude` writes its default .claude.json.
     // Defaults to the active link's parent (production: the user's home).
@@ -832,7 +870,12 @@ export class ModelDeckService {
     this.proxyReloginDriver = options.proxyReloginDriver || new ProxyReloginDriver({
       baseUrl: this.cliproxyBaseUrl,
       managementKeyPath: this.cliproxyManagementKeyPath,
-      fetcher: options.proxyReloginFetch || globalThis.fetch,
+      fetcher: (url, init) => {
+        // A role change can finish while the driver reads the key.
+        const remote = this.proxyRoleRemote();
+        if (remote) throw Object.assign(serviceError(remote.reason, 409), remote);
+        return (options.proxyReloginFetch || globalThis.fetch)(url, init);
+      },
       readFile: options.proxyReloginReadFile || fs.promises.readFile,
       requestTimeoutMs: options.proxyReloginRequestTimeoutMs,
     });
@@ -863,6 +906,7 @@ export class ModelDeckService {
       warn: options.warnUsageQueue,
       log: options.logUsageQueue,
       requestTimeoutMs: options.usageQueueRequestTimeoutMs,
+      canPull: () => !this.proxyRoleRemote(),
     });
     this.detectForeignUsageConsumers = options.detectForeignUsageConsumers
       || ((guardOptions) => (options.platform || process.platform) === 'darwin'
@@ -973,6 +1017,7 @@ export class ModelDeckService {
     this.createCodexProfile = options.createCodexProfile || createCodexProfileHome;
     this.readClaudeAuth = options.readClaudeAuth || readClaudeAuthStatus;
     this.readClaudeTier = options.readClaudeTier || readClaudeRateLimitTier;
+    this.readClaudePlanName = options.readClaudePlanName || readClaudePlanDisplayName;
     this.readClaudeIdentity = options.readClaudeIdentity || readClaudeProfileIdentity;
     this.readCodexAuth = options.readCodexAuth || readCodexLoginStatus;
     this.readCodexPlan = options.readCodexPlan || readCodexPlan;
@@ -1014,6 +1059,15 @@ export class ModelDeckService {
     this.now = options.now || Date.now;
     this.setTimeout = options.setTimeout || globalThis.setTimeout;
     this.clearTimeout = options.clearTimeout || globalThis.clearTimeout;
+    this.poolHubFetch = options.poolHubFetch || globalThis.fetch;
+    this.logPoolHub = options.logPoolHub || ((message) => console.error(message));
+    this.poolHubUrl = '';
+    this.poolHubStopped = true;
+    this.poolHubTimer = null;
+    this.poolHubRequest = null;
+    this.poolHubStatus = { lastAttemptAt: null, lastAnsweredAt: null, lastFailedAt: null, lastReadOk: null };
+    this.poolHubFailed = false;
+    this.poolHubPool = null;
     this.yieldToServeLoop = options.yieldToServeLoop
       || (() => new Promise((resolve) => setImmediate(resolve)));
     this.logUsageSnapshotPrune = options.logUsageSnapshotPrune
@@ -1190,6 +1244,11 @@ export class ModelDeckService {
   }
 
   configLintStatus() {
+    // A report taken under the other proxy role describes a pool this Mac no
+    // longer (or does not yet) manage; never serve it as current (#784 review).
+    if (this.configLintLatest && this.configLintRole !== this.store.getSettings().proxyRole) {
+      return { generatedAt: null, findings: [] };
+    }
     return this.configLintLatest || { generatedAt: null, findings: [] };
   }
 
@@ -1199,6 +1258,7 @@ export class ModelDeckService {
       if (this.codexProfilesMigrationPromise) await this.codexProfilesMigrationPromise;
       if (this.codexProfilesMigrationBlocked) return this.configLintStatus();
       this.configLintActive = true;
+      const role = this.store.getSettings().proxyRole;
       let findings;
       try {
         const snapshot = await this.configLintSnapshotCollector(configLintSnapshotOptions(this));
@@ -1211,7 +1271,8 @@ export class ModelDeckService {
         findings,
       };
       this.configLintLatest = report;
-      return report;
+      this.configLintRole = role;
+      return this.configLintStatus();
     })();
     this.configLintPromise = task;
     try { return await task; }
@@ -1329,6 +1390,8 @@ export class ModelDeckService {
     // Demo fixture mode: fixtures never refresh, so never arm the scheduler.
     if (this.demoFixtures) return;
     this.autoRefreshStarted = true;
+    this.poolHubStopped = false;
+    this.reschedulePoolHub();
     // Local, credential-free startup migration for pre-#62 Claude rows.
     void this.trackAutoRefreshStartup(this.backfillClaudeIdentities()).catch(() => {});
     // Issue #203: every managed Claude home carries the same inert profile
@@ -1379,6 +1442,8 @@ export class ModelDeckService {
   }
 
   stopAutoRefresh() {
+    this.poolHubStopped = true;
+    this.stopPoolHub();
     this.autoRefreshStarted = false;
     this.autoRefreshGeneration += 1;
     if (this.autoRefreshTimer != null) this.clearTimeout(this.autoRefreshTimer);
@@ -1632,7 +1697,191 @@ export class ModelDeckService {
   }
 
   // -------------------------------------------------------------------------
+  // Issue #788 — remote decks read the pool host's status page.
+  poolHubState() {
+    const settings = this.store.getSettings();
+    if (this.autoRefreshStarted && !this.demoFixtures && !this.poolHubStopped
+      && settings.proxyRole === 'remote' && settings.poolHubUrl && !this.poolHubRequest) {
+      // Switching from one polled URL to another is the settings PUT's to
+      // apply, since it can still roll back; a state read only starts polling
+      // when nothing is polled yet, or catches up an overdue poll.
+      if (!this.poolHubUrl) this.reschedulePoolHub(settings);
+      else if (settings.poolHubUrl === this.poolHubUrl && (this.poolHubStatus.lastAttemptAt === null
+        || this.now() - Date.parse(this.poolHubStatus.lastAttemptAt) >= POOL_HUB_POLL_MS)) {
+        // Timers may remain asleep after wake; state reads recover one overdue poll.
+        void this.readPoolHub();
+      }
+    }
+    return { role: settings.proxyRole, ...(settings.proxyRole === 'remote' && settings.poolHubUrl ? {
+      hub: { url: settings.poolHubUrl, ...(settings.poolHubUrl === this.poolHubUrl
+        ? this.poolHubStatus : { lastAttemptAt: null, lastAnsweredAt: null, lastFailedAt: null, lastReadOk: null }) },
+    } : {}) };
+  }
+
+  stopPoolHub() {
+    if (this.poolHubTimer != null) this.clearTimeout(this.poolHubTimer);
+    this.poolHubTimer = null;
+    this.poolHubRequest?.abort();
+    this.poolHubRequest = null;
+    this.poolHubUrl = '';
+  }
+
+  reschedulePoolHub(settings = this.store.getSettings()) {
+    if (this.poolHubStopped || this.demoFixtures) return;
+    const url = settings.proxyRole === 'remote' ? settings.poolHubUrl : '';
+    if (url === this.poolHubUrl) {
+      // A failed combined PUT may have retired an in-flight read before
+      // restoring this URL. Resume it without discarding its last answer.
+      if (url && !this.poolHubRequest && this.poolHubTimer == null) void this.readPoolHub();
+      return;
+    }
+    this.stopPoolHub();
+    this.poolHubStatus = { lastAttemptAt: null, lastAnsweredAt: null, lastFailedAt: null, lastReadOk: null };
+    this.poolHubFailed = false;
+    this.poolHubPool = null;
+    this.poolHubUrl = url;
+    if (url) void this.readPoolHub();
+  }
+
+  async readPoolHub() {
+    const url = this.poolHubUrl;
+    const current = () => {
+      const settings = this.store.getSettings();
+      return this.poolHubUrl === url && settings.proxyRole === 'remote' && settings.poolHubUrl === url;
+    };
+    if (this.poolHubStopped || this.demoFixtures || !url || !current() || this.poolHubRequest) return;
+    if (this.poolHubTimer != null) this.clearTimeout(this.poolHubTimer);
+    this.poolHubTimer = null;
+    const controller = new AbortController();
+    this.poolHubRequest = controller;
+    this.poolHubStatus.lastAttemptAt = new Date(this.now()).toISOString();
+    const timeout = this.setTimeout(() => controller.abort(), 10_000);
+    timeout?.unref?.();
+    let onAbort;
+    const aborted = new Promise((_, reject) => {
+      onAbort = () => reject(new Error('hub read aborted'));
+      controller.signal.addEventListener('abort', onAbort, { once: true });
+    });
+    try {
+      const read = async () => {
+        // The page serves its status at the root; a path in poolHubUrl is the
+        // browser address only (CodeRabbit, PR #794).
+        const response = await this.poolHubFetch(new URL('/api/status', url).toString(), {
+          method: 'GET', redirect: 'error', credentials: 'omit', signal: controller.signal,
+        });
+        if (controller.signal.aborted || !response.ok || !response.body) {
+          void response.body?.cancel().catch(() => {});
+          throw new Error('hub response unavailable');
+        }
+        const reader = response.body.getReader();
+        const cancel = () => { void reader.cancel().catch(() => {}); };
+        controller.signal.addEventListener('abort', cancel, { once: true });
+        const chunks = [];
+        let size = 0;
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            size += value.byteLength;
+            if (size > 64 * 1024) throw new Error('hub response too large');
+            chunks.push(Buffer.from(value));
+          }
+        } finally {
+          controller.signal.removeEventListener('abort', cancel);
+          cancel();
+          reader.releaseLock();
+        }
+        const data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        if (!data || !isIso8601Timestamp(data.generatedAt) || !Array.isArray(data.sources)
+          || !data.sources.every((source) => source && typeof source.name === 'string'
+            && typeof source.reachable === 'boolean'
+            && (source.readAt === null || isIso8601Timestamp(source.readAt))
+            && (source.ok === undefined || typeof source.ok === 'boolean'))) {
+          throw new Error('invalid hub status');
+        }
+        // Issue #827: an older page sends no pool block; a malformed one
+        // fails the whole read rather than show half a pool.
+        const pool = data.pool === undefined ? null : parsePoolHubRecord(data.pool);
+        return { ok: data.sources.some((source) => source.ok ?? source.reachable), pool };
+      };
+      const { ok, pool } = await Promise.race([read(), aborted]);
+      if (this.poolHubRequest !== controller || !current()) return;
+      this.poolHubStatus.lastAnsweredAt = new Date(this.now()).toISOString();
+      this.poolHubStatus.lastReadOk = ok;
+      // A hub clock running ahead cannot make a record outlive its receipt.
+      this.poolHubPool = pool && { ...pool, readAt: Math.min(pool.readAt, this.now()) };
+      this.recordPoolHubFailure(!ok);
+    } catch {
+      if (this.poolHubRequest === controller && current()) {
+        this.poolHubPool = null;
+        this.poolHubStatus.lastFailedAt = new Date(this.now()).toISOString();
+        this.recordPoolHubFailure(true);
+      }
+    } finally {
+      this.clearTimeout(timeout);
+      controller.signal.removeEventListener('abort', onAbort);
+      controller.abort();
+      if (this.poolHubRequest === controller) {
+        this.poolHubRequest = null;
+        if (current()) {
+          const timer = this.setTimeout(() => {
+            if (this.poolHubTimer !== timer) return;
+            this.poolHubTimer = null;
+            void this.readPoolHub();
+          }, POOL_HUB_POLL_MS);
+          this.poolHubTimer = timer;
+          this.poolHubTimer?.unref?.();
+        }
+      }
+    }
+  }
+
+  /// Issue #827: the hub's pool members by `provider:tag`, or null when this
+  /// Mac must show no pool data: not remote, no answer, the page's own read
+  /// of its daemon failing, or a record 10 minutes old or more (counted from
+  /// its own time or its arrival here, whichever is earlier).
+  poolHubMembers(settings = this.store.getSettings()) {
+    const pool = this.poolHubPool;
+    if (!pool || settings.proxyRole !== 'remote' || !settings.poolHubUrl
+      || settings.poolHubUrl !== this.poolHubUrl || this.poolHubStatus.lastReadOk !== true) return null;
+    return this.now() - pool.readAt < POOL_HUB_FRESH_MS ? pool.members : null;
+  }
+
+  /// Issue #827: put the hub's pool record on matching remote accounts. The
+  /// match is the identity tag, never the label; a tag the hub lists twice
+  /// matches nothing. Repair stays on the hub, so it is offered as unavailable.
+  applyPoolHubFields(accounts) {
+    const remote = this.proxyRoleRemote();
+    const members = remote ? this.poolHubMembers() : null;
+    if (!members) return;
+    for (const account of accounts) {
+      const identity = this.proxyPoolIdentityFor(account);
+      const entry = identity && members.get(`${identity.provider}:${poolMemberTag(identity.provider, identity.value)}`);
+      if (!entry) continue;
+      account.proxyPool = 'member';
+      if (entry.weight != null) account.proxyWeight = entry.weight;
+      if (entry.fableExcluded) account.proxyFableExcluded = true;
+      if (entry.credential) account.proxyCredential = entry.credential;
+      if (entry.credential && entry.credentialDetail) account.proxyCredentialDetail = entry.credentialDetail;
+      account.proxyRelogin = { available: false, reason: remote.reason };
+    }
+  }
+
+  recordPoolHubFailure(failed) {
+    if (failed && !this.poolHubFailed) this.logPoolHub('[modeldeck] pool hub status read failed');
+    this.poolHubFailed = failed;
+  }
+
+  // -------------------------------------------------------------------------
   // Issue #338 — sole CLIProxyAPI usage-queue consumer.
+
+  // Issue #784: a local forwarder does not make this Mac the pool host.
+  proxyRoleRemote(settings = this.store.getSettings()) {
+    return settings.proxyRole === 'remote' ? {
+      code: 'proxy-role-remote',
+      reason: 'This Mac uses the proxy pool on another machine; manage it there.',
+    } : null;
+  }
 
   /// This lifecycle is independent of provider auto-refresh. Enabling starts
   /// with one immediate pull, then schedules from completion so slow pulls or
@@ -1654,7 +1903,7 @@ export class ModelDeckService {
 
   async rescheduleUsageQueueConsumer(settings = this.store.getSettings(), { guardChecked = false } = {}) {
     if (!this.usageQueueConsumerStarted) return;
-    const enabled = settings.usageQueueConsumerEnabled === true;
+    const enabled = settings.usageQueueConsumerEnabled === true && !this.proxyRoleRemote(settings);
     // Ordinary settings PUTs must not create extra destructive reads.
     if (enabled === this.usageQueueConsumerScheduledEnabled) {
       // A blocked/unknown enable can be retried after the operator unloads
@@ -1675,7 +1924,8 @@ export class ModelDeckService {
     if (enabled) {
       const guard = guardChecked ? this.usageQueueGuard : await this.refreshUsageQueueGuard();
       if (!this.usageQueueConsumerStarted || generation !== this.usageQueueConsumerGeneration) return;
-      if (guard.status !== 'clear') {
+      if (guard.status !== 'clear' || this.proxyRoleRemote()
+        || !this.store.getSettings().usageQueueConsumerEnabled) {
         this.usageQueueConsumerScheduledEnabled = false;
         return;
       }
@@ -1747,12 +1997,14 @@ export class ModelDeckService {
   }
 
   usageQueueStatus(settings = this.store.getSettings()) {
+    const remote = this.proxyRoleRemote(settings);
     return {
       configured: settings.usageQueueConsumerEnabled === true,
-      running: this.usageQueueConsumerScheduledEnabled === true,
+      running: !remote && this.usageQueueConsumerScheduledEnabled === true,
       inFlight: this.usageQueueConsumerPromise != null,
       guard: { ...this.usageQueueGuard },
       lastPull: this.usageQueueLastPull,
+      ...remote,
     };
   }
 
@@ -1760,7 +2012,7 @@ export class ModelDeckService {
     // Re-read the persisted gate at the moment of every destructive pull. The
     // API normally calls rescheduleUsageQueueConsumer immediately, but this
     // guard also makes direct Store changes fail closed.
-    if (!this.store.getSettings().usageQueueConsumerEnabled) {
+    if (this.proxyRoleRemote() || !this.store.getSettings().usageQueueConsumerEnabled) {
       this.usageQueueConsumerScheduledEnabled = false;
       return;
     }
@@ -1781,7 +2033,7 @@ export class ModelDeckService {
       if (!this.usageQueueConsumerStarted
         || generation !== this.usageQueueConsumerGeneration) return;
       const settings = this.store.getSettings();
-      if (!settings.usageQueueConsumerEnabled) {
+      if (this.proxyRoleRemote(settings) || !settings.usageQueueConsumerEnabled) {
         this.usageQueueConsumerScheduledEnabled = false;
         return;
       }
@@ -1798,7 +2050,10 @@ export class ModelDeckService {
   pullUsageQueue() {
     if (this.usageQueueConsumerPromise) return this.usageQueueConsumerPromise;
     const promise = Promise.resolve().then(async () => {
+      const remote = this.proxyRoleRemote();
+      if (remote) return { skipped: true, ...remote };
       const result = await this.usageQueueConsumer.pull();
+      if (result?.skipped) return result;
       this.usageQueueLastPull = {
         at: new Date(this.now()).toISOString(),
         records: Number(result?.records || 0),
@@ -2860,8 +3115,9 @@ export class ModelDeckService {
   }
 
   async refreshClaudeProfileMetadata(account) {
-    const [rateLimitTier, profileIdentity] = await Promise.all([
+    const [rateLimitTier, displayName, profileIdentity] = await Promise.all([
       this.readClaudeTier({ claudeConfigDir: account.profileRef }),
+      this.readClaudePlanName({ claudeConfigDir: account.profileRef }),
       this.readClaudeIdentity({ claudeConfigDir: account.profileRef }),
     ]);
     // Rebase on the freshest record after the awaits: a reset-identity that
@@ -2870,9 +3126,14 @@ export class ModelDeckService {
     if (!latest || latest.profileRef !== account.profileRef) return latest ?? account;
     const metadata = { ...latest.metadata };
     const currentPlan = metadata.claudePlan || {};
-    if (rateLimitTier) metadata.claudePlan = {
+    // Issue #825: the plan name saves even without a tier code; a fresh tier
+    // read with no name clears a stale one.
+    if (rateLimitTier || displayName) metadata.claudePlan = {
       subscriptionType: currentPlan.subscriptionType ?? null,
-      rateLimitTier,
+      rateLimitTier: rateLimitTier || currentPlan.rateLimitTier || null,
+      ...((displayName || (!rateLimitTier && currentPlan.displayName))
+        ? { displayName: displayName || currentPlan.displayName }
+        : {}),
     };
     // Backfill only: a recorded identity is the onboarding-time truth the
     // verifier checks against. Overwriting it from the live profile would
@@ -2892,7 +3153,7 @@ export class ModelDeckService {
     // call does not author — #522's ownership record, and the narrow
     // claudeRenewal/claudePlan windows for free.
     const authored = [];
-    if (rateLimitTier) authored.push('claudePlan');
+    if (rateLimitTier || displayName) authored.push('claudePlan');
     if (identitySource) authored.push('claudeAccountUuid', 'identitySource');
     const current = this.store.getAccount(account.id);
     if (!current || current.profileRef !== account.profileRef) return current ?? account;
@@ -3969,7 +4230,9 @@ export class ModelDeckService {
   // for the app to run in the user's own terminal. ModelDeck never performs
   // the login itself and never sees credentials. Known pitfall
   // (docs/HANDOFF.md): this must never construct a `logout` invocation.
-  async loginSpec(accountId) {
+  // `headless` (#808): Codex signs in with a device code instead of a
+  // browser callback on this machine, for a box reached over SSH.
+  async loginSpec(accountId, { headless = false } = {}) {
     const account = this.store.getAccount(accountId);
     if (!account) throw new Error('account not found');
     if (!account.enabled) throw new Error('account is disabled');
@@ -4047,9 +4310,9 @@ export class ModelDeckService {
       provider: 'codex',
       account,
       command: this.codexPath,
-      args: ['login'],
+      args: headless ? ['login', '--device-auth'] : ['login'],
       env: { CODEX_HOME: profileRef },
-      preview: `CODEX_HOME=${shellQuote(profileRef)} ${shellQuote(this.codexPath)} login`,
+      preview: `CODEX_HOME=${shellQuote(profileRef)} ${shellQuote(this.codexPath)} login${headless ? ' --device-auth' : ''}`,
     };
   }
 
@@ -4188,10 +4451,16 @@ export class ModelDeckService {
     // Issue #26: persist the plan facts the status read surfaced alongside
     // the identity — same call, no extra provider work.
     const claudePlan = account.provider === 'claude' && result.plan
-      && (result.plan.subscriptionType || result.plan.rateLimitTier)
+      && (result.plan.subscriptionType || result.plan.rateLimitTier || result.plan.displayName)
       ? {
           subscriptionType: result.plan.subscriptionType || account.metadata?.claudePlan?.subscriptionType || null,
           rateLimitTier: result.plan.rateLimitTier || account.metadata?.claudePlan?.rateLimitTier || null,
+          // Issue #825: a tier read from the profile file means the file was
+          // read, so a missing name there is a real absence and clears the
+          // stored one; with no tier either, keep what was saved.
+          ...((result.plan.displayName || (!result.plan.rateLimitTier && account.metadata?.claudePlan?.displayName))
+            ? { displayName: result.plan.displayName || account.metadata.claudePlan.displayName }
+            : {}),
         }
       : null;
     const codexPlan = account.provider === 'codex' ? codexPlanMetadata(result.plan?.planType) : null;
@@ -5748,7 +6017,8 @@ export class ModelDeckService {
   // directory, or no parseable JSON auth object. Once any parseable auth file
   // exists, absence of an account identity is affirmative `absent` state.
   async readProxyWeights({ includeEmpty = false } = {}) {
-    if (!this.cliproxyAuthDir) return null;
+    // The pin-compat harness also borrows this reader without a service/store.
+    if (this.proxyRoleRemote?.() || !this.cliproxyAuthDir) return null;
     let names;
     try { names = await fs.promises.readdir(this.cliproxyAuthDir); }
     catch { return null; }
@@ -5758,6 +6028,7 @@ export class ModelDeckService {
     const issues = [];
     let parseableFiles = 0;
     for (const name of names.sort()) {
+      if (this.proxyRoleRemote?.()) return null;
       if (!name.endsWith('.json')) continue;
       const file = path.join(this.cliproxyAuthDir, name);
       let handle;
@@ -5771,6 +6042,7 @@ export class ModelDeckService {
           issues.push({ path: file, reason: 'auth metadata is not a regular file' });
           continue;
         }
+        if (this.proxyRoleRemote?.()) return null;
         const source = await handle.readFile('utf8');
         const object = inspectJsonObjectDocument(source);
         const property = (key) => object.properties.findLast((item) => item.key === key);
@@ -5925,7 +6197,7 @@ export class ModelDeckService {
   // failure — no key, proxy down, unknown shape — the answer is null, meaning
   // UNKNOWN, and every downstream key is omitted so the UI renders nothing.
   async proxyCredentialHealth({ force = false } = {}) {
-    if (!this.cliproxyManagementKeyPath) return null;
+    if (this.proxyRoleRemote() || !this.cliproxyManagementKeyPath) return null;
     const now = this.proxyReloginNow();
     const cached = this.proxyCredentialHealthCache;
     if (!force && cached && now - cached.at < PROXY_CREDENTIAL_HEALTH_TTL_MS) {
@@ -6059,6 +6331,8 @@ export class ModelDeckService {
   }
 
   proxyReloginAvailabilityFor(account, managementKeyPresent) {
+    const remote = this.proxyRoleRemote();
+    if (remote) return { available: false, ...remote };
     return decideProxyReloginAvailability({
       provider: account.provider,
       baseUrl: this.cliproxyBaseUrl,
@@ -6074,11 +6348,13 @@ export class ModelDeckService {
   async startProxyRelogin(accountId) {
     const account = this.store.getAccount(accountId);
     if (!account) throw serviceError('account not found', 404);
+    const remote = this.proxyRoleRemote();
+    if (remote) throw Object.assign(serviceError(remote.reason, 409), remote);
     const availability = this.proxyReloginAvailabilityFor(
       account,
       await this.proxyReloginDriver.managementKeyPresent(),
     );
-    if (!availability.available) throw serviceError(availability.reason, 409);
+    if (!availability.available) throw Object.assign(serviceError(availability.reason, 409), availability);
     if (this.activeProxyReloginSession(accountId) || this.proxyReloginStarts.has(accountId)) {
       throw serviceError('a proxy sign-in is already in progress for this account', 409);
     }
@@ -6088,6 +6364,8 @@ export class ModelDeckService {
     try {
       started = await inFlight;
     } catch (error) {
+      const remote = this.proxyRoleRemote();
+      if (remote) throw Object.assign(serviceError(remote.reason, 409), remote);
       const reason = error instanceof ProxyReloginError ? error.reason : null;
       throw serviceError(
         proxyReloginFailureText(reason, { status: error?.status ?? null }),
@@ -6115,6 +6393,8 @@ export class ModelDeckService {
   async proxyReloginState(accountId) {
     const account = this.store.getAccount(accountId);
     if (!account) throw serviceError('account not found', 404);
+    const remote = this.proxyRoleRemote();
+    if (remote) return { accountId, provider: account.provider, phase: 'idle', available: false, ...remote };
     const session = this.proxyReloginSessions.get(accountId);
     if (!session) {
       const availability = this.proxyReloginAvailabilityFor(
@@ -6127,6 +6407,7 @@ export class ModelDeckService {
         phase: 'idle',
         available: availability.available,
         ...(availability.reason ? { reason: availability.reason } : {}),
+        ...(availability.code ? { code: availability.code } : {}),
       };
     }
     // Re-reading through activeProxyReloginSession applies the expiry rule.
@@ -6136,6 +6417,10 @@ export class ModelDeckService {
     try {
       status = await this.proxyReloginDriver.status(session.state);
     } catch (error) {
+      // A role change during the key read surfaces here as a transport
+      // error; report the role, not a failed sign-in (#784 review).
+      const remote = this.proxyRoleRemote();
+      if (remote) return { accountId, provider: account.provider, phase: 'idle', available: false, ...remote };
       session.phase = proxyReloginNextPhase(session.phase, 'transport-error');
       session.detail = proxyReloginFailureText(
         error instanceof ProxyReloginError ? error.reason : null,
@@ -6171,6 +6456,8 @@ export class ModelDeckService {
   async cancelProxyRelogin(accountId) {
     const account = this.store.getAccount(accountId);
     if (!account) throw serviceError('account not found', 404);
+    const remote = this.proxyRoleRemote();
+    if (remote) throw Object.assign(serviceError(remote.reason, 409), remote);
     const session = this.activeProxyReloginSession(accountId);
     if (!session) throw serviceError(proxyReloginFailureText('no-session'), 409);
     let cancelledUpstream = false;
@@ -6184,6 +6471,8 @@ export class ModelDeckService {
   async joinProxyPool(accountId) {
     const account = this.store.getAccount(accountId);
     if (!account) throw serviceError('account not found', 404);
+    const remote = this.proxyRoleRemote();
+    if (remote) throw Object.assign(serviceError(remote.reason, 409), remote);
     if (account.provider !== 'claude' && account.provider !== 'codex') {
       throw serviceError('proxy-pool login is only supported for claude and codex accounts', 400);
     }
@@ -6202,6 +6491,8 @@ export class ModelDeckService {
   }
 
   async performProxyPoolJoin(account) {
+    const remote = this.proxyRoleRemote();
+    if (remote) throw Object.assign(serviceError(remote.reason, 409), remote);
     if (!this.cliproxyAuthDir) {
       throw serviceError('CLIProxyAPI auth directory is not configured', 409);
     }
@@ -6251,6 +6542,8 @@ export class ModelDeckService {
     }
 
     const args = ['-config', configFile, account.provider === 'claude' ? '-claude-login' : '-codex-login'];
+    const remoteBeforeSpawn = this.proxyRoleRemote();
+    if (remoteBeforeSpawn) throw Object.assign(serviceError(remoteBeforeSpawn.reason, 409), remoteBeforeSpawn);
     let child;
     try {
       child = this.spawn(binary, args, {
@@ -6295,8 +6588,24 @@ export class ModelDeckService {
       settleChild({ kind: 'exit', code: child.exitCode, signal: child.signalCode });
     }
 
+    // Stops the login helper: SIGTERM, then SIGKILL if it outlives the grace.
+    const stopChild = async () => {
+      try { child.kill?.('SIGTERM'); } catch { /* best-effort cleanup */ }
+      await this.proxyJoinWait(childSettled, this.proxyJoinTerminationGraceMs);
+      if (!childOutcome) {
+        try { child.kill?.('SIGKILL'); } catch { /* best-effort cleanup */ }
+        await this.proxyJoinWait(childSettled, this.proxyJoinTerminationGraceMs);
+      }
+    };
     const startedAt = this.proxyJoinNow();
     while (true) {
+      const remote = this.proxyRoleRemote();
+      if (remote) {
+        // A helper left running could still finish its browser sign-in and
+        // write into the local pool this Mac no longer manages (#784 review).
+        if (!childOutcome) await stopChild();
+        throw Object.assign(serviceError(remote.reason, 409), remote);
+      }
       const pool = await this.readProxyWeights();
       if (this.proxyPoolFor(account, pool) === 'member') {
         return {
@@ -6323,12 +6632,7 @@ export class ModelDeckService {
       }
       const elapsed = Math.max(0, this.proxyJoinNow() - startedAt);
       if (elapsed >= this.proxyJoinTimeoutMs) {
-        try { child.kill?.('SIGTERM'); } catch { /* best-effort cleanup */ }
-        await this.proxyJoinWait(childSettled, this.proxyJoinTerminationGraceMs);
-        if (!childOutcome) {
-          try { child.kill?.('SIGKILL'); } catch { /* best-effort cleanup */ }
-          await this.proxyJoinWait(childSettled, this.proxyJoinTerminationGraceMs);
-        }
+        await stopChild();
         const termination = childOutcome?.kind === 'exit'
           ? (childOutcome.signal
             ? `terminated by ${String(childOutcome.signal).replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64)}`
@@ -6499,7 +6803,7 @@ export class ModelDeckService {
     if (active) {
       try {
         shellEnvWired = (await fs.promises.readFile(this.claudeShellEnvFile, 'utf8'))
-          .includes(`find-generic-password -s ${service} -w`);
+          .includes(clientKeyShellFetch(service));
       } catch { shellEnvWired = false; }
     }
     // The two writes are separate files and cannot be atomic together, so
@@ -6522,8 +6826,9 @@ export class ModelDeckService {
       shellEnvWired,
       // D6/§2.5: the shared item is left in place and its value stays in
       // `api-keys`, so live shells that read it at startup keep working —
-      // their requests attribute as honest NULL, never guessed.
-      legacySharedKeyStillAdmitted: record?.mode === 'per-profile',
+      // their requests attribute as honest NULL, never guessed. Remote
+      // installs admit only the new profile key, not this client's legacy key.
+      legacySharedKeyStillAdmitted: record?.mode === 'per-profile' && !this.proxyRoleRemote(),
       // Computed from EVIDENCE, never from the recorded stage alone. A stage
       // left over from an earlier migration — after an unwire removed the
       // helper, say — must not report a profile as wired when neither file
@@ -6542,6 +6847,8 @@ export class ModelDeckService {
   /// method performs the third stage only, the two files the daemon owns, and
   /// REFUSES until the app reports the consented config write landed: wiring
   /// a helper to a key `api-keys` does not carry would 401 every request.
+  /// In remote role the pool operator instead attests to verified host
+  /// admission; local config-write consent is refused there (issue #786).
   ///
   /// Resumable: each stage is persisted as it completes, so a crash between
   /// settings.json and the shell env file is picked up by the next call
@@ -6554,13 +6861,22 @@ export class ModelDeckService {
     if (account.provider !== 'claude') {
       throw serviceError('client key wiring is only supported for claude accounts', 400);
     }
-    if (input?.configWriteVerified !== true) {
-      throw serviceError(
-        'per-profile client key migration needs the consented config write to have landed first; '
-        + 'the proxy would reject a key its api-keys list does not carry',
-        409,
-      );
-    }
+    const assertRole = () => {
+      if (this.proxyRoleRemote()) {
+        if (input?.configWriteVerified === true || input?.poolHostVerified !== true) {
+          throw Object.assign(serviceError('block local key setup in remote role; a verified pool host install is required', 409),
+            { code: 'proxy-role-remote' });
+        }
+      } else if (input?.poolHostVerified === true) {
+        throw Object.assign(serviceError('pool host installs are only accepted in remote role', 409), { code: 'proxy-role-host' });
+      } else if (input?.configWriteVerified !== true) {
+        throw serviceError(
+          'per-profile client key migration needs the consented config write to have landed first; '
+          + 'the proxy would reject a key its api-keys list does not carry', 409,
+        );
+      }
+    };
+    assertRole();
     const service = clientKeyService(account.id);
     await this.assertClientKeyItemPresent(service);
     return this.withClaudeActivationLock(async () => {
@@ -6569,7 +6885,10 @@ export class ModelDeckService {
       const profileRef = managedClaudeProfile(latest.profileRef, this.claudeProfilesDir);
       return this.withClaudeProfileSettingsLock(
         profileRef,
-        () => this.applyClaudeClientKeyMigration(latest, profileRef, service),
+        () => {
+          assertRole();
+          return this.applyClaudeClientKeyMigration(latest, profileRef, service);
+        },
       );
     });
   }
@@ -6891,7 +7210,7 @@ export class ModelDeckService {
     // read, never per account. Both answer "unknown" (null / false) without a
     // management key, which is exactly the state a fixture — and a fresh
     // managed install awaiting #431 — is in.
-    const [proxyWeights, proxyHealth, proxyManagementKeyPresent] = await Promise.all([
+    const [proxyWeights, proxyHealth, proxyManagementKeyPresent] = this.proxyRoleRemote() ? [null, null, false] : await Promise.all([
       this.readProxyWeights(),
       this.proxyCredentialHealth(),
       this.proxyReloginDriver.managementKeyPresent(),
@@ -7128,7 +7447,7 @@ export class ModelDeckService {
   // Presence checks only — auth contents stay CLIProxyAPI's business. Cheap:
   // two existsSync per state read, no network, no timer, no polling.
   managedProxyStatus() {
-    const configDir = this.cliproxyConfigDir;
+    const configDir = this.proxyRoleRemote() ? null : this.cliproxyConfigDir;
     if (!configDir) {
       return {
         baseUrl: this.cliproxyBaseUrl,
@@ -7240,6 +7559,57 @@ export class ModelDeckService {
     });
   }
 
+  listPoolClientKeys() {
+    const remote = this.proxyRoleRemote();
+    if (remote) throw Object.assign(serviceError(remote.reason, 409), { code: remote.code });
+    return this.store.poolClientKeys().map(({ keySha256, ...entry }) => ({ ...entry, hashPrefix: keySha256.slice(0, 8) }));
+  }
+
+  updatePoolClientKeys(input) {
+    this.listPoolClientKeys(); // Host-only, including before validation or a write.
+    if (!isJsonObject(input) || ['add', 'revoke', 'revokeWhere'].filter((key) => Object.hasOwn(input, key)).length !== 1) {
+      throw serviceError('supply exactly one of add, revoke or revokeWhere', 400);
+    }
+    if (Object.hasOwn(input, 'revokeWhere')) {
+      const where = poolKeySelection(input.revokeWhere);
+      if (where.keySha256s.length + where.hashPrefixes.length > CLIENT_KEY_REPORT_MAX_ENTRIES) {
+        throw serviceError('pool client keys must be a bounded array', 400);
+      }
+      const candidates = this.store.poolClientKeys().filter((row) => row.machine === where.machine
+        && (!Object.hasOwn(where, 'profileSlug') || row.profileSlug === where.profileSlug));
+      const hashes = new Set(where.keySha256s);
+      const prefixes = new Set(where.hashPrefixes);
+      const seen = new Set();
+      // Check all rows, including revoked ones, before any mutation. A stale
+      // prefix must still identify exactly one row in this selection.
+      for (const row of candidates) {
+        const prefix = row.keySha256.slice(0, 8);
+        if (!prefixes.has(prefix)) continue;
+        if (seen.has(prefix)) throw serviceError(`ambiguous hash prefix ${prefix}; no rows revoked`, 409);
+        seen.add(prefix);
+      }
+      const selected = candidates.filter((row) => !row.revokedAt
+        && (hashes.has(row.keySha256) || prefixes.has(row.keySha256.slice(0, 8))));
+      const at = new Date(this.now()).toISOString();
+      for (const row of selected) this.store.revokePoolClientKey(row.keySha256, at);
+      return { keys: this.listPoolClientKeys(), revokedPrefixes: selected.map((row) => row.keySha256.slice(0, 8)) };
+    }
+    const adding = Object.hasOwn(input, 'add');
+    const items = adding ? input.add : input.revoke;
+    if (!Array.isArray(items) || items.length > CLIENT_KEY_REPORT_MAX_ENTRIES) {
+      throw serviceError('pool client keys must be a bounded array', 400);
+    }
+    // Validate the entire batch before any row changes. Neither operation
+    // admits raw keys or copies arbitrary caller fields into the store.
+    const entries = items.map(adding ? poolKeyEntry : assertPoolKeyHash);
+    const at = new Date(this.now()).toISOString();
+    for (const entry of entries) {
+      if (adding) this.store.addPoolClientKey(entry, at);
+      else this.store.revokePoolClientKey(entry, at);
+    }
+    return { keys: this.listPoolClientKeys() };
+  }
+
   reportManagedProxy(input) {
     const report = managedProxyAppReport(input);
     this.managedProxyAppReport = {
@@ -7259,6 +7629,9 @@ export class ModelDeckService {
   // the account is benched; the alert's recorded scope is pool members only.
   memberBlackoutStatus(accounts) {
     const alerts = [];
+    // Issue #827: a remote Mac's request archive stopped when it went
+    // remote; its old streaks say nothing about the hub's pool now.
+    if (this.proxyRoleRemote()) return { threshold: MEMBER_BLACKOUT_FAILURE_THRESHOLD, alerts };
     for (const account of accounts) {
       if (!account.enabled || account.proxyPool !== 'member' || account.proxyWeight === 0) continue;
       const selector = account.provider === 'claude'
@@ -7336,18 +7709,30 @@ export class ModelDeckService {
       this.providerActivationState('claude', this.claudeActiveLink, value.accounts),
       this.providerActivationState('codex', this.codexActiveLink, value.accounts),
     ]);
+    // A role PUT can finish while account/activation reads are in flight.
+    // Never publish old local pool evidence as part of a remote response.
+    if (this.proxyRoleRemote()) {
+      for (const account of accounts) {
+        for (const key of ['proxyPool', 'proxyWeight', 'proxyFableExcluded', 'proxyCredential', 'proxyCredentialDetail', 'proxyRelogin']) {
+          delete account[key];
+        }
+      }
+      this.applyPoolHubFields(accounts);
+    }
     const claudeSecureStorage = this.claudeSecureStorage.value == null && claudeActivation.resolvedProfileRef
       ? { ...this.claudeSecureStorage, value: claudeActivation.resolvedProfileRef }
       : this.claudeSecureStorage;
     const result = {
       ...value,
       accounts,
+      codexProfilesDir: this.codexProfilesDir,
       activation: { claude: claudeActivation, codex: codexActivation },
       managed: { claude: this.isProviderManaged('claude'), codex: this.isProviderManaged('codex') },
       managementBlocked: this.providerManagementBlocked(),
       claudeSecureStorage,
       scheduler: this.refreshSchedulerStatus(),
       usageQueue: this.usageQueueStatus(),
+      proxy: this.poolHubState(),
       warehouseIngest: this.warehouseIngestStatus(),
       daemon: this.daemonRuntimeStatus(),
       ...(this.codexProfilesMigration ? { codexProfilesMigration: this.codexProfilesMigration } : {}),

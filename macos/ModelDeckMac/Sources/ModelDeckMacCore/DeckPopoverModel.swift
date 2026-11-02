@@ -2738,6 +2738,28 @@ public final class DeckPopoverModel: ObservableObject {
         )
     }
 
+    // MARK: GitHub star prompt (Tim, 2026-11-01)
+
+    /// True while the once-ever star line should render (see
+    /// `GitHubStarPrompt` for when it turns on).
+    @Published public private(set) var showsGitHubStarPrompt: Bool = false
+
+    /// Call once per deck open: counts the day and may turn the line on.
+    public func noteDeckOpenedForStarPrompt(
+        now: Date = Date(),
+        roll: () -> Int = { Int.random(in: 0..<GitHubStarPrompt.chancePerOpen) }
+    ) {
+        let prompt = GitHubStarPrompt(defaults: defaults)
+        prompt.deckOpened(now: now, roll: roll)
+        showsGitHubStarPrompt = prompt.isShowing
+    }
+
+    /// Star clicked or line dismissed: it never shows again.
+    public func finishGitHubStarPrompt() {
+        GitHubStarPrompt(defaults: defaults).finish()
+        showsGitHubStarPrompt = false
+    }
+
     /// Tim directive 2026-08-02: on each popover open, cards whose headline
     /// moved since the PREVIOUS open glow briefly — "what changed since I
     /// last looked" at a glance. Number animation is permitted only when its
@@ -2998,6 +3020,11 @@ public final class DeckPopoverModel: ObservableObject {
             (defaults.stringArray(forKey: Self.dismissedHeaderNoticesDefaultsKey) ?? [])
                 .compactMap(DeckHeaderNotice.init(rawValue:))
         )
+        // App launch counts as a usage day for the star prompt, so a user
+        // who keeps the deck closed still accrues days while it runs.
+        let starPrompt = GitHubStarPrompt(defaults: defaults)
+        starPrompt.recordUsageDay()
+        self.showsGitHubStarPrompt = starPrompt.isShowing
     }
 
     public func isExpanded(_ accountID: String) -> Bool {

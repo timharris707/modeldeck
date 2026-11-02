@@ -53,6 +53,8 @@ const EXPOSED_ERROR_CODES = new Set([
   'management-in-progress',
   'claude-unmanage-unavailable',
   'profile-exists',
+  'proxy-role-remote',
+  'proxy-role-host',
   'claude-activation-operation-timeout',
   'claude-activation-operation-still-running',
   'claude-activation-queue-timeout',
@@ -265,6 +267,10 @@ export function createApp({
       if (req.method === 'POST' && url.pathname === '/api/client-keys/report') {
         return json(res, 200, { clientKeys: ownedService.reportClientKeys(await body(req)) });
       }
+      if (url.pathname === '/api/pool-client-keys' && (req.method === 'GET' || req.method === 'POST')) {
+        return json(res, 200, req.method === 'POST'
+          ? ownedService.updatePoolClientKeys(await body(req)) : { keys: ownedService.listPoolClientKeys() });
+      }
       // Issue #359: every usage-analytics API route shares the dashboard's
       // kill-switch boundary. Prefix gating keeps future /api/usage/* routes
       // indistinguishable from routes that do not exist until explicitly enabled.
@@ -475,14 +481,19 @@ export function createApp({
                 : previous.sharedUserScopeEnabled,
             // A failed combined update must never arm/disarm a destructive
             // queue consumer later than the response implies. Roll this one
-            // handoff flag back even though ordinary validated fields remain.
+            // handoff flag and pool role back even though ordinary validated
+            // fields remain.
             usageQueueConsumerEnabled: previous.usageQueueConsumerEnabled,
+            proxyRole: previous.proxyRole,
+            poolHubUrl: previous.poolHubUrl,
           });
+          ownedService.reschedulePoolHub?.(restored);
           await ownedService.rescheduleUsageQueueConsumer?.(restored);
           await ownedService.rescheduleWarehouseIngest?.(ownedStore.getSettings());
           throw error;
         }
         const current = ownedStore.getSettings();
+        ownedService.reschedulePoolHub?.(current);
         ownedService.rescheduleAutoRefresh(current);
         await ownedService.rescheduleUsageQueueConsumer?.(current);
         await ownedService.rescheduleWarehouseIngest?.(current);
@@ -539,7 +550,7 @@ export function createApp({
       if (req.method === 'GET' && loginMatch) {
         const account = ownedStore.getAccount(decodeURIComponent(loginMatch[1]));
         if (!account) return json(res, 404, { error: 'account not found' });
-        const spec = await ownedService.loginSpec(account.id);
+        const spec = await ownedService.loginSpec(account.id, { headless: url.searchParams.get('headless') === '1' });
         return json(res, 200, {
           provider: spec.provider,
           account: ownedService.accountForPublicResponse(spec.account),

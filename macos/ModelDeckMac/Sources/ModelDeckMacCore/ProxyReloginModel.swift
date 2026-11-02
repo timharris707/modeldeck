@@ -587,8 +587,14 @@ public final class ProxyReloginModel: ObservableObject {
                 guard self.isCurrent(accountID, generation) else { return }
                 self.phases[accountID] = nil
                 // 409 (no key / already running) and 502 land here with the
-                // daemon's sanitized sentence.
-                self.errors[accountID] = SettingsSyncModel.message(for: error)
+                // daemon's sanitized sentence. Issue #784: the remote-role
+                // refusal is the daemon's stated reason, not a failure.
+                let message = SettingsSyncModel.message(for: error)
+                if ProxyRoleCopy.isRemoteRefusal(error) {
+                    self.notes[accountID] = message
+                } else {
+                    self.errors[accountID] = message
+                }
                 self.outcomeAt[accountID] = self.now()
             }
             guard self.generations[accountID] == generation else { return }
@@ -621,6 +627,15 @@ public final class ProxyReloginModel: ObservableObject {
                 return
             }
             guard isCurrent(accountID, generation) else { return }
+            // Issue #784: the role moved to remote mid-attempt. The daemon
+            // set this Mac's repair aside and answers `idle` from now on, so
+            // the poll would never settle; say why, calmly, and stop.
+            if state.code == ProxyRoleCopy.remoteRefusalCode {
+                phases[accountID] = nil
+                notes[accountID] = state.reason ?? ProxyRoleCopy.remoteReason
+                outcomeAt[accountID] = now()
+                return
+            }
             let phase = ProxyRelogin.Phase(daemon: state.phase)
             if phase.isSettled {
                 settle(account: account, phase: phase, detail: state.detail)

@@ -261,18 +261,21 @@ function parsedSource(record) {
     : { value: source, rawKey: null };
 }
 
-function resolvedProfileLabel(apiKey, resolveClientKeyProfile) {
-  if (typeof apiKey !== 'string' || apiKey.length === 0) return null;
-  const profile = resolveClientKeyProfile(hash(apiKey));
+function resolvedClientKeyProfile(apiKey, resolveClientKeyProfile) {
+  const profile = typeof apiKey === 'string' && apiKey.length > 0
+    ? resolveClientKeyProfile(hash(apiKey)) : null;
   const label = profile?.profileLabel;
   // Legacy map rows predate the report boundary's label gate. An invalid
   // stored label must degrade to honest NULL, never abort a dequeued batch.
-  return typeof label === 'string'
+  const profileLabel = typeof label === 'string'
     && label.trim()
     && label.length <= 128
     && !/\p{Cc}/u.test(label)
     ? label
     : null;
+  const machine = typeof profile?.machine === 'string' && /^[a-z0-9-]{1,64}$/.test(profile.machine)
+    ? profile.machine : null;
+  return { profileLabel, machine };
 }
 
 export function classifyUserAgent(value) {
@@ -308,7 +311,7 @@ export function parseUsageRecord(input, {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('usage record must be an object');
   const record = input;
   const rawClientKey = typeof record.api_key === 'string' ? record.api_key : null;
-  const profileLabel = resolvedProfileLabel(rawClientKey, resolveClientKeyProfile);
+  const profile = resolvedClientKeyProfile(rawClientKey, resolveClientKeyProfile);
   const breakdown = object(record.token_breakdown);
   const breakdownInput = object(breakdown.input);
   const breakdownOutput = object(breakdown.output);
@@ -362,9 +365,9 @@ export function parseUsageRecord(input, {
 
   return {
     requestId: requiredText(firstDefined(record.request_id, record.requestId), 'usage record request_id'),
-    machine: requiredText(machine, 'usage record machine'),
+    machine: requiredText(profile.machine ?? machine, 'usage record machine'),
     observedAt,
-    profileLabel,
+    profileLabel: profile.profileLabel,
     source: source.value,
     provider,
     providerRequestId: providerRequestId(responseHeaders, [

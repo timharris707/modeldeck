@@ -142,7 +142,7 @@ for (const provider of ['claude', 'codex']) {
       env: { PATH: process.env.PATH, HOME: path.dirname(home), MODELDECK_DB_PATH: path.join(path.dirname(home), 'absent.sqlite') }, encoding: 'utf8',
     });
     assert.equal(installer.status, 1);
-    assert.match(installer.stderr, /not-managed \(409\)/);
+    assert.match(installer.stderr, process.platform === 'darwin' ? /not-managed \(409\)/ : /macOS-only/);
     assert.equal(fs.existsSync(service.configLintZshenvPath), false);
     assert.deepEqual(homeSnapshot(home), before);
   });

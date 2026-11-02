@@ -49,7 +49,8 @@
     "managed": true,
     "roster": { "status": "unknown", "reason": "daemon roster unavailable" },
     "authFiles": { "status": "unknown", "path": "/fixture/proxy/auth", "reason": "permission denied" },
-    "managementKey": { "status": "unknown", "path": "/fixture/proxy/.mgmt-key", "reason": "permission denied" }
+    "managementKey": { "status": "unknown", "path": "/fixture/proxy/.mgmt-key", "reason": "permission denied" },
+    "usageQueue": { "status": "unknown", "path": "/fixture/proxy/config.yaml", "reason": "permission denied" }
   },
   "sharedScope": {
     "enabled": true,

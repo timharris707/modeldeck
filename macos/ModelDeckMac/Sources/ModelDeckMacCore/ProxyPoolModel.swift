@@ -12,6 +12,12 @@ import Observation
 // The #149/#174 discipline end to end: on a machine without the proxy the
 // daemon omits `proxyPool` entirely and `presentation(for:)` returns nil —
 // the UI renders NOTHING anywhere.
+//
+// Issue #784 review: on a Mac that uses the pool on another machine the
+// daemon omits `proxyPool` too, because membership is the host's business.
+// Session routing is still this Mac's — its sessions reach the pool through
+// the forwarder on 127.0.0.1:8317 — so in remote role the row is built from
+// the routing fields alone, and says nothing about membership.
 
 /// Daemon seam for the proxy-pool ops; `DaemonClient` conforms, tests stub.
 public protocol ProxyPoolManaging: Sendable {
@@ -31,7 +37,13 @@ public enum ProxyPool {
     /// on this machine (render nothing — the #149/#174 discipline).
     /// Membership leads; the routing dimension follows for Claude accounts
     /// (the daemon reports routing for Claude only).
-    public static func statusText(for account: DeckAccount) -> String? {
+    public static func statusText(for account: DeckAccount, role: ProxyRole = .host) -> String? {
+        guard role == .host else {
+            // Remote role: routing alone (Claude only — the daemon reports
+            // routing for Claude only). Never "In pool".
+            guard let routed = account.proxyRouted else { return nil }
+            return routed ? "Routed" : "Not routed"
+        }
         guard let pool = account.proxyPool?.lowercased(),
               pool == "member" || pool == "absent" else { return nil }
         guard pool == "member" else {
@@ -55,7 +67,12 @@ public enum ProxyPool {
         case route
     }
 
-    public static func action(for account: DeckAccount) -> Action? {
+    public static func action(for account: DeckAccount, role: ProxyRole = .host) -> Action? {
+        guard role == .host else {
+            // Remote role: never a join (that happens on the host), and
+            // routing needs no membership here.
+            return account.provider == "claude" && account.proxyRouted == false ? .route : nil
+        }
         guard let pool = account.proxyPool?.lowercased() else { return nil }
         if pool == "absent" { return .join }
         guard pool == "member" else { return nil }
@@ -66,14 +83,18 @@ public enum ProxyPool {
     /// Whether the row's ⋯ menu offers the quiet unroute item — routed
     /// Claude accounts only (routing is the reversible dimension the user
     /// may want back off; leaving the pool is not ModelDeck's operation).
-    public static func offersUnroute(for account: DeckAccount) -> Bool {
+    public static func offersUnroute(for account: DeckAccount, role: ProxyRole = .host) -> Bool {
         // CodeRabbit (PR #285): the SAME recognized-pool gate `statusText`
         // and `action` use. A non-nil check alone let an unknown future
         // value ("quarantined") offer the item while the line itself
         // rendered nothing.
         // Lowercased like statusText/action (CodeRabbit, PR #285): a
         // "Member" from a future daemon must gate identically everywhere.
-        guard let pool = account.proxyPool?.lowercased(), pool == "member" || pool == "absent" else { return false }
+        // Issue #784 review: off the pool host there is no membership to
+        // gate on, and Stop routing is the remote Mac's rollback.
+        if role == .host {
+            guard let pool = account.proxyPool?.lowercased(), pool == "member" || pool == "absent" else { return false }
+        }
         guard account.provider == "claude" else { return false }
         // Adversarial review M4: `proxyRouted` is presence-only daemon-side
         // (ANY `ANTHROPIC_BASE_URL`), so keying the offer off it invited a
@@ -221,8 +242,9 @@ public final class ProxyPoolModel: ObservableObject {
     /// The row's complete proxy rendering state; nil when the daemon
     /// reported no pool on this machine AND no attempt state is held (a
     /// late failure note must still answer even if the pool key flickers).
-    public func presentation(for account: DeckAccount) -> ProxyPoolRowPresentation? {
-        let status = ProxyPool.statusText(for: account)
+    /// `role` is the pool role of the state `account` came from (#784).
+    public func presentation(for account: DeckAccount, role: ProxyRole = .host) -> ProxyPoolRowPresentation? {
+        let status = ProxyPool.statusText(for: account, role: role)
         let phase = phases[account.id]
         let note = notes[account.id]
         let error = errors[account.id]
@@ -234,13 +256,13 @@ public final class ProxyPoolModel: ObservableObject {
         case nil:
             if let error { display = .error(error) }
             else if let note { display = .note(note) }
-            else if let action = ProxyPool.action(for: account) { display = .action(action) }
+            else if let action = ProxyPool.action(for: account, role: role) { display = .action(action) }
             else { display = .quiet }
         }
         return ProxyPoolRowPresentation(
             statusText: status ?? "",
             display: display,
-            offersUnroute: phase == nil && ProxyPool.offersUnroute(for: account)
+            offersUnroute: phase == nil && ProxyPool.offersUnroute(for: account, role: role)
         )
     }
 
@@ -276,7 +298,15 @@ public final class ProxyPoolModel: ObservableObject {
                       self.phases[accountID] == .joining else { return }
                 self.phases[accountID] = nil
                 // 409/502/504 land here with the daemon's sanitized message.
-                self.errors[accountID] = SettingsSyncModel.message(for: error)
+                // Issue #784: the remote-role refusal (the role moved while
+                // the join waited) is the daemon's stated reason, not a
+                // failure.
+                let message = SettingsSyncModel.message(for: error)
+                if ProxyRoleCopy.isRemoteRefusal(error) {
+                    self.notes[accountID] = message
+                } else {
+                    self.errors[accountID] = message
+                }
             }
             guard self.joinGenerations[accountID] == generation else { return }
             self.joinTasks[accountID] = nil

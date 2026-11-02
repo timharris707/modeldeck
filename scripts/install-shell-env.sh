@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 
+# The block is written for macOS paths and zsh. On Linux (#806) ModelDeck does
+# not switch the default homes; start sessions with `modeldeck launch`, which
+# pins the profile itself.
+if [ "$(uname -s)" != Darwin ]; then
+  echo 'install-shell-env.sh is macOS-only; on Linux start sessions with: modeldeck launch claude|codex' >&2
+  exit 1
+fi
+
 target="${MODELDECK_ZSHENV_PATH:-${HOME}/.zshenv}"
 script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd -P)
 begin='# >>> ModelDeck Claude identity switching >>>'

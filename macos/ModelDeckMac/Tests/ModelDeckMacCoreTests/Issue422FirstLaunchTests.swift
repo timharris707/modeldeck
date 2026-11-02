@@ -82,6 +82,8 @@ final class LifecycleSpy {
     func stop() { stops += 1 }
 }
 
+/// `proxyRole` defaults to `.host`, the pool host the pre-#784 tests
+/// describe (and the app's role when none was ever recorded).
 @MainActor
 func makeOnboardingModel(
     detection: [ExternalProxyProbe] = [.silent],
@@ -91,11 +93,13 @@ func makeOnboardingModel(
     bundleAvailable: Bool = true,
     spy: LifecycleSpy = LifecycleSpy(),
     detector: FakeDetector? = nil,
-    stopper: FakeStopper? = nil
+    stopper: FakeStopper? = nil,
+    supervisionInspector: (any ExternalProxySupervisionInspecting)? = nil,
+    proxyRole: ProxyRole = .host
 ) -> ManagedProxyOnboardingModel {
     ManagedProxyOnboardingModel(dependencies: .init(
         detector: detector ?? FakeDetector(detection),
-        supervision: FakeSupervisionInspector(supervision),
+        supervision: supervisionInspector ?? FakeSupervisionInspector(supervision),
         stopper: stopper ?? FakeStopper(succeeds: stopSucceeds),
         store: store,
         bundleAvailable: bundleAvailable,
@@ -103,7 +107,7 @@ func makeOnboardingModel(
         startManagedProxy: { spy.start() },
         stopManagedProxy: { spy.stop() },
         adoptManagedProxy: { spy.adopt() }
-    ))
+    ), proxyRole: proxyRole)
 }
 
 let answeringConfirmed = ExternalProxyProbe(portAnswering: true, handshake: .confirmed)

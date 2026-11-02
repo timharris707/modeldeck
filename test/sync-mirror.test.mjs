@@ -46,6 +46,7 @@ function fixture(t, {
     fs.writeFileSync(copiedScript, contents.replace(stripEntry, ''));
   }
 
+  write(source, 'ops/private-operator.sh');
   write(source, 'public/readme.md', 'safe mirror content\n');
   write(source, '.claude/settings.json');
   write(source, 'docs/HANDOFF.md');
@@ -109,6 +110,7 @@ test('strip list is absent from the committed mirror staging tree', (t) => {
   assert.equal(result.status, 0, result.stderr);
 
   const stripped = [
+    'ops',
     '.claude',
     'docs/HANDOFF.md',
     'docs/ACCOUNT_ONBOARDING.md',
@@ -175,7 +177,9 @@ test('--check-only does not touch or create the mirror clone', (t) => {
 test('scrub gate catches a pattern hit inside a binary artifact', (t) => {
   const data = fixture(t);
   const binary = path.join(data.source, 'public', 'artifact.bin');
-  fs.writeFileSync(binary, Buffer.concat([Buffer.from('FORBIDDEN_42'), Buffer.from([0, 1, 2, 255])]));
+  // The hit ends its own line: GNU regex does not treat NUL as a line end, so
+  // an anchored pattern only matches across platforms this way (#807).
+  fs.writeFileSync(binary, Buffer.concat([Buffer.from([0, 1, 2, 255, 10]), Buffer.from('FORBIDDEN_42\n'), Buffer.from([0, 1, 2, 255])]));
   git(data.source, 'add', '.');
   git(data.source, 'commit', '-m', 'binary with planted hit');
   const result = runSync(data);
@@ -198,4 +202,37 @@ test('the source checkout is rejected as a mirror target', (t) => {
   const result = runSync({ ...data, mirror: data.source });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /must not be the source checkout/);
+});
+
+
+test('ops remains in STRIPPED_PATHS and the release runbook strip list', () => {
+  const script = fs.readFileSync(syncScript, 'utf8');
+  const release = fs.readFileSync(new URL('../docs/RELEASE.md', import.meta.url), 'utf8');
+  const check = (scriptText, releaseText) => {
+    const strippedPaths = scriptText.match(/STRIPPED_PATHS=\(([\s\S]*?)\n\)/)?.[1] || '';
+    assert.match(strippedPaths, /^\s*"ops"\s*$/m);
+    assert.match(releaseText, /^- `ops`(?:\s|$)/m);
+  };
+  check(script, release);
+  assert.throws(() => check(script.replace(/^\s*"ops"\s*\n/m, ''), release));
+  assert.throws(() => check(script, release.replace(/^- `ops`.*$/m, '')));
+});
+
+// Codex review of #818: ops/ never reaches the mirror, so a workflow that
+// runs anything in it must not reach the mirror either, or the public CI fails.
+test('workflows that use ops/ are stripped from the mirror and listed in the runbook', () => {
+  const script = fs.readFileSync(syncScript, 'utf8');
+  const release = fs.readFileSync(new URL('../docs/RELEASE.md', import.meta.url), 'utf8');
+  const strippedPaths = script.match(/STRIPPED_PATHS=\(([\s\S]*?)\n\)/)?.[1] || '';
+  const dir = new URL('../.github/workflows/', import.meta.url);
+  const names = fs.existsSync(dir) ? fs.readdirSync(dir) : [];
+  const users = names.filter((name) => /(^|[\s"'/])ops\//.test(fs.readFileSync(new URL(name, dir), 'utf8')));
+  // In the private repo the Linux job is here and must be caught; the mirror
+  // never has it (CodeRabbit on #818), and the rule still holds there.
+  if (names.includes('test-linux.yml')) assert.ok(users.includes('test-linux.yml'));
+  for (const name of users) {
+    const entry = `.github/workflows/${name}`;
+    assert.ok(strippedPaths.split('\n').some((line) => line.trim() === `"${entry}"`), `${entry} in STRIPPED_PATHS`);
+    assert.ok(release.split('\n').some((line) => line.startsWith(`- \`${entry}\``)), `${entry} in docs/RELEASE.md`);
+  }
 });

@@ -218,6 +218,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
   // operator-owned cutover switch: release day retires both old consumers,
   // then enables the guarded daemon consumer in the same motion.
   usageQueueConsumerEnabled: false,
+  // Issue #784: only the pool host manages proxy state. Older installs keep
+  // today's host behavior until the operator selects a remote pool.
+  proxyRole: 'host',
+  poolHubUrl: '',
   layout: 'two-column',
   defaultSort: 'next-reset',
   notificationThresholdPercent: 25,
@@ -265,8 +269,36 @@ export const DEFAULT_SETTINGS = Object.freeze({
   extraClaudeScanRoots: Object.freeze([]),
 });
 
+function normalizePoolHubUrl(value) {
+  const message = 'poolHubUrl must be empty or an absolute http/https URL of at most 256 characters, without credentials, query or fragment, on a single-label host, .ts.net host or 100.64.0.0/10 IPv4 address';
+  if (value === '') return '';
+  if (typeof value !== 'string' || value.length > 256 || !/^https?:\/\//i.test(value)
+    || /[\s\\?#]/.test(value)) throw new Error(message);
+  let url;
+  try { url = new URL(value); } catch { throw new Error(message); }
+  const host = url.hostname;
+  if (host.split('.')[0] === 'localhost' || host.endsWith('-localhost') || host === 'broadcasthost') {
+    throw new Error(message);
+  }
+  const octets = host.split('.').map(Number);
+  const ipv4 = /^\d+\.\d+\.\d+\.\d+$/.test(host);
+  const allowed = ipv4
+    ? octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127
+    : /^[a-z0-9-]+$/.test(host) || /^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net$/.test(host);
+  if (!allowed || url.username || url.password || value.slice(value.indexOf('//') + 2).split('/')[0].includes('@')) {
+    throw new Error(message);
+  }
+  const normalized = `${url.origin}${url.pathname.replace(/\/+$/, '')}`;
+  if (normalized.length > 256) throw new Error(message);
+  return normalized;
+}
+
 function validateSetting(key, value) {
   if (!Object.hasOwn(DEFAULT_SETTINGS, key)) throw new Error(`unknown setting: ${key}`);
+  if (key === 'poolHubUrl') normalizePoolHubUrl(value);
+  if (key === 'proxyRole' && !['host', 'remote'].includes(value)) {
+    throw new Error('proxyRole must be host or remote');
+  }
   if (['claudeManaged', 'codexManaged'].includes(key) && value !== null && typeof value !== 'boolean') {
     throw new Error(`${key} must be a boolean or null`);
   }
@@ -1550,6 +1582,17 @@ export class Store {
         profile_id TEXT NOT NULL,
         profile_label TEXT,
         created_at TEXT NOT NULL
+      );
+
+      -- Remote hashes outlive app reports and revocation, so delayed usage
+      -- still attributes to the machine that held the key (issue #786).
+      CREATE TABLE IF NOT EXISTS pool_client_keys (
+        key_sha256 TEXT PRIMARY KEY,
+        machine TEXT NOT NULL,
+        profile_slug TEXT,
+        profile_label TEXT,
+        created_at TEXT NOT NULL,
+        revoked_at TEXT
       );
 
       -- The last report generation applied. The app persists a monotonic
@@ -4939,7 +4982,7 @@ export class Store {
     const stored = JSON.parse(row?.value_json || '{}');
     const settings = { ...DEFAULT_SETTINGS };
     for (const [key, value] of Object.entries(stored)) {
-      try { validateSetting(key, value); settings[key] = value; }
+      try { validateSetting(key, value); settings[key] = key === 'poolHubUrl' ? normalizePoolHubUrl(value) : value; }
       catch { /* Ignore invalid persisted values and retain the typed default. */ }
     }
     return settings;
@@ -4954,6 +4997,7 @@ export class Store {
     this.validateSettings(input);
     const current = this.getSettings();
     const settings = { ...current, ...input };
+    settings.poolHubUrl = normalizePoolHubUrl(settings.poolHubUrl);
     // Issue #90 change-event provenance. The flag is one-way: it turns true
     // when this write CHANGES the interval or when the app asserts an
     // explicit user selection (autoRefreshIntervalCustomized: true in the
@@ -5046,8 +5090,31 @@ export class Store {
   // key value, raw or hashed, is never stored or logged by the caller.
   clientKeyProfile(keySha256) {
     const row = this.db.prepare('SELECT * FROM client_key_map WHERE key_sha256 = ?').get(String(keySha256 || ''));
-    if (!row) return null;
-    return { profileId: row.profile_id, profileLabel: row.profile_label };
+    if (row) return { profileId: row.profile_id, profileLabel: row.profile_label };
+    const remote = this.db.prepare('SELECT profile_label, machine FROM pool_client_keys WHERE key_sha256 = ?')
+      .get(String(keySha256 || ''));
+    return remote ? { profileLabel: remote.profile_label, machine: remote.machine } : null;
+  }
+
+  // Inputs are validated by the service; repeated adds never reassign or
+  // resurrect an existing hash. Only hashes and attribution reach SQLite.
+  addPoolClientKey({ keySha256, machine, profileSlug = null, profileLabel = null }, createdAt = now()) {
+    this.db.prepare(`
+      INSERT INTO pool_client_keys(key_sha256, machine, profile_slug, profile_label, created_at)
+      VALUES (?, ?, ?, ?, ?) ON CONFLICT(key_sha256) DO NOTHING
+    `).run(keySha256, machine, profileSlug, profileLabel, createdAt);
+  }
+
+  revokePoolClientKey(keySha256, revokedAt = now()) {
+    this.db.prepare('UPDATE pool_client_keys SET revoked_at = COALESCE(revoked_at, ?) WHERE key_sha256 = ?')
+      .run(revokedAt, keySha256);
+  }
+
+  poolClientKeys() {
+    return this.db.prepare('SELECT * FROM pool_client_keys ORDER BY machine, profile_slug, key_sha256').all()
+      .map((row) => ({ keySha256: row.key_sha256, machine: row.machine,
+        profileSlug: row.profile_slug, profileLabel: row.profile_label,
+        createdAt: row.created_at, revokedAt: row.revoked_at }));
   }
 
   // Apply one app report as an ATOMIC FULL REPLACEMENT (design §2.1).

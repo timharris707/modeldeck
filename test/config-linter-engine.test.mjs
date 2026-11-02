@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { CONFIG_LINT_RULES, evaluateConfigLint } from '../src/config-linter.mjs';
+import { parseUsageQueueRetention } from '../src/config-linter-snapshot.mjs';
+import { USAGE_QUEUE_CONSUMER_INTERVAL_MS } from '../src/usage-queue-consumer.mjs';
 
 const fixtures = fileURLToPath(new URL('./fixtures/config-linter/', import.meta.url));
 const readFixture = (name) => JSON.parse(fs.readFileSync(`${fixtures}${name}.json`, 'utf8'));
@@ -22,9 +24,10 @@ const expectedSeverities = new Map([
   ['MD-L13', 'warn'],
   ['MD-L14', 'warn'],
   ['MD-L15', 'warn'],
+  ['MD-L17', 'warn'],
 ]);
 
-test('registry carries all required fields for MD-L01 through MD-L15', () => {
+test('registry carries all required fields for MD-L01 through MD-L17 (MD-L16 reserved for #585)', () => {
   assert.deepEqual(CONFIG_LINT_RULES.map((rule) => rule.id), [...expectedSeverities.keys()]);
   for (const rule of CONFIG_LINT_RULES) {
     assert.equal(typeof rule.predicate, 'function', rule.id);
@@ -184,4 +187,79 @@ test('malformed daemon CLI version facts cannot turn version-gated rules into er
   const finding = evaluateConfigLint(snapshot).find((item) => item.ruleId === 'MD-L01');
   assert.match(finding?.message || '', /could not evaluate/i);
   assert.notEqual(finding?.severity, 'error');
+});
+
+// Issue #785: the proxy drops usage records unread longer than its retention
+// (absent or <= 0 means 60, capped at 3600); the daemon pulls every 5 minutes.
+test('MD-L17 reads the retention the way the proxy does', () => {
+  const cases = [
+    ['host: "127.0.0.1"\n', { seconds: 60, source: 'default' }],
+    ['redis-usage-queue-retention-seconds: 3600\n', { seconds: 3600, source: 'config' }],
+    ['redis-usage-queue-retention-seconds: 3600 # an hour\r\n', { seconds: 3600, source: 'config' }],
+    ['redis-usage-queue-retention-seconds: 0\n', { seconds: 60, source: 'config' }],
+    ['redis-usage-queue-retention-seconds: -5\n', { seconds: 60, source: 'config' }],
+    ['redis-usage-queue-retention-seconds: 7200\n', { seconds: 3600, source: 'config' }],
+    ['nested:\n  redis-usage-queue-retention-seconds: 3600\n', { seconds: 60, source: 'default' }],
+    ['redis-usage-queue-retention-seconds: "3600"\n', null],
+    ['redis-usage-queue-retention-seconds:\n', null],
+    ['redis-usage-queue-retention-seconds: 600\nredis-usage-queue-retention-seconds: 3600\n', null],
+    ['redis-usage-queue-retention-seconds: 0600\n', null],
+    ['"redis-usage-queue-retention-seconds": 3600\n', { seconds: 3600, source: 'config' }],
+    // Proxy v8 layout: the nested spelling wins over the top-level one.
+    ['config-version: 8\nobservability:\n  logs:\n    debug: false\n  usage:\n    usage-statistics-enabled: true\n    redis-usage-queue-retention-seconds: 3600\n', { seconds: 3600, source: 'config' }],
+    ['redis-usage-queue-retention-seconds: 3600\nobservability:\n  usage:\n    redis-usage-queue-retention-seconds: 60 # example default\n', { seconds: 60, source: 'config' }],
+    ['observability:\n  usage:\n    usage-statistics-enabled: true\nredis-usage-queue-retention-seconds: 3600\n', { seconds: 3600, source: 'config' }],
+    ['observability:\n  other:\n    redis-usage-queue-retention-seconds: 3600\n', { seconds: 60, source: 'default' }],
+    ['observability: { usage: { redis-usage-queue-retention-seconds: 60 } }\nredis-usage-queue-retention-seconds: 3600\n', null],
+    // Anchors, aliases and merge keys are beyond this line reader (CodeRabbit, #803).
+    ['observability: &obs\n  usage:\n    redis-usage-queue-retention-seconds: 60\nredis-usage-queue-retention-seconds: 3600\n', null],
+    ['defaults: &d\n  redis-usage-queue-retention-seconds: 60\nobservability: *d\nredis-usage-queue-retention-seconds: 3600\n', null],
+    ['observability:\n  usage:\n    <<: *usage\nredis-usage-queue-retention-seconds: 3600\n', null],
+    ['<<: *base\nhost: "127.0.0.1"\n', null],
+    ['redis-usage-queue-retention-seconds: *ret\n', null],
+    ['logging:\n  <<: *log\nredis-usage-queue-retention-seconds: 3600\n', { seconds: 3600, source: 'config' }],
+  ];
+  for (const [source, expected] of cases) assert.deepEqual(parseUsageQueueRetention(source), expected, source);
+});
+
+test('MD-L17 fires only when retention is under twice the pull interval on a consumer-on pool', () => {
+  const pullSeconds = USAGE_QUEUE_CONSUMER_INTERVAL_MS / 1000;
+  const lint = (usageQueue) => evaluateConfigLint({ ...readFixture('clean'), proxy: { ...readFixture('clean').proxy, usageQueue } })
+    .filter((finding) => finding.ruleId === 'MD-L17');
+  const on = { status: 'ok', consumerEnabled: true, path: '/fixture/proxy/config.yaml', retentionSource: 'config' };
+  assert.equal(lint({ ...on, retentionSeconds: 2 * pullSeconds - 1 }).length, 1);
+  assert.equal(lint({ ...on, retentionSeconds: 2 * pullSeconds }).length, 0);
+  assert.equal(lint({ status: 'ok', consumerEnabled: false }).length, 0);
+  assert.equal(lint({ status: 'remote' }).length, 0);
+  const [finding] = lint({ ...on, retentionSeconds: 60, retentionSource: 'default' });
+  assert.equal(finding.severity, 'warn');
+  assert.deepEqual(finding.evidence, [{
+    path: '/fixture/proxy/config.yaml', retentionSeconds: 60, retentionSource: 'default', pullIntervalSeconds: pullSeconds,
+  }]);
+});
+
+// Tripwire: every config ModelDeck writes or tells Tim to write must keep
+// records for at least two of the daemon's pull intervals.
+test('every retention ModelDeck writes outlasts the usage-queue pull interval', () => {
+  const pullSeconds = USAGE_QUEUE_CONSUMER_INTERVAL_MS / 1000;
+  const sources = [
+    'macos/ModelDeckMac/Sources/ModelDeckMacCore/ManagedProxyLive.swift',
+    'docs/live-proxy-ops.md',
+  ];
+  for (const source of sources) {
+    const text = fs.readFileSync(new URL(`../${source}`, import.meta.url), 'utf8');
+    const values = [...text.matchAll(/redis-usage-queue-retention-seconds:\s*(\d+)/g)].map((match) => Number(match[1]));
+    assert.ok(values.length > 0, `${source} sets no retention`);
+    for (const value of values) assert.ok(value >= 2 * pullSeconds, `${source}: ${value} < ${2 * pullSeconds}`);
+  }
+});
+
+test('MD-L06 points Linux at modeldeck launch, never the macOS-only shell installer', () => {
+  const snapshot = readFixture('clean');
+  snapshot.shell.zshenv.hasCodexBlock = false;
+  const fix = (platform) => evaluateConfigLint({ ...snapshot, platform })
+    .find((finding) => finding.ruleId === 'MD-L06').suggestedFix;
+  assert.match(fix('darwin'), /install-shell-env\.sh/);
+  assert.doesNotMatch(fix('linux'), /install-shell-env\.sh/);
+  assert.match(fix('linux'), /modeldeck launch codex/);
 });

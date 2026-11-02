@@ -149,15 +149,19 @@ struct ManagedProxySection: View {
     var body: some View {
         if available {
             Section(ManagedProxyOnboardingCopy.settingsSectionTitle) {
-                Text(ManagedProxyOnboardingCopy.settingsSummary(for: model.choice))
+                // Issue #784: in remote role the line is the daemon's reason
+                // and there is nothing here to enable or stop.
+                Text(ManagedProxyOnboardingCopy.settingsSummary(for: model.choice, role: model.proxyRole))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                if model.choice?.wantsManagedProxy == true {
-                    stopManaging
-                } else {
-                    Button(ManagedProxyOnboardingCopy.enableFromSettingsTitle) {
-                        Task { await model.enableFromSettings() }
+                if managedProxySettingsOffersActions(role: model.proxyRole) {
+                    if model.choice?.wantsManagedProxy == true {
+                        stopManaging
+                    } else {
+                        Button(ManagedProxyOnboardingCopy.enableFromSettingsTitle) {
+                            Task { await model.enableFromSettings() }
+                        }
                     }
                 }
                 if let instructions = model.restoreInstructions {

@@ -163,6 +163,73 @@ struct ProxyPoolDerivationTests {
     }
 }
 
+// MARK: - #784 routing off the pool host
+
+/// Issue #784 review: a remote-role daemon strips `proxyPool`, because pool
+/// membership is the host's business. Session routing is still this Mac's —
+/// through the forwarder on 127.0.0.1:8317 — so the row keeps its routing
+/// line, its Route offer and its Stop routing rollback, and never says
+/// "In pool".
+@Suite("Session routing stays on a remote-role Mac (issue #784)")
+struct ProxyPoolRemoteRoutingTests {
+    @Test func anUnroutedClaudeAccountOffersRouting() {
+        let a = account(proxyRouted: false, cliproxyRouted: false, helperRouted: false)
+        #expect(ProxyPool.statusText(for: a, role: .remote) == "Not routed")
+        #expect(ProxyPool.action(for: a, role: .remote) == .route)
+        #expect(ProxyPool.offersUnroute(for: a, role: .remote) == false)
+    }
+
+    @Test func aRoutedClaudeAccountKeepsItsRollback() {
+        let a = account(proxyRouted: true, cliproxyRouted: true, helperRouted: true)
+        #expect(ProxyPool.statusText(for: a, role: .remote) == "Routed")
+        #expect(ProxyPool.action(for: a, role: .remote) == nil)
+        #expect(ProxyPool.offersUnroute(for: a, role: .remote))
+        // The M4 rule holds here too: a gateway base URL that is not the
+        // local forwarder is the user's own config, never ours to delete.
+        let gateway = account(proxyRouted: true, cliproxyRouted: false)
+        #expect(ProxyPool.offersUnroute(for: gateway, role: .remote) == false)
+    }
+
+    @Test func membershipNeverShowsAndJoinIsNeverOffered() {
+        // Even a stray pool word from a skewed daemon says nothing here.
+        for pool: String? in [nil, "member", "absent"] {
+            let a = account(proxyPool: pool, proxyRouted: false)
+            #expect(ProxyPool.statusText(for: a, role: .remote)?.contains("pool") == false)
+            #expect(ProxyPool.action(for: a, role: .remote) != .join)
+        }
+        // Codex reports no routing, and joining happens on the host: nothing.
+        let codex = account(id: "x1", provider: "codex", label: "Codex One")
+        #expect(ProxyPool.statusText(for: codex, role: .remote) == nil)
+        #expect(ProxyPool.action(for: codex, role: .remote) == nil)
+        #expect(ProxyPool.offersUnroute(for: codex, role: .remote) == false)
+    }
+
+    @Test func theHostRowIsUnchanged() {
+        // The same remote-stripped account in host role renders nothing, as
+        // before #784 — and a host member row reads exactly as it did.
+        let stripped = account(proxyRouted: true, cliproxyRouted: true)
+        #expect(ProxyPool.statusText(for: stripped, role: .host) == nil)
+        #expect(ProxyPool.action(for: stripped, role: .host) == nil)
+        #expect(ProxyPool.offersUnroute(for: stripped, role: .host) == false)
+        let member = account(proxyPool: "member", proxyRouted: false)
+        #expect(ProxyPool.statusText(for: member, role: .host) == "In pool · not routed")
+        #expect(ProxyPool.action(for: member, role: .host) == .route)
+    }
+
+    @Test @MainActor func theRowPresentsRoutingInRemoteRole() {
+        let model = ProxyPoolModel(manager: ProxyManagerStub(), stateProvider: StateStub())
+        let unrouted = account(proxyRouted: false, cliproxyRouted: false)
+        #expect(model.presentation(for: unrouted, role: .remote)
+            == ProxyPoolRowPresentation(statusText: "Not routed", display: .action(.route), offersUnroute: false))
+        let routed = account(proxyRouted: true, cliproxyRouted: true)
+        #expect(model.presentation(for: routed, role: .remote)
+            == ProxyPoolRowPresentation(statusText: "Routed", display: .quiet, offersUnroute: true))
+        // Host role, same accounts: nothing, exactly as before.
+        #expect(model.presentation(for: unrouted, role: .host) == nil)
+        #expect(model.presentation(for: routed, role: .host) == nil)
+    }
+}
+
 // MARK: - #279 decoding
 
 @Suite("Proxy pool fields decode tolerantly (issue #279)")
@@ -279,6 +346,23 @@ struct ProxyPoolModelTests {
         await model.joinTasks[a.id]?.value
         #expect(model.presentation(for: a)?.display
             == .error("CLIProxyAPI claude login timed out before a matching auth file appeared"))
+    }
+
+    // Issue #784: a join the daemon set aside because the role moved to
+    // remote while it waited. The daemon's sentence is the reason, not a
+    // failure.
+    @Test func aRemoteRoleRefusalReadsAsTheDaemonsReasonNotAFailure() async {
+        let manager = ProxyManagerStub(join: .failure(DaemonClientError.daemonCodedError(
+            message: ProxyRoleCopy.remoteReason,
+            code: ProxyRoleCopy.remoteRefusalCode,
+            status: 409
+        )))
+        let model = ProxyPoolModel(manager: manager, stateProvider: StateStub())
+        let a = account(proxyPool: "absent")
+        model.beginJoin(account: a)
+        await model.joinTasks[a.id]?.value
+        #expect(model.errors[a.id] == nil)
+        #expect(model.presentation(for: a)?.display == .note(ProxyRoleCopy.remoteReason))
     }
 
     @Test func stoppingTheWaitIsHonestAboutTheDaemonStillWatching() async {

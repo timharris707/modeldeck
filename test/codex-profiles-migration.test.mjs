@@ -478,6 +478,11 @@ test('codex-profiles-migration-deferred-accounts-remain-usable-and-retryable', a
   assert.equal(data.service.codexProfilesDir, data.legacyDir);
   const spec = await data.service.loginSpec(data.account.id);
   assert.equal(spec.env.CODEX_HOME, data.account.profileRef);
+  // #808: a headless box signs Codex in with a device code.
+  assert.deepEqual(spec.args, ['login']);
+  const headless = await data.service.loginSpec(data.account.id, { headless: true });
+  assert.deepEqual(headless.args, ['login', '--device-auth']);
+  assert.match(headless.preview, / login --device-auth$/);
   data.service.requireProviderCli = async () => {};
   const added = await data.service.createCodexAccount({ label: 'Dummy third' });
   assert.equal(path.dirname(added.profileRef), data.legacyDir);

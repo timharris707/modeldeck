@@ -27,12 +27,12 @@ test('CLIProxyAPI pin records the resolved release, commit, and official Go arch
   const pin = readCLIProxyPin(fileURLToPath(pinPath));
   assert.deepEqual(pin, {
     repository: 'https://github.com/router-for-me/CLIProxyAPI',
-    tag: 'v8.0.40',
-    commit: 'd946c4fba6fc9a5cfbca1f3d85184d62ad2fb683',
+    tag: 'v8.0.47',
+    commit: '90c447d3a8727d115aa7552ec93ce023736ed492',
     goVersion: '1.26.10',
     goDarwinArm64Sha256: '0b5183492292ada170f9b561a834863808dd02edba599e4ad0e89899330020b3',
     bundlePath: 'Contents/Resources/cliproxyapi/cliproxyapi',
-    version: '8.0.40',
+    version: '8.0.47',
   });
 });
 
@@ -185,7 +185,7 @@ test('build script validates arguments and check-only stays offline', () => {
 // a version-matching local toolchain is not attestation, so a signing build
 // only ever accepts the checksum-verified official archive. TRIPWIRE
 // cliproxyapi-pinned-toolchain-only.
-test('signing builds refuse unpinned Go toolchains without the explicit escape hatch', () => {
+test('signing builds refuse unpinned Go toolchains without the explicit escape hatch', { skip: process.platform !== 'darwin' && 'macOS release build' }, () => {
   const script = fileURLToPath(buildScript);
 
   let result = spawnSync('bash', [script, '--help'], { encoding: 'utf8' });

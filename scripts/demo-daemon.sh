@@ -30,7 +30,11 @@ mkdir -p "$DEMO_DIR"
 # check: a symlink like /tmp/demo -> ~/Library/Application Support/ModelDeck
 # would pass a lexical comparison and then write fixtures into live data.
 DEMO_DIR="$(cd -P "$DEMO_DIR" && pwd -P)"
-LIVE_DATA_DIR="$HOME/Library/Application Support/ModelDeck"
+if [[ "$(uname -s)" == Darwin ]]; then
+  LIVE_DATA_DIR="$HOME/Library/Application Support/ModelDeck"
+else
+  LIVE_DATA_DIR="$HOME/.local/share/modeldeck"
+fi
 LIVE_DATA_DIR_REAL="$(cd -P "$LIVE_DATA_DIR" 2>/dev/null && pwd -P || echo "$LIVE_DATA_DIR")"
 case "$DEMO_DIR" in
   "$LIVE_DATA_DIR"|"$LIVE_DATA_DIR"/*|"$LIVE_DATA_DIR_REAL"|"$LIVE_DATA_DIR_REAL"/*)

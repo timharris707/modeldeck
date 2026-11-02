@@ -723,3 +723,66 @@ test('launchd inspection honors the injected executable and never touches live l
   assert.deepEqual(executables, [launchctlFixture]);
   assert.equal(executables.includes('/bin/launchctl'), false);
 });
+
+// Issue #785: with the usage-queue consumer on, the linter reads only the
+// retention number from the proxy's config.yaml, which also holds secrets.
+test('MD-L17 reads only the retention number from the proxy config', async (t) => {
+  const data = estate(t);
+  data.store.saveSettings({ usageQueueConsumerEnabled: true });
+  const configFile = path.join(data.paths.cliproxyConfigDir, 'config.yaml');
+  const secrets = [
+    'remote-management:',
+    '  secret-key: "placeholder-config-secret-must-not-surface"',
+    'api-keys:',
+    '  - "placeholder-client-key-must-not-surface"',
+  ];
+  fs.writeFileSync(configFile, `${secrets.join('\n')}\n`, { mode: 0o600 });
+
+  let snapshot = await collectConfigLintSnapshot(data.collectOptions);
+  let findings = evaluateConfigLint(snapshot).filter((item) => item.ruleId === 'MD-L17');
+  assert.deepEqual(snapshot.proxy.usageQueue, {
+    status: 'ok', consumerEnabled: true, path: configFile, retentionSeconds: 60, retentionSource: 'default',
+  });
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].severity, 'warn');
+  const serialized = JSON.stringify({ snapshot, findings });
+  for (const forbidden of ['placeholder-config-secret-must-not-surface', 'placeholder-client-key-must-not-surface']) {
+    assert.ok(!serialized.includes(forbidden), forbidden);
+  }
+
+  fs.writeFileSync(configFile, `${secrets.join('\n')}\nredis-usage-queue-retention-seconds: 3600\n`, { mode: 0o600 });
+  snapshot = await collectConfigLintSnapshot(data.collectOptions);
+  assert.equal(snapshot.proxy.usageQueue.retentionSeconds, 3600);
+  assert.deepEqual(evaluateConfigLint(snapshot).filter((item) => item.ruleId === 'MD-L17'), []);
+});
+
+test('MD-L17 never opens the proxy config while the usage-queue consumer is off', async (t) => {
+  const data = estate(t);
+  const configFile = path.join(data.paths.cliproxyConfigDir, 'config.yaml');
+  fs.writeFileSync(configFile, 'host: "127.0.0.1"\n', { mode: 0o600 });
+  const opened = [];
+  const snapshot = await collectConfigLintSnapshot({
+    ...data.collectOptions,
+    open: async (file, flags) => { opened.push(file); return fs.promises.open(file, flags); },
+  });
+  assert.deepEqual(snapshot.proxy.usageQueue, { status: 'ok', consumerEnabled: false });
+  assert.ok(!opened.includes(configFile));
+});
+
+test('MD-L17 cannot evaluate a missing or symlinked proxy config', async (t) => {
+  const data = estate(t);
+  data.store.saveSettings({ usageQueueConsumerEnabled: true });
+  const configFile = path.join(data.paths.cliproxyConfigDir, 'config.yaml');
+  const outside = path.join(data.root, 'outside.yaml');
+  fs.writeFileSync(outside, 'redis-usage-queue-retention-seconds: 3600\n', { mode: 0o600 });
+
+  for (const prepare of [() => {}, () => fs.symlinkSync(outside, configFile)]) {
+    fs.rmSync(configFile, { force: true });
+    prepare();
+    const snapshot = await collectConfigLintSnapshot(data.collectOptions);
+    assert.equal(snapshot.proxy.usageQueue.status, 'unknown');
+    const findings = evaluateConfigLint(snapshot).filter((item) => item.ruleId === 'MD-L17');
+    assert.equal(findings.length, 1);
+    assert.match(findings[0].message, /could not evaluate/i);
+  }
+});

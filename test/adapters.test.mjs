@@ -32,6 +32,7 @@ import {
   extractClaudeSubscriptionType,
   readClaudeAuthStatus,
   readClaudeRateLimitTier,
+  readClaudePlanDisplayName,
   readClaudeProfileIdentity,
 } from '../src/adapters/claude.mjs';
 import {
@@ -250,6 +251,23 @@ test('reads the organization rate-limit tier from the profile .claude.json', asy
   assert.equal(await readClaudeRateLimitTier({ claudeConfigDir: profile }), 'default_claude_max_20x');
 });
 
+// Issue #825: Anthropic renamed Max 20x to Ultra without changing the tier
+// code; the plan name lives in its own field.
+test('reads the plan display name from the profile .claude.json', async (t) => {
+  const root = temporaryRoot(t);
+  const profile = path.join(root, 'profile');
+  fs.mkdirSync(profile, { mode: 0o700 });
+  assert.equal(await readClaudePlanDisplayName({ claudeConfigDir: profile }), null); // absent file
+  fs.writeFileSync(path.join(profile, '.claude.json'), JSON.stringify({
+    oauthAccount: { organizationRateLimitTier: 'default_claude_max_20x' },
+  }), { mode: 0o600 });
+  assert.equal(await readClaudePlanDisplayName({ claudeConfigDir: profile }), null); // field absent
+  fs.writeFileSync(path.join(profile, '.claude.json'), JSON.stringify({
+    oauthAccount: { organizationRateLimitTier: 'default_claude_max_20x', planDisplayName: ' Ultra ' },
+  }), { mode: 0o600 });
+  assert.equal(await readClaudePlanDisplayName({ claudeConfigDir: profile }), 'Ultra');
+});
+
 test('reads normalized Claude identity facts from the credential-free profile file', async (t) => {
   const root = temporaryRoot(t);
   fs.writeFileSync(path.join(root, '.claude.json'), JSON.stringify({
@@ -268,7 +286,7 @@ test('claude auth status captures the plan without extra provider calls', async 
   const profileRef = path.join(profilesDir, 'work');
   fs.mkdirSync(profileRef, { mode: 0o700 });
   fs.writeFileSync(path.join(profileRef, '.claude.json'), JSON.stringify({
-    oauthAccount: { organizationRateLimitTier: 'default_claude_max_20x' },
+    oauthAccount: { organizationRateLimitTier: 'default_claude_max_20x', planDisplayName: 'Ultra' },
   }), { mode: 0o600 });
   const calls = [];
   const status = await readClaudeAuthStatus({
@@ -283,7 +301,8 @@ test('claude auth status captures the plan without extra provider calls', async 
   assert.deepEqual(status, {
     authenticated: true,
     identity: 'user@example.invalid',
-    plan: { subscriptionType: 'max', rateLimitTier: 'default_claude_max_20x' },
+    // Issue #825: the plan name Claude saves beside the unchanged tier code.
+    plan: { subscriptionType: 'max', rateLimitTier: 'default_claude_max_20x', displayName: 'Ultra' },
   });
 });
 
@@ -881,7 +900,7 @@ test('pinned env file exports both variables with one identical quoted path', ()
   assert.throws(() => claudePinnedEnvFileContent(), /real path is required/);
 });
 
-test('proxy-routed pinned env file adds the guarded Keychain pointer without changing the quoted pins', () => {
+test('proxy-routed pinned env file adds the guarded Keychain pointer without changing the quoted pins', { skip: process.platform !== 'darwin' && 'Keychain strings are macOS-only; the Linux block is in client-key-linux.test.mjs' }, () => {
   const content = claudePinnedEnvFileContent("/profiles/o'brien", true);
   const expected = `'/profiles/o'\\''brien'`;
   assert.ok(content.includes(`export CLAUDE_CONFIG_DIR=${expected}`));
@@ -1480,7 +1499,7 @@ test('claude auth status reads identity under the managed profile home only', as
   assert.deepEqual(status, {
     authenticated: true,
     identity: 'user@example.invalid',
-    plan: { subscriptionType: null, rateLimitTier: null },
+    plan: { subscriptionType: null, rateLimitTier: null, displayName: null },
   });
   assert.deepEqual(calls[0].args, ['auth', 'status']);
   assert.ok(!calls[0].args.includes('logout'));

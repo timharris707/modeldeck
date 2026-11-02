@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { LEGACY_CLIENT_KEY_SERVICE, clientKeyShellFetch } from '../src/client-key-helper.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -342,7 +343,7 @@ test('Claude activation pins proxy credentials by Keychain pointer and removes t
   assert.ok(content.includes(`export CLAUDE_CONFIG_DIR='${firstReal}'`));
   assert.ok(content.includes(`export CLAUDE_SECURESTORAGE_CONFIG_DIR='${firstReal}'`));
   // #278 review, major 1: guarded pointer — only a non-empty lookup exports.
-  assert.ok(content.includes('__modeldeck_key="$("${MODELDECK_SECURITY_BIN:-/usr/bin/security}" find-generic-password -s cli-proxy-api-client -w 2>/dev/null || true)"'));
+  assert.ok(content.includes(`__modeldeck_key="$(${clientKeyShellFetch(LEGACY_CLIENT_KEY_SERVICE)} 2>/dev/null || true)"`));
   assert.ok(content.includes('export ANTHROPIC_API_KEY="$__modeldeck_key"'));
   assert.equal((fs.statSync(envFile).mode & 0o777), 0o600);
   // The activation path only reads routing from settings. The credential
@@ -375,17 +376,20 @@ test('Claude activation pins proxy credentials by Keychain pointer and removes t
   // shared item (asserted above); a profile with a per-profile record must
   // get its own, or activation would hand a migrated profile another
   // profile's key — the mis-attribution blocker 1 exists to prevent.
-  const service = `cli-proxy-api-client.${first.id}`;
-  data.service.saveClaudeClientKeyRecord(first.id, {
-    mode: 'per-profile',
-    service,
-    helper: `security find-generic-password -s ${service} -w`,
-    writtenAt: new Date().toISOString(),
-  });
-  await data.service.activateAccount(first.id);
-  content = fs.readFileSync(envFile, 'utf8');
-  assert.ok(content.includes(`find-generic-password -s ${service} -w`));
-  assert.ok(!content.includes('-s cli-proxy-api-client -w'));
+  // Per-profile items are macOS-only; elsewhere the Mac app never writes one (#808).
+  if (process.platform === 'darwin') {
+    const service = `cli-proxy-api-client.${first.id}`;
+    data.service.saveClaudeClientKeyRecord(first.id, {
+      mode: 'per-profile',
+      service,
+      helper: `security find-generic-password -s ${service} -w`,
+      writtenAt: new Date().toISOString(),
+    });
+    await data.service.activateAccount(first.id);
+    content = fs.readFileSync(envFile, 'utf8');
+    assert.ok(content.includes(`find-generic-password -s ${service} -w`));
+    assert.ok(!content.includes('-s cli-proxy-api-client -w'));
+  }
   await data.service.activateAccount(second.id);
 
   // Codex activation must not touch the Claude pin.
@@ -951,6 +955,30 @@ test('Claude login specs are version-aware (issue #99)', async (t) => {
       assert.deepEqual(spec.args, ['login']);
     } finally { data.close(); }
   });
+});
+
+// Issue #825: verify saves the plan display name, keeps it when the profile
+// file gave nothing, and clears it when the file was read without one.
+test('Claude verify saves, keeps, and clears the plan display name', async () => {
+  let plan = { subscriptionType: null, rateLimitTier: null, displayName: 'Ultra' };
+  const data = fixture({
+    readClaudeAuth: async () => ({ authenticated: true, identity: 'user@example.invalid', plan }),
+  });
+  try {
+    const account = data.store.saveAccount({
+      provider: 'claude', label: 'Work', identity: 'user@example.invalid', profileRef: data.firstHome,
+    });
+    await data.service.verifyAccount(account.id);
+    assert.deepEqual(data.store.getAccount(account.id).metadata.claudePlan,
+      { subscriptionType: null, rateLimitTier: null, displayName: 'Ultra' });
+    plan = { subscriptionType: 'max', rateLimitTier: null, displayName: null };
+    await data.service.verifyAccount(account.id);
+    assert.equal(data.store.getAccount(account.id).metadata.claudePlan.displayName, 'Ultra');
+    plan = { subscriptionType: 'max', rateLimitTier: 'default_claude_max_5x', displayName: null };
+    await data.service.verifyAccount(account.id);
+    assert.deepEqual(data.store.getAccount(account.id).metadata.claudePlan,
+      { subscriptionType: 'max', rateLimitTier: 'default_claude_max_5x' });
+  } finally { data.close(); }
 });
 
 // Issue #99 fix direction 2: post-login identity verification with teeth.

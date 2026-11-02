@@ -18,7 +18,10 @@ const launcher = path.join(repoRoot, 'scripts', 'demo-daemon.sh');
 
 function makeHome() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-demo-iso-'));
-  const liveDataDir = path.join(home, 'Library', 'Application Support', 'ModelDeck');
+  // The live directory the scripts guard: ~/Library on macOS, XDG data elsewhere (#807).
+  const liveDataDir = process.platform === 'darwin'
+    ? path.join(home, 'Library', 'Application Support', 'ModelDeck')
+    : path.join(home, '.local', 'share', 'modeldeck');
   fs.mkdirSync(liveDataDir, { recursive: true });
   return { home, liveDataDir };
 }

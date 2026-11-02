@@ -291,7 +291,8 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         for plan in candidates.compactMap({ $0 }) {
             if let label = PlanTierFormatter.label(
                 subscriptionType: plan.subscriptionType,
-                rateLimitTier: plan.rateLimitTier
+                rateLimitTier: plan.rateLimitTier,
+                displayName: plan.displayName
             ) {
                 return label
             }
@@ -535,7 +536,8 @@ public struct DeckAccountMetadata: Codable, Equatable, Sendable {
 /// captures these with zero extra provider calls: `subscriptionType` from
 /// `claude auth status` JSON ("max") and `rateLimitTier` from the profile's
 /// `.claude.json` (`oauthAccount.organizationRateLimitTier`, e.g.
-/// "default_claude_max_20x").
+/// "default_claude_max_20x"). `displayName` is the plan name Claude saves
+/// beside the tier (`oauthAccount.planDisplayName`, "Ultra"; issue #825).
 ///
 /// Decoding is deliberately shape-tolerant (issue #30, ahead of #26's Codex
 /// payload): a bare string ("pro") reads as the subscription type, and an
@@ -544,15 +546,18 @@ public struct DeckAccountMetadata: Codable, Equatable, Sendable {
 public struct ProviderPlanInfo: Codable, Equatable, Sendable {
     public var subscriptionType: String?
     public var rateLimitTier: String?
+    public var displayName: String?
 
-    public init(subscriptionType: String? = nil, rateLimitTier: String? = nil) {
+    public init(subscriptionType: String? = nil, rateLimitTier: String? = nil, displayName: String? = nil) {
         self.subscriptionType = subscriptionType
         self.rateLimitTier = rateLimitTier
+        self.displayName = displayName
     }
 
     private enum CodingKeys: String, CodingKey {
         case subscriptionType, planType, plan, type
         case rateLimitTier, tier
+        case displayName
     }
 
     public init(from decoder: Decoder) throws {
@@ -578,7 +583,8 @@ public struct ProviderPlanInfo: Codable, Equatable, Sendable {
         }
         self.init(
             subscriptionType: first([.subscriptionType, .planType, .plan, .type]),
-            rateLimitTier: first([.rateLimitTier, .tier])
+            rateLimitTier: first([.rateLimitTier, .tier]),
+            displayName: first([.displayName])
         )
     }
 
@@ -586,6 +592,7 @@ public struct ProviderPlanInfo: Codable, Equatable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encodeIfPresent(subscriptionType, forKey: .subscriptionType)
         try container.encodeIfPresent(rateLimitTier, forKey: .rateLimitTier)
+        try container.encodeIfPresent(displayName, forKey: .displayName)
     }
 }
 
@@ -594,9 +601,15 @@ public struct ProviderPlanInfo: Codable, Equatable, Sendable {
 /// present ("Max (20x)"), the subscription alone when no multiplier is
 /// recognizable, nothing at all when the plan is unknown. Tolerates absent
 /// or unrecognized tier strings gracefully. Provider-generic (issue #30):
-/// Codex tiers ("Pro", "Plus") flow through the same derivation.
+/// Codex tiers ("Pro", "Plus") flow through the same derivation. A plan
+/// display name, when the provider saved one, wins outright and renders as
+/// written (issue #825: Max 20x became "Ultra" while the tier code still
+/// says "max_20x").
 public enum PlanTierFormatter {
-    public static func label(subscriptionType: String?, rateLimitTier: String?) -> String? {
+    public static func label(subscriptionType: String?, rateLimitTier: String?, displayName: String? = nil) -> String? {
+        if let name = displayName?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+            return name
+        }
         guard let base = baseName(subscriptionType: subscriptionType, rateLimitTier: rateLimitTier) else {
             return nil
         }
@@ -612,9 +625,10 @@ public enum PlanTierFormatter {
             return subscription.prefix(1).uppercased() + subscription.dropFirst()
         }
         // Fall back to a recognizable plan word inside the tier string.
+        // "ultra" is Max 20x renamed (Anthropic, 2026-10-30, issue #799).
         guard let tier = rateLimitTier?.lowercased() else { return nil }
         let tokens = tier.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
-        for plan in ["max", "pro", "plus", "team", "enterprise", "free"] where tokens.contains(Substring(plan)) {
+        for plan in ["ultra", "max", "pro", "plus", "team", "enterprise", "free"] where tokens.contains(Substring(plan)) {
             return plan.prefix(1).uppercased() + plan.dropFirst()
         }
         return nil
@@ -1041,6 +1055,61 @@ public struct ModelDropStatus: Codable, Equatable, Sendable {
     }
 }
 
+/// Issue #784: `/api/state.proxy`. A role string this build does not know is
+/// still the daemon saying "not the host", so it stands down like remote. A
+/// block without a string role is malformed: it throws here, and
+/// `DeckState`'s `try?` reads it as absent, which is host.
+public struct DeckProxyStatus: Codable, Equatable, Sendable {
+    public var role: ProxyRole
+    /// Issue #788: the pool host's usage page, reported in remote role once
+    /// one is set. A missing or malformed block reads as none and never
+    /// costs the role.
+    public var hub: DeckProxyHub?
+
+    public init(role: ProxyRole, hub: DeckProxyHub? = nil) {
+        self.role = role
+        self.hub = hub
+    }
+
+    private enum CodingKeys: String, CodingKey { case role, hub }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.role = ProxyRole(named: try container.decode(String.self, forKey: .role))
+        self.hub = try? container.decodeIfPresent(DeckProxyHub.self, forKey: .hub)
+    }
+}
+
+/// Issue #788: `/api/state.proxy.hub`. The daemon reads the pool host's
+/// usage page about every 5 minutes and reports the page's URL, when it last
+/// tried (`lastAttemptAt`), when the page last answered (`lastAnsweredAt`),
+/// when a read last finished in failure (`lastFailedAt`; an answer never
+/// clears it), and whether the last answer said the page has fresh data
+/// from its own daemon (`lastReadOk`). Timestamps are ISO strings, null until
+/// the first such event; a daemon from before `lastFailedAt` omits it, which
+/// reads as null. A field of the wrong type makes the whole block malformed.
+public struct DeckProxyHub: Codable, Equatable, Sendable {
+    public var url: String
+    public var lastAttemptAt: String?
+    public var lastAnsweredAt: String?
+    public var lastFailedAt: String?
+    public var lastReadOk: Bool?
+
+    public init(
+        url: String,
+        lastAttemptAt: String? = nil,
+        lastAnsweredAt: String? = nil,
+        lastFailedAt: String? = nil,
+        lastReadOk: Bool? = nil
+    ) {
+        self.url = url
+        self.lastAttemptAt = lastAttemptAt
+        self.lastAnsweredAt = lastAnsweredAt
+        self.lastFailedAt = lastFailedAt
+        self.lastReadOk = lastReadOk
+    }
+}
+
 /// `GET /api/state` — only the slices Phase 3 needs. The daemon also returns
 /// `projects` and `launches`; they are ignored here and picked up in Phase 4+.
 public struct DeckState: Codable, Equatable, Sendable {
@@ -1080,6 +1149,10 @@ public struct DeckState: Codable, Equatable, Sendable {
     /// plus one more: a `status` this build does not recognize reads as
     /// absent rather than rendering a line it cannot explain.
     public var codexProfilesMigration: CodexProfilesMigration?
+    /// Issue #784: which Mac hosts the proxy pool, and since #788 the pool
+    /// host's usage page. Same tolerant contract as the fields above; read
+    /// the role through `proxyRole`.
+    public var proxy: DeckProxyStatus?
 
     public init(
         accounts: [DeckAccount] = [],
@@ -1092,7 +1165,8 @@ public struct DeckState: Codable, Equatable, Sendable {
         sharedScope: SharedScopeStatus? = nil,
         codexProfilesMigration: CodexProfilesMigration? = nil,
         managed: [String: Bool]? = nil,
-        managementBlocked: [String: String]? = nil
+        managementBlocked: [String: String]? = nil,
+        proxy: DeckProxyStatus? = nil
     ) {
         self.managed = managed
         self.managementBlocked = managementBlocked
@@ -1105,11 +1179,12 @@ public struct DeckState: Codable, Equatable, Sendable {
         self.modelDrop = modelDrop
         self.sharedScope = sharedScope
         self.codexProfilesMigration = codexProfilesMigration
+        self.proxy = proxy
     }
 
     private enum CodingKeys: String, CodingKey {
         case managed, managementBlocked, accounts, usage, activation, scheduler, daemon, memberBlackout, modelDrop, sharedScope
-        case codexProfilesMigration
+        case codexProfilesMigration, proxy
     }
 
     public init(from decoder: Decoder) throws {
@@ -1128,7 +1203,12 @@ public struct DeckState: Codable, Equatable, Sendable {
             CodexProfilesMigration.self,
             forKey: .codexProfilesMigration
         )
+        self.proxy = try? container.decodeIfPresent(DeckProxyStatus.self, forKey: .proxy)
     }
+
+    /// Issue #784: a daemon that omits `proxy` (pre-#784), or sends a block
+    /// without a readable role, reads as `.host`, today's behaviour.
+    public var proxyRole: ProxyRole { proxy?.role ?? .host }
 
     public func isManaged(_ provider: DeckProvider) -> Bool {
         // An older daemon predates this choice and manages both providers.
@@ -1350,6 +1430,9 @@ public struct ProxyReloginState: Codable, Equatable, Sendable {
     public var available: Bool?
     public var reason: String?
     public var cancelledUpstream: Bool?
+    /// Issue #784: `proxy-role-remote` when the daemon answers for a Mac
+    /// that uses the pool on another machine; `reason` then says so.
+    public var code: String?
 
     public init(
         accountId: String? = nil,
@@ -1359,7 +1442,8 @@ public struct ProxyReloginState: Codable, Equatable, Sendable {
         url: String? = nil,
         available: Bool? = nil,
         reason: String? = nil,
-        cancelledUpstream: Bool? = nil
+        cancelledUpstream: Bool? = nil,
+        code: String? = nil
     ) {
         self.accountId = accountId
         self.provider = provider
@@ -1369,10 +1453,11 @@ public struct ProxyReloginState: Codable, Equatable, Sendable {
         self.available = available
         self.reason = reason
         self.cancelledUpstream = cancelledUpstream
+        self.code = code
     }
 
     private enum CodingKeys: String, CodingKey {
-        case accountId, provider, phase, detail, url, available, reason, cancelledUpstream
+        case accountId, provider, phase, detail, url, available, reason, cancelledUpstream, code
     }
 
     public init(from decoder: Decoder) throws {
@@ -1388,7 +1473,8 @@ public struct ProxyReloginState: Codable, Equatable, Sendable {
             url: (try? container.decodeIfPresent(String.self, forKey: .url)) ?? nil,
             available: (try? container.decodeIfPresent(Bool.self, forKey: .available)) ?? nil,
             reason: (try? container.decodeIfPresent(String.self, forKey: .reason)) ?? nil,
-            cancelledUpstream: (try? container.decodeIfPresent(Bool.self, forKey: .cancelledUpstream)) ?? nil
+            cancelledUpstream: (try? container.decodeIfPresent(Bool.self, forKey: .cancelledUpstream)) ?? nil,
+            code: (try? container.decodeIfPresent(String.self, forKey: .code)) ?? nil
         )
     }
 }

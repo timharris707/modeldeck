@@ -84,6 +84,7 @@ instead of asserting.
 | MD-L13 | Proxy auth dir: a weight-bearing auth file no registered account claims (a decommissioned account silently keeping a stale weight) | warn | rebalance cron's NOTE path |
 | MD-L14 | Proxy `.mgmt-key` file missing while the proxy is managed, or readable by group/other | warn | managed-proxy-adoption.md |
 | MD-L15 | `MODELDECK_*` environment overrides active on the running daemon that point config/auth dirs at different installs (the split the CLIPROXY_AUTH_DIR comment in paths.mjs guards: reporting on one install while reading auth metadata from another) | warn | PR #430 review note in paths.mjs |
+| MD-L17 | The daemon's usage-queue consumer is on, but the proxy's `config.yaml` keeps unread usage records (`redis-usage-queue-retention-seconds`, default 60; proxy v8's `observability.usage` spelling wins when both exist) for less than two of the daemon's 5-minute pulls, so usage can be dropped before it is read. Only that one number is read from the file. MD-L16 is reserved for #585 | warn | #785 |
 
 MD-L11 is `info` in v1. PATH enumeration is deterministic and sorted, but the
 linter cannot establish every reachable executable's version without spawning

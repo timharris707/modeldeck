@@ -63,6 +63,7 @@ export class UsageQueueConsumer {
     warn = (message) => console.warn(`[modeldeck] ${message}`),
     log = (message) => console.log(`[modeldeck] ${message}`),
     requestTimeoutMs = USAGE_QUEUE_REQUEST_TIMEOUT_MS,
+    canPull = () => true,
   } = {}) {
     if (!store?.ingestRequestUsage) throw new Error('usage queue consumer requires a Store');
     this.store = store;
@@ -74,10 +75,12 @@ export class UsageQueueConsumer {
     this.warn = warn;
     this.log = log;
     this.requestTimeoutMs = requestTimeoutMs;
+    this.canPull = canPull;
   }
 
   async pull() {
     const result = summary();
+    if (!this.canPull()) return { ...result, skipped: true };
     let url;
     try {
       url = loopbackUsageQueueUrl(this.baseUrl);
@@ -102,6 +105,9 @@ export class UsageQueueConsumer {
 
     let response;
     try {
+      // The pool role may change while the key read is pending. Check
+      // again immediately before the request that destructively drains it.
+      if (!this.canPull()) return { ...result, skipped: true };
       const timeout = Number(this.requestTimeoutMs);
       response = await this.fetcher(url, {
         method: 'GET',

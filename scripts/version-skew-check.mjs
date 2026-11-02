@@ -4,10 +4,11 @@
 // installed Codex CLI, Claude Code CLI, live proxy binary, the bundled pin, and
 // upstream CLIProxyAPI releases, and reports which process actually holds the
 // proxy port and whether the launch agent is alive. Spends no provider quota,
-// sends nothing to a live port, and executes nothing it finds: it reads version
-// strings from files, upstream release metadata, and the local process table.
+// reads daemon settings and (in remote role) forwarder health. It executes
+// nothing it finds: versions come from files and the local process table.
 import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { readCLIProxyPin } from './cliproxyapi-pin.mjs';
@@ -87,7 +88,7 @@ export function parseBinaryVersion(buffer, { majorHint }) {
 
 // Pure comparison: returns [{level: 'warn'|'info', message}]. Any 'warn' means
 // the recorded pair no longer describes reality and needs a re-verify.
-export function evaluateSkew({ pairs, pinVersion, live, codex, claude, upstreamTags, portHolder, launchAgent, probeErrors }) {
+export function evaluateSkew({ pairs, pinVersion, live, codex, claude, upstreamTags, portHolder, launchAgent, probeErrors, role = 'host', health }) {
   const findings = [];
   const warn = (message) => findings.push({ level: 'warn', message });
   const info = (message) => findings.push({ level: 'info', message });
@@ -95,13 +96,23 @@ export function evaluateSkew({ pairs, pinVersion, live, codex, claude, upstreamT
   for (const [name, actual, recorded] of [
     ['Codex CLI', codex, pairs.codexCli],
     ['Claude Code CLI', claude, pairs.claudeCli],
-    ['live proxy binary', live, pairs.liveProxy.version],
+    ...(role === 'remote' ? [] : [['live proxy binary', live, pairs.liveProxy.version]]),
   ]) {
     if (actual == null) {
       warn(`${name}: version could not be read; re-verify the pair by hand`);
     } else if (actual !== recorded) {
       warn(`${name} is ${actual} but the verified pair (${pairs.verifiedOn}) records ${recorded}; re-verify the pair and update scripts/version-pairs.json`);
     }
+  }
+
+  if (role === 'remote') {
+    info('remote role: proxy checks run on the pool host');
+    for (const message of probeErrors ?? []) warn(`probe failed: ${message}`);
+    if (portHolder === null) warn('pool forwarder is missing: nothing is listening on port 8317');
+    else if (!portHolder) warn('pool forwarder on port 8317 could not be checked');
+    else if (!portHolder.isForwarder) warn('port 8317 is held by a process that is not the pool forwarder');
+    if (health?.status !== 'ok') warn('pool forwarder healthz failed: expected status ok on port 8317');
+    return findings;
   }
 
   // The stamped Claude client identity is compiled into the proxy, so the
@@ -228,12 +239,19 @@ function samePath(a, b) {
 // version comes from the executable's bytes, or from the bundled pin when the
 // executable is the app's own copy (that binary carries no scannable version
 // string). Nothing found here is executed (decision 0010).
-export function probePortHolder(port, { recordedBinaryPath, pin, majorHint }) {
+export function probePortHolder(port, { recordedBinaryPath, pin, majorHint, role = 'host' }) {
   const pids = listeningPids(port);
   if (pids === null) return null;
   return pickPortHolder(pids.map((pid) => {
     const path = executablePath(pid);
     if (path === null) return { pid, path: null, version: null, matchesRecorded: false };
+    if (role === 'remote') {
+      let commandLine = '';
+      try {
+        commandLine = execFileSync('ps', ['-ww', '-o', 'args=', '-p', pid], { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] });
+      } catch { /* The process may have exited between probes. */ }
+      return { pid, path, isForwarder: isPoolForwarder(path, commandLine), matchesRecorded: false };
+    }
     const matchesRecorded = samePath(path, recordedBinaryPath);
     let version = null;
     if (pin && path.endsWith(`/${pin.bundlePath}`)) {
@@ -248,13 +266,48 @@ export function probePortHolder(port, { recordedBinaryPath, pin, majorHint }) {
       }
     }
     return { pid, path, version, matchesRecorded };
-  }));
+  }), role);
 }
 
 // Every listener is examined; the one reported is the first that is NOT the
 // recorded binary, so a recorded listener can never mask a foreign one.
-export function pickPortHolder(holders) {
-  return holders.find((holder) => !holder.matchesRecorded) ?? holders[0] ?? null;
+export function pickPortHolder(holders, role = 'host') {
+  return holders.find((holder) => role === 'remote' ? !holder.isForwarder : !holder.matchesRecorded) ?? holders[0] ?? null;
+}
+
+// The installer launches Node with just the script path. Do not accept an
+// arbitrary command merely mentioning the forwarder (e.g. node -e or a shell).
+export function isPoolForwarder(executable, commandLine) {
+  if (!executable || !path.isAbsolute(executable) || !samePath(executable, process.execPath)) return false;
+  const command = commandLine.trim();
+  // ps does not quote argv: try the separator positions so paths with spaces
+  // and Homebrew's node symlink still resolve to the two exact files.
+  for (const separator of command.matchAll(/\s+/g)) {
+    const node = command.slice(0, separator.index);
+    const script = command.slice(separator.index + separator[0].length);
+    if (path.isAbsolute(node) && path.isAbsolute(script) && samePath(node, executable)
+      && samePath(script, fileURLToPath(new URL('../tools/pool-forwarder/forwarder.mjs', import.meta.url)))) return true;
+  }
+  return false;
+}
+
+export async function probeClientRole({ fetchImpl = fetch, daemonUrl = 'http://127.0.0.1:3867', log = console.log } = {}) {
+  try {
+    const response = await fetchImpl(`${daemonUrl}/api/settings`, { signal: AbortSignal.timeout(3000), redirect: 'error' });
+    if (response.ok) {
+      const settings = await response.json();
+      return settings?.proxyRole === 'remote' ? 'remote' : 'host';
+    }
+  } catch { /* An older or stopped daemon keeps the existing host checks. */ }
+  log('role unknown (daemon not answering); checks assume host');
+  return 'host';
+}
+
+export async function probeForwarderHealth({ fetchImpl = fetch, healthUrl = 'http://127.0.0.1:8317/healthz' } = {}) {
+  try {
+    const response = await fetchImpl(healthUrl, { signal: AbortSignal.timeout(3000), redirect: 'error' });
+    return response.ok ? await response.json() : null;
+  } catch { return null; }
 }
 
 // `ps -o etime=` renders [[dd-]hh:]mm:ss.
@@ -305,34 +358,37 @@ function upstreamReleaseTags() {
   }
 }
 
-function main() {
+async function main() {
+  const role = await probeClientRole();
   const pairs = readVersionPairs();
-  const pin = readCLIProxyPin();
+  const pin = role === 'remote' ? null : readCLIProxyPin();
   const binaryPath = pairs.liveProxy.binaryPath.replace(/^~(?=\/)/, os.homedir());
 
   const majorHint = pairs.liveProxy.version.split('.')[0];
   let live = null;
-  if (fs.existsSync(binaryPath)) {
+  if (role !== 'remote' && fs.existsSync(binaryPath)) {
     live = parseBinaryVersion(fs.readFileSync(binaryPath), { majorHint });
   }
 
   const probeErrors = [];
   let portHolder;
   try {
-    portHolder = probePortHolder(PROXY_PORT, { recordedBinaryPath: binaryPath, pin, majorHint });
+    portHolder = probePortHolder(PROXY_PORT, { recordedBinaryPath: binaryPath, pin, majorHint, role });
   } catch (error) {
     probeErrors.push(error.message);
   }
 
   const findings = evaluateSkew({
     pairs,
-    pinVersion: pin.version,
+    role,
+    health: role === 'remote' ? await probeForwarderHealth() : undefined,
+    pinVersion: pin?.version,
     live,
     codex: cliVersion('codex'),
     claude: cliVersion('claude'),
-    upstreamTags: upstreamReleaseTags(),
+    upstreamTags: role === 'remote' ? [] : upstreamReleaseTags(),
     portHolder,
-    launchAgent: pairs.liveProxy.launchdLabel ? probeLaunchAgent(pairs.liveProxy.launchdLabel) : undefined,
+    launchAgent: role !== 'remote' && pairs.liveProxy.launchdLabel ? probeLaunchAgent(pairs.liveProxy.launchdLabel) : undefined,
     probeErrors,
   });
 
@@ -357,7 +413,7 @@ function isEntrypoint() {
 
 if (isEntrypoint()) {
   try {
-    main();
+    await main();
   } catch (error) {
     console.error(`version-skew-check.mjs: ERROR: ${error.message}`);
     process.exitCode = 1;

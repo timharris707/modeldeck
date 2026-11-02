@@ -418,12 +418,15 @@ in sync with it:
 - `docs/ACCOUNT_ONBOARDING.md`
 - `docs/lane-routing-policy.md`
 - `docs/live-proxy-ops.md`
+- `docs/linux-install.md` (private until Tim decides to publish Linux support)
 - `docs/incidents/`
 - `scripts/lane-codex.sh`
 - `scripts/lane-watch.mjs`
 - `scripts/live-proxy-swap.sh`
 - `test/lane-codex-args.test.mjs`
 - `design/mac-app-roadmap.md`
+- `ops` (the pool host's operator scripts, e.g. the rebalancer)
+- `.github/workflows/test-linux.yml` (the Linux test job runs the `ops` rebalancer selftest)
 - The scrub-pattern file named by `MD_SCRUB_PATTERNS` when it is inside the
   source repository.
 

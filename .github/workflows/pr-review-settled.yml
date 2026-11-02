@@ -49,3 +49,7 @@ jobs:
       # own caller).
       skip-title-regex: 'handoff:|progress-log'
       skip-label: skip-review
+      # The gate mostly waits for CodeRabbit, so it runs on L.Box's gate
+      # runners (scripts/box-gate-runners.sh) instead of paid GitHub minutes.
+      # Back to GitHub: set repo variable MODELDECK_GATE_RUNNER to '"ubuntu-latest"'.
+      runs-on: ${{ vars.MODELDECK_GATE_RUNNER || '["self-hosted","modeldeck-gate"]' }}

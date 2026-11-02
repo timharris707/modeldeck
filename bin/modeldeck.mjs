@@ -4,9 +4,11 @@ import path from 'node:path';
 import { Store } from '../src/db.mjs';
 import { ModelDeckService } from '../src/service.mjs';
 import { evaluateCapacity } from '../src/capacity.mjs';
+import { addAccount, runInTerminal, signin } from '../src/signin-cli.mjs';
+import { resolveMutationToken } from '../src/token.mjs';
 import { configLintFailureFindings, evaluateConfigLint, renderConfigLintTable } from '../src/config-linter.mjs';
 import { collectConfigLintSnapshot, configLintSnapshotOptions } from '../src/config-linter-snapshot.mjs';
-import { LEGACY_CLIENT_KEY_SERVICE, assertClientKeyService } from '../src/client-key-helper.mjs';
+import { LEGACY_CLIENT_KEY_SERVICE, assertClientKeyService, readClientKey } from '../src/client-key-helper.mjs';
 import {
   DB_PATH, PROJECTS_ROOT, CLAUDE_PATH, CLAUDE_PROFILES_DIR, CLAUDE_ACTIVE_LINK,
   CLAUDE_SHELL_ENV_FILE, CLAUDE_STATUSLINE_DIR, CODEX_PATH, CODEX_ACTIVE_LINK, CODEX_PROFILES_DIR,
@@ -30,6 +32,8 @@ Usage:
   modeldeck resolve <claude|codex> [project-path]
   modeldeck launch <claude|codex> [--project path] [--dry-run] [-- <provider args>]
   modeldeck refresh
+  modeldeck add <claude|codex> <label> [--manage]
+  modeldeck signin <account id or label>
 `);
 }
 
@@ -87,6 +91,35 @@ if (command === 'serve') {
     if (args.includes('--json')) console.log(JSON.stringify({ findings }, null, 2));
     else process.stdout.write(renderConfigLintTable(findings));
     if (findings.some((finding) => finding.severity === 'error')) process.exitCode = 1;
+  }
+} else if (command === 'signin' || command === 'add') {
+  // #808, #811: sign in or add an account from this terminal (SSH included)
+  // through the running daemon; the provider prints the URL or code to
+  // finish elsewhere.
+  const manage = command === 'add' && args.includes('--manage');
+  const rest = args.filter((arg) => arg !== '--manage');
+  const usageError = command === 'signin'
+    ? (rest.length !== 1 || manage) && 'usage: modeldeck signin <account id or label>'
+    : rest.length !== 2 && 'usage: modeldeck add <claude|codex> <label> [--manage]';
+  if (usageError) {
+    console.error(usageError);
+    process.exitCode = 2;
+  } else {
+    const { token, source } = resolveMutationToken();
+    if (source === 'ephemeral') {
+      console.error('ModelDeck: no stored mutation token; run scripts/set-mutation-token.sh and restart the daemon first.');
+      process.exitCode = 1;
+    } else {
+      const daemonUrl = `http://127.0.0.1:${PORT}`;
+      try {
+        process.exitCode = command === 'signin'
+          ? await signin(rest[0], { daemonUrl, token, run: runInTerminal })
+          : await addAccount(rest[0], rest[1], { daemonUrl, token, manage });
+      } catch (error) {
+        console.error(`ModelDeck: ${error.message}`);
+        process.exitCode = 1;
+      }
+    }
   }
 } else {
   const store = new Store(DB_PATH);
@@ -176,14 +209,8 @@ if (command === 'serve') {
           // launcher and the preview it prints can never fetch different
           // keys. Validated here too — this is a command argument.
           const keychainService = assertClientKeyService(spec.keychainService || LEGACY_CLIENT_KEY_SERVICE);
-          let key = '';
-          try {
-            key = execFileSync(process.env.MODELDECK_SECURITY_BIN || '/usr/bin/security', [
-              'find-generic-password', '-s', keychainService, '-w',
-            ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-          } catch {
-            key = '';
-          }
+          // #808: the Keychain on macOS, the owner-only key file elsewhere.
+          const key = readClientKey(keychainService, { execFileSync });
           if (key) {
             env.ANTHROPIC_API_KEY = key;
             env.MODELDECK_MANAGED_ANTHROPIC_API_KEY = '1';

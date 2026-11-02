@@ -14,10 +14,9 @@
 // full isolated-instance launcher and docs/RELEASE.md for the screenshot
 // capture flow.
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { Store } from '../src/db.mjs';
-import { DB_PATH, CLAUDE_PROFILES_DIR } from '../src/paths.mjs';
+import { DB_PATH, CLAUDE_PROFILES_DIR, defaultDataDir } from '../src/paths.mjs';
 
 if (!process.env.MODELDECK_DATA_DIR) throw new Error('Set MODELDECK_DATA_DIR to an isolated demo directory');
 
@@ -27,7 +26,7 @@ if (!process.env.MODELDECK_DATA_DIR) throw new Error('Set MODELDECK_DATA_DIR to 
 // the live directory must not defeat the refusal.
 fs.mkdirSync(process.env.MODELDECK_DATA_DIR, { recursive: true });
 const dataDir = fs.realpathSync(process.env.MODELDECK_DATA_DIR);
-const liveDataDir = path.join(os.homedir(), 'Library', 'Application Support', 'ModelDeck');
+const liveDataDir = defaultDataDir();
 let liveDataDirReal = liveDataDir;
 try { liveDataDirReal = fs.realpathSync(liveDataDir); } catch { /* live dir may not exist */ }
 function insideDemoDir(p) {

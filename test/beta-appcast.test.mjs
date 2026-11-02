@@ -122,7 +122,7 @@ test('stable release rejects --beta and schema notes without floor before signin
   assert.match(run('--first-feeds').stderr, /Rollback floor/);
 });
 
-test('beta bundle stamping keeps numeric Apple version and full display version', t => {
+test('beta bundle stamping keeps numeric Apple version and full display version', { skip: process.platform !== 'darwin' && 'needs PlistBuddy (macOS)' }, t => {
   const { root } = releaseFixture(t, '1.2.0-beta.1');
   fs.mkdirSync(path.join(root, 'Contents'));
   const plist = path.join(root, 'Contents/Info.plist');

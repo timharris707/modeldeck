@@ -403,3 +403,18 @@ test('legacy subagent backfill is idempotent on its migrated output', (t) => {
   assert.deepEqual(transcriptIdentitySnapshot(secondTarget), afterFirstRun);
   assertLegacySubagentsBackfilled(readLegacySubagentState(secondTarget));
 });
+
+// CodeRabbit on #812: with only MODELDECK_DATA_DIR set, the default target is
+// the database the daemon opens there, not the platform default folder.
+test('the default target follows MODELDECK_DATA_DIR', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const fixture = buildFixture();
+  const dataDir = path.join(fixture.root, 'custom-data');
+  const env = { PATH: process.env.PATH, HOME: fixture.root, MODELDECK_DATA_DIR: dataDir };
+  const { fileURLToPath } = await import('node:url');
+  const script = fileURLToPath(new URL('../scripts/migrate-db.mjs', import.meta.url));
+  const result = spawnSync(process.execPath, [script, '--source', fixture.sourcePath], { env, encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(fs.existsSync(path.join(dataDir, 'modeldeck.sqlite')));
+  fs.rmSync(fixture.root, { recursive: true, force: true });
+});

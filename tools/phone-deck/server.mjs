@@ -1,11 +1,12 @@
 // Phone Deck — read-only phone and tablet usage page.
 //
-// Read-only. Every upstream call is a GET against a ModelDeck daemon: the M1's
-// own (127.0.0.1:3867) and the M5's over `ssh m5 curl ...`. The browser gets a
-// filtered, display-safe view only: labels, plan tier, per-window percents and
-// reset times, reading ages, a sign-in flag, and the M5 pool's routing weight
-// (Tim asked to show everything; the weight is the number on his Mac deck).
-// No emails, UUIDs, profile paths or proxy credentials ever leave this process.
+// GET-only daemon reads: by default the M1 locally and the M5 over SSH;
+// SOURCES=local reads only this host's daemon, with no SSH or pool directory scan.
+// /api/deck projects display fields; /api/status reports cached source health
+// and, on the pool host, each member's weight and sign-in state under a
+// one-way identity tag for remote Macs' decks (#827).
+// Identity fields are omitted and sensitive display-text patterns are redacted
+// (see README). No provider calls, refreshes, sign-ins or credential writes.
 //
 //   node tools/phone-deck/server.mjs            (binds 127.0.0.1:3871)
 //   PORT=3871 HOSTS=127.0.0.1 node .../server.mjs
@@ -13,7 +14,10 @@ import http from 'node:http';
 import { readFile, readdir } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { realpathSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
+import { isIP } from 'node:net';
+import { validateConfig } from './config.mjs';
+import { poolCredentialDetail, poolMemberTag } from '../../src/pool-member-tag.mjs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -22,7 +26,6 @@ const HOSTS = (process.env.HOSTS || '127.0.0.1').split(',').map((h) => h.trim())
 const HERE = new URL('./', import.meta.url);
 const MARKS = new URL('../../macos/ModelDeckMac/Sources/ModelDeckMacCore/Resources/', import.meta.url);
 const POOL_AUTH_DIR = join(homedir(), '.config/cliproxyapi/auth');
-const DAEMON = 'http://127.0.0.1:3867';
 const M5_HOST = process.env.M5_HOST || 'm5'; // overridable only to test the asleep path
 
 const STATE_TTL = 60_000;          // upstream state cache
@@ -31,112 +34,6 @@ const HISTORY_TTL = 10 * 60_000;
 const M5_RETRY = 2 * 60_000;       // after a failed M5 read, wait this long before trying again
 const STALE_AFTER = 10 * 60_000;   // Mac app: 2x its 5-minute fallback refresh interval
 export const DOWN_AFTER = 5 * 60_000;     // one slow answer isn't "asleep": banner only after this long without a good read
-
-const machines = {
-  M5: { name: 'M5', remote: true, state: null, stateAt: 0, lastTry: 0, ok: false, error: null, forecast: null, forecastAt: 0 },
-  M1: { name: 'M1', remote: false, state: null, stateAt: 0, lastTry: 0, ok: false, error: null, forecast: null, forecastAt: 0 },
-};
-const historyCache = new Map(); // `${machine}:${accountId}:${resetsAt}` -> { at, rows }
-let deck = null;
-let deckAt = 0;
-let inflight = null;
-
-const log = (...a) => console.log(new Date().toISOString(), ...a);
-
-// ---------- upstream reads (GET only) ----------
-
-async function localGet(path) {
-  const res = await fetch(DAEMON + path, { signal: AbortSignal.timeout(25_000) }); // slow for a while after a restart
-  if (!res.ok) throw new Error(`M1 ${path} -> HTTP ${res.status}`);
-  return res.json();
-}
-
-// One ssh round trip for several GETs on the M5's daemon. Paths are checked to
-// be shell-safe before they go inside the remote single quotes.
-export const SAFE_PATH = /^\/api\/[A-Za-z0-9/?=&:.\-_%+]+$/;
-async function m5GetMany(paths) {
-  for (const p of paths) if (!SAFE_PATH.test(p)) throw new Error('unsafe path');
-  const cmd = paths.map((p) => `curl -s -m 15 'http://127.0.0.1:3867${p}'; printf '\\n\\036\\n'`).join('; ');
-  return new Promise((resolve, reject) => {
-    execFile('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', M5_HOST, cmd],
-      { timeout: 25_000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout) => {
-        if (err) return reject(new Error(err.killed ? 'ssh timed out' : 'ssh failed'));
-        const parts = stdout.split('\n\x1e\n');
-        resolve(paths.map((_, i) => { try { return JSON.parse(parts[i]); } catch { return null; } }));
-      });
-  });
-}
-
-async function readMachine(m, now) {
-  if (m.remote && !m.ok && m.lastTry && now - m.lastTry < M5_RETRY && now - m.stateAt > DOWN_AFTER) return; // asleep: don't stall every page load
-  m.lastTry = now;
-  const wantForecast = now - m.forecastAt > FORECAST_TTL;
-  try {
-    let state, forecast;
-    if (m.remote) {
-      // Separate round trips, so a slow forecast can't time out the state read.
-      [[state], [forecast]] = await Promise.all([
-        m5GetMany(['/api/state']),
-        wantForecast ? m5GetMany(['/api/usage/exhaustion-forecast']).catch(() => [null]) : [null],
-      ]);
-    } else {
-      [state, forecast] = await Promise.all([
-        localGet('/api/state'),
-        wantForecast ? localGet('/api/usage/exhaustion-forecast').catch(() => null) : null,
-      ]);
-    }
-    if (!state || !Array.isArray(state.accounts)) throw new Error('no state');
-    m.state = state; m.stateAt = Date.now(); m.ok = true; m.error = null;
-    if (wantForecast && forecast && Array.isArray(forecast.accounts)) { m.forecast = forecast; m.forecastAt = Date.now(); }
-  } catch (e) {
-    m.ok = false; m.error = e.message;
-    log(`${m.name} read failed: ${e.message}`);
-  }
-}
-
-async function readHistories(accounts, now) {
-  // The all-models weekly of each account, from the machine whose reading we show.
-  const wants = { M1: [], M5: [] };
-  for (const acct of accounts) {
-    const w = acct._weekly;
-    if (!w) continue;
-    const key = `${w.machine}:${w.accountId}:${w.resetsAt}`;
-    const hit = historyCache.get(key);
-    if (hit && now - hit.at < HISTORY_TTL) continue;
-    const since = new Date(Date.parse(w.resetsAt) - w.durationMs).toISOString().replace(/\.\d+Z$/, 'Z');
-    const until = new Date(now).toISOString().replace(/\.\d+Z$/, 'Z');
-    const q = new URLSearchParams({ accountId: w.accountId, scope: w.scope, since, until, bucket: 'hour' });
-    wants[w.machine].push({ key, path: `/api/usage/history?${q}` });
-  }
-  const store = (key, body) => {
-    if (body && Array.isArray(body.rows)) historyCache.set(key, { at: Date.now(), rows: body.rows });
-  };
-  const jobs = [];
-  if (wants.M1.length) {
-    jobs.push(Promise.all(wants.M1.map(async (x) => store(x.key, await localGet(x.path).catch(() => null)))));
-  }
-  if (wants.M5.length && machines.M5.ok) {
-    jobs.push(m5GetMany(wants.M5.map((x) => x.path))
-      .then((bodies) => bodies.forEach((b, i) => store(wants.M5[i].key, b)))
-      .catch((e) => log(`M5 history failed: ${e.message}`)));
-  }
-  await Promise.all(jobs);
-  for (const [k, v] of historyCache) if (now - v.at > 6 * HISTORY_TTL) historyCache.delete(k);
-}
-
-// The pool's Grok and Antigravity sign-ins, counted from file NAMES only.
-// The files themselves are never opened.
-async function poolSignins() {
-  try {
-    const names = await readdir(POOL_AUTH_DIR);
-    return {
-      grok: names.filter((n) => /^xai-.*\.json$/.test(n)).length,
-      antigravity: names.filter((n) => /^antigravity-.*\.json$/.test(n)).length,
-    };
-  } catch {
-    return { grok: 0, antigravity: 0 };
-  }
-}
 
 // ---------- the Mac app's window rules (macos/.../DeckPopoverModel.swift) ----------
 
@@ -252,7 +149,8 @@ export function planLabel(meta) {
     const tokens = String(plan.rateLimitTier || '').toLowerCase().split(/[^a-z0-9]+/);
     let base = sub ? cap(sub) : null;
     if (!base) {
-      const word = ['max', 'pro', 'plus', 'team', 'enterprise', 'free'].find((p) => tokens.includes(p));
+      // 'ultra' is Max 20x renamed (Anthropic, 2026-10-30, issue #799).
+      const word = ['ultra', 'max', 'pro', 'plus', 'team', 'enterprise', 'free'].find((p) => tokens.includes(p));
       base = word ? cap(word) : null;
     }
     if (!base) continue;
@@ -288,11 +186,13 @@ const normLabel = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '')
 const iso = (ms) => (ms == null ? null : new Date(ms).toISOString());
 const round1 = (n) => (n == null ? null : Math.round(n * 10) / 10);
 
-// ---------- merge the two Macs ----------
+// ---------- merge the configured sources ----------
+
+const machineList = (machines) => machines.M5 && machines.M1 ? [machines.M5, machines.M1] : Object.values(machines);
 
 export function mergeAccounts(machines) {
   const list = [];
-  for (const m of [machines.M5, machines.M1]) { // M5 first: its display labels win
+  for (const m of machineList(machines)) { // M5 first in two-Mac mode: its display labels win
     if (!m.state) continue;
     for (const a of m.state.accounts) {
       if (!a.enabled) continue;
@@ -408,8 +308,8 @@ export function buildAccount(acct, idx, now, machines) {
       label: acct.label,
       color: /^#[0-9a-f]{6}$/i.test(acct.color || '') ? acct.color : null,
       plan: planLabel([...acct.from.values()][0]?.metadata) || planLabel([...acct.from.values()][1]?.metadata),
-      // The M5 pool's weight: a number while in the pool, null when outside it.
-      weight: weightOf(acct.from.get('M5')),
+      // The pool host's weight (M5 in two-Mac mode): null when outside it.
+      weight: weightOf(acct.from.get(machineList(machines).length === 1 ? machineList(machines)[0].name : 'M5')),
       reads: true,
       windows: windows.map((w) => ({
         title: w.title, rank: w.rank, spend: w.spend, remaining: round1(w.remaining),
@@ -451,12 +351,57 @@ export function historyFor(w, histories) {
   return { title: w.title, start: iso(start), end: iso(end), points: points.map(([t, r]) => [iso(t), r]) };
 }
 
+// Guard display text as well as omitted identity fields: daemon labels and plan
+// names can themselves contain an identity or credential. Ordinary text is unchanged:
+// token prefixes match case-sensitively, and a long unbroken run counts as a key only
+// when it mixes digits with letters the way random keys do (#787 review).
+const IDENTITY_TEXT = /[^\s@]+(?:@|%40)[^\s@]+|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|\/(?:Users|home|private|Volumes|var)\/|~\//i;
+const TOKEN_TEXT = /(?<![A-Za-z0-9])(?:ghp_|gho_|github_pat_|AIza|ya29\.)\S{6,}|(?<![A-Za-z0-9])(?:[Ss][Kk]-|[Xx][Aa][Ii]-)\S{6,}|\bBearer [A-Za-z0-9._~+\/-]{8,}|\beyJ[A-Za-z0-9_-]{8,}/;
+const keyLike = (run) => /\d/.test(run) && (/^[0-9a-f]+$/i.test(run) || (/[a-z]/.test(run) && /[A-Z]/.test(run)));
+function displaySafe(value) {
+  if (typeof value === 'string') {
+    const secret = IDENTITY_TEXT.test(value) || TOKEN_TEXT.test(value)
+      || (value.match(/[A-Za-z0-9_+\/-]{32,}={0,2}/g) || []).some(keyLike);
+    return secret ? '[redacted]' : value;
+  }
+  if (Array.isArray(value)) return value.map(displaySafe);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, displaySafe(v)]));
+  return value;
+}
+
+// Issue #827: on the pool host (one local source), the pool's own record of
+// each member, for remote Macs' decks. Members are named only by a one-way
+// tag of their identity; accounts outside the pool are left out entirely.
+export function hubPoolOf(machines) {
+  const list = machineList(machines);
+  if (list.length !== 1 || list[0].remote || !list[0].state) return undefined;
+  const m = list[0];
+  const members = [];
+  for (const a of m.state.accounts) {
+    if (!a.enabled || a.proxyPool !== 'member') continue;
+    const provider = normProvider(a.provider);
+    const match = poolMemberTag(provider, provider === 'claude' ? a.identity : a.codexAccountId);
+    if (!match) continue;
+    const credential = ['ok', 'error', 'resting', 'disabled'].includes(a.proxyCredential) ? a.proxyCredential : null;
+    members.push({
+      provider, match,
+      weight: Number.isInteger(a.proxyWeight) && a.proxyWeight >= 0 ? a.proxyWeight : null,
+      fableExcluded: a.proxyFableExcluded === true,
+      credential,
+      // Never the proxy's own text: only a retry time or "provider overloaded".
+      credentialDetail: poolCredentialDetail(credential, a.proxyCredentialDetail),
+    });
+  }
+  return { readAt: m.stateAt ? iso(m.stateAt) : null, members };
+}
+
 // Pure projection: callers supply machine snapshots, time, and optional cached data.
 export function buildDeck(machines, now, { pool = {}, histories = new Map(), generatedAt = now } = {}) {
   const built = mergeAccounts(machines).map((a, i) => buildAccount(a, i, now, machines));
   const accounts = built.map((b) => ({ ...b.out, history: historyFor(b._weekly, histories) }));
 
-  const poolNote = 'Signed in to the M1 proxy pool. ModelDeck doesn’t read its usage yet.';
+  const poolName = machineList(machines).find((m) => !m.remote)?.name;
+  const poolNote = `Signed in to the ${poolName} proxy pool. ModelDeck doesn’t read its usage yet.`;
   for (let i = 0; i < pool.grok; i++) {
     accounts.push({ id: `g${i + 1}`, provider: 'grok', label: pool.grok > 1 ? `Grok ${i + 1}` : 'Grok', reads: false, note: poolNote });
   }
@@ -464,36 +409,158 @@ export function buildDeck(machines, now, { pool = {}, histories = new Map(), gen
     accounts.push({ id: `ag${i + 1}`, provider: 'antigravity', label: pool.antigravity > 1 ? `Antigravity ${i + 1}` : 'Antigravity', reads: false, note: poolNote });
   }
 
-  return {
+  const hubPool = hubPoolOf(machines);
+  return displaySafe({
     generatedAt: iso(generatedAt),
-    sources: [machines.M5, machines.M1].map((m) => ({
+    sources: machineList(machines).map((m) => ({
       name: m.name,
+      ok: m.ok,
       reachable: m.ok || (m.stateAt > 0 && generatedAt - m.stateAt < DOWN_AFTER),
       readAt: m.stateAt ? iso(m.stateAt) : null,
       note: m.ok ? null : (m.remote ? 'Asleep or offline' : 'Not answering'),
     })),
     accounts,
+    ...(hubPool ? { hubPool } : {}),
+  });
+}
+
+export const SAFE_PATH = /^\/api\/[A-Za-z0-9/?=&:.\-_%+]+$/;
+const log = (...a) => console.log(new Date().toISOString(), ...a);
+
+// Each reader owns its caches; injected I/O keeps offline tests fail-closed.
+export function createDeckReader(env = process.env, { fetch = globalThis.fetch, execFile: run = execFile, readdir: list = readdir } = {}) {
+  const { local, name, daemonPort } = validateConfig(env);
+  const daemon = `http://127.0.0.1:${daemonPort}`;
+  const machines = local ? {
+    [name]: { name, remote: false, state: null, stateAt: 0, lastTry: 0, ok: false, error: null, forecast: null, forecastAt: 0 },
+  } : {
+    M5: { name: 'M5', remote: true, state: null, stateAt: 0, lastTry: 0, ok: false, error: null, forecast: null, forecastAt: 0 },
+    M1: { name: 'M1', remote: false, state: null, stateAt: 0, lastTry: 0, ok: false, error: null, forecast: null, forecastAt: 0 },
   };
-}
+  const historyCache = new Map(); // `${machine}:${accountId}:${resetsAt}` -> { at, rows }
+  let deck = null;
+  let deckAt = 0;
+  let inflight = null;
 
-async function build() {
-  const now = Date.now();
-  await Promise.all([readMachine(machines.M5, now), readMachine(machines.M1, now)]);
-  const built = mergeAccounts(machines).map((a, i) => buildAccount(a, i, now, machines));
-  await readHistories(built, now);
-  const pool = await poolSignins();
-  return buildDeck(machines, now, { pool, histories: historyCache, generatedAt: Date.now() });
-}
+  // ---------- upstream reads (GET only) ----------
 
-async function getDeck() {
-  if (deck && Date.now() - deckAt < STATE_TTL) return deck;
-  if (!inflight) {
-    inflight = build()
-      .then((d) => { deck = d; deckAt = Date.now(); return d; })
-      .finally(() => { inflight = null; });
+  async function localGet(path) {
+    const res = await fetch(daemon + path, { method: 'GET', signal: AbortSignal.timeout(25_000) }); // slow for a while after a restart
+    if (!res.ok) throw new Error(`${local ? name : 'M1'} ${path} -> HTTP ${res.status}`);
+    try { return await res.json(); } catch { throw new Error('Invalid daemon JSON'); }
   }
-  return inflight;
+
+  // One ssh round trip for several GETs on the M5's daemon. Paths are checked to
+  // be shell-safe before they go inside the remote single quotes.
+  async function m5GetMany(paths) {
+    for (const p of paths) if (!SAFE_PATH.test(p)) throw new Error('unsafe path');
+    const cmd = paths.map((p) => `curl -s -m 15 'http://127.0.0.1:3867${p}'; printf '\\n\\036\\n'`).join('; ');
+    return new Promise((resolve, reject) => {
+      run('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', M5_HOST, cmd],
+        { timeout: 25_000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout) => {
+          if (err) return reject(new Error(err.killed ? 'ssh timed out' : 'ssh failed'));
+          const parts = stdout.split('\n\x1e\n');
+          resolve(paths.map((_, i) => { try { return JSON.parse(parts[i]); } catch { return null; } }));
+        });
+    });
+  }
+
+  async function readMachine(m, now) {
+    if (m.remote && !m.ok && m.lastTry && now - m.lastTry < M5_RETRY && now - m.stateAt > DOWN_AFTER) return; // asleep: don't stall every page load
+    m.lastTry = now;
+    const wantForecast = now - m.forecastAt > FORECAST_TTL;
+    try {
+      let state, forecast;
+      if (m.remote) {
+        // Separate round trips, so a slow forecast can't time out the state read.
+        [[state], [forecast]] = await Promise.all([
+          m5GetMany(['/api/state']),
+          wantForecast ? m5GetMany(['/api/usage/exhaustion-forecast']).catch(() => [null]) : [null],
+        ]);
+      } else {
+        [state, forecast] = await Promise.all([
+          localGet('/api/state'),
+          wantForecast ? localGet('/api/usage/exhaustion-forecast').catch(() => null) : null,
+        ]);
+      }
+      if (!state || !Array.isArray(state.accounts)) throw new Error('no state');
+      m.state = state; m.stateAt = Date.now(); m.ok = true; m.error = null;
+      if (wantForecast && forecast && Array.isArray(forecast.accounts)) { m.forecast = forecast; m.forecastAt = Date.now(); }
+    } catch {
+      m.ok = false; m.error = 'Read failed';
+      log(`${m.name} read failed`);
+    }
+  }
+
+  async function readHistories(accounts, now) {
+    // The all-models weekly of each account, from the machine whose reading we show.
+    const wants = Object.fromEntries(machineList(machines).map((m) => [m.name, []]));
+    for (const acct of accounts) {
+      const w = acct._weekly;
+      if (!w) continue;
+      const key = `${w.machine}:${w.accountId}:${w.resetsAt}`;
+      const hit = historyCache.get(key);
+      if (hit && now - hit.at < HISTORY_TTL) continue;
+      const since = new Date(Date.parse(w.resetsAt) - w.durationMs).toISOString().replace(/\.\d+Z$/, 'Z');
+      const until = new Date(now).toISOString().replace(/\.\d+Z$/, 'Z');
+      const q = new URLSearchParams({ accountId: w.accountId, scope: w.scope, since, until, bucket: 'hour' });
+      wants[w.machine].push({ key, path: `/api/usage/history?${q}` });
+    }
+    const store = (key, body) => {
+      if (body && Array.isArray(body.rows)) historyCache.set(key, { at: Date.now(), rows: body.rows });
+    };
+    const jobs = [];
+    for (const m of machineList(machines)) {
+      const wanted = wants[m.name];
+      if (!wanted.length) continue;
+      if (!m.remote) {
+        jobs.push(Promise.all(wanted.map(async (x) => store(x.key, await localGet(x.path).catch(() => null)))));
+      } else if (m.ok) {
+        jobs.push(m5GetMany(wanted.map((x) => x.path))
+          .then((bodies) => bodies.forEach((b, i) => store(wanted[i].key, b)))
+          .catch(() => log(`${m.name} history failed`)));
+      }
+    }
+    await Promise.all(jobs);
+    for (const [k, v] of historyCache) if (now - v.at > 6 * HISTORY_TTL) historyCache.delete(k);
+  }
+
+  // The pool's Grok and Antigravity sign-ins, counted from file NAMES only.
+  // The files themselves are never opened.
+  async function poolSignins() {
+    try {
+      const names = await list(POOL_AUTH_DIR);
+      return {
+        grok: names.filter((n) => /^xai-.*\.json$/.test(n)).length,
+        antigravity: names.filter((n) => /^antigravity-.*\.json$/.test(n)).length,
+      };
+    } catch {
+      return { grok: 0, antigravity: 0 };
+    }
+  }
+
+  async function build() {
+    const now = Date.now();
+    await Promise.all(machineList(machines).map((m) => readMachine(m, now)));
+    const built = mergeAccounts(machines).map((a, i) => buildAccount(a, i, now, machines));
+    await readHistories(built, now);
+    const pool = local ? {} : await poolSignins();
+    return buildDeck(machines, now, { pool, histories: historyCache, generatedAt: Date.now() });
+  }
+
+  async function getDeck() {
+    if (deck && Date.now() - deckAt < STATE_TTL) return deck;
+    if (!inflight) {
+      inflight = build()
+        .then((d) => { deck = d; deckAt = Date.now(); return d; })
+        .finally(() => { inflight = null; });
+    }
+    return inflight;
+  }
+
+  return getDeck;
 }
+const getDeck = createDeckReader();
 
 // ---------- HTTP ----------
 
@@ -513,15 +580,17 @@ const SECURITY = {
   'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'self'",
 };
 
-// Answers only to an IP address, localhost, or a tailnet name, so a web page
-// can't rebind its own domain to this Mac and read the deck.
-export function hostAllowed(host = '') {
+// Host checking limits DNS rebinding to explicitly trusted names.
+const shortHostname = hostname().split('.')[0].toLowerCase();
+const { allowedNames } = validateConfig(process.env);
+export function hostAllowed(host = '', names = allowedNames) {
   const name = host.toLowerCase().replace(/:\d+$/, '');
-  return name === 'localhost' || /^[\d.]+$/.test(name) || name.startsWith('[')
-    || name.endsWith('.ts.net') || /^[a-z0-9-]+$/.test(name);
+  const ip = name.startsWith('[') && name.endsWith(']') ? name.slice(1, -1) : name;
+  return name === 'localhost' || isIP(ip) !== 0 || name.endsWith('.ts.net')
+    || (/^[a-z0-9-]+$/.test(name) && (name === shortHostname || names.includes(name)));
 }
 
-export async function handle(req, res) {
+export async function handle(req, res, readDeck = getDeck) {
   const send = (status, type, body, extra = {}) => {
     res.writeHead(status, { 'Content-Type': type, ...SECURITY, ...extra });
     res.end(req.method === 'HEAD' ? undefined : body);
@@ -534,14 +603,21 @@ export async function handle(req, res) {
     if (path === '/' || path === '/index.html') {
       return send(200, 'text/html; charset=utf-8', await readFile(new URL('index.html', HERE)), { 'Cache-Control': 'no-store' });
     }
-    if (path === '/api/deck') {
-      return send(200, 'application/json; charset=utf-8', JSON.stringify(await getDeck()), { 'Cache-Control': 'no-store' });
+    if (path === '/api/deck' || path === '/api/status') {
+      const deck = await readDeck();
+      const { hubPool, ...page } = deck;
+      const body = path === '/api/status' ? {
+        generatedAt: deck.generatedAt,
+        sources: deck.sources.map(({ name, ok, reachable, readAt }) => ({ name, ok, reachable, readAt })),
+        ...(hubPool ? { pool: hubPool } : {}),
+      } : page;
+      return send(200, 'application/json; charset=utf-8', JSON.stringify(body), { 'Cache-Control': 'no-store' });
     }
     const s = STATIC[path];
     if (s) return send(200, s.type, await readFile(s.file), { 'Cache-Control': `public, max-age=${s.maxAge}` });
     return send(404, 'text/plain', 'Not found\n');
-  } catch (e) {
-    log(`error on ${path}: ${e.message}`);
+  } catch {
+    log('request failed');
     return send(500, 'text/plain', 'Server error\n');
   }
 }

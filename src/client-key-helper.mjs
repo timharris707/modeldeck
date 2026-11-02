@@ -11,6 +11,14 @@
 // command injection through a profile name is structurally impossible
 // (design §3.5). Account ids are `crypto.randomUUID()` values, which already
 // satisfy that charset.
+//
+// #808: off macOS there is no Keychain. The legacy shared service maps to the
+// machine's one client-key file, `pool-client-key` in the secrets directory
+// (decision 0046; per-machine keys on Linux, Tim's decision 4 on #783), and
+// per-profile services are refused. The directory path is single-quoted.
+import path from 'node:path';
+import { SECRETS_DIR } from './paths.mjs';
+import { readSecretFile } from './secret-file.mjs';
 
 /// The pre-#522 shared item. Reserved EXCLUSIVELY for the legacy shared key:
 /// `find-generic-password -s cli-proxy-api-client` without `-a` returns the
@@ -48,12 +56,60 @@ export function assertClientKeyService(service) {
   throw new Error('client key Keychain service name is not a ModelDeck client-key service');
 }
 
-export function clientKeyHelperCommand(service) {
+export const POOL_CLIENT_KEY_FILE = 'pool-client-key';
+
+function shellQuote(value) {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/// Off macOS: the key file a service maps to. Only the legacy service has one.
+export function clientKeyFile(service, { secretsDir = SECRETS_DIR } = {}) {
+  if (assertClientKeyService(service) !== LEGACY_CLIENT_KEY_SERVICE) {
+    throw new Error('per-profile client keys are macOS-only; this machine uses its one pool-client-key file');
+  }
+  return path.join(secretsDir, POOL_CLIENT_KEY_FILE);
+}
+
+/// The shell command that prints a client key: the Keychain on macOS, the
+/// key file elsewhere. Used as the Claude `apiKeyHelper`. Off macOS it prints
+/// the file only if it and its folder are not symlinks, are ours and have no
+/// group or other bits (special bits allowed, as readClientKey), with
+/// absolute tools, never a PATH lookup (#813 reviews).
+export function clientKeyHelperCommand(service, { platform = process.platform, secretsDir } = {}) {
+  if (platform !== 'darwin') {
+    const keyFile = clientKeyFile(service, { secretsDir });
+    const ownerOnly = (target) => `[ ! -L ${target} ] && case "$(/usr/bin/stat -c %u:%a -- ${target})" in "$(/usr/bin/id -u)":[1-7]00|"$(/usr/bin/id -u)":[1-7][1-7]00) true ;; *) false ;; esac`;
+    const file = shellQuote(keyFile);
+    return `${ownerOnly(shellQuote(path.dirname(keyFile)))} && ${ownerOnly(file)} && /bin/cat -- ${file}`;
+  }
   return `security find-generic-password -s ${assertClientKeyService(service)} -w`;
 }
 
+/// The same lookup for generated shell snippets. On macOS it keeps the
+/// absolute `security` path with its test override (MODELDECK_SECURITY_BIN).
+export function clientKeyShellFetch(service, { platform = process.platform, secretsDir } = {}) {
+  if (platform !== 'darwin') return clientKeyHelperCommand(service, { platform, secretsDir });
+  return `"\${MODELDECK_SECURITY_BIN:-/usr/bin/security}" find-generic-password -s ${assertClientKeyService(service)} -w`;
+}
+
+/// Reads a client key in-process; '' when absent or unreadable. Off macOS
+/// the file must pass the owner-only checks (decision 0046).
+export function readClientKey(service, {
+  platform = process.platform, secretsDir, execFileSync, securityBin = process.env.MODELDECK_SECURITY_BIN || '/usr/bin/security',
+} = {}) {
+  try {
+    if (platform !== 'darwin') return readSecretFile(clientKeyFile(service, { secretsDir })) ?? '';
+    return execFileSync(securityBin, ['find-generic-password', '-s', assertClientKeyService(service), '-w'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return '';
+  }
+}
+
 /// The exact string every ModelDeck release before #522 wrote into
-/// `settings.json`. It is a CONSTANT, not a pattern — see `classifyClaudeHelper`.
+/// `settings.json` on macOS, or this machine's key-file helper elsewhere. It
+/// is a CONSTANT, not a pattern — see `classifyClaudeHelper`.
 export const LEGACY_CLIENT_KEY_HELPER = clientKeyHelperCommand(LEGACY_CLIENT_KEY_SERVICE);
 
 /// The Keychain service a profile's wiring must point at, from the recorded

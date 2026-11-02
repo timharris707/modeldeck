@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveMutationToken } from '../src/token.mjs';
 
 export async function enableUsageQueue({
   base = process.env.MODELDECK_BASE_URL || 'http://127.0.0.1:3867',
@@ -9,7 +10,8 @@ export async function enableUsageQueue({
   stdout = process.stdout,
   wait = (duration) => new Promise((resolve) => setTimeout(resolve, duration)),
 } = {}) {
-  if (!token) throw new Error('MODELDECK_MUTATION_TOKEN is required');
+  token = token?.trim();
+  if (!token) throw new Error('no mutation token: set one with scripts/set-mutation-token.sh');
   let previousEnabled;
   try {
     const previousResponse = await fetcher(new URL('/api/settings', base), { redirect: 'error' });
@@ -92,7 +94,11 @@ export async function enableUsageQueue({
 const isMain = process.argv[1]
   && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
-  enableUsageQueue().catch((error) => {
+  // The stored token (Keychain on macOS, the owner-only file on Linux) when
+  // the environment does not carry one (#811); never a throwaway token.
+  const { token, source } = resolveMutationToken();
+  // null, not undefined: the parameter default would re-read the raw variable.
+  enableUsageQueue({ token: source === 'ephemeral' ? null : token }).catch((error) => {
     process.stderr.write(`enable-usage-queue.mjs: ${error.message}\n`);
     process.exitCode = 1;
   });

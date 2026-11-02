@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   RESPAWN_LOOP_RUNS,
   YOUNG_PROCESS_SECONDS,
@@ -255,4 +256,71 @@ test('a malformed stampedClaudeClient block fails validation', () => {
 test('the checked-in pairs file parses and validates', () => {
   const pairs = readVersionPairs();
   assert.match(pairs.codexCli, /^\d+\.\d+\.\d+$/);
+});
+
+const REMOTE = { ...MATCHED, role: 'remote', live: null, upstreamTags: [], launchAgent: null,
+  portHolder: { pid: '123', path: '/opt/node/bin/node', isForwarder: true, matchesRecorded: false }, health: { status: 'ok' } };
+test('healthy remote client skips host proxy checks but retains CLI pair checks', () => {
+  const findings = evaluateSkew(REMOTE);
+  assert.deepEqual(findings, [{ level: 'info', message: 'remote role: proxy checks run on the pool host' }]);
+  assert.ok(evaluateSkew({ ...REMOTE, codex: '0.0.1' }).some((f) => f.level === 'warn' && /Codex CLI/.test(f.message)));
+});
+test('remote client with missing forwarder fails plainly', () => {
+  assert.ok(evaluateSkew({ ...REMOTE, portHolder: null }).some((f) => f.level === 'warn' && /forwarder.*missing/.test(f.message)));
+});
+test('remote client with failed healthz or wrong listener fails plainly', () => {
+  for (const health of [null, {}, { status: 'bad' }]) assert.ok(evaluateSkew({ ...REMOTE, health }).some((f) => f.level === 'warn' && /healthz/.test(f.message)));
+  assert.ok(evaluateSkew({ ...REMOTE, portHolder: { ...REMOTE.portHolder, isForwarder: false } }).some((f) => f.level === 'warn' && /not the pool forwarder/.test(f.message)));
+});
+test('explicit host role keeps existing skew behavior', () => {
+  assert.deepEqual(evaluateSkew({ ...MATCHED, role: 'host' }), evaluateSkew(MATCHED));
+});
+
+import { isPoolForwarder, probeClientRole, probeForwarderHealth } from '../scripts/version-skew-check.mjs';
+test('forwarder identity requires the mapped Node executable and the actual script argument', (t) => {
+  const script = fs.realpathSync(fileURLToPath(new URL('../tools/pool-forwarder/forwarder.mjs', import.meta.url)));
+  const node = fs.realpathSync(process.execPath);
+  assert.equal(isPoolForwarder(node, `${process.execPath} ${script}`), true);
+  assert.equal(isPoolForwarder(node, 'node tools/pool-forwarder/forwarder.mjs'), false);
+  assert.equal(isPoolForwarder(node, `${node} /other/tools/pool-forwarder/forwarder.mjs`), false);
+  assert.equal(isPoolForwarder(node, `relative/node ${script}`), false);
+  assert.equal(isPoolForwarder('/other/node', `${node} ${script}`), false);
+  assert.equal(isPoolForwarder('node', `${node} ${script}`), false);
+  const aliases = fs.mkdtempSync(path.join(os.tmpdir(), 'forwarder identity '));
+  t.after(() => fs.rmSync(aliases, { recursive: true, force: true }));
+  fs.symlinkSync(node, path.join(aliases, 'node'));
+  fs.symlinkSync(script, path.join(aliases, 'forwarder.mjs'));
+  assert.equal(isPoolForwarder(node, `${path.join(aliases, 'node')} ${path.join(aliases, 'forwarder.mjs')}`), true);
+  for (const [executable, args] of [
+    ['/bin/sh', `node ${script}`], ['/opt/bin/not-node', `node ${script}`],
+    ['/opt/bin/node', `node -e ${script}`], ['/opt/bin/node', `node /other.mjs ${script}`],
+    ['/opt/bin/node', `node ${script}.bak`], ['/opt/bin/node', 'node /other.mjs'],
+  ]) assert.equal(isPoolForwarder(executable, args), false, args);
+  const forwarder = { isForwarder: true };
+  const other = { isForwarder: false };
+  assert.equal(pickPortHolder([forwarder, other], 'remote'), other);
+});
+
+test('role and health reads are injectable and daemon failure retains host behavior', async () => {
+  const calls = [];
+  const fetchImpl = async (url) => { calls.push(url); return { ok: true, json: async () => ({ proxyRole: 'remote', status: 'ok' }) }; };
+  assert.equal(await probeClientRole({ fetchImpl, daemonUrl: 'http://test-daemon' }), 'remote');
+  assert.equal((await probeForwarderHealth({ fetchImpl, healthUrl: 'http://test-proxy/healthz' })).status, 'ok');
+  assert.deepEqual(calls, ['http://test-daemon/api/settings', 'http://test-proxy/healthz']);
+  const failed = async () => { throw Error('offline'); };
+  assert.equal(await probeClientRole({ fetchImpl: failed }), 'host');
+  assert.equal(await probeForwarderHealth({ fetchImpl: failed }), null);
+  assert.equal(await probeClientRole({ fetchImpl: async () => ({ ok: false }) }), 'host');
+});
+
+
+test('failed role reads announce unknown role while retaining host checks', async () => {
+  for (const fetchImpl of [async () => { throw Error('offline'); }, async () => ({ ok: false }), async () => ({ ok: true, json: async () => { throw Error('bad json'); } })]) {
+    const lines = [];
+    assert.equal(await probeClientRole({ fetchImpl, log: line => lines.push(line) }), 'host');
+    assert.deepEqual(lines, ['role unknown (daemon not answering); checks assume host']);
+  }
+  const lines = [];
+  assert.equal(await probeClientRole({ fetchImpl: async () => ({ ok: true, json: async () => ({ proxyRole: 'host' }) }), log: line => lines.push(line) }), 'host');
+  assert.deepEqual(lines, []);
 });

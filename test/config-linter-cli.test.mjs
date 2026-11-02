@@ -280,7 +280,7 @@ test('a WAL frame with a bad checksum becomes could-not-evaluate without changin
   assert.equal(result.signal, null, result.stderr);
   assert.equal(result.status, 0, result.stderr);
   const report = JSON.parse(result.stdout);
-  assert.equal(report.findings.length, 15);
+  assert.equal(report.findings.length, 16);
   assert.ok(report.findings.every((finding) => /could not evaluate/i.test(finding.message)));
   assert.ok(report.findings.every((finding) => finding.evidence.some((item) => /checksum/i.test(item.reason || ''))));
   assert.deepEqual(treeState(estate.root), before);
@@ -305,7 +305,7 @@ test('an impossible WAL commit size is refused before allocation', (t) => {
   assert.equal(result.signal, null, result.stderr);
   assert.equal(result.status, 0, result.stderr);
   const report = JSON.parse(result.stdout);
-  assert.equal(report.findings.length, 15);
+  assert.equal(report.findings.length, 16);
   assert.ok(report.findings.every((finding) => finding.evidence.some((item) => /database size/i.test(item.reason || ''))));
 });
 
@@ -334,7 +334,7 @@ test('a missing database is reported as could-not-evaluate JSON instead of stder
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stderr, '');
   const report = JSON.parse(result.stdout);
-  assert.equal(report.findings.length, 15);
+  assert.equal(report.findings.length, 16);
   assert.ok(report.findings.every((finding) => /could not evaluate/i.test(finding.message)));
 });
 

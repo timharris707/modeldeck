@@ -24,6 +24,8 @@ import {
 import { claudePinnedEnvFileContent, claudeProxyPointerShellSnippet } from '../src/adapters/claude.mjs';
 
 const BASE_URL = 'http://127.0.0.1:8317';
+// Per-profile Keychain items exist only on macOS; elsewhere they are refused (#808).
+const macOnly = { skip: process.platform !== 'darwin' && 'per-profile client keys are macOS-only' };
 
 function fixture(options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-522-'));
@@ -104,7 +106,7 @@ test('TRIPWIRE #522 helper-service-shape: only a derived, charset-restricted ser
  * The named acceptance case from issue #522 / design §2.5 / security-review
  * should-fix 7: recognition is proven ownership, never pattern inference.
  */
-test('#522 guard: a helper matching the per-profile pattern with a real slug, but no ownership record, is foreign', () => {
+test('#522 guard: a helper matching the per-profile pattern with a real slug, but no ownership record, is foreign', macOnly, () => {
   const knownSlug = '7f3c9e21-4a0b-4d55-9f8e-2c1b0a9d7e64';
   const otherSlug = '0b1d4c88-2e6f-4a17-b3c5-9d8e7f6a5b40';
   const looksGenerated = clientKeyHelperCommand(clientKeyService(knownSlug));
@@ -124,7 +126,7 @@ test('#522 guard: a helper matching the per-profile pattern with a real slug, bu
   }), 'recorded');
 });
 
-test('#522 guard: the legacy shared helper is ours only while no per-profile record exists', () => {
+test('#522 guard: the legacy shared helper is ours only while no per-profile record exists', macOnly, () => {
   assert.equal(classifyClaudeHelper(LEGACY_CLIENT_KEY_HELPER, null), 'legacy');
   assert.equal(classifyClaudeHelper(LEGACY_CLIENT_KEY_HELPER, { mode: 'legacy', helper: null }), 'legacy');
   // Once the profile is migrated and recorded, the legacy string in
@@ -139,7 +141,7 @@ test('#522 guard: the legacy shared helper is ours only while no per-profile rec
   assert.equal(classifyClaudeHelper('printf sk-mine', null), 'foreign');
 });
 
-test('#522 wire on an un-migrated install writes the legacy helper and records it verbatim', async (t) => {
+test('#522 wire on an un-migrated install writes the legacy helper and records it verbatim', macOnly, async (t) => {
   const data = fixture();
   t.after(() => data.close());
   const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome, isDefault: true });
@@ -161,7 +163,7 @@ test('#522 wire on an un-migrated install writes the legacy helper and records i
   assert.equal(wiring.complete, false);
 });
 
-test('#522 guard: an unrecorded per-profile-shaped helper gets the existing 409 and is never overwritten', async (t) => {
+test('#522 guard: an unrecorded per-profile-shaped helper gets the existing 409 and is never overwritten', macOnly, async (t) => {
   const data = fixture();
   t.after(() => data.close());
   const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome, isDefault: true });
@@ -197,7 +199,7 @@ test('#522 guard: an unrecorded per-profile-shaped helper gets the existing 409 
   );
 });
 
-test('#522 migration points settings, the pinned shell env and the launch preview at the profile\'s own item', async (t) => {
+test('#522 migration points settings, the pinned shell env and the launch preview at the profile\'s own item', macOnly, async (t) => {
   const data = fixture();
   t.after(() => data.close());
   const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome, isDefault: true });
@@ -242,7 +244,7 @@ test('#522 migration points settings, the pinned shell env and the launch previe
   assert.equal(fs.readFileSync(data.settingsOf(data.firstHome), 'utf8'), before);
 });
 
-test('#522 migration refuses before the consented config write and before the key is provisioned', async (t) => {
+test('#522 migration refuses before the consented config write and before the key is provisioned', macOnly, async (t) => {
   const data = fixture();
   t.after(() => data.close());
   const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome, isDefault: true });
@@ -295,7 +297,7 @@ test('#522 migration refuses before the consented config write and before the ke
   assert.ok(!probe[1].includes('-w'), 'presence probe never reads a value');
 });
 
-test('#522 migration is resumable and reports partial state honestly', async (t) => {
+test('#522 migration is resumable and reports partial state honestly', macOnly, async (t) => {
   const data = fixture();
   t.after(() => data.close());
   const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome, isDefault: true });
@@ -335,7 +337,7 @@ test('#522 migration is resumable and reports partial state honestly', async (t)
   assert.ok(record.migration.startedAt <= record.migration.updatedAt);
 });
 
-test('#522 unwire removes the recorded helper and clears the record', async (t) => {
+test('#522 unwire removes the recorded helper and clears the record', macOnly, async (t) => {
   const data = fixture();
   t.after(() => data.close());
   const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome, isDefault: true });
@@ -367,7 +369,7 @@ test('#522 unwire removes the recorded helper and clears the record', async (t) 
  * client could declare an arbitrary helper "ours" and have ModelDeck
  * overwrite or delete it.
  */
-test('TRIPWIRE #522 helper-record-is-daemon-owned: an account edit can neither wipe nor forge the ownership record', async (t) => {
+test('TRIPWIRE #522 helper-record-is-daemon-owned: an account edit can neither wipe nor forge the ownership record', macOnly, async (t) => {
   const data = fixture();
   t.after(() => data.close());
   const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome, isDefault: true });
@@ -423,7 +425,7 @@ test('TRIPWIRE #522 helper-record-is-daemon-owned: an account edit can neither w
  * a gate the test resolves, so the migration is GUARANTEED to land inside the
  * window rather than racing it.
  */
-test('TRIPWIRE #522 helper-record-survives-concurrent-save: a migration landing inside saveAccount\'s awaits is not clobbered', async (t) => {
+test('TRIPWIRE #522 helper-record-survives-concurrent-save: a migration landing inside saveAccount\'s awaits is not clobbered', macOnly, async (t) => {
   const data = fixture();
   t.after(() => data.close());
   const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome, isDefault: true });
@@ -480,7 +482,7 @@ test('TRIPWIRE #522 helper-record-survives-concurrent-save: a migration landing 
  * different profiles' keys. Verify must still land its OWN plan/identity
  * facts, so this also proves the rebase does not clobber authored keys.
  */
-test('TRIPWIRE #522 helper-record-survives-verify: a migration landing inside the auth-probe window is not clobbered', async (t) => {
+test('TRIPWIRE #522 helper-record-survives-verify: a migration landing inside the auth-probe window is not clobbered', macOnly, async (t) => {
   let openGate;
   const gate = new Promise((resolve) => { openGate = resolve; });
   let reachedWindow;
@@ -525,7 +527,7 @@ test('TRIPWIRE #522 helper-record-survives-verify: a migration landing inside th
   assert.equal(Object.hasOwn(readSettings(data.settingsOf(data.firstHome)), 'apiKeyHelper'), false);
 });
 
-test('#522 unwire spends the migration: state stays honest and a re-migration still runs', async (t) => {
+test('#522 unwire spends the migration: state stays honest and a re-migration still runs', macOnly, async (t) => {
   const data = fixture();
   t.after(() => data.close());
   const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome, isDefault: true });
@@ -550,7 +552,7 @@ test('#522 unwire spends the migration: state stays honest and a re-migration st
   );
 });
 
-test('#522 each profile resolves its OWN item: one profile\'s migration never repoints another', async (t) => {
+test('#522 each profile resolves its OWN item: one profile\'s migration never repoints another', macOnly, async (t) => {
   const data = fixture();
   t.after(() => data.close());
   const first = data.store.saveAccount({ provider: 'claude', label: 'One', profileRef: data.firstHome, isDefault: true });

@@ -388,7 +388,7 @@ button { font: inherit; color: inherit; }
     </linearGradient>
   </defs>
 </svg>
-<div class="wrap"><main id="app"><div class="loading"><div class="brand"><svg viewBox="0 0 16 13" aria-hidden="true"><rect width="12" height="3" rx="1.5" fill="#4C8DFF"/><rect y="5" width="8" height="3" rx="1.5" fill="#E0A94A"/><rect y="10" width="16" height="3" rx="1.5" fill="#EA5C50"/></svg><span>ModelDeck</span></div><p>Reading the M5 and the M1…</p></div></main></div>
+<div class="wrap"><main id="app"><div class="loading"><div class="brand"><svg viewBox="0 0 16 13" aria-hidden="true"><rect width="12" height="3" rx="1.5" fill="#4C8DFF"/><rect y="5" width="8" height="3" rx="1.5" fill="#E0A94A"/><rect y="10" width="16" height="3" rx="1.5" fill="#EA5C50"/></svg><span>ModelDeck</span></div><p>Reading ModelDeck…</p></div></main></div>
 <div class="shade" id="shade"></div>
 <div class="sheet" id="sheet" role="dialog" aria-modal="true" aria-label="Window detail"></div>
 <nav class="switcher" id="switcher" aria-label="Views">
@@ -502,11 +502,11 @@ function banner(d, now) {
   const down = d.sources.filter((s) => !s.reachable);
   if (!down.length) return '';
   return down.map((s) => {
-    const last = s.readAt ? `Showing its last numbers, from ${ago(ms(s.readAt), now)}.` : 'Its accounts show only what the other Mac has.';
+    const last = s.readAt ? `Showing its last numbers, from ${ago(ms(s.readAt), now)}.` : d.sources.length > 1 ? 'Its accounts show only what the other Mac has.' : 'No readings have arrived yet.';
     return `<div class="banner"><b>${esc(s.name)} isn’t answering</b> (${esc(s.note || 'offline')}). ${last}</div>`;
   }).join('');
 }
-const footer = () => `<p class="foot">Read-only. Numbers come from ModelDeck on the M5 and the M1 over your tailnet.<br>This page checks again every minute.</p>`;
+const footer = (d) => `<p class="foot">Read-only. Numbers come from ModelDeck on ${d.sources.map((s) => `the ${esc(s.name)}`).join(' and ')} over your tailnet.<br>This page checks again every minute.</p>`;
 
 // Sparkline of the all-models weekly across its whole window, with the
 // even-pace line from 100% at the window start to 0% at its reset.
@@ -558,13 +558,13 @@ function renderA(d, now, width) {
   const buckets = cols === 3 ? [['claude'], ['codex'], ['grok', 'antigravity']]
     : cols === 2 ? [['claude'], ['codex', 'grok', 'antigravity']] : [ORDER];
   const body = buckets.map((ps) => `<div class="colA">${groups.filter(([p]) => ps.includes(p)).map(([p, l]) => groupA(p, l, now)).join('')}</div>`).join('');
-  return `${header(d, now)}<div class="deckA cols-${cols}">${body}</div>${footer()}`;
+  return `${header(d, now)}<div class="deckA cols-${cols}">${body}</div>${footer(d)}`;
 }
 function groupA(p, list, now) {
   return `<section class="grp"><div class="ghead">${mark(p, 26)}<h2>${PROVIDERS[p]?.name || esc(p)}</h2><span class="count">${plural(list.length, 'account')}</span></div>
     ${list.map((a) => (a.reads ? cardA(a, now) : unreadA(a))).join('')}</section>`;
 }
-// The M5 pool's routing weight, as on the Mac deck: a number in the pool, a bare fork outside it.
+// The pool's routing weight, as on the Mac deck: a number in the pool, a bare fork outside it.
 const FORK = '<svg width="10" height="11" viewBox="0 0 10 11" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><path d="M2 1v3.5c0 1.5 3 2 3 3.5V10M8 1v3.5c0 1.5-3 2-3 3.5"/></svg>';
 function weightTag(a) {
   if (a.weight === undefined) return '';
@@ -671,7 +671,7 @@ function renderB(d, now) {
   }).join('');
 
   const unread = d.accounts.filter((a) => !a.reads);
-  const unreadHtml = unread.length ? `<div class="sec-h"><h3>Not read yet</h3><span>In the M1 proxy pool</span></div><div class="unreadB">${unread.map((a) =>
+  const unreadHtml = unread.length ? `<div class="sec-h"><h3>Not read yet</h3><span>In the ${esc(d.sources.at(-1).name)} proxy pool</span></div><div class="unreadB">${unread.map((a) =>
     `<div class="ur">${mark(a.provider, 30)}<div><b>${esc(a.label)}</b><span>Signed in to the pool · usage isn’t read yet</span></div></div>`).join('')}</div>` : '';
 
   const best = ['claude', 'codex'].map((p) => accts.filter((a) => a.provider === p && !tooOld(a, now)).map((a) => ({ a, room: roomOf(a) })).filter((x) => x.room)
@@ -680,7 +680,7 @@ function renderB(d, now) {
   return `${header(d, now)}<h1 class="h-title">Where’s room?</h1><p class="h-sub">${sub}</p>
     ${chips ? `<div class="sec-h"><h3>Next resets</h3><span>Room coming back</span></div><div class="chips">${chips}</div>` : ''}
     <div class="boards">${boards}</div>${unreadHtml}
-    <p class="foot">Room is the tighter of each account’s 5-hour limit and its all-models weekly. Fable has its own weekly, shown beside it.</p>${footer()}`;
+    <p class="foot">Room is the tighter of each account’s 5-hour limit and its all-models weekly. Fable has its own weekly, shown beside it.</p>${footer(d)}`;
 }
 function pickCard({ a, room }, p, now) {
   const sev = room.lim.severity;
@@ -739,7 +739,7 @@ function renderC(d, now, width) {
     <span class="sw"><i style="background:color-mix(in oklab, var(--crit) 80%, var(--card))"></i></span><span>10% or less</span></div>`;
   return `${header(d, now)}${timelineC(accts, now)}
     <div class="sec-h"><h3>Every window</h3><span>Tap a cell for its reset</span></div>
-    <div class="gridwrap"><div class="heat" style="--cols:${cols.length}"><div class="hh first">Account<small>&nbsp;</small></div>${head}${rows}</div></div>${legend}${footer()}`;
+    <div class="gridwrap"><div class="heat" style="--cols:${cols.length}"><div class="hh first">Account<small>&nbsp;</small></div>${head}${rows}</div></div>${legend}${footer(d)}`;
 }
 function heatAlpha(w) {
   const used = usedW(w) / 100;
@@ -857,7 +857,7 @@ if (typeof document !== 'undefined') {
     const now = Date.now(), width = window.innerWidth, v = VARIANTS[vi];
     app.innerHTML = v === 'A' ? renderA(DECK, now, width) : v === 'B' ? renderB(DECK, now) : renderC(DECK, now, width);
     // Under the header row, where the iPad's switch can't cover it.
-    if (failed) app.querySelector('.top').insertAdjacentHTML('afterend', '<div class="banner"><b>Can’t reach the M1 right now.</b> Showing the last numbers this page loaded.</div>');
+    if (failed) app.querySelector('.top').insertAdjacentHTML('afterend', `<div class="banner"><b>Can’t reach the ${esc(DECK.sources.at(-1).name)} right now.</b> Showing the last numbers this page loaded.</div>`);
     if (sheetKey) sheet.innerHTML = sheetC(DECK, sheetKey, now);
   };
   const load = async () => {
