@@ -211,3 +211,63 @@ test('the status line program never names a credential store or a network API', 
     assert.doesNotMatch(src, banned, `statusline.mjs must not use ${banned}`);
   }
 });
+
+// #853: agent homes live outside ~/.claude-accounts (the Mini's
+// ~/.claude-insight-agents). Their own status line hands the capture an
+// absolute folder path; the reader picks the folder up from the capture and
+// still checks its account at read time.
+test('an agent folder outside the accounts directory is captured by path and read with its account', () => {
+  const { home, paths } = fixture();
+  const agentHome = path.join(home, '.claude-insight-agents');
+  fs.mkdirSync(agentHome);
+  fs.writeFileSync(path.join(agentHome, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'uuid-agents', planDisplayName: 'Max' } }));
+  assert.equal(capture(agentHome, payload(55, 9), { paths, now: NOW }), true);
+  const saved = JSON.parse(fs.readFileSync(path.join(paths.terminalDir, 'claude-insight-agents.json'), 'utf8'));
+  assert.deepEqual([saved.folder, saved.dir, saved.accountUuid], ['claude-insight-agents', agentHome, 'uuid-agents']);
+  let out = collect({ paths: readerPaths(home, paths), now: NOW, useCache: false });
+  assert.deepEqual(out.folders.map((f) => [f.folder, f.accountUuid, f.plan]).filter(([f]) => f === 'claude-insight-agents'), [['claude-insight-agents', 'uuid-agents', 'Max']]);
+  assert.deepEqual(out.readings.filter((r) => r.folder === 'claude-insight-agents').map((r) => [r.scope, r.usedPercent, r.source]), [['weekly', 55, 'terminal'], ['5-hour', 9, 'terminal']]);
+  // The agent home is signed in to another account since the capture.
+  fs.writeFileSync(path.join(agentHome, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'uuid-other' } }));
+  out = collect({ paths: readerPaths(home, paths), now: NOW, useCache: false });
+  assert.deepEqual(out.readings.filter((r) => r.folder === 'claude-insight-agents'), []);
+  assert.equal(capture('relative/path', payload(1), { paths, now: NOW }), false);
+  assert.equal(capture('/', payload(1), { paths, now: NOW }), false);
+});
+
+// #853 review: an agent home whose name matches an accounts folder, or another
+// agent home's, never overwrites that folder's capture.
+test('a path capture never replaces another folder\'s capture of the same name', () => {
+  const { home, paths } = fixture();
+  const clash = path.join(home, 'agents', '.alpha');
+  fs.mkdirSync(clash, { recursive: true });
+  fs.writeFileSync(path.join(clash, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'uuid-clash' } }));
+  assert.equal(capture('alpha', payload(10), { paths, now: NOW }), true);
+  assert.equal(capture(clash, payload(90), { paths, now: NOW + 120_000 }), false, 'alpha lives under the accounts directory');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(paths.terminalDir, 'alpha.json'), 'utf8')).accountUuid, 'uuid-alpha');
+  const first = path.join(home, 'one', '.claude-agents');
+  const second = path.join(home, 'two', '.claude-agents');
+  for (const dir of [first, second]) {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: `uuid-${path.basename(path.dirname(dir))}` } }));
+  }
+  assert.equal(capture(first, payload(20), { paths, now: NOW }), true);
+  assert.equal(capture(second, payload(80), { paths, now: NOW + 120_000 }), false, 'another path already owns the name');
+  assert.equal(capture(first, payload(21), { paths, now: NOW + 120_000 }), true, 'the owning path keeps updating');
+});
+
+// #853 review, reverse order: a path captured first, then an accounts folder of
+// the same name appears. The accounts folder takes its name back and keeps it.
+test('an accounts folder takes its name back from a path captured first', () => {
+  const { home, paths } = fixture();
+  const early = path.join(home, 'agents', '.gamma');
+  fs.mkdirSync(early, { recursive: true });
+  fs.writeFileSync(path.join(early, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'uuid-early' } }));
+  assert.equal(capture(early, payload(30), { paths, now: NOW }), true);
+  fs.mkdirSync(path.join(paths.accountsDir, 'gamma'));
+  fs.writeFileSync(path.join(paths.accountsDir, 'gamma', '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'uuid-gamma' } }));
+  assert.equal(capture('gamma', payload(40), { paths, now: NOW + 120_000 }), true, 'the accounts folder takes the name');
+  assert.equal(capture(early, payload(31), { paths, now: NOW + 240_000 }), false, 'the path no longer writes it');
+  const out = collect({ paths: readerPaths(home, paths), now: NOW + 240_000, useCache: false });
+  assert.deepEqual(out.readings.filter((r) => r.folder === 'gamma' && r.scope === 'weekly').map((r) => [r.accountUuid, r.usedPercent]), [['uuid-gamma', 40]]);
+});

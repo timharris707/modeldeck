@@ -111,7 +111,9 @@ arrival, whichever is earlier. Two-Mac mode sends no `pool`.
 ## Run on the Studio (several machines, #834)
 
 `MACHINES` lists the machines to read, in display order, as `Name=local` (this
-machine) or `Name=<ssh host>`:
+machine), `Name=<ssh host>`, or `Name=<ssh host>/direct` for a machine read only
+for its direct sign-ins, with no daemon read (#856: an SSH user such as the
+Mini's `agents`, whose loopback port answers with another user's daemon):
 
 ```sh
 MACHINES="Studio=local,Linux=linux,M5=m5,M1=tim-m1-worker" tools/phone-deck/launch-agent.sh install

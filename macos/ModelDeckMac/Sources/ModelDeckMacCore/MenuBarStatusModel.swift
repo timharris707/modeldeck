@@ -622,13 +622,17 @@ public final class MenuBarStatusModel: ObservableObject {
 
     /// Optional background auto-refresh against the local daemon (spec
     /// default 5 min; 0 or negative disables). Replaces any prior schedule.
-    public func startAutoRefresh(interval: TimeInterval) {
+    /// `interval` is the daemon's provider-polling cadence (0 while off),
+    /// which the freshness rules key on. `reloadEvery` (issue #852) is how often
+    /// this model re-reads the daemon's cached state; it defaults to `interval`.
+    public func startAutoRefresh(interval: TimeInterval, reloadEvery: TimeInterval? = nil) {
         stopAutoRefresh()
         autoRefreshInterval = max(interval, 0)
-        guard interval > 0 else { return }
+        let every = reloadEvery ?? interval
+        guard every > 0 else { return }
         autoRefreshTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                try? await Task.sleep(nanoseconds: UInt64(every * 1_000_000_000))
                 guard !Task.isCancelled else { return }
                 await self?.refresh()
             }

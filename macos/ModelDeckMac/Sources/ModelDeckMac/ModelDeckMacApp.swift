@@ -294,7 +294,9 @@ struct ModelDeckMacApp: App {
                     : nil
                 notifications?.thresholds = settings.usageThresholds
             }
-            statusModel?.startAutoRefresh(interval: settings.effectiveAutoRefreshInterval)
+            // Issue #852: reload the cached state even with polling off.
+            statusModel?.startAutoRefresh(interval: settings.effectiveAutoRefreshInterval,
+                                          reloadEvery: settings.stateReloadInterval)
         }
         // Issue #297: the deck's health basis (the #254 focus toggle and,
         // since #746, the lead-window picker) is app-local (UserDefaults on

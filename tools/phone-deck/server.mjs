@@ -280,7 +280,9 @@ export function buildAccount(acct, idx, now, machines) {
     for (const u of machines[mname].state.usage || []) {
       // A daemon reading this page shows its readings back as 'pool-hub' rows
       // (#836); they are this page's own, so the original machine keeps the label.
-      if (u.accountId !== a.id || u.source === 'pool-hub') continue;
+      // One naming this machine is its own reading, which the daemon swapped for
+      // the page's equal copy (#848); dropping it erased the window (#850).
+      if (u.accountId !== a.id || (u.source === 'pool-hub' && u.hubSource !== mname)) continue;
       const obs = Date.parse(u.observedAt);
       // Equivalent scope names ('week', 'weekly') are one window (#834 review).
       const key = knownTitle(u.scope) ?? u.scope;
@@ -526,7 +528,7 @@ export function createDeckReader(env = process.env, {
   const daemon = `http://127.0.0.1:${daemonPort}`;
   const fresh = (n, extra) => ({ name: n, state: null, stateAt: 0, lastTry: 0, ok: false, error: null, forecast: null, forecastAt: 0, ...extra });
   const machines = listed ? Object.fromEntries(listed.map((m) => [m.name, fresh(m.name, {
-    remote: m.host != null, host: m.host, listed: true, daemonState: null, direct: null, directOk: false,
+    remote: m.host != null, host: m.host, listed: true, directOnly: m.directOnly, daemonState: null, direct: null, directOk: false,
   })])) : local ? {
     [name]: fresh(name, { remote: false }),
   } : {
@@ -586,7 +588,8 @@ export function createDeckReader(env = process.env, {
   async function readListed(m, now) {
     m.lastTry = now;
     const wantForecast = now - m.forecastAt > FORECAST_TTL;
-    const daemonRead = m.remote
+    // #856: a direct-only machine has no daemon of its own to read.
+    const daemonRead = m.directOnly ? Promise.resolve([null, null]) : m.remote
       ? Promise.all([
         sshGetMany(m.host, ['/api/state']),
         wantForecast ? sshGetMany(m.host, ['/api/usage/exhaustion-forecast']).catch(() => [null]) : [null],
@@ -600,7 +603,7 @@ export function createDeckReader(env = process.env, {
     const directOk = directResult.status === 'fulfilled' && Array.isArray(directResult.value?.folders);
     if (directOk) m.direct = directResult.value;
     m.directOk = directOk;
-    if (!daemonOk) log(`${m.name} daemon read failed`);
+    if (!daemonOk && !m.directOnly) log(`${m.name} daemon read failed`);
     if (!directOk) log(`${m.name} direct read failed`);
     if (daemonOk || directOk) {
       m.state = withDirect(m.daemonState || { accounts: [], usage: [] }, m.direct);

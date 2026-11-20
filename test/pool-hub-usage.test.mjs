@@ -16,7 +16,7 @@ import path from 'node:path';
 import { Store } from '../src/db.mjs';
 import { ModelDeckService, POOL_HUB_FRESH_MS } from '../src/service.mjs';
 import { claudeUsageTags } from '../src/pool-member-tag.mjs';
-import { createDeckReader, handle } from '../tools/phone-deck/server.mjs';
+import { buildDeck, createDeckReader, handle } from '../tools/phone-deck/server.mjs';
 
 const HUB = 'http://100.72.124.113:3871';
 const DECK_UUID = '00000000-0000-4000-8000-00000000d3c4';
@@ -218,4 +218,43 @@ test('a page without a usage block, a malformed one, or a tag two cards share pa
     const cards = await d.weekly();
     assert.equal(cards.click.used, 5, `reply ${index}`);
   }
+});
+
+// #850 — the Studio, 2026-11-20: four cards lost their weekly numbers once a
+// minute. The M5's only copy of a reading came back to the page as a
+// 'pool-hub' row naming the M5 (its daemon takes the page's equal copy), the
+// page dropped every 'pool-hub' row, the window vanished, the M5 showed its
+// own row again, and round it went.
+//
+// TRIPWIRE page-daemon-loop-keeps-windows: real page build -> real remote
+// daemon merge -> real page build, three rounds. A window must never vanish.
+test('TRIPWIRE page-daemon-loop-keeps-windows: a reading only one machine holds survives the round trip', async (t) => {
+  const d = fixture(t);
+  const observedAt = ago(13 * 3_600_000);
+  d.store.recordUsage(d.accounts.click.id, { scope: 'weekly', usedPercent: 0, resetsAt: RESET, observedAt, source: 'claude-oauth-api' });
+  // The M5's daemon state as the page reads it: this test's remote daemon.
+  const m5State = async () => {
+    const value = await d.service.state();
+    return { accounts: value.accounts, usage: value.usage };
+  };
+  const page = async () => buildDeck({
+    Studio: { name: 'Studio', remote: false, ok: true, stateAt: Date.now(), state: { accounts: [], usage: [] }, forecast: null },
+    M5: { name: 'M5', remote: true, ok: true, stateAt: Date.now(), state: await m5State(), forecast: null },
+  }, Date.now());
+  let deck = await page();
+  d.setReply(async () => new Response(JSON.stringify({
+    generatedAt: deck.generatedAt, sources: deck.sources.map(({ name, ok, reachable, readAt }) => ({ name, ok, reachable, readAt })),
+    usage: deck.hubUsage,
+  })));
+  await d.goRemote();
+  for (let round = 1; round <= 3; round += 1) {
+    const click = deck.accounts.find((a) => a.label === 'Click AI');
+    const weekly = click?.windows.find((w) => w.title === 'Weekly · all models');
+    assert.ok(weekly, `round ${round}: the weekly window is on the card`);
+    assert.deepEqual([weekly.remaining, weekly.source], [100, 'M5'], `round ${round}`);
+    await d.advance(60_000);
+    deck = await page();
+  }
+  const row = (await d.service.state()).usage.find((u) => u.accountId === d.accounts.click.id && u.scope === 'weekly');
+  assert.deepEqual([row.source, row.hubSource], ['pool-hub', 'M5'], 'the daemon did swap in the echo, so the loop really ran');
 });

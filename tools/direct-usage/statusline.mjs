@@ -56,22 +56,41 @@ function accountUuid(accountsDir, folder) {
 }
 
 /// Save one payload's windows for `folder`. Returns true when it wrote.
-export function capture(folder, payload, { paths = capturePaths(), now = Date.now() } = {}) {
-  if (!FOLDER.test(folder)) return false;
+/// A folder under the accounts directory by name, or (#853) any account
+/// folder by absolute path, such as an agent home outside ~/.claude-accounts.
+export function captureTarget(target) {
+  if (typeof target !== 'string') return null;
+  if (path.isAbsolute(target)) {
+    const dir = path.resolve(target);
+    const folder = path.basename(dir).replace(/^\.+/, '');
+    return FOLDER.test(folder) ? { folder, dir } : null;
+  }
+  return FOLDER.test(target) ? { folder: target, dir: null } : null;
+}
+
+export function capture(target, payload, { paths = capturePaths(), now = Date.now() } = {}) {
+  const where = captureTarget(target);
+  if (!where) return false;
+  const { folder, dir } = where;
   const windows = windowsOf(payload);
   if (!windows) return false;
-  const uuid = accountUuid(paths.accountsDir, folder);
+  const uuid = dir ? accountUuid(path.dirname(dir), path.basename(dir)) : accountUuid(paths.accountsDir, folder);
   if (!uuid) return false;
   const file = path.join(paths.terminalDir, `${folder}.json`);
+  // #853 review: an accounts folder always owns its name. A path capture never
+  // takes over a name an accounts folder or another path holds; a capture for
+  // the accounts folder takes its name back from a path that held it first.
+  if (dir && fs.existsSync(path.join(paths.accountsDir, folder))) return false;
   try {
     const prev = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (dir && (prev?.dir ?? null) !== dir) return false;
     // A status line runs often; the same numbers need saving once a minute.
     if (prev?.accountUuid === uuid && JSON.stringify(prev.windows) === JSON.stringify(windows)
       && now - Date.parse(prev.observedAt) < SAME_FOR_MS) return false;
   } catch { /* first capture */ }
   fs.mkdirSync(paths.terminalDir, { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ v: CAPTURE_VERSION, folder, accountUuid: uuid, observedAt: new Date(now).toISOString(), windows }), { mode: 0o600 });
+  fs.writeFileSync(tmp, JSON.stringify({ v: CAPTURE_VERSION, folder, ...(dir ? { dir } : {}), accountUuid: uuid, observedAt: new Date(now).toISOString(), windows }), { mode: 0o600 });
   fs.renameSync(tmp, file);
   return true;
 }

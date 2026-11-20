@@ -18,13 +18,16 @@ export function validateConfig(env) {
 // MACHINES (#834): the Studio's several-machine mode, in display order:
 // "Studio=local,Linux=linux,M5=m5". Each value is "local" (this machine) or
 // the SSH host name of a machine whose daemon and direct sign-ins to read.
+// "Name=host/direct" (#856) reads only that machine's direct sign-ins: for an
+// account such as the Mini's agents user, whose loopback port answers with
+// another user's daemon.
 function parseMachines(env) {
   if (env.MACHINES === undefined) return null;
   if (env.SOURCES !== undefined || env.MACHINE_LABEL !== undefined) throw new Error('MACHINES cannot be combined with SOURCES or MACHINE_LABEL');
   const list = env.MACHINES.split(',').map((item) => {
-    const m = /^([A-Za-z0-9 -]{1,24})=(local|[a-z0-9][a-z0-9.-]{0,62})$/.exec(item);
-    if (!m) throw new Error('MACHINES must be comma-separated Name=local or Name=ssh-host entries');
-    return { name: m[1], host: m[2] === 'local' ? null : m[2] };
+    const m = /^([A-Za-z0-9 -]{1,24})=(local|[a-z0-9][a-z0-9.-]{0,62})(\/direct)?$/.exec(item);
+    if (!m || (m[2] === 'local' && m[3])) throw new Error('MACHINES must be comma-separated Name=local, Name=ssh-host or Name=ssh-host/direct entries');
+    return { name: m[1], host: m[2] === 'local' ? null : m[2], directOnly: !!m[3] };
   });
   if (list.length > 8) throw new Error('MACHINES must name 1 to 8 machines');
   if (new Set(list.map((m) => m.name)).size !== list.length) throw new Error('MACHINES names must be different');

@@ -148,6 +148,9 @@ struct DeckPopoverView: View {
             // ordering is fine.
             deckModel.captureUsageChanges(state: statusModel.deckState)
             deckModel.noteDeckOpenedForStarPrompt()
+            // Issue #852: the deck stays alive between opens, so `.task` runs
+            // once; re-read the daemon's cached state on every open.
+            Task { await statusModel.refresh() }
         }
         .task {
             launchAtLoginModel.load()

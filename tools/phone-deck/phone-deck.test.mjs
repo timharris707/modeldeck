@@ -879,3 +879,42 @@ test('TRIPWIRE the page skips readings a daemon took from this page, so the sour
   }, NOW);
   assert.deepEqual(deck.accounts.map((a) => a.windows.map((w) => [w.title, w.remaining, w.source])), [[['Weekly · all models', 63, 'M5']]]);
 });
+
+// #856: the Mini's agents user answers the daemon read with another user's
+// daemon on the shared loopback port. A "host/direct" entry reads only that
+// machine's direct sign-ins, so no stale foreign card or "Sign in needed" row.
+test('TRIPWIRE a direct-only machine is never asked for a daemon state', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  assert.throws(() => createDeckReader({ MACHINES: 'Studio=local/direct' }), /MACHINES/);
+  const remoteCommands = [];
+  const studioState = { accounts: [account('s1', { label: 'Probe Account', authState: 'signin-required', metadata: { claudeAccountUuid: UUID } })], usage: [] };
+  const agentsDirect = {
+    v: 1, readAt: new Date(NOW).toISOString(),
+    folders: [{ folder: 'claude-insight-agents', accountUuid: UUID, plan: 'Max', rateLimitTier: null }],
+    readings: [{ folder: 'claude-insight-agents', accountUuid: UUID, entry: null, source: 'terminal', scope: 'weekly', usedPercent: 30,
+      resetsAt: '2026-10-24T12:00:00.000Z', status: null, observedAt: new Date(NOW - 60_000).toISOString() }],
+    health: { t3Logs: false, t3Entries: 0, conversationsLastDay: 0, withoutReadingLastDay: 0, formatWarning: false },
+  };
+  const reader = createDeckReader({ MACHINES: 'Studio=local,Mini agents=mini-agents/direct', DIRECT_NO_CACHE: '1' }, {
+    fetch: async (url) => ({ ok: true, json: async () => (new URL(url).pathname === '/api/state' ? studioState : { accounts: [] }) }),
+    readDirectLocal: () => ({ ...directOut('probe', []), folders: [] }),
+    readerSource: async () => 'READER SOURCE',
+    execFile: (cmd, args, options, callback) => {
+      const remote = args.at(-1);
+      remoteCommands.push(remote);
+      const stdin = { on() {}, end() {} };
+      // A daemon read here would return the Mini's other user's state.
+      if (remote.startsWith('curl')) setImmediate(() => callback(null, JSON.stringify({ accounts: [account('x', { label: 'ClickAI Skills', authState: 'signin-required' })], usage: [] })));
+      else setImmediate(() => callback(null, JSON.stringify(agentsDirect)));
+      return { stdin };
+    },
+    readdir: async () => { throw new Error('no pool listing in this mode'); },
+  });
+  const deck = await reader();
+  assert.equal(remoteCommands.filter((c) => c.startsWith('curl')).length, 0, 'no daemon read on the direct-only machine');
+  assert.deepEqual(deck.accounts.filter((a) => a.provider === 'claude').map((a) => a.label), ['Probe Account'], 'no foreign card');
+  const card = deck.accounts[0];
+  assert.deepEqual(card.windows.map((w) => [w.title, w.remaining, w.source]), [['Weekly · all models', 70, 'Mini agents · Terminal']]);
+  assert.deepEqual(card.machines.map((m) => [m.name, m.signIn]), [['Studio', 'needed'], ['Mini agents', 'ok']]);
+  assert.equal(card.signIn, null);
+});

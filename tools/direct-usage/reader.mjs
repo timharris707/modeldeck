@@ -55,17 +55,41 @@ export function readFolders(accountsDir) {
   const folders = [];
   for (const d of names) {
     if (!d.isDirectory() || d.name.startsWith('.')) continue;
-    let oauth;
-    try { oauth = JSON.parse(fs.readFileSync(path.join(accountsDir, d.name, '.claude.json'), 'utf8')).oauthAccount; } catch { continue; }
-    if (!oauth || typeof oauth.accountUuid !== 'string') continue;
-    folders.push({
-      folder: d.name,
-      accountUuid: oauth.accountUuid,
-      plan: typeof oauth.planDisplayName === 'string' ? oauth.planDisplayName : null,
-      rateLimitTier: typeof oauth.organizationRateLimitTier === 'string' ? oauth.organizationRateLimitTier : null,
-    });
+    const f = folderAccount(path.join(accountsDir, d.name), d.name);
+    if (f) folders.push(f);
   }
   return folders.sort((a, b) => a.folder.localeCompare(b.folder));
+}
+
+// One account folder's identity-free display fields, or null.
+function folderAccount(dir, folder) {
+  let oauth;
+  try { oauth = JSON.parse(fs.readFileSync(path.join(dir, '.claude.json'), 'utf8')).oauthAccount; } catch { return null; }
+  if (!oauth || typeof oauth.accountUuid !== 'string') return null;
+  return {
+    folder,
+    accountUuid: oauth.accountUuid,
+    plan: typeof oauth.planDisplayName === 'string' ? oauth.planDisplayName : null,
+    rateLimitTier: typeof oauth.organizationRateLimitTier === 'string' ? oauth.organizationRateLimitTier : null,
+  };
+}
+
+// #853: account folders outside the accounts directory that a terminal capture
+// names by absolute path (agent homes). Their account is read at read time,
+// like every other folder's, so a reading stays with the account that made it.
+export function captureFolders(terminalDir, known) {
+  let names;
+  try { names = fs.readdirSync(terminalDir).filter((n) => n.endsWith('.json')); } catch { return []; }
+  const out = [];
+  for (const name of names) {
+    let c;
+    try { c = JSON.parse(fs.readFileSync(path.join(terminalDir, name), 'utf8')); } catch { continue; }
+    if (typeof c?.dir !== 'string' || !path.isAbsolute(c.dir) || `${c.folder}.json` !== name
+      || path.basename(c.dir).replace(/^\.+/, '') !== c.folder || known.has(c.folder)) continue;
+    const f = folderAccount(c.dir, c.folder);
+    if (f) { out.push(f); known.add(c.folder); }
+  }
+  return out;
 }
 
 // T3 entry name -> account folder name, for entries whose folder sits
@@ -207,6 +231,7 @@ function readNewLines(file, offset, size, onLine) {
 export function collect({ paths = defaultPaths(), now = Date.now(), useCache = true } = {}) {
   const cache = useCache ? loadCache(paths.cacheFile) : loadCache('');
   const folders = readFolders(paths.accountsDir);
+  folders.push(...captureFolders(paths.terminalDir, new Set(folders.map((f) => f.folder))));
   const uuidOf = new Map(folders.map((f) => [f.folder, f.accountUuid]));
   const entryFolders = readEntryFolders(paths.t3Settings, paths.accountsDir);
   let logNames = [];

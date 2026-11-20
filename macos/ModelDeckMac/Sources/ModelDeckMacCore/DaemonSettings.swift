@@ -213,6 +213,14 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         autoRefreshEnabled ? TimeInterval(autoRefreshIntervalSeconds) : 0
     }
 
+    /// Issue #852: how often the app re-reads the daemon's cached state. That
+    /// read is local and free, so it runs even with provider polling off; a Mac
+    /// that takes its numbers from another Mac's usage page depends on it.
+    public static let stateReloadWhileRefreshOff: TimeInterval = 60
+    public var stateReloadInterval: TimeInterval {
+        effectiveAutoRefreshInterval > 0 ? effectiveAutoRefreshInterval : Self.stateReloadWhileRefreshOff
+    }
+
     /// The pinned menu-bar account id; nil when the menu bar follows the
     /// lowest remaining % across all accounts (the "" sentinel).
     public var menuBarPinnedAccountId: String? {
