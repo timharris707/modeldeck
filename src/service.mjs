@@ -1381,8 +1381,11 @@ export class ModelDeckService {
             if (!envStat.isFile() || !fs.lstatSync(this.codexActiveLink).isSymbolicLink()) throw new Error('Unsafe Codex terminal pin');
             const target = fs.realpathSync(this.codexActiveLink);
             const account = this.store.listAccounts().find((item) => item.provider === 'codex' && path.resolve(item.profileRef) === target);
-            if (!account) throw new Error('Unregistered Codex terminal pin');
-            await this.writeCodexShellEnvFile(this.providerProfileRef(account));
+            // A pin to a profile with no registered account (its accounts were
+            // removed) is not ModelDeck's to rewrite, and must never shut the
+            // daemon: the Studio lost every card to it on 2026-11-19.
+            if (!account) this.logCodexMigration('Codex terminal pin names no registered account; left unchanged');
+            else await this.writeCodexShellEnvFile(this.providerProfileRef(account));
           }
         } catch {
           result = { ...result, retryable: false, blocked: true, warning: 'The Codex terminal environment could not be updated. Restart ModelDeck to retry.' };

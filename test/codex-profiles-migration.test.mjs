@@ -1411,3 +1411,24 @@ test('codex-migration-rename-failures-restore-original-root', async (t) => {
     });
   }
 });
+
+// The Studio, 2026-11-19: its Codex accounts were removed from ModelDeck, but
+// the terminal pin and ~/.codex stayed. On the next restart the pin check
+// found no registered account and shut the whole daemon ("Daemon unreachable",
+// every route 503), Claude cards included. A pin to a profile ModelDeck no
+// longer has is not ModelDeck's to rewrite: leave it and keep running.
+test('TRIPWIRE codex-terminal-pin-to-an-unregistered-profile-never-blocks-the-daemon', async (t) => {
+  const data = fixture(t);
+  data.store.saveSettings({ codexManaged: true });
+  assert.notEqual((await data.service.migrateCodexProfilesDir()).blocked, true);
+  fs.writeFileSync(data.service.codexShellEnvFile, 'dummy terminal pin\n', { mode: 0o600 });
+  data.store.deleteAccount(data.account.id);
+  data.service.codexProfilesMigrationPromise = null;
+  const { app, starts } = await startup(data);
+  assert.equal(data.service.codexProfilesMigrationBlocked, false);
+  assert.ok(starts.length > 0, 'daemon work starts');
+  assert.equal((await health(app)).warning ?? null, null);
+  assert.equal((await migrationRequest(app, 'GET', '/api/state')).status, 200);
+  assert.equal(fs.readFileSync(data.service.codexShellEnvFile, 'utf8'), 'dummy terminal pin\n', 'left as it was');
+  assert.ok(data.logs.some((line) => /terminal pin/.test(line)), 'logged once for the record');
+});
