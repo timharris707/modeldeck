@@ -108,6 +108,42 @@ overload, or null. A remote Mac refuses any other value, and shows the record
 only while it is under 10 minutes old, counted from the page's `readAt` or its
 arrival, whichever is earlier. Two-Mac mode sends no `pool`.
 
+## Run on the Studio (several machines, #834)
+
+`MACHINES` lists the machines to read, in display order, as `Name=local` (this
+machine) or `Name=<ssh host>`:
+
+```sh
+MACHINES="Studio=local,Linux=linux,M5=m5,M1=tim-m1-worker" tools/phone-deck/launch-agent.sh install
+```
+
+For each machine the page reads its ModelDeck daemon as two-Mac mode does, and
+its **direct sign-ins** (`~/.claude-accounts/<name>`) with
+`tools/direct-usage/reader.mjs`. The reader runs on the machine itself: locally
+in-process, or piped over SSH to `node --input-type=module`, so a remote
+machine needs only Node. It returns what Claude Code reported in T3
+conversations (the Agent SDK's `rate_limit_event`, which T3 saves in its
+provider logs), each folder's account uuid and plan name, and a health record.
+It never opens a credential file or the Keychain and makes no network call.
+It keeps a small cache in `~/.cache/modeldeck/direct-usage/` on each machine
+so it reads only new log lines; `DIRECT_NO_CACHE=1` (a trial run) writes
+nothing there.
+
+Cards for the same Claude account merge by account uuid; the newest reading of
+each window wins, and each window says where it came from (`Linux · T3`) and how
+old it is. A direct folder counts as signed in. A direct reading updates when
+the account is used (each conversation's start and each percent change), so an
+idle account keeps its last number. A banner names a machine whose reader
+failed, or whose T3 ran Claude conversations in the last day with no reading in
+its log (a sign that a T3 update changed the log). This mode sends no `pool`,
+shows no routing weights and lists no pool directory. Known limit: T3's log lines
+do not name the account, only the T3 entry. The reader records each reading's
+account uuid when it first reads the line, and drops readings when a folder is
+later signed in to another account; but a reader starting without its cache
+attributes a folder's older lines to whatever account the folder holds now.
+Folders are one per account by design, and readings age out after 8 days. `MACHINES` cannot be
+combined with `SOURCES` or `MACHINE_LABEL`; `--two-mac` clears it.
+
 ## Open on iPhone or iPad
 
 1. Connect Tailscale on the phone or tablet to the same tailnet.
@@ -125,7 +161,10 @@ arrival, whichever is earlier. Two-Mac mode sends no `pool`.
   daemon and the M5 daemon through `ssh m5 curl …`. File **names only** in the
   M1's `~/.config/cliproxyapi/auth` directory count Grok and Antigravity sign-ins;
   the files are never opened.
-- **Both modes:** this folder's page, manifest and icons, and the repo's provider images.
+- **Several-machine mode (`MACHINES`):** the same GET endpoints on each listed
+  machine's daemon (locally, or `ssh <host> curl …`), and the direct reader
+  described above on each machine. No pool directory reads.
+- **All modes:** this folder's page, manifest and icons, and the repo's provider images.
 
 The browser receives display labels, plans, usage percentages, reset times,
 reading ages, sign-in status, forecasts/history, and the M5 pool's routing

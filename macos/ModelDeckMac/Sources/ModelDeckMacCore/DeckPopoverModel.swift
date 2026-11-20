@@ -440,6 +440,7 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
 /// % left, and next reset; expanded it lists every window.
 public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     public var account: DeckAccount
+    public var proxy: DeckProxyStatus?
     public var provider: DeckProvider?
     public var windows: [DeckWindow]
     /// Whether this is the provider's DB-default account (the account the
@@ -457,6 +458,17 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     /// window filtering). Feeds the per-card staleness marker; nil when no
     /// snapshot carries a parseable `observedAt`.
     public var newestObservedAt: Date?
+    /// Issue #836: the newest reading this card took from the usage page,
+    /// with the page's name for where it came from ("Linux · T3").
+    public var hubReading: HubReading?
+    public struct HubReading: Equatable, Sendable {
+        public var observedAt: Date
+        public var source: String?
+        public init(observedAt: Date, source: String?) {
+            self.observedAt = observedAt
+            self.source = source
+        }
+    }
     /// Issue #746 (Tim, 2026-10-08; supersedes the 2026-08-02 model-window
     /// switch): the window class this card's collapsed line leads with —
     /// the deck-wide choice, or the card's own override when one is set.
@@ -579,7 +591,8 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     /// same way — the split changes wording/tone/color on the ONE notice
     /// line, never the card's footprint or notice count.
     public func staleness(now: Date, autoRefreshInterval: TimeInterval) -> DeckFreshness.CardStaleness? {
-        guard keychainRecovery == nil, signInRecovery == nil else { return nil }
+        guard keychainRecovery == nil, signInRecovery == nil,
+              !DeckFreshness.usesRemotePool(for: account, proxy: proxy) else { return nil }
         return DeckFreshness.cardStaleness(
             newestObservedAt: newestObservedAt,
             lastRefreshError: account.lastRefreshError,
@@ -597,6 +610,29 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
         DeckFreshness.keychainRecovery(for: account)
     }
 
+    /// The pool hub, rather than a local sign-in, explains these accounts (#832).
+    public func remotePoolNotice(now: Date) -> (text: String, isWarning: Bool)? {
+        guard DeckFreshness.usesRemotePool(for: account, proxy: proxy) else { return nil }
+        let host = proxy?.hub.flatMap { ProxyRoleCopy.hubPage($0.url)?.host }
+        let location = host.map { " on \($0)" } ?? " on another machine"
+        if let hub = proxy?.hub {
+            let freshness = ProxyRoleCopy.hubFreshness(hub, now: now)
+            if freshness == ProxyRoleCopy.hubNotAnswering {
+                return ("Pool hub\(location) is not answering", true)
+            }
+            if freshness == ProxyRoleCopy.hubNoFreshData {
+                return ("Pool hub\(location) has no fresh data", true)
+            }
+        }
+        // #836: numbers from the usage page say how old they are and where
+        // the page got them, as the page itself does.
+        if let hubReading {
+            let age = DeckFreshness.ageText(observedAt: hubReading.observedAt, now: now)
+            return (["Read \(age)", hubReading.source].compactMap { $0 }.joined(separator: " · "), false)
+        }
+        return ("Uses the pool\(location)", false)
+    }
+
     /// Issue #114: non-nil when the daemon reported `signin-required` — the
     /// stored sign-in is missing or expired (for Claude, the structural fate
     /// of every non-active account under CLI ≥ 2.1.216). The card renders an
@@ -607,7 +643,7 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     /// or an old daemon: today's alarm verbatim). Same slot, same #118
     /// one-click path either way.
     public var signInRecovery: DeckFreshness.SignInRecovery? {
-        DeckFreshness.signInRecovery(for: account)
+        DeckFreshness.signInRecovery(for: account, proxy: proxy)
     }
 
     /// Issue #264: the clocked variant the deck card renders — upgrades the
@@ -626,7 +662,8 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
             for: account,
             newestObservedAt: newestObservedAt,
             now: now,
-            autoRefreshInterval: autoRefreshInterval
+            autoRefreshInterval: autoRefreshInterval,
+            proxy: proxy
         )
     }
 
@@ -796,8 +833,12 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
         activationState: ProviderActivationState = .unknown,
         newestObservedAt: Date? = nil,
         leadWindow: DeckLeadWindow = .lowest,
-        prefersGeneralWeeklyHeadline: Bool = false
+        prefersGeneralWeeklyHeadline: Bool = false,
+        proxy: DeckProxyStatus? = nil,
+        hubReading: HubReading? = nil
     ) {
+        self.proxy = proxy
+        self.hubReading = hubReading
         self.account = account
         self.provider = provider
         self.windows = windows
@@ -988,7 +1029,16 @@ public enum DeckBuilder {
                         .max(),
                     // Issue #746: a per-card override wins over the deck setting.
                     leadWindow: leadWindowOverrides[account.id] ?? leadWindow,
-                    prefersGeneralWeeklyHeadline: preferGeneralWeeklyHeadline
+                    prefersGeneralWeeklyHeadline: preferGeneralWeeklyHeadline,
+                    proxy: state.proxy,
+                    hubReading: snapshots
+                        .filter { $0.source == "pool-hub" }
+                        .compactMap { snapshot in
+                            DeckDateParsing.date(from: snapshot.observedAt).map {
+                                DeckAccountRow.HubReading(observedAt: $0, source: snapshot.hubSource)
+                            }
+                        }
+                        .max { $0.observedAt < $1.observedAt }
                 )
             }
     }
@@ -1955,7 +2005,7 @@ public final class DeckPopoverModel: ObservableObject {
         state: DeckState?
     ) -> DeckAccount? {
         state?.accounts.first {
-            $0.id == accountID && DeckFreshness.signInRecovery(for: $0) != nil
+            $0.id == accountID && DeckFreshness.signInRecovery(for: $0, proxy: state?.proxy) != nil
         }
     }
 

@@ -17,15 +17,17 @@ import { realpathSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { isIP } from 'node:net';
 import { validateConfig } from './config.mjs';
-import { poolCredentialDetail, poolMemberTag } from '../../src/pool-member-tag.mjs';
+import { claudeUsageTags, poolCredentialDetail, poolMemberTag } from '../../src/pool-member-tag.mjs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { collect as collectDirect } from '../direct-usage/reader.mjs';
 
 const PORT = Number(process.env.PORT || 3871);
 const HOSTS = (process.env.HOSTS || '127.0.0.1').split(',').map((h) => h.trim()).filter(Boolean);
 const HERE = new URL('./', import.meta.url);
 const MARKS = new URL('../../macos/ModelDeckMac/Sources/ModelDeckMacCore/Resources/', import.meta.url);
 const POOL_AUTH_DIR = join(homedir(), '.config/cliproxyapi/auth');
+const READER_FILE = new URL('../direct-usage/reader.mjs', import.meta.url);
 const M5_HOST = process.env.M5_HOST || 'm5'; // overridable only to test the asleep path
 
 const STATE_TTL = 60_000;          // upstream state cache
@@ -160,8 +162,11 @@ export function planLabel(meta) {
   return null;
 }
 
-// DeckFreshness.signInRecovery, per machine.
+// DeckFreshness.signInRecovery, per machine. A direct sign-in folder
+// (~/.claude-accounts, #834) is a working sign-in that Claude Code renews
+// itself, whatever ModelDeck's own profile folder says.
 export function signInOf(a) {
+  if (a.directFolder) return { state: 'ok', text: null };
   const auth = a.authState;
   if (!auth || auth === 'ok') return { state: 'ok', text: null };
   if (auth === 'signin-required') {
@@ -188,7 +193,38 @@ const round1 = (n) => (n == null ? null : Math.round(n * 10) / 10);
 
 // ---------- merge the configured sources ----------
 
-const machineList = (machines) => machines.M5 && machines.M1 ? [machines.M5, machines.M1] : Object.values(machines);
+const twoMac = (machines) => Object.keys(machines).length === 2 && machines.M5 && machines.M1 && !machines.M5.listed;
+const machineList = (machines) => twoMac(machines) ? [machines.M5, machines.M1] : Object.values(machines);
+
+// #834: fold one machine's direct readings (tools/direct-usage/reader.mjs)
+// into its daemon state. A folder whose account the daemon already knows
+// (same Claude account uuid) feeds that account; any other folder becomes an
+// account of its own, named after the folder.
+export function withDirect(state, direct) {
+  if (!direct) return state;
+  const accounts = [...(state?.accounts || [])];
+  const usage = [...(state?.usage || [])];
+  for (const f of direct.folders || []) {
+    const at = accounts.findIndex((a) => a.enabled && normProvider(a.provider) === 'claude'
+      && a.metadata?.claudeAccountUuid === f.accountUuid);
+    let id;
+    if (at >= 0) {
+      id = accounts[at].id;
+      accounts[at] = { ...accounts[at], directFolder: true };
+    } else {
+      id = `direct:${f.folder}`;
+      accounts.push({
+        id, provider: 'claude', label: f.folder, enabled: true, directFolder: true,
+        metadata: { claudeAccountUuid: f.accountUuid, claudePlan: f.plan ? { displayName: f.plan } : null },
+      });
+    }
+    for (const r of direct.readings || []) {
+      if (r.folder !== f.folder) continue;
+      usage.push({ accountId: id, scope: r.scope, usedPercent: r.usedPercent, resetsAt: r.resetsAt, observedAt: r.observedAt, via: r.source === 'terminal' ? 'Terminal' : 'T3', detail: {} });
+    }
+  }
+  return { ...state, accounts, usage };
+}
 
 export function mergeAccounts(machines) {
   const list = [];
@@ -244,13 +280,16 @@ export function buildAccount(acct, idx, now, machines) {
     for (const u of machines[mname].state.usage || []) {
       if (u.accountId !== a.id) continue;
       const obs = Date.parse(u.observedAt);
-      const prev = best.get(u.scope);
-      if (!prev || obs > prev.obs) best.set(u.scope, { u, obs, machine: mname, accountId: a.id });
+      // Equivalent scope names ('week', 'weekly') are one window (#834 review).
+      const key = knownTitle(u.scope) ?? u.scope;
+      const prev = best.get(key);
+      if (!prev || obs > prev.obs) best.set(key, { u, obs, machine: mname, accountId: a.id });
     }
   }
   let newest = null;
   const windows = [];
   for (const { u, obs, machine, accountId } of best.values()) {
+    const src = u.via ? `${machine} · ${u.via}` : machine;
     if (newest == null || obs > newest) newest = obs;
     const remaining = u.remainingPercent ?? (u.usedPercent != null ? 100 - u.usedPercent : null);
     const resetsAt = u.resetsAt ? Date.parse(u.resetsAt) : null;
@@ -263,7 +302,7 @@ export function buildAccount(acct, idx, now, machines) {
     };
     if (hidden(w, acct.provider)) continue;
     windows.push({
-      ...w, title: windowTitle(u.scope), observedAt: obs, machine, accountId, duration,
+      ...w, title: windowTitle(u.scope), observedAt: obs, machine, src, direct: !!u.via, accountId, duration,
       state: idle ? 'idle' : anchor.kind, rolledAt: anchor.rolledAt ?? null, idleText: idle,
       severity: idle ? 'unknown' : severity(remaining),
     });
@@ -278,8 +317,8 @@ export function buildAccount(acct, idx, now, machines) {
   // Sign-in, per machine and overall (trouble only when no machine is signed in).
   const perMachine = [...acct.from].map(([mname, a]) => ({ name: mname, ...signInOf(a) }));
   const anyOk = perMachine.some((p) => p.state === 'ok');
-  const feeds = [...new Set(windows.map((w) => w.machine))];
-  const lead = perMachine.find((p) => p.name === feeds[0]) || perMachine[0];
+  const feeds = [...new Set(windows.map((w) => w.src))];
+  const lead = perMachine.find((p) => p.name === windows[0]?.machine) || perMachine[0];
   let renewedAt = null;
   for (const a of acct.from.values()) {
     const last = a.renew?.lastAttempt || a.metadata?.claudeRenewal?.lastAttempt;
@@ -309,17 +348,21 @@ export function buildAccount(acct, idx, now, machines) {
       color: /^#[0-9a-f]{6}$/i.test(acct.color || '') ? acct.color : null,
       plan: planLabel([...acct.from.values()][0]?.metadata) || planLabel([...acct.from.values()][1]?.metadata),
       // The pool host's weight (M5 in two-Mac mode): null when outside it.
-      weight: weightOf(acct.from.get(machineList(machines).length === 1 ? machineList(machines)[0].name : 'M5')),
+      // The several-machine mode reads no pool host, so it shows none.
+      weight: weightOf(acct.from.get(twoMac(machines) ? 'M5'
+        : machineList(machines).length === 1 ? machineList(machines)[0].name : undefined)),
       reads: true,
       windows: windows.map((w) => ({
         title: w.title, rank: w.rank, spend: w.spend, remaining: round1(w.remaining),
-        resetsAt: iso(w.resetsAt), observedAt: iso(w.observedAt), source: w.machine,
+        resetsAt: iso(w.resetsAt), observedAt: iso(w.observedAt), source: w.src,
         state: w.state, rolledAt: iso(w.rolledAt), idleText: w.idleText, spendText: w.spendText,
         severity: w.severity,
       })),
       headline,
       newestObservedAt: iso(newest),
       stale: newest != null && now - newest > STALE_AFTER,
+      // #834: a direct reading updates on use, so its card always shows its age.
+      ...(windows.some((w) => w.direct) ? { direct: true } : {}),
       feeds,
       machines: perMachine.map((p) => ({ name: p.name, signIn: p.state, text: p.text })),
       signIn: anyOk ? null : { text: lead?.text || 'Sign in needed', state: lead?.state || 'needed' },
@@ -331,13 +374,46 @@ export function buildAccount(acct, idx, now, machines) {
       machine: weekly.machine, accountId: weekly.accountId, scope: weekly.scope,
       resetsAt: new Date(weekly.resetsAt).toISOString(), durationMs: weekly.duration,
       title: weekly.title, observedAt: weekly.observedAt, remaining: weekly.remaining,
+      // A direct weekly's history is its own readings, from every machine.
+      rows: weekly.direct ? directRows(acct, machines, weekly) : null,
     } : null,
+    _usage: acct.provider === 'claude' ? hubUsageOf(acct, windows) : null,
   };
+}
+
+// #836: a Claude card's readings for remote Macs' decks, named only by
+// one-way tags of the account's email and Claude account id.
+function hubUsageOf(acct, windows) {
+  const matches = new Set();
+  for (const a of acct.from.values()) {
+    for (const tag of claudeUsageTags(a.identity, a.metadata?.claudeAccountUuid)) matches.add(tag);
+  }
+  const shown = windows.filter((w) => !w.spend && w.remaining != null);
+  if (!matches.size || matches.size > 8 || !shown.length) return null;
+  return {
+    matches: [...matches],
+    windows: shown.slice(0, 12).map((w) => ({
+      scope: w.scope, usedPercent: round1(100 - w.remaining), resetsAt: iso(w.resetsAt),
+      observedAt: iso(w.observedAt), source: w.src,
+    })),
+  };
+}
+
+function directRows(acct, machines, weekly) {
+  const rows = [];
+  for (const [mname, a] of acct.from) {
+    for (const u of machines[mname].state.usage || []) {
+      if (u.via && u.accountId === a.id && windowTitle(u.scope) === weekly.title && Date.parse(u.resetsAt) === weekly.resetsAt) {
+        rows.push({ bucketStart: u.observedAt, lastUsedPercent: u.usedPercent });
+      }
+    }
+  }
+  return rows;
 }
 
 export function historyFor(w, histories) {
   if (!w) return null;
-  const hit = histories.get(`${w.machine}:${w.accountId}:${w.resetsAt}`);
+  const hit = w.rows ? { rows: w.rows } : histories.get(`${w.machine}:${w.accountId}:${w.resetsAt}`);
   if (!hit) return null;
   const end = Date.parse(w.resetsAt);
   const start = end - w.durationMs;
@@ -374,7 +450,7 @@ function displaySafe(value) {
 // tag of their identity; accounts outside the pool are left out entirely.
 export function hubPoolOf(machines) {
   const list = machineList(machines);
-  if (list.length !== 1 || list[0].remote || !list[0].state) return undefined;
+  if (list.length !== 1 || list[0].remote || list[0].listed || !list[0].state) return undefined;
   const m = list[0];
   const members = [];
   for (const a of m.state.accounts) {
@@ -395,6 +471,15 @@ export function hubPoolOf(machines) {
   return { readAt: m.stateAt ? iso(m.stateAt) : null, members };
 }
 
+// #834: say when a machine's direct readings may be missing, so an old number
+// is never mistaken for a quiet account.
+export function directWarning(m) {
+  if (!m.listed || !m.ok) return null;
+  if (!m.directOk) return 'Couldn’t read its Claude sign-ins; its numbers may be out of date';
+  if (m.direct?.health?.formatWarning) return 'Its T3 conversations left no usage readings today; a T3 update may have changed its log';
+  return null;
+}
+
 // Pure projection: callers supply machine snapshots, time, and optional cached data.
 export function buildDeck(machines, now, { pool = {}, histories = new Map(), generatedAt = now } = {}) {
   const built = mergeAccounts(machines).map((a, i) => buildAccount(a, i, now, machines));
@@ -410,6 +495,7 @@ export function buildDeck(machines, now, { pool = {}, histories = new Map(), gen
   }
 
   const hubPool = hubPoolOf(machines);
+  const usageCards = built.map((b) => b._usage).filter(Boolean);
   return displaySafe({
     generatedAt: iso(generatedAt),
     sources: machineList(machines).map((m) => ({
@@ -418,9 +504,11 @@ export function buildDeck(machines, now, { pool = {}, histories = new Map(), gen
       reachable: m.ok || (m.stateAt > 0 && generatedAt - m.stateAt < DOWN_AFTER),
       readAt: m.stateAt ? iso(m.stateAt) : null,
       note: m.ok ? null : (m.remote ? 'Asleep or offline' : 'Not answering'),
+      ...(m.listed ? { warning: directWarning(m) } : {}),
     })),
     accounts,
     ...(hubPool ? { hubPool } : {}),
+    ...(usageCards.length ? { hubUsage: { readAt: iso(generatedAt), accounts: usageCards } } : {}),
   });
 }
 
@@ -428,15 +516,24 @@ export const SAFE_PATH = /^\/api\/[A-Za-z0-9/?=&:.\-_%+]+$/;
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 // Each reader owns its caches; injected I/O keeps offline tests fail-closed.
-export function createDeckReader(env = process.env, { fetch = globalThis.fetch, execFile: run = execFile, readdir: list = readdir } = {}) {
-  const { local, name, daemonPort } = validateConfig(env);
+export function createDeckReader(env = process.env, {
+  fetch = globalThis.fetch, execFile: run = execFile, readdir: list = readdir,
+  readDirectLocal = () => collectDirect({ useCache: env.DIRECT_NO_CACHE !== '1' }), readerSource = () => readFile(READER_FILE, 'utf8'),
+} = {}) {
+  const { local, name, daemonPort, machines: listed } = validateConfig(env);
   const daemon = `http://127.0.0.1:${daemonPort}`;
-  const machines = local ? {
-    [name]: { name, remote: false, state: null, stateAt: 0, lastTry: 0, ok: false, error: null, forecast: null, forecastAt: 0 },
+  const fresh = (n, extra) => ({ name: n, state: null, stateAt: 0, lastTry: 0, ok: false, error: null, forecast: null, forecastAt: 0, ...extra });
+  const machines = listed ? Object.fromEntries(listed.map((m) => [m.name, fresh(m.name, {
+    remote: m.host != null, host: m.host, listed: true, daemonState: null, direct: null, directOk: false,
+  })])) : local ? {
+    [name]: fresh(name, { remote: false }),
   } : {
-    M5: { name: 'M5', remote: true, state: null, stateAt: 0, lastTry: 0, ok: false, error: null, forecast: null, forecastAt: 0 },
-    M1: { name: 'M1', remote: false, state: null, stateAt: 0, lastTry: 0, ok: false, error: null, forecast: null, forecastAt: 0 },
+    M5: fresh('M5', { remote: true, host: M5_HOST }),
+    M1: fresh('M1', { remote: false }),
   };
+  // DIRECT_NO_CACHE=1 makes every reader write nothing (a trial run).
+  const remoteReader = `MD_DIRECT_READER_MAIN=1${env.DIRECT_NO_CACHE === '1' ? ' MD_DIRECT_NO_CACHE=1' : ''} PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH node --input-type=module`;
+  let source = null;
   const historyCache = new Map(); // `${machine}:${accountId}:${resetsAt}` -> { at, rows }
   let deck = null;
   let deckAt = 0;
@@ -450,13 +547,13 @@ export function createDeckReader(env = process.env, { fetch = globalThis.fetch, 
     try { return await res.json(); } catch { throw new Error('Invalid daemon JSON'); }
   }
 
-  // One ssh round trip for several GETs on the M5's daemon. Paths are checked to
-  // be shell-safe before they go inside the remote single quotes.
-  async function m5GetMany(paths) {
+  // One ssh round trip for several GETs on a remote machine's daemon. Paths are
+  // checked to be shell-safe before they go inside the remote single quotes.
+  async function sshGetMany(host, paths) {
     for (const p of paths) if (!SAFE_PATH.test(p)) throw new Error('unsafe path');
     const cmd = paths.map((p) => `curl -s -m 15 'http://127.0.0.1:3867${p}'; printf '\\n\\036\\n'`).join('; ');
     return new Promise((resolve, reject) => {
-      run('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', M5_HOST, cmd],
+      run('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', host, cmd],
         { timeout: 25_000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout) => {
           if (err) return reject(new Error(err.killed ? 'ssh timed out' : 'ssh failed'));
           const parts = stdout.split('\n\x1e\n');
@@ -465,8 +562,55 @@ export function createDeckReader(env = process.env, { fetch = globalThis.fetch, 
     });
   }
 
+  // #834: the direct reader runs where the sign-ins are. A remote machine
+  // gets the reader's source on stdin, so it needs only Node, no checkout.
+  async function readDirect(m) {
+    if (!m.remote) return readDirectLocal();
+    source ??= await readerSource();
+    return new Promise((resolve, reject) => {
+      const child = run('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', m.host, remoteReader],
+        { timeout: 25_000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout) => {
+          if (err) return reject(new Error(err.killed ? 'ssh timed out' : 'ssh failed'));
+          try { resolve(JSON.parse(stdout)); } catch { reject(new Error('Invalid reader JSON')); }
+        });
+      // A remote side that closes early must not crash the page (EPIPE).
+      child?.stdin?.on?.('error', () => {});
+      child?.stdin?.end(source);
+    });
+  }
+
+  // A listed machine (#834) answers if either its daemon or its direct
+  // reader does; each keeps its last good result when the other fails.
+  async function readListed(m, now) {
+    m.lastTry = now;
+    const wantForecast = now - m.forecastAt > FORECAST_TTL;
+    const daemonRead = m.remote
+      ? Promise.all([
+        sshGetMany(m.host, ['/api/state']),
+        wantForecast ? sshGetMany(m.host, ['/api/usage/exhaustion-forecast']).catch(() => [null]) : [null],
+      ]).then(([[state], [forecast]]) => [state, forecast])
+      : Promise.all([localGet('/api/state'), wantForecast ? localGet('/api/usage/exhaustion-forecast').catch(() => null) : null]);
+    const [daemonResult, directResult] = await Promise.allSettled([daemonRead, readDirect(m)]);
+    const [state, forecast] = daemonResult.status === 'fulfilled' ? daemonResult.value : [null, null];
+    const daemonOk = !!state && Array.isArray(state.accounts);
+    if (daemonOk) m.daemonState = state;
+    if (daemonOk && wantForecast && forecast && Array.isArray(forecast.accounts)) { m.forecast = forecast; m.forecastAt = Date.now(); }
+    const directOk = directResult.status === 'fulfilled' && Array.isArray(directResult.value?.folders);
+    if (directOk) m.direct = directResult.value;
+    m.directOk = directOk;
+    if (!daemonOk) log(`${m.name} daemon read failed`);
+    if (!directOk) log(`${m.name} direct read failed`);
+    if (daemonOk || directOk) {
+      m.state = withDirect(m.daemonState || { accounts: [], usage: [] }, m.direct);
+      m.stateAt = Date.now(); m.ok = true; m.error = null;
+    } else {
+      m.ok = false; m.error = 'Read failed';
+    }
+  }
+
   async function readMachine(m, now) {
     if (m.remote && !m.ok && m.lastTry && now - m.lastTry < M5_RETRY && now - m.stateAt > DOWN_AFTER) return; // asleep: don't stall every page load
+    if (m.listed) return readListed(m, now);
     m.lastTry = now;
     const wantForecast = now - m.forecastAt > FORECAST_TTL;
     try {
@@ -474,8 +618,8 @@ export function createDeckReader(env = process.env, { fetch = globalThis.fetch, 
       if (m.remote) {
         // Separate round trips, so a slow forecast can't time out the state read.
         [[state], [forecast]] = await Promise.all([
-          m5GetMany(['/api/state']),
-          wantForecast ? m5GetMany(['/api/usage/exhaustion-forecast']).catch(() => [null]) : [null],
+          sshGetMany(m.host, ['/api/state']),
+          wantForecast ? sshGetMany(m.host, ['/api/usage/exhaustion-forecast']).catch(() => [null]) : [null],
         ]);
       } else {
         [state, forecast] = await Promise.all([
@@ -497,7 +641,7 @@ export function createDeckReader(env = process.env, { fetch = globalThis.fetch, 
     const wants = Object.fromEntries(machineList(machines).map((m) => [m.name, []]));
     for (const acct of accounts) {
       const w = acct._weekly;
-      if (!w) continue;
+      if (!w || w.rows) continue; // a direct weekly carries its own readings
       const key = `${w.machine}:${w.accountId}:${w.resetsAt}`;
       const hit = historyCache.get(key);
       if (hit && now - hit.at < HISTORY_TTL) continue;
@@ -516,7 +660,7 @@ export function createDeckReader(env = process.env, { fetch = globalThis.fetch, 
       if (!m.remote) {
         jobs.push(Promise.all(wanted.map(async (x) => store(x.key, await localGet(x.path).catch(() => null)))));
       } else if (m.ok) {
-        jobs.push(m5GetMany(wanted.map((x) => x.path))
+        jobs.push(sshGetMany(m.host, wanted.map((x) => x.path))
           .then((bodies) => bodies.forEach((b, i) => store(wanted[i].key, b)))
           .catch(() => log(`${m.name} history failed`)));
       }
@@ -544,7 +688,7 @@ export function createDeckReader(env = process.env, { fetch = globalThis.fetch, 
     await Promise.all(machineList(machines).map((m) => readMachine(m, now)));
     const built = mergeAccounts(machines).map((a, i) => buildAccount(a, i, now, machines));
     await readHistories(built, now);
-    const pool = local ? {} : await poolSignins();
+    const pool = local || listed ? {} : await poolSignins();
     return buildDeck(machines, now, { pool, histories: historyCache, generatedAt: Date.now() });
   }
 
@@ -605,11 +749,12 @@ export async function handle(req, res, readDeck = getDeck) {
     }
     if (path === '/api/deck' || path === '/api/status') {
       const deck = await readDeck();
-      const { hubPool, ...page } = deck;
+      const { hubPool, hubUsage, ...page } = deck;
       const body = path === '/api/status' ? {
         generatedAt: deck.generatedAt,
         sources: deck.sources.map(({ name, ok, reachable, readAt }) => ({ name, ok, reachable, readAt })),
         ...(hubPool ? { pool: hubPool } : {}),
+        ...(hubUsage ? { usage: hubUsage } : {}),
       } : page;
       return send(200, 'application/json; charset=utf-8', JSON.stringify(body), { 'Cache-Control': 'no-store' });
     }

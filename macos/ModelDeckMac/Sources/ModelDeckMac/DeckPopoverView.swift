@@ -2168,6 +2168,13 @@ struct DeckAccountRowView: View {
                 }
                 .foregroundStyle(kind == .busy ? Color.primary : Color.secondary)
                 .help(text)
+            } else if let notice = row.remotePoolNotice(now: Date()) {
+                Text(notice.text)
+                    .font(.system(size: 10))
+                    .lineLimit(1)
+                    .foregroundStyle(notice.isWarning ? severityColor(.warning) : Color.secondary)
+                    .help(notice.text)
+                    .accessibilityLabel(notice.text)
             } else if let recovery = signInRecovery ?? row.signInRecovery {
                 let warningID = DeckWarningID(topic: .signInRequired, elementID: row.id)
                 Button {

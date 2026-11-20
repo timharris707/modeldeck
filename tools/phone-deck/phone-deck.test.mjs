@@ -28,6 +28,7 @@ syncBuiltinESMExports();
 const {
   createDeckReader, buildDeck, mergeAccounts, headlineOf, weightOf, windowTitle, windowRank,
   severity, hidden, planLabel, signInOf, hostAllowed, SAFE_PATH, DOWN_AFTER, handle, isMain, hubPoolOf,
+  withDirect, directWarning,
 } = await import('./server.mjs');
 const { poolMemberTag } = await import('../../src/pool-member-tag.mjs');
 after(() => {
@@ -687,4 +688,182 @@ test('installer: DAEMON_PORT is written and preserved', { skip: MACOS_ONLY }, as
   assert.doesNotMatch(twoMac.plist, /DAEMON_PORT/);
   const explicit = await installFixture({ DAEMON_PORT: '13868' }, { installedEnv: { SOURCES: 'local', DAEMON_PORT: '13867' }, twoMac: true });
   assert.match(explicit.plist, /<key>DAEMON_PORT<\/key><string>13868<\/string>/);
+});
+
+// ---------- #834: several machines and direct sign-in readings ----------
+
+const UUID = 'aaaaaaaa-0000-4000-8000-000000000001';
+const directOut = (folder, readings, health = {}) => ({
+  v: 1, readAt: new Date(NOW).toISOString(),
+  folders: [{ folder, accountUuid: UUID, plan: 'Ultra', rateLimitTier: 'default_claude_max_20x' }],
+  readings: readings.map(([usedPercent, ageMs]) => ({
+    folder, entry: `claude-${folder}`, source: 't3', scope: 'weekly', usedPercent,
+    resetsAt: '2026-10-24T12:00:00.000Z', status: 'allowed', observedAt: new Date(NOW - ageMs).toISOString(),
+  })),
+  health: { t3Logs: true, t3Entries: 1, conversationsLastDay: 1, withoutReadingLastDay: 0, formatWarning: false, ...health },
+});
+const listedMachine = (name, state, direct, extra = {}) => ({
+  name, listed: true, remote: name !== 'Studio', ok: true, stateAt: NOW, directOk: true, direct,
+  state: withDirect(state, direct), forecast: null, ...extra,
+});
+
+test('config: MACHINES lists named machines and refuses unsafe or mixed settings', () => {
+  assert.doesNotThrow(() => createDeckReader({ MACHINES: 'Studio=local,Linux=linux,M5=m5,M1=tim-m1-worker' }));
+  for (const MACHINES of ['Studio', 'Studio=local,Other=local', 'A=local,A=linux', 'X=bad host', 'Y=-oProxyCommand=x', "Z=host'x", 'Studio=local,']) {
+    assert.throws(() => createDeckReader({ MACHINES }), /MACHINES/, MACHINES);
+  }
+  assert.throws(() => createDeckReader({ MACHINES: 'Studio=local', SOURCES: 'local' }), /cannot be combined/);
+  assert.throws(() => createDeckReader({ MACHINES: 'Studio=local', MACHINE_LABEL: 'Studio' }), /cannot be combined/);
+});
+
+test('direct: a folder feeds the daemon account with the same uuid and counts as signed in', () => {
+  const state = { accounts: [account('d1', { label: 'Model Deck', authState: 'signin-required', metadata: { claudeAccountUuid: UUID } })], usage: [] };
+  const merged = withDirect(state, directOut('modeldeck', [[1, 0]]));
+  assert.equal(merged.accounts.length, 1);
+  assert.equal(merged.accounts[0].directFolder, true);
+  assert.deepEqual(signInOf(merged.accounts[0]), { state: 'ok', text: null });
+  assert.deepEqual(merged.usage.map((u) => [u.accountId, u.scope, u.usedPercent, u.via]), [['d1', 'weekly', 1, 'T3']]);
+  assert.equal(withDirect(state, null), state, 'no direct read leaves the daemon state as it was');
+});
+
+test('direct: a folder no daemon knows becomes its own account, named after the folder', () => {
+  const merged = withDirect({ accounts: [], usage: [] }, directOut('probe', [[10, 0]]));
+  assert.deepEqual(merged.accounts.map((a) => [a.id, a.label, a.directFolder]), [['direct:probe', 'probe', true]]);
+  assert.equal(planLabel(merged.accounts[0].metadata), 'Ultra');
+});
+
+test('deck: Studio labels, Linux readings; one card, no sign-in warning, source and age shown', () => {
+  const studio = { accounts: [account('s1', { label: 'Probe Account', authState: 'signin-required', metadata: { claudeAccountUuid: UUID } })], usage: [] };
+  const machines = {
+    Studio: listedMachine('Studio', studio, { ...directOut('probe', []), folders: [] }),
+    Linux: listedMachine('Linux', { accounts: [], usage: [] }, directOut('probe', [[8, 3_600_000], [9, 1_800_000], [10, 600_000]])),
+  };
+  const deck = buildDeck(machines, NOW);
+  assert.equal(deck.accounts.length, 1);
+  const card = deck.accounts[0];
+  assert.equal(card.label, 'Probe Account');
+  assert.equal(card.signIn, null);
+  assert.equal(card.weight, undefined, 'no pool host is read in this mode');
+  assert.deepEqual(card.windows.map((w) => [w.title, w.remaining, w.source]), [['Weekly · all models', 90, 'Linux · T3']]);
+  assert.deepEqual(card.feeds, ['Linux · T3']);
+  assert.equal(card.direct, true, 'the page shows this card’s age even when fresh');
+  assert.equal(card.newestObservedAt, new Date(NOW - 600_000).toISOString());
+  assert.deepEqual(deck.sources.map((s) => [s.name, s.warning]), [['Studio', null], ['Linux', null]]);
+});
+
+test('deck: a direct weekly draws its history from its own readings on every machine', () => {
+  const machines = {
+    Studio: listedMachine('Studio', { accounts: [], usage: [] }, directOut('probe', [[5, 20 * 3_600_000]])),
+    Linux: listedMachine('Linux', { accounts: [], usage: [] }, directOut('probe', [[8, 3_600_000], [10, 600_000]])),
+  };
+  const built = mergeAccounts(machines);
+  assert.equal(built.length, 1, 'same uuid on two machines is one account');
+  const deck = buildDeck(machines, NOW);
+  assert.deepEqual(deck.accounts[0].history.points.map(([, r]) => r), [95, 92, 90, 90]);
+});
+
+test('deck: the newest reading wins between the daemon probe and a direct reading', () => {
+  const studio = { accounts: [account('s1', { metadata: { claudeAccountUuid: UUID } })], usage: [usage('s1', 'weekly', 85, 0)] };
+  const machines = { Studio: listedMachine('Studio', studio, directOut('modeldeck', [[10, 60_000]])) };
+  const card = buildDeck(machines, NOW).accounts[0];
+  assert.deepEqual(card.windows.map((w) => [w.remaining, w.source]), [[85, 'Studio']]);
+  assert.equal('direct' in card, false);
+});
+
+test('TRIPWIRE direct warnings: reader failure and the T3 log-format warning reach the page', () => {
+  assert.equal(directWarning(listedMachine('Linux', { accounts: [], usage: [] }, directOut('x', []))), null);
+  assert.match(directWarning(listedMachine('Linux', { accounts: [], usage: [] }, null, { directOk: false })), /Couldn’t read its Claude sign-ins/);
+  assert.match(directWarning(listedMachine('Linux', { accounts: [], usage: [] }, directOut('x', [], { formatWarning: true }))), /T3 update may have changed its log/);
+  assert.equal(directWarning({ ...machine('M1'), listed: false }), null, 'other modes have no direct reader');
+  assert.equal('warning' in buildDeck({ M5: machine('M5'), M1: machine('M1') }, NOW).sources[0], false, 'other modes keep their JSON shape');
+});
+
+test('reader: listed machines read daemons and direct sign-ins; the reader goes over SSH on stdin', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  const execs = [];
+  const studioState = { accounts: [account('s1', { label: 'Probe Account', authState: 'signin-required', metadata: { claudeAccountUuid: UUID } })], usage: [] };
+  const reader = createDeckReader({ MACHINES: 'Studio=local,Linux=linux', DIRECT_NO_CACHE: '1' }, {
+    fetch: async (url) => {
+      const path = new URL(url).pathname;
+      return { ok: true, json: async () => path === '/api/state' ? studioState : { accounts: [] } };
+    },
+    readDirectLocal: () => ({ ...directOut('probe', []), folders: [] }),
+    readerSource: async () => 'READER SOURCE',
+    execFile: (cmd, args, options, callback) => {
+      const stdin = { data: null, on(event, fn) { if (event === 'error') this.onError = fn; }, end(d) { this.data = d; } };
+      execs.push({ cmd, args, stdin });
+      const remote = args.at(-1);
+      // The Linux daemon is down; its direct reader answers.
+      if (remote.startsWith('curl')) setImmediate(() => callback(new Error('down')));
+      else setImmediate(() => callback(null, JSON.stringify(directOut('probe', [[10, 0]]))));
+      return { stdin };
+    },
+    readdir: async () => { throw new Error('the pool directory is never listed in this mode'); },
+  });
+  const deck = await reader();
+  const direct = execs.find((e) => !e.args.at(-1).startsWith('curl'));
+  assert.equal(direct.cmd, 'ssh');
+  assert.deepEqual(direct.args.slice(0, 5), ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', 'linux']);
+  assert.match(direct.args.at(-1), /^MD_DIRECT_READER_MAIN=1 MD_DIRECT_NO_CACHE=1 PATH=.* node --input-type=module$/);
+  assert.equal(direct.stdin.data, 'READER SOURCE');
+  assert.equal(typeof direct.stdin.onError, 'function', 'a remote that closes early (EPIPE) must not crash the page');
+  assert.ok(execs.every((e) => e.args[4] === 'linux'), 'only the listed host is contacted');
+  assert.deepEqual(deck.sources.map((s) => [s.name, s.ok, s.warning]), [['Studio', true, null], ['Linux', true, null]]);
+  assert.deepEqual(deck.accounts.map((a) => [a.label, a.signIn, a.windows[0]?.source]), [['Probe Account', null, 'Linux · T3']]);
+});
+
+test('deck: daemon and direct names for the same window merge, and the newer one wins either way (#834 review)', () => {
+  const studio = (age) => ({ accounts: [account('s1', { metadata: { claudeAccountUuid: UUID } })], usage: [usage('s1', 'week', 85, age)] });
+  const newerDirect = buildDeck({ Studio: listedMachine('Studio', studio(600_000), directOut('modeldeck', [[10, 60_000]])) }, NOW).accounts[0];
+  assert.deepEqual(newerDirect.windows.map((w) => [w.title, w.remaining, w.source]), [['Weekly · all models', 90, 'Studio · T3']]);
+  const newerDaemon = buildDeck({ Studio: listedMachine('Studio', studio(0), directOut('modeldeck', [[10, 60_000]])) }, NOW).accounts[0];
+  assert.deepEqual(newerDaemon.windows.map((w) => [w.title, w.remaining, w.source]), [['Weekly · all models', 85, 'Studio']]);
+  const perModel = { accounts: [account('s1', { metadata: { claudeAccountUuid: UUID } })], usage: [usage('s1', 'Fable weekly', 70)] };
+  const both = buildDeck({ Studio: listedMachine('Studio', perModel, directOut('modeldeck', [[10, 60_000]])) }, NOW).accounts[0];
+  assert.deepEqual(both.windows.map((w) => w.title), ['Weekly · all models', 'Weekly · Fable'], 'per-model weeklies stay separate');
+});
+
+test('pool: a single local machine listed with MACHINES sends no hubPool; SOURCES=local still does (#834 review)', () => {
+  const state = { accounts: [account('p', { proxyPool: 'member', proxyWeight: 3, identity: 'probe@example.test' })], usage: [] };
+  assert.equal('hubPool' in buildDeck({ Studio: listedMachine('Studio', state, null) }, NOW), false);
+  assert.equal(hubPoolOf({ Studio: { ...machine('Studio', state.accounts), remote: false } }) !== undefined, true);
+});
+
+test('installer: choosing MACHINES drops saved hub settings, and choosing the hub drops saved MACHINES (#834 review)', { skip: MACOS_ONLY }, async () => {
+  const toList = await installFixture({ MACHINES: 'Studio=local,Linux box=linux' }, { installedEnv: { SOURCES: 'local', MACHINE_LABEL: 'Studio', ALLOWED_NAMES: 'alias' } });
+  assert.equal(toList.code, 0, toList.output);
+  assert.match(toList.plist, /<key>MACHINES<\/key><string>Studio=local,Linux box=linux<\/string>/);
+  assert.doesNotMatch(toList.plist, /<key>(SOURCES|MACHINE_LABEL)<\/key>/);
+  assert.match(toList.plist, /<key>ALLOWED_NAMES<\/key><string>alias<\/string>/);
+  const toHub = await installFixture({ SOURCES: 'local' }, { installedEnv: { MACHINES: 'Studio=local' } });
+  assert.equal(toHub.code, 0, toHub.output);
+  assert.doesNotMatch(toHub.plist, /<key>MACHINES<\/key>/);
+  const same = await installFixture({}, { installedEnv: { MACHINES: 'Studio=local,M5=m5' } });
+  assert.equal(same.code, 0, same.output);
+  assert.match(same.plist, /<key>MACHINES<\/key><string>Studio=local,M5=m5<\/string>/);
+  const reset = await installFixture({}, { installedEnv: { MACHINES: 'Studio=local' }, twoMac: true });
+  assert.equal(reset.code, 0, reset.output);
+  assert.doesNotMatch(reset.plist, /<key>MACHINES<\/key>/);
+});
+
+test('reader: a failed direct read keeps the last direct card and warns while the daemon answers (#834 review)', async (t) => {
+  let now = NOW;
+  t.mock.method(Date, 'now', () => now);
+  t.mock.method(console, 'log', () => {});
+  let fail = false;
+  const reader = createDeckReader({ MACHINES: 'Studio=local' }, {
+    fetch: async (url) => ({ ok: true, json: async () => (new URL(url).pathname === '/api/state' ? { accounts: [], usage: [] } : { accounts: [] }) }),
+    readDirectLocal: () => {
+      if (fail) throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+      return directOut('probe', [[10, 60_000]]);
+    },
+  });
+  const first = await reader();
+  assert.deepEqual(first.accounts.map((a) => [a.label, a.windows[0].remaining]), [['probe', 90]]);
+  assert.equal(first.sources[0].warning, null);
+  fail = true; now += 60_001;
+  const second = await reader();
+  assert.deepEqual(second.accounts.map((a) => [a.label, a.windows[0].remaining]), [['probe', 90]], 'the card stays');
+  assert.equal(second.sources[0].ok, true, 'the daemon still answers');
+  assert.match(second.sources[0].warning, /Couldn’t read its Claude sign-ins/);
 });

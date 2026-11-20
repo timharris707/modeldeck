@@ -499,14 +499,17 @@ function header(d, now) {
     <div class="fresh"><b>Updated ${ago(gen, now)}</b><br><span class="srcs">${srcs}</span></div></header>${banner(d, now)}`;
 }
 function banner(d, now) {
-  const down = d.sources.filter((s) => !s.reachable);
-  if (!down.length) return '';
-  return down.map((s) => {
-    const last = s.readAt ? `Showing its last numbers, from ${ago(ms(s.readAt), now)}.` : d.sources.length > 1 ? 'Its accounts show only what the other Mac has.' : 'No readings have arrived yet.';
+  const others = d.sources.length > 2 ? 'the other machines have' : 'the other Mac has';
+  const down = d.sources.filter((s) => !s.reachable).map((s) => {
+    const last = s.readAt ? `Showing its last numbers, from ${ago(ms(s.readAt), now)}.` : d.sources.length > 1 ? `Its accounts show only what ${others}.` : 'No readings have arrived yet.';
     return `<div class="banner"><b>${esc(s.name)} isn’t answering</b> (${esc(s.note || 'offline')}). ${last}</div>`;
-  }).join('');
+  });
+  // #834: a machine whose direct readings may be missing says so.
+  const warned = d.sources.filter((s) => s.reachable && s.warning).map((s) => `<div class="banner"><b>${esc(s.name)}:</b> ${esc(s.warning)}.</div>`);
+  return [...down, ...warned].join('');
 }
-const footer = (d) => `<p class="foot">Read-only. Numbers come from ModelDeck on ${d.sources.map((s) => `the ${esc(s.name)}`).join(' and ')} over your tailnet.<br>This page checks again every minute.</p>`;
+const listOf = (names) => (names.length < 3 ? names.join(' and ') : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`);
+const footer = (d) => `<p class="foot">Read-only. Numbers come from ModelDeck on ${listOf(d.sources.map((s) => `the ${esc(s.name)}`))} over your tailnet.<br>This page checks again every minute.</p>`;
 
 // Sparkline of the all-models weekly across its whole window, with the
 // even-pace line from 100% at the window start to 0% at its reset.
@@ -576,9 +579,10 @@ function cardA(a, now) {
   const sev = sevOf(w);
   const isOpen = OPEN.has(a.id);
   let notice = '';
-  if (a.signIn) notice = `<div class="notice warn">${esc(a.signIn.text)}</div>`;
-  else if (a.stale) notice = `<div class="notice">Data from ${ago(ms(a.newestObservedAt), now)}</div>`;
   const newest = ms(a.newestObservedAt);
+  if (a.signIn) notice = `<div class="notice warn">${esc(a.signIn.text)}</div>`;
+  else if (a.direct && newest) notice = `<div class="notice">Read ${ago(newest, now)} · ${esc(a.feeds.join(' + '))}</div>`;
+  else if (a.stale) notice = `<div class="notice">Data from ${ago(newest, now)}</div>`;
   const rows = a.windows.map((x) => {
     const age = ms(x.observedAt);
     const older = newest && age && newest - age > 10 * MIN ? ` · <span class="age">read ${ago(age, now)}</span>` : '';

@@ -716,6 +716,9 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
     /// deck needs. Optional end to end so states from older daemons (or
     /// providers whose adapters send `detail: {}`) decode unchanged.
     public var detail: UsageSnapshotDetail?
+    /// Issue #836: where the usage page got a `pool-hub` row, e.g.
+    /// "Linux · T3". Absent on every other row and from older daemons.
+    public var hubSource: String?
 
     public init(
         accountId: String,
@@ -726,8 +729,10 @@ public struct UsageSnapshot: Codable, Equatable, Sendable {
         observedAt: String? = nil,
         source: String? = nil,
         stale: Bool = false,
-        detail: UsageSnapshotDetail? = nil
+        detail: UsageSnapshotDetail? = nil,
+        hubSource: String? = nil
     ) {
+        self.hubSource = hubSource
         self.accountId = accountId
         self.scope = scope
         self.usedPercent = usedPercent

@@ -38,3 +38,12 @@ export function poolMemberTag(provider, identity) {
     .digest('hex')
     .slice(0, POOL_MEMBER_TAG_LENGTH);
 }
+
+/// Issue #836: the tags a Claude account's usage travels under from the usage
+/// page to a remote Mac: its email and its Claude account id, each one-way.
+/// A Mac that never learned one of them still matches on the other.
+export function claudeUsageTags(identity, accountUuid) {
+  const tags = [poolMemberTag('claude', identity)];
+  if (typeof accountUuid === 'string' && accountUuid.trim()) tags.push(poolMemberTag('claude', `uuid:${accountUuid}`));
+  return tags.filter(Boolean);
+}

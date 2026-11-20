@@ -275,6 +275,7 @@ public enum DeckFreshness {
         var hasCurrent = false
         for id in ids {
             let account = accountsByID[id]
+            if let account, usesRemotePool(for: account, proxy: state.proxy) { continue }
             let observedAt = newestByAccount[id]
             let ageStale = observedAt.map {
                 isStale(observedAt: $0, now: now, autoRefreshInterval: autoRefreshInterval)
@@ -443,10 +444,17 @@ public enum DeckFreshness {
     /// multi-account deck decays into sign-in failures with no visible cause.
     static let signInRecoveryClaudeDetail = "Claude keeps only the active subscription's sign-in fresh, so other subscriptions' sign-ins expire until they are next signed in. Activating this subscription and running Claude Code once may also renew it."
 
+    /// A remote Mac deliberately has no local sign-in for pool accounts (#832).
+    public static func usesRemotePool(for account: DeckAccount, proxy: DeckProxyStatus?) -> Bool {
+        proxy?.role == .remote && account.authState == "signin-required"
+            && account.signinReason?.lowercased() == "missing"
+    }
+
     /// Non-nil exactly when the daemon reported `signin-required` for this
     /// account (issue #89's authState) — pure derivation, no clock. The
     /// keychain-denied notice never coexists with this one: `authState` is
     /// single-valued, and the row model gives #98's notice precedence.
+    /// Remote pool accounts missing a local sign-in need no recovery (#832).
     ///
     /// Issue #149: the notice splits by tone on `signinReason`. "expired"
     /// (idle-decay) renders the calm neutral idle text; "missing" — or an
@@ -454,7 +462,8 @@ public enum DeckFreshness {
     /// needed" alarm VERBATIM. Both tones keep the full #114 structural
     /// story for Claude and the last-refresh-error line; both occupy the
     /// same single notice slot and drive the same #118 one-click path.
-    public static func signInRecovery(for account: DeckAccount) -> SignInRecovery? {
+    public static func signInRecovery(for account: DeckAccount, proxy: DeckProxyStatus? = nil) -> SignInRecovery? {
+        guard !usesRemotePool(for: account, proxy: proxy) else { return nil }
         let renewalFailures = account.provider == "claude"
             ? (account.renew?.consecutiveFailures ?? 0)
             : 0
@@ -521,9 +530,10 @@ public enum DeckFreshness {
         for account: DeckAccount,
         newestObservedAt: Date?,
         now: Date,
-        autoRefreshInterval: TimeInterval
+        autoRefreshInterval: TimeInterval,
+        proxy: DeckProxyStatus? = nil
     ) -> SignInRecovery? {
-        guard let base = signInRecovery(for: account) else { return nil }
+        guard let base = signInRecovery(for: account, proxy: proxy) else { return nil }
         guard base.tone == .idle,
               let newestObservedAt,
               !isStale(observedAt: newestObservedAt, now: now, autoRefreshInterval: autoRefreshInterval)

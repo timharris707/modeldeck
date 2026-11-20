@@ -35,12 +35,18 @@ case "${1:-}" in
   install)
     [[ -x "$NODE" ]] || { printf 'Node is missing: %s\n' "$NODE" >&2; exit 1; }
     [[ $# == 1 || ( $# == 2 && "$2" == --two-mac ) ]] || { printf 'Usage: %s install [--two-mac]\n' "$0" >&2; exit 2; }
+    # A mode chosen now drops the other mode's saved settings (#834 review):
+    # MACHINES excludes the hub's SOURCES and MACHINE_LABEL, and the reverse.
+    explicit_machines="${MACHINES+x}"
+    explicit_hub="${SOURCES+x}${MACHINE_LABEL+x}"
     if [[ -f "$PLIST" ]]; then
       /usr/bin/plutil -lint "$PLIST" >/dev/null
-      for key in SOURCES MACHINE_LABEL ALLOWED_NAMES DAEMON_PORT; do
+      for key in SOURCES MACHINE_LABEL MACHINES ALLOWED_NAMES DAEMON_PORT; do
         # An explicit mode reset discards the hub settings and a scratch daemon
         # port, but keeps host aliases; a port given now still applies.
-        [[ "${2:-}" == --two-mac && ( "$key" == SOURCES || "$key" == MACHINE_LABEL || "$key" == DAEMON_PORT ) ]] && continue
+        [[ "${2:-}" == --two-mac && ( "$key" == SOURCES || "$key" == MACHINE_LABEL || "$key" == MACHINES || "$key" == DAEMON_PORT ) ]] && continue
+        [[ -n "$explicit_machines" && ( "$key" == SOURCES || "$key" == MACHINE_LABEL ) ]] && continue
+        [[ -n "$explicit_hub" && "$key" == MACHINES ]] && continue
         if [[ -z "${!key+x}" ]] && /usr/bin/plutil -type "EnvironmentVariables.$key" "$PLIST" >/dev/null 2>&1; then
           # The sentinel preserves trailing newlines so validation cannot lose them.
           value="$(/usr/bin/plutil -extract "EnvironmentVariables.$key" raw -expect string -n "$PLIST" && printf .)" || exit 1
@@ -50,7 +56,7 @@ case "${1:-}" in
       done
     fi
     if [[ "${2:-}" == --two-mac ]]; then
-      unset SOURCES MACHINE_LABEL
+      unset SOURCES MACHINE_LABEL MACHINES
       printf '%s\n' 'Using two-Mac mode (--two-mac)'
     fi
     "$NODE" --input-type=module - "$DIR" <<'VALIDATE'
@@ -79,7 +85,7 @@ VALIDATE
     "$NODE" --input-type=module - "$DIR" "$HOME" > "$temporary" <<'NODE'
 const [dir, home] = process.argv.slice(2);
 const xml = (s) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c]));
-const optionalEnv = ['SOURCES', 'MACHINE_LABEL', 'ALLOWED_NAMES', 'DAEMON_PORT']
+const optionalEnv = ['SOURCES', 'MACHINE_LABEL', 'MACHINES', 'ALLOWED_NAMES', 'DAEMON_PORT']
   .filter((key) => process.env[key] !== undefined)
   .map((key) => `    <key>${key}</key><string>${xml(process.env[key])}</string>\n`).join('');
 console.log(`<?xml version="1.0" encoding="UTF-8"?>

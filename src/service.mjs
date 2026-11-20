@@ -102,7 +102,7 @@ import { collectConfigLintSnapshot, configLintSnapshotOptions } from './config-l
 import { configLintFailureFindings, evaluateConfigLint } from './config-linter.mjs';
 import { CLAUDE_PROFILES_DIR, CODEX_PROFILES_DIR } from './paths.mjs';
 import { migrateCodexProfilesDir } from './codex-profiles-migration.mjs';
-import { poolCredentialDetail, poolMemberTag } from './pool-member-tag.mjs';
+import { claudeUsageTags, poolCredentialDetail, poolMemberTag } from './pool-member-tag.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -764,6 +764,40 @@ function parsePoolHubRecord(pool) {
   return { readAt: Date.parse(pool.readAt), members };
 }
 
+/// Issue #836: validate the usage page's `usage` block into
+/// `{ readAt, windows: Map<tag, windows | null> }`. A tag two cards list maps
+/// to null so it matches nobody. Throws on any malformed field.
+function parsePoolHubUsage(usage) {
+  const invalid = () => { throw new Error('invalid hub usage'); };
+  if (!usage || typeof usage !== 'object' || !isIso8601Timestamp(usage.readAt)
+    || !Array.isArray(usage.accounts) || usage.accounts.length > 200) invalid();
+  const byTag = new Map();
+  for (const entry of usage.accounts) {
+    if (!entry || !Array.isArray(entry.matches) || !entry.matches.length || entry.matches.length > 8
+      || !entry.matches.every((tag) => typeof tag === 'string' && /^[0-9a-f]{24}$/.test(tag))
+      || !Array.isArray(entry.windows) || entry.windows.length > 12) invalid();
+    const windows = entry.windows.map((w) => {
+      if (!w || typeof w.scope !== 'string' || !w.scope.trim() || w.scope.length > 64
+        || typeof w.usedPercent !== 'number' || !(w.usedPercent >= 0 && w.usedPercent <= 100)
+        || !(w.resetsAt === null || isIso8601Timestamp(w.resetsAt))
+        || !isIso8601Timestamp(w.observedAt)
+        || !(w.source === null || (typeof w.source === 'string' && w.source.length <= 64))) invalid();
+      return { scope: w.scope, usedPercent: w.usedPercent, resetsAt: w.resetsAt, observedAt: w.observedAt, source: w.source };
+    });
+    for (const tag of new Set(entry.matches)) byTag.set(tag, byTag.has(tag) ? null : windows);
+  }
+  return { readAt: Date.parse(usage.readAt), windows: byTag };
+}
+
+/// Issue #836 review: one key for the spellings of the same window, as the
+/// deck reads them; model windows ("Fable weekly") keep their own key.
+function usageWindowKey(scope) {
+  const lower = String(scope).trim().toLowerCase();
+  if (['5h', '5hr', '5-hour', 'five_hour', 'session'].includes(lower)) return '5-hour';
+  if (['week', 'weekly', '7d', 'seven_day'].includes(lower)) return 'weekly';
+  return lower;
+}
+
 function isIso8601Timestamp(value) {
   if (typeof value !== 'string') return false;
   const match = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-](\d{2}):(\d{2}))$/);
@@ -1068,6 +1102,7 @@ export class ModelDeckService {
     this.poolHubStatus = { lastAttemptAt: null, lastAnsweredAt: null, lastFailedAt: null, lastReadOk: null };
     this.poolHubFailed = false;
     this.poolHubPool = null;
+    this.poolHubUsage = null;
     this.yieldToServeLoop = options.yieldToServeLoop
       || (() => new Promise((resolve) => setImmediate(resolve)));
     this.logUsageSnapshotPrune = options.logUsageSnapshotPrune
@@ -1739,6 +1774,7 @@ export class ModelDeckService {
     this.poolHubStatus = { lastAttemptAt: null, lastAnsweredAt: null, lastFailedAt: null, lastReadOk: null };
     this.poolHubFailed = false;
     this.poolHubPool = null;
+    this.poolHubUsage = null;
     this.poolHubUrl = url;
     if (url) void this.readPoolHub();
   }
@@ -1802,18 +1838,22 @@ export class ModelDeckService {
         // Issue #827: an older page sends no pool block; a malformed one
         // fails the whole read rather than show half a pool.
         const pool = data.pool === undefined ? null : parsePoolHubRecord(data.pool);
-        return { ok: data.sources.some((source) => source.ok ?? source.reachable), pool };
+        // Issue #836: the same holds for the page's usage block.
+        const usage = data.usage === undefined ? null : parsePoolHubUsage(data.usage);
+        return { ok: data.sources.some((source) => source.ok ?? source.reachable), pool, usage };
       };
-      const { ok, pool } = await Promise.race([read(), aborted]);
+      const { ok, pool, usage } = await Promise.race([read(), aborted]);
       if (this.poolHubRequest !== controller || !current()) return;
       this.poolHubStatus.lastAnsweredAt = new Date(this.now()).toISOString();
       this.poolHubStatus.lastReadOk = ok;
       // A hub clock running ahead cannot make a record outlive its receipt.
       this.poolHubPool = pool && { ...pool, readAt: Math.min(pool.readAt, this.now()) };
+      this.poolHubUsage = usage && { ...usage, readAt: Math.min(usage.readAt, this.now()) };
       this.recordPoolHubFailure(!ok);
     } catch {
       if (this.poolHubRequest === controller && current()) {
         this.poolHubPool = null;
+        this.poolHubUsage = null;
         this.poolHubStatus.lastFailedAt = new Date(this.now()).toISOString();
         this.recordPoolHubFailure(true);
       }
@@ -1865,6 +1905,43 @@ export class ModelDeckService {
       if (entry.credential && entry.credentialDetail) account.proxyCredentialDetail = entry.credentialDetail;
       account.proxyRelogin = { available: false, reason: remote.reason };
     }
+  }
+
+  /// Issue #836: usage rows with the usage page's readings on matching remote
+  /// Claude accounts, each replacing this Mac's own row of the same scope
+  /// only when it is newer. Same freshness rule as the pool record; the match
+  /// is a tag of the email or the Claude account id, never the label. Rows
+  /// from the page carry `source: 'pool-hub'` and the page's own source name.
+  withPoolHubUsage(usage, accounts) {
+    const settings = this.store.getSettings();
+    const hub = this.poolHubUsage;
+    if (!hub || !this.proxyRoleRemote(settings) || !settings.poolHubUrl || settings.poolHubUrl !== this.poolHubUrl
+      || this.poolHubStatus.lastReadOk !== true || this.now() - hub.readAt >= POOL_HUB_FRESH_MS) return usage;
+    const rows = [...usage];
+    for (const account of accounts) {
+      if (account.provider !== 'claude') continue;
+      const found = new Set(claudeUsageTags(account.identity, account.metadata?.claudeAccountUuid)
+        .filter((tag) => hub.windows.has(tag)).map((tag) => hub.windows.get(tag)));
+      // Two different cards, or a tag the page lists twice: match nothing.
+      if (found.size !== 1 || found.has(null)) continue;
+      for (const w of [...found][0]) {
+        const observedAt = Date.parse(w.observedAt);
+        if (observedAt > this.now() + 5 * 60_000) continue;
+        // Spellings of one window ('week', 'weekly') are one row (#836 review).
+        const key = usageWindowKey(w.scope);
+        const index = rows.findIndex((row) => row.accountId === account.id && usageWindowKey(row.scope) === key);
+        if (index >= 0 && !(observedAt > Date.parse(rows[index].observedAt))) continue;
+        const row = {
+          accountId: account.id, scope: index >= 0 ? rows[index].scope : w.scope, usedPercent: w.usedPercent,
+          remainingPercent: Math.round((100 - w.usedPercent) * 10) / 10,
+          resetsAt: w.resetsAt, observedAt: w.observedAt, source: 'pool-hub', stale: false, detail: {},
+          ...(w.source ? { hubSource: w.source } : {}),
+        };
+        if (index >= 0) rows[index] = row;
+        else rows.push(row);
+      }
+    }
+    return rows;
   }
 
   recordPoolHubFailure(failed) {
@@ -7725,6 +7802,7 @@ export class ModelDeckService {
     const result = {
       ...value,
       accounts,
+      usage: this.withPoolHubUsage(value.usage, accounts),
       codexProfilesDir: this.codexProfilesDir,
       activation: { claude: claudeActivation, codex: codexActivation },
       managed: { claude: this.isProviderManaged('claude'), codex: this.isProviderManaged('codex') },
@@ -7984,7 +8062,7 @@ export class ModelDeckService {
       ));
       return authFlagged ? { ...account, authFlagged } : account;
     });
-    return evaluateWorstCapacity(this.store.latestUsage(), accounts, {
+    return evaluateWorstCapacity(this.withPoolHubUsage(this.store.latestUsage(), accounts), accounts, {
       thresholdPercent: settings.notificationThresholdPercent,
       criticalPercent: options.criticalPercent ?? 10,
       now: options.now ?? this.now(),
