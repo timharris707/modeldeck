@@ -1370,3 +1370,76 @@ test('renewal attempt metadata survives a daemon restart', async () => {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+// #847 review: reads turned off after the renewal's auth-status check and
+// before its usage probe. The refusal is no renewal attempt: nothing is
+// recorded or budgeted, and the prior activation is restored.
+test('renewal-refused-by-disabled-reads-records-no-attempt-and-restores-activation', async () => {
+  const data = fixture({
+    serviceOptions: {
+      exec: async (_command, args) => {
+        if (args[0] === 'auth') data.store.saveSettings({ providerUsageReadsEnabled: false });
+        return { stdout: args[0] === 'auth' ? MATCHING_STATUS : '', stderr: '' };
+      },
+    },
+  });
+  try {
+    data.expire();
+    await assert.rejects(data.service.renewClaudeAccount(data.target.id), (error) => error.statusCode === 409);
+    const saved = data.store.getAccount(data.target.id).metadata.claudeRenewal;
+    assert.equal(saved?.attempts?.length ?? 0, 0);
+    assert.equal(saved?.consecutiveFailures ?? 0, 0);
+    assert.equal(saved?.lastAttempt ?? null, null);
+    assert.equal(fs.realpathSync(data.activeLink), fs.realpathSync(data.priorHome));
+  } finally { data.close(); }
+});
+
+// #847 review: the same refusal on the flip path. Reads turn off during the
+// auth-status call made while the target is active; the prior activation is
+// restored and nothing is recorded.
+test('renewal-refused-by-disabled-reads-on-the-flip-path-restores-the-prior-profile', async () => {
+  const other = JSON.stringify({ email: 'other@example.invalid' });
+  let authCalls = 0;
+  const seen = [];
+  const data = fixture({
+    serviceOptions: {
+      exec: async (_command, args) => {
+        if (args[0] === 'auth') {
+          authCalls += 1;
+          seen.push(fs.realpathSync(data.activeLink));
+          if (authCalls === 2) data.store.saveSettings({ providerUsageReadsEnabled: false });
+        }
+        return { stdout: args[0] === 'auth' ? other : '', stderr: '' };
+      },
+    },
+  });
+  try {
+    data.expire();
+    await assert.rejects(data.service.renewClaudeAccount(data.target.id), (error) => error.statusCode === 409);
+    assert.deepEqual(seen, [fs.realpathSync(data.priorHome), fs.realpathSync(data.targetHome)], 'the target was activated');
+    assert.equal(fs.realpathSync(data.activeLink), fs.realpathSync(data.priorHome), 'then the prior profile was restored');
+    const saved = data.store.getAccount(data.target.id).metadata.claudeRenewal;
+    assert.equal(saved?.attempts?.length ?? 0, 0);
+    assert.equal(saved?.consecutiveFailures ?? 0, 0);
+    assert.equal(saved?.lastAttempt ?? null, null);
+  } finally { data.close(); }
+});
+
+// #847 review: reads turn off during the renewal helper's setup, before the
+// auth-status spawn. Both callers get the 409, not "unavailable" or "busy",
+// no claude process starts, and nothing is recorded.
+test('renewal-and-identity-check-refuse-when-reads-turn-off-during-cli-setup', async () => {
+  const data = fixture();
+  try {
+    const turnOff = async () => { data.store.saveSettings({ providerUsageReadsEnabled: false }); return path.join(data.root, 'data', 'claude-renewal', 'cfg-000000000000'); };
+    data.expire();
+    data.service.claudeRenewalConfigDir = turnOff;
+    await assert.rejects(data.service.renewClaudeAccount(data.target.id), (error) => error.statusCode === 409);
+    data.store.saveSettings({ providerUsageReadsEnabled: true });
+    await assert.rejects(data.service.verifyClaudeIdentity(data.target.id), (error) => error.statusCode === 409);
+    assert.equal(data.calls.length, 0, 'no claude process started');
+    const saved = data.store.getAccount(data.target.id).metadata.claudeRenewal;
+    assert.equal(saved?.lastAttempt ?? null, null);
+    assert.equal(fs.realpathSync(data.activeLink), fs.realpathSync(data.priorHome));
+  } finally { data.close(); }
+});

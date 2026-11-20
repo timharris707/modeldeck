@@ -612,6 +612,11 @@ const CLIENT_KEY_REPORT_MAX_ENTRIES = 1000;
 const CLIENT_KEY_REPORT_MAX_GENERATION = 1_000_000_000;
 export const CLIENT_KEY_REPORT_MAX_GENERATION_JUMP = 1_000_000;
 const SHA256_OF_EMPTY_STRING = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+// #847: the refusal a disabled provider read throws. Never a provider failure.
+const PROVIDER_USAGE_READS_OFF = 'provider-usage-reads-off';
+
+const readsOffMark = (error) => (error?.code === PROVIDER_USAGE_READS_OFF ? { readsOff: true } : {});
+
 const CLAUDE_UNMANAGE_UNAVAILABLE_REASON = 'Turning off account switching for Claude is not available yet. Your accounts and history are unchanged.';
 
 function serviceError(message, statusCode) {
@@ -1031,9 +1036,12 @@ export class ModelDeckService {
       && grokHomeDiscoveryEntryLimit > 0
       ? grokHomeDiscoveryEntryLimit
       : DEFAULT_GROK_HOME_DISCOVERY_ENTRY_LIMIT;
-    this.fetchClaude = options.fetchClaude || fetchClaudeUsage;
-    this.fetchCodex = options.fetchCodex || fetchCodexRateLimits;
-    this.fetchGrok = options.fetchGrok || fetchGrokUsage;
+    // #847: every provider read with a stored sign-in refuses while
+    // providerUsageReadsEnabled is off, whatever path or timing reaches it.
+    const guarded = (read) => (...args) => { this.assertProviderUsageReadsAllowed(); return read(...args); };
+    this.fetchClaude = guarded(options.fetchClaude || fetchClaudeUsage);
+    this.fetchCodex = guarded(options.fetchCodex || fetchCodexRateLimits);
+    this.fetchGrok = guarded(options.fetchGrok || fetchGrokUsage);
     this.activateClaude = (...args) => {
       this.requireManaged('claude');
       return (options.activateClaude || activateClaudeProfile)(...args);
@@ -1049,11 +1057,11 @@ export class ModelDeckService {
     this.ensureClaudeProfileExplainer = options.reconcileClaudeProfileExplainer
       || reconcileClaudeProfileExplainer;
     this.createCodexProfile = options.createCodexProfile || createCodexProfileHome;
-    this.readClaudeAuth = options.readClaudeAuth || readClaudeAuthStatus;
+    this.readClaudeAuth = guarded(options.readClaudeAuth || readClaudeAuthStatus);
     this.readClaudeTier = options.readClaudeTier || readClaudeRateLimitTier;
     this.readClaudePlanName = options.readClaudePlanName || readClaudePlanDisplayName;
     this.readClaudeIdentity = options.readClaudeIdentity || readClaudeProfileIdentity;
-    this.readCodexAuth = options.readCodexAuth || readCodexLoginStatus;
+    this.readCodexAuth = guarded(options.readCodexAuth || readCodexLoginStatus);
     this.readCodexPlan = options.readCodexPlan || readCodexPlan;
     this.readCodexAccountId = options.readCodexAccountId || readCodexAccountId;
     this.claudeCredentialsPresent = options.claudeCredentialsPresent || claudeCredentialsPresent;
@@ -1933,7 +1941,9 @@ export class ModelDeckService {
         // Spellings of one window ('week', 'weekly') are one row (#836 review).
         const key = usageWindowKey(w.scope);
         const index = rows.findIndex((row) => row.accountId === account.id && usageWindowKey(row.scope) === key);
-        if (index >= 0 && !(observedAt > Date.parse(rows[index].observedAt))) continue;
+        // An equal reading is the page's copy of this Mac's own; take it so the
+        // card names its source instead of the pool line (#847).
+        if (index >= 0 && observedAt < Date.parse(rows[index].observedAt)) continue;
         const row = {
           accountId: account.id, scope: index >= 0 ? rows[index].scope : w.scope, usedPercent: w.usedPercent,
           remainingPercent: Math.round((100 - w.usedPercent) * 10) / 10,
@@ -3071,6 +3081,9 @@ export class ModelDeckService {
       if (!enabledIds.has(accountId)) this.accountRefreshErrors.delete(accountId);
     }
     for (const result of results) {
+      // #847 review: a disabled-read refusal neither sets nor clears an
+      // account's refresh error, so an expired sign-in stays expired.
+      if (result.readsOff) continue;
       if (result.ok) this.accountRefreshErrors.delete(result.accountId);
       else this.accountRefreshErrors.set(result.accountId, { message: result.error, at });
       if (result.ok) {
@@ -3112,7 +3125,7 @@ export class ModelDeckService {
         refreshedSnapshots.set(account.id, snapshots);
         return { accountId: account.id, ok: true, snapshotCount: snapshots.length };
       } catch (error) {
-        return { accountId: account.id, ok: false, error: error.message };
+        return { accountId: account.id, ok: false, error: error.message, ...readsOffMark(error) };
       }
     }));
     const enabledIds = new Set(accounts.map((account) => account.id));
@@ -3150,10 +3163,26 @@ export class ModelDeckService {
     } catch { /* The linter reports an unavailable stored fact instead of breaking refresh. */ }
   }
 
+  /// #847: false when this Mac is set to take usage only from what the
+  /// provider programs hand over, never by reading a stored sign-in.
+  providerUsageReadsAllowed() {
+    return this.store.getSettings().providerUsageReadsEnabled !== false;
+  }
+
+  assertProviderUsageReadsAllowed() {
+    if (!this.providerUsageReadsAllowed()) {
+      throw Object.assign(serviceError('ModelDeck is set not to read stored sign-ins on this Mac (providerUsageReadsEnabled is off).', 409), {
+        code: PROVIDER_USAGE_READS_OFF,
+      });
+    }
+  }
+
   async refreshClaudeAccount(accountId) {
+    if (!this.providerUsageReadsAllowed()) return null;
     const account = this.store.getAccount(accountId);
     if (!account || account.provider !== 'claude' || !account.enabled) return null;
     await this.refreshClaudeProfileMetadata(account).catch(() => {});
+    if (!this.providerUsageReadsAllowed()) return null;
     let result;
     const refreshedSnapshots = new Map();
     try {
@@ -3168,7 +3197,7 @@ export class ModelDeckService {
       refreshedSnapshots.set(account.id, snapshots);
       result = { accountId: account.id, ok: true, snapshotCount: snapshots.length };
     } catch (error) {
-      result = { accountId: account.id, ok: false, error: error.message };
+      result = { accountId: account.id, ok: false, error: error.message, ...readsOffMark(error) };
     }
     const enabled = this.store.listAccounts()
       .filter((item) => item.provider === 'claude' && item.enabled);
@@ -4455,6 +4484,8 @@ export class ModelDeckService {
   async verifyAccount(accountId) {
     const account = this.store.getAccount(accountId);
     if (!account) throw new Error('account not found');
+    // #847 review: verifying reads the stored sign-in too.
+    this.assertProviderUsageReadsAllowed();
     this.assertNoProviderManagement(account.provider);
     const result = account.provider === 'claude'
       // Public issue #2, second sighting: the login step resolved the CLI
@@ -4616,7 +4647,7 @@ export class ModelDeckService {
         for (const snapshot of snapshots) this.store.recordUsage(account.id, snapshot);
         return { accountId: account.id, ok: true, snapshotCount: snapshots.length };
       } catch (error) {
-        return { accountId: account.id, ok: false, error: error.message };
+        return { accountId: account.id, ok: false, error: error.message, ...readsOffMark(error) };
       }
     }));
     // Issue #108 — mirror of the Claude fingerprint block in refreshClaude:
@@ -4656,7 +4687,7 @@ export class ModelDeckService {
         for (const snapshot of snapshots) this.store.recordUsage(account.id, snapshot);
         return { accountId: account.id, ok: true, snapshotCount: snapshots.length };
       } catch (error) {
-        return { accountId: account.id, ok: false, error: error.message };
+        return { accountId: account.id, ok: false, error: error.message, ...readsOffMark(error) };
       }
     }));
     this.recordAccountRefreshResults(results);
@@ -4711,16 +4742,25 @@ export class ModelDeckService {
       // watcher above is the fast path (about a second); this is the backstop
       // for platforms without recursive fs.watch and for a watcher that died.
       await this.ingestClaudeStatuslineSessionModels().catch(() => {});
+      // #847: no provider usage call with a stored sign-in, scheduled or asked.
+      // Status line captures are local files, so they are still picked up.
+      if (!this.providerUsageReadsAllowed()) {
+        await this.ingestClaudeStatuslineCaptures().catch(() => {});
+        return { ...result, usageReadsOff: true };
+      }
       try {
         result.claude = { ok: true, profiles: await this.refreshClaude() };
         if (result.claude.profiles.some((item) => !item.ok)) result.claude.ok = false;
       }
       catch (error) { result.claude = { ok: false, error: error.message }; }
+      // Recheck at each provider boundary: the setting may turn off mid-cycle (#847 review).
+      if (!this.providerUsageReadsAllowed()) return { ...result, usageReadsOff: true };
       result.codex = { ok: true, profiles: await this.refreshCodex() };
       if (result.codex.profiles.some((item) => !item.ok)) result.codex.ok = false;
       // Decision 0035: additive and last. A Grok failure can never change what
       // the other two report, and an install with no Grok accounts leaves the
       // key null — exactly what an older app already ignores.
+      if (!this.providerUsageReadsAllowed()) return { ...result, usageReadsOff: true };
       try {
         const profiles = await this.refreshGrok();
         if (profiles.length) {
@@ -4997,7 +5037,10 @@ export class ModelDeckService {
     // installedToolVersion, the bare name goes first and the install-dir
     // fallback answers only an ENOENT — so a PATH-visible CLI spawns
     // exactly once, and a native-installer one in ~/.local/bin still runs.
-    const spawn = (binary) => this.exec(binary, args, {
+    // #847 review: the setting is checked at the spawn itself, after every
+    // setup await, for the first binary and for the fallback alike.
+    const spawn = (binary) => { this.assertProviderUsageReadsAllowed(); return run(binary); };
+    const run = (binary) => this.exec(binary, args, {
       // cwd stays the shared scratch ROOT, unchanged from before #263. Only
       // the env moves. Pointing cwd at the per-account config dir would have
       // made it a project path for the CLI (a second settings search location)
@@ -5023,11 +5066,15 @@ export class ModelDeckService {
   // makes the verifier's no-inference contract structural: unlike
   // finishClaudeRenewal, this helper has no path to the `-p` rung.
   async readScopedClaudeAuthStatus(profileRef) {
+    this.assertProviderUsageReadsAllowed();
     let invocation;
     let failed = false;
     try {
       invocation = await this.runClaudeRenewalCli(['auth', 'status', '--json'], profileRef);
     } catch (error) {
+      // #847 review: a disabled read is a refusal for the caller, not a
+      // failed status read (which would surface as "unavailable" or "busy").
+      if (error?.code === PROVIDER_USAGE_READS_OFF) throw error;
       invocation = error;
       failed = true;
     }
@@ -5100,6 +5147,8 @@ export class ModelDeckService {
       this.recordAccountRefreshResults([{ accountId: account.id, ok: true, snapshotCount: snapshots.length }]);
       return { ok: true, expired: false };
     } catch (error) {
+      // #847 review: a disabled read is a refusal, not a failed renewal.
+      if (error?.code === PROVIDER_USAGE_READS_OFF) throw error;
       return {
         ok: false,
         expired: SIGN_IN_REQUIRED_ERROR_PATTERN.test(error.message)
@@ -5199,6 +5248,7 @@ export class ModelDeckService {
     this.requireManaged('claude');
     let previous;
     let activated = false;
+    let readsOff = null;
     let result = {
       at,
       outcome: 'failed',
@@ -5236,6 +5286,7 @@ export class ModelDeckService {
       }
       result = await this.finishClaudeRenewal(account, at, 'flip');
     } catch (error) {
+      if (error?.code === PROVIDER_USAGE_READS_OFF) readsOff = error;
       if (error?.code === 'claude-renewal-restore-unsafe') {
         result.detail = 'ModelDeck could not safely verify the previously active Claude profile, so renewal was not attempted.';
       }
@@ -5258,10 +5309,15 @@ export class ModelDeckService {
         }
       }
     }
+    // #847 review: once the prior activation is back, a disabled read
+    // propagates unrecorded; it is no renewal attempt.
+    if (readsOff && !result.restoreFailed) throw readsOff;
     return result;
   }
 
   async performClaudeRenewal(accountId) {
+    // #847 review: queued work rechecks once it holds the lock.
+    this.assertProviderUsageReadsAllowed();
     const account = this.store.getAccount(accountId);
     if (account && account.provider !== 'claude') {
       throw new Error('Claude renewal provider mismatch: this account is not a Claude account.');
@@ -5333,11 +5389,13 @@ export class ModelDeckService {
     }
 
     this.requireManaged('claude');
+    this.assertProviderUsageReadsAllowed();
     const result = await this.performClaudeFlipRenewal(latestAccount, at);
     return this.recordClaudeRenewalAttempt(accountId, { ...result, identityDecline });
   }
 
   async renewClaudeAccount(accountId) {
+    this.assertProviderUsageReadsAllowed();
     if (this.providerManagementOperations.has('claude')) this.assertProviderIdle('claude');
     if (this.claudeRenewalPromise) throw new ClaudeRenewalConflictError();
     const account = this.store.getAccount(accountId);
@@ -5384,6 +5442,7 @@ export class ModelDeckService {
   }
 
   async performClaudeIdentityVerification(accountId) {
+    this.assertProviderUsageReadsAllowed();
     // Re-check after waiting behind unrelated Claude work. Activation marks
     // its account before queueing and renewal records its account while
     // queued, so same-account work that arrived meanwhile becomes an honest
@@ -5439,6 +5498,7 @@ export class ModelDeckService {
   }
 
   async verifyClaudeIdentity(accountId) {
+    this.assertProviderUsageReadsAllowed();
     const account = this.store.getAccount(accountId);
     if (!account) throw serviceError('account not found', 404);
     if (account.provider !== 'claude') {

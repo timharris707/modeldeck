@@ -163,6 +163,19 @@ test('a page reading replaces this Mac\'s row for the same window under another 
   assert.equal(d.service.worstCapacity().worst.remainingPercent, 30, 'the old 95% row no longer counts');
 });
 
+// #847: on the M5, the page's newest reading for an account was the M5's own
+// (same time, same number). The card kept its own row and fell back to "Uses
+// the pool on <host>". An equal page reading now replaces it and names its source.
+test('a page reading equal to this Mac\'s own replaces it, so the card names its source', async (t) => {
+  const d = fixture(t);
+  const state = pageDaemonState();
+  d.setReply(async () => new Response(await pageStatusBody(state)));
+  const own = state.usage[0];
+  d.store.recordUsage(d.accounts.click.id, { scope: 'weekly', usedPercent: own.usedPercent, resetsAt: own.resetsAt, observedAt: own.observedAt, source: 'claude-oauth-api' });
+  await d.goRemote();
+  assert.deepEqual((await d.weekly()).click, { used: 40, source: 'pool-hub', hubSource: 'Studio' });
+});
+
 test('the page sends only one-way tags, never an email or account id', async () => {
   const body = await pageStatusBody();
   const status = JSON.parse(body);

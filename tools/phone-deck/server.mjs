@@ -278,7 +278,9 @@ export function buildAccount(acct, idx, now, machines) {
   const best = new Map();
   for (const [mname, a] of acct.from) {
     for (const u of machines[mname].state.usage || []) {
-      if (u.accountId !== a.id) continue;
+      // A daemon reading this page shows its readings back as 'pool-hub' rows
+      // (#836); they are this page's own, so the original machine keeps the label.
+      if (u.accountId !== a.id || u.source === 'pool-hub') continue;
       const obs = Date.parse(u.observedAt);
       // Equivalent scope names ('week', 'weekly') are one window (#834 review).
       const key = knownTitle(u.scope) ?? u.scope;

@@ -192,6 +192,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
   // independently switchable from usage refreshes so the background
   // invocation can be stopped without making the deck stale.
   autoRenewEnabled: true,
+  // Off on a Mac whose usage comes only from what the provider programs hand
+  // over (#847, Tim 2026-11-19): ModelDeck then makes no usage call with a
+  // stored sign-in and renews none, on a schedule or on request.
+  providerUsageReadsEnabled: true,
   // Issue #342: the unauthenticated OTLP exporter endpoints are reachable
   // only over the daemon's loopback listener and remain absent until the
   // operator explicitly enables collection.
@@ -302,7 +306,7 @@ function validateSetting(key, value) {
   if (['claudeManaged', 'codexManaged'].includes(key) && value !== null && typeof value !== 'boolean') {
     throw new Error(`${key} must be a boolean or null`);
   }
-  if (['autoRefreshEnabled', 'autoRenewEnabled', 'otelReceiverEnabled', 'autoRefreshIntervalCustomized', 'pauseWhileActive', 'sharedUserScopeEnabled', 'usageAnalyticsEnabled', 'usageQueueConsumerEnabled'].includes(key) && typeof value !== 'boolean') {
+  if (['autoRefreshEnabled', 'autoRenewEnabled', 'providerUsageReadsEnabled', 'otelReceiverEnabled', 'autoRefreshIntervalCustomized', 'pauseWhileActive', 'sharedUserScopeEnabled', 'usageAnalyticsEnabled', 'usageQueueConsumerEnabled'].includes(key) && typeof value !== 'boolean') {
     throw new Error(`${key} must be a boolean`);
   }
   if (key === 'autoRefreshIntervalSeconds'

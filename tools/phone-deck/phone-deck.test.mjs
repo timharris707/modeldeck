@@ -867,3 +867,15 @@ test('reader: a failed direct read keeps the last direct card and warns while th
   assert.equal(second.sources[0].ok, true, 'the daemon still answers');
   assert.match(second.sources[0].warning, /Couldn’t read its Claude sign-ins/);
 });
+
+// The Studio, 2026-11-19: its daemon reads this page (poolHubUrl) and returns
+// the page's readings as 'pool-hub' rows. The page read them back and every
+// card said "· Studio" for numbers that came from the M5. They are skipped.
+test('TRIPWIRE the page skips readings a daemon took from this page, so the source machine keeps its name', () => {
+  const echo = { ...usage('s1', 'weekly', 63), source: 'pool-hub', hubSource: 'M5' };
+  const deck = buildDeck({
+    Studio: { ...machine('Studio', [account('s1', { metadata: { claudeAccountUuid: 'uuid-x' } })], [echo]), remote: false },
+    M5: machine('M5', [account('m1', { metadata: { claudeAccountUuid: 'uuid-x' } })], [usage('m1', 'weekly', 63)]),
+  }, NOW);
+  assert.deepEqual(deck.accounts.map((a) => a.windows.map((w) => [w.title, w.remaining, w.source])), [[['Weekly · all models', 63, 'M5']]]);
+});

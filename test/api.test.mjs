@@ -1676,6 +1676,7 @@ test('settings API validates partial updates and drives worst-capacity threshold
     codexManaged: true,
     autoRefreshEnabled: true,
     autoRenewEnabled: true,
+    providerUsageReadsEnabled: true,
     otelReceiverEnabled: false,
     autoRefreshIntervalSeconds: 300,
     autoRefreshIntervalCustomized: false,
